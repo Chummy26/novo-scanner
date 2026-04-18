@@ -117,6 +117,14 @@ impl GateSpotAdapter {
                         return Err(Error::WebSocket("stream closed".into()));
                     };
                     let msg = msg.map_err(|e| Error::WebSocket(format!("recv: {}", e)))?;
+                    // ANY received frame proves the TCP connection is alive —
+                    // update the liveness watchdog BEFORE filtering by channel.
+                    // Gate `spot.tickers` is trade-driven: during quiet spans
+                    // the only traffic can be our pong replies to `spot.pong`,
+                    // which previously were dropped by the filter and the
+                    // watchdog then forced a false-positive reconnect at 60s.
+                    last_frame_at = std::time::Instant::now();
+
                     if msg.is_ping() {
                         client.send(Message::pong(msg.into_payload())).await
                             .map_err(|e| Error::WebSocket(format!("pong: {}", e)))?;
@@ -154,7 +162,6 @@ impl GateSpotAdapter {
                             debug!(symbol, "gate-spot: symbol not in universe");
                         }
                     });
-                    last_frame_at = std::time::Instant::now();
                 }
                 _ = tokio::time::sleep_until((last_frame_at + Duration::from_secs(60)).into()) => {
                     return Err(Error::WebSocket("silent disconnect gate-spot".into()));

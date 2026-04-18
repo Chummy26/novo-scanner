@@ -7,7 +7,18 @@
 //! Ping:     server pushes "ping" every 5s; 3 consecutive misses → disconnect
 //!           (effective 15s timeout per PhD#5 D-18, tighter than the
 //!           prompt's "1 min" assumption).
-//! Subscribe: `{"method":"subscribe","params":["ticker@btc_usdt"]}`
+//! Channel:  `depth@{sym},5` — top-5 levels of the order book.
+//!   The `ticker@{sym}` channel is NOT used because XT spot ticker frames
+//!   omit `bp`/`ap` — the only price present is `c` (last trade), which on
+//!   illiquid symbols stays stale for minutes and creates ghost spreads
+//!   (e.g. SIREN/RAVE appearing to trade at 30% apart vs other venues when
+//!   the real bid/ask was actually aligned).
+//! Subscribe: `{"sub":"depth@btc_usdt,5"}` per message (XT docs "Limited Depth").
+//!   The `{"method":"subscribe","params":[...]}` shape is the XT **futures**
+//!   request format; spot public streams use the `sub` keyword and a single
+//!   topic per frame. Sending the wrong shape silently drops — server never
+//!   emits data → adapter reconnects every 30s with zero frames received.
+//! Volume:    Not in depth frames — picked up by `vol_poller` via REST.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,15 +93,20 @@ impl XtSpotAdapter {
             .connect().await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
-        // Subscribe to ticker@{sym} for each universe symbol.
+        // Subscribe one topic per message using XT spot's `{"sub":"<topic>"}`
+        // shape. The spot server rejects (silently) the futures-style
+        // `{"method":"subscribe","params":[…]}` wrapper — we verified this
+        // empirically: the old wrapper produced 0 frames across 3 reconnects.
         let xt_symbols: Vec<String> = self.universe.per_venue[Venue::XtSpot.idx()]
             .keys().cloned().collect();
-        for chunk in xt_symbols.chunks(50) {
-            let params: Vec<String> = chunk.iter().map(|s| format!("\"ticker@{}\"", s)).collect();
-            let sub = format!(r#"{{"method":"subscribe","params":[{}]}}"#, params.join(","));
+        info!(venue = "xt-spot", count = xt_symbols.len(), "subscribing depth@sym,5");
+        for sym in &xt_symbols {
+            let sub = format!(r#"{{"sub":"depth@{},5"}}"#, sym);
             client.send(Message::text(sub)).await
-                .map_err(|e| Error::WebSocket(format!("subscribe: {}", e)))?;
-            tokio::time::sleep(Duration::from_millis(20)).await;
+                .map_err(|e| Error::WebSocket(format!("subscribe {}: {}", sym, e)))?;
+            // Light spacing — XT docs don't publish a hard rate limit for
+            // public sub but being polite avoids any server-side throttle.
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         let mut decoder = GzipDecoder::new(8 * 1024);
@@ -104,6 +120,10 @@ impl XtSpotAdapter {
                         return Err(Error::WebSocket("stream closed".into()));
                     };
                     let msg = msg.map_err(|e| Error::WebSocket(format!("recv: {}", e)))?;
+                    // ANY frame proves TCP alive — update before filters to avoid
+                    // false-positive reconnect during market-quiet windows.
+                    last_frame_at = std::time::Instant::now();
+
                     if msg.is_close() { return Ok(()); }
                     let payload = msg.as_payload();
                     let bytes: &[u8] = &payload[..];
@@ -147,23 +167,21 @@ impl XtSpotAdapter {
 
                     let Ok(topic_lv) = sonic_rs::get(text, &["topic"]) else { continue };
                     let Some(topic) = topic_lv.as_str() else { continue };
-                    if topic != "ticker" { continue; }
+                    if topic != "depth" { continue; }
 
                     let t0 = std::time::Instant::now();
-                    let _ = parse_and_apply(text, |sym, bid, ask, qv| {
+                    let _ = parse_and_apply(text, |sym, bid, ask| {
                         if let Some(id) = self.universe.lookup(Venue::XtSpot, sym) {
                             let ts = now_ns();
                             store.slot(Venue::XtSpot, id).commit(
                                 bid, Qty::from_f64(1.0), ask, Qty::from_f64(1.0), ts
                             );
                             self.stale.cell(Venue::XtSpot, id).update(ts);
-                            if qv > 0.0 { self.vol.set(Venue::XtSpot, id, qv); }
                             Metrics::init().record_ingest(Venue::XtSpot, t0.elapsed().as_nanos() as u64);
                         } else {
                             debug!(symbol = sym, "xt-spot: not in universe");
                         }
                     });
-                    last_frame_at = std::time::Instant::now();
                 }
                 _ = tokio::time::sleep_until((last_frame_at + Duration::from_secs(30)).into()) => {
                     return Err(Error::WebSocket("silent disconnect xt-spot (15-30s window)".into()));
@@ -175,37 +193,36 @@ impl XtSpotAdapter {
 
 fn parse_and_apply<F>(json: &str, f: F) -> Result<()>
 where
-    F: FnOnce(&str, Price, Price, f64),
+    F: FnOnce(&str, Price, Price),
 {
-    // XT spot ticker frame doesn't include bid/ask — only open/close/high/low
-    // and base/quote volume. We take `c` (close=last) as a flat-spread proxy
-    // until the per-symbol book-ticker channel is wired up.
-    //
-    // Observed payload:
-    //   data.s  symbol (lowercase)
-    //   data.c  close/last trade price (string)
-    //   data.q  base volume 24h (string)
-    //   data.v  quote volume 24h (string)
+    // XT spot depth@{sym},5 frame observed on wire:
+    //   {
+    //     "topic":"depth",
+    //     "event":"depth@btc_usdt,5",
+    //     "data": {
+    //       "s":"btc_usdt",
+    //       "b":[["41999.50","0.5"], ...],   // best bid first (desc by price)
+    //       "a":[["42001.00","0.3"], ...],   // best ask first (asc by price)
+    //       "t":1234567890
+    //     }
+    //   }
     let s_lv = sonic_rs::get(json, &["data", "s"])
         .map_err(|e| Error::Decode(format!("data.s: {}", e)))?;
     let sym = s_lv.as_str().ok_or_else(|| Error::Decode("data.s not str".into()))?;
 
-    let get_num = |k: &str| -> f64 {
-        sonic_rs::get(json, &["data", k])
-            .ok()
-            .and_then(|lv| lv.as_str().and_then(|s| s.parse::<f64>().ok()))
-            .unwrap_or(0.0)
-    };
-    // Prefer real bp/ap if the server ever includes them; otherwise flatten to c.
-    let mut bp = get_num("bp");
-    let mut ap = get_num("ap");
-    if bp <= 0.0 || ap <= 0.0 {
-        let c = get_num("c");
-        if c > 0.0 { bp = c; ap = c; } else { return Ok(()); }
-    }
-    // volume 24h in quote currency (USDT for */USDT pairs).
-    let qvol = get_num("v");
-    f(sym, Price::from_f64(bp), Price::from_f64(ap), qvol);
+    // Best bid at data.b[0][0], best ask at data.a[0][0]. Both sides may be
+    // empty momentarily on sparse books — skip the frame in that case rather
+    // than committing a zero price. sonic_rs paths with mixed string+index
+    // segments require the `pointer!` macro (homogeneous arrays don't work).
+    let bid_s = sonic_rs::get(json, sonic_rs::pointer!["data", "b", 0, 0])
+        .ok().and_then(|lv| lv.as_str().map(|s| s.to_string())).unwrap_or_default();
+    let ask_s = sonic_rs::get(json, sonic_rs::pointer!["data", "a", 0, 0])
+        .ok().and_then(|lv| lv.as_str().map(|s| s.to_string())).unwrap_or_default();
+
+    let bid_f = bid_s.parse::<f64>().unwrap_or(0.0);
+    let ask_f = ask_s.parse::<f64>().unwrap_or(0.0);
+    if bid_f <= 0.0 || ask_f <= 0.0 { return Ok(()); }
+    f(sym, Price::from_f64(bid_f), Price::from_f64(ask_f));
     Ok(())
 }
 
@@ -214,27 +231,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_xt_spot_ticker_with_bp_ap() {
-        let js = r#"{"topic":"ticker","event":"ticker@btc_usdt","data":{"s":"btc_usdt","c":"42000","ap":"42001","bp":"41999","v":"1000000"}}"#;
-        let mut got: Option<(String, Price, Price, f64)> = None;
-        parse_and_apply(js, |s, b, a, v| got = Some((s.into(), b, a, v))).unwrap();
-        let (s, b, a, v) = got.unwrap();
+    fn parse_xt_spot_depth_top_of_book() {
+        let js = r#"{"topic":"depth","event":"depth@btc_usdt,5","data":{"s":"btc_usdt","b":[["41999.50","0.5"],["41999.00","1.0"]],"a":[["42001.00","0.3"],["42001.50","0.8"]],"t":1700000000000}}"#;
+        let mut got: Option<(String, Price, Price)> = None;
+        parse_and_apply(js, |s, b, a| got = Some((s.into(), b, a))).unwrap();
+        let (s, b, a) = got.unwrap();
         assert_eq!(s, "btc_usdt");
-        assert_eq!(b, Price::from_f64(41999.0));
-        assert_eq!(a, Price::from_f64(42001.0));
-        assert_eq!(v, 1_000_000.0);
+        assert_eq!(b, Price::from_f64(41999.50));
+        assert_eq!(a, Price::from_f64(42001.00));
     }
 
     #[test]
-    fn parse_xt_spot_ticker_fallback_to_close() {
-        // XT spot really emits frames with no bp/ap — only c.
-        let js = r#"{"topic":"ticker","event":"ticker@btc_usdt","data":{"s":"btc_usdt","c":"77220.76","o":"74687.23","v":"915000","q":"11930"}}"#;
-        let mut got: Option<(String, Price, Price, f64)> = None;
-        parse_and_apply(js, |s, b, a, v| got = Some((s.into(), b, a, v))).unwrap();
-        let (s, b, a, v) = got.unwrap();
-        assert_eq!(s, "btc_usdt");
-        assert_eq!(b, Price::from_f64(77220.76));
-        assert_eq!(a, Price::from_f64(77220.76));
-        assert_eq!(v, 915000.0);
+    fn parse_xt_spot_depth_empty_side_skipped() {
+        // Missing one side → must not commit a zero price.
+        let js = r#"{"topic":"depth","event":"depth@ill_usdt,5","data":{"s":"ill_usdt","b":[],"a":[["0.01","1"]],"t":1}}"#;
+        let mut got: Option<(String, Price, Price)> = None;
+        parse_and_apply(js, |s, b, a| got = Some((s.into(), b, a))).unwrap();
+        assert!(got.is_none(), "empty-side frame must skip");
     }
 }

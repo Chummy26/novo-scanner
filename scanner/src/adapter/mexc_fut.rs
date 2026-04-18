@@ -111,6 +111,10 @@ impl MexcFutAdapter {
                         return Err(Error::WebSocket("stream closed".into()));
                     };
                     let msg = msg.map_err(|e| Error::WebSocket(format!("recv: {}", e)))?;
+                    // ANY frame proves TCP alive — update before filters to avoid
+                    // false-positive reconnect during market-quiet windows.
+                    last_frame_at = std::time::Instant::now();
+
                     if msg.is_close() { return Ok(()); }
                     if !msg.is_text() { continue; }
 
@@ -143,7 +147,6 @@ impl MexcFutAdapter {
                             debug!(symbol, "mexc-fut: not in universe");
                         }
                     });
-                    last_frame_at = std::time::Instant::now();
                 }
                 _ = tokio::time::sleep_until((last_frame_at + Duration::from_secs(60)).into()) => {
                     return Err(Error::WebSocket("silent disconnect mexc-fut".into()));
@@ -194,15 +197,15 @@ where
         // Wire-captured evidence: for BTC_USDT at BTC=77,057, MEXC fut
         // emits bid1=77056.8 ask1=77056.9 (correct) while maxBidPrice=84810
         // minAskPrice=69390 (circuit-breaker limits).
-        let mut bid = num("bid1");
-        let mut ask = num("ask1");
-        // Fallback only when the symbol has zero open interest and bid1/ask1
-        // are genuinely absent — we keep lastPrice as a degraded quote so
-        // the book stays populated rather than silently vanishing.
-        if bid <= 0.0 || ask <= 0.0 {
-            let last = num("lastPrice");
-            if last > 0.0 { bid = last; ask = last; } else { continue; }
-        }
+        let bid = num("bid1");
+        let ask = num("ask1");
+        // Skip the frame when bid1/ask1 are absent instead of substituting
+        // lastPrice: the last-trade price can sit still for minutes on
+        // illiquid contracts and produces phantom spreads against venues
+        // that emit a live BBO. Better to leave the book un-committed for
+        // this tick than to commit stale data (vol_poller + stale threshold
+        // already handle the "never populated" case cleanly).
+        if bid <= 0.0 || ask <= 0.0 { continue; }
         // amount24 = USDT volume 24h; volume24 = contracts count.
         let vol24 = num("amount24");
         f(sym, Price::from_f64(bid), Price::from_f64(ask), vol24);
@@ -232,10 +235,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_push_ticker_falls_back_to_last_when_no_book() {
+    fn parse_push_ticker_skips_when_no_book() {
+        // No bid1/ask1 in the frame — must NOT emit a synthetic quote derived
+        // from lastPrice. Illiquid contracts often have a stale last with no
+        // live BBO, and committing (last, last) creates ghost spreads.
         let js = r#"{"channel":"push.ticker","data":{"symbol":"XYZ_USDT","lastPrice":1.23,"amount24":10}}"#;
-        let mut seen = Vec::new();
+        let mut seen: Vec<(String, f64, f64)> = Vec::new();
         parse_and_apply(js, |s, b, a, _| seen.push((s.to_string(), b.to_f64(), a.to_f64()))).unwrap();
-        assert_eq!(seen[0], ("XYZ_USDT".into(), 1.23, 1.23));
+        assert!(seen.is_empty(), "frame without bid1/ask1 must be skipped, not flattened to last");
     }
 }

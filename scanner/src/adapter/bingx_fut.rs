@@ -122,6 +122,10 @@ async fn run_shard(
                     return Err(Error::WebSocket("stream closed".into()));
                 };
                 let msg = msg.map_err(|e| Error::WebSocket(format!("recv: {}", e)))?;
+                // ANY frame proves TCP alive — update before filters to avoid
+                // false-positive reconnect during market-quiet windows.
+                last_frame_at = std::time::Instant::now();
+
                 if msg.is_close() { return Ok(()); }
 
                 let payload = msg.as_payload();
@@ -154,7 +158,6 @@ async fn run_shard(
                         debug!(symbol = sym, "bingx-fut: not in universe");
                     }
                 });
-                last_frame_at = std::time::Instant::now();
             }
             _ = tokio::time::sleep_until((last_frame_at + Duration::from_secs(90)).into()) => {
                 return Err(Error::WebSocket("silent disconnect bingx-fut".into()));

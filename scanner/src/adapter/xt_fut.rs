@@ -2,13 +2,18 @@
 //!
 //! Endpoint: wss://fstream.xt.com/ws/market (primary per PhD#5 D-15 correction)
 //! Alt:      wss://fstream.x.group/ws/market
-//! Channel:  ticker@{symbol} — per-symbol subscribe.
+//! Channel:  `depth@{symbol},5` — top-5 bid/ask levels per symbol.
+//!   `ticker@{symbol}` is NOT used: XT futures ticker frames emit only `c`
+//!   (last trade) with no `bp`/`ap`, so falling back to `c` generates stale
+//!   prices when trades are sparse.
 //! Ping:     client sends "ping" (plain text) every 20s; 30s timeout.
 //! Encoding: JSON plain (no GZIP, no Base64 — futures is simpler than spot).
+//! Volume:   picked up by `vol_poller` via REST (depth frames don't carry it).
 //!
-//! Frame (ticker):
+//! Frame (depth):
 //! ```json
-//! {"topic":"ticker","event":"ticker@btc_usdt","data":{"s":"btc_usdt","c":"42000","ap":"42001","bp":"41999", ... }}
+//! {"topic":"depth","event":"depth@btc_usdt,5",
+//!  "data":{"s":"btc_usdt","b":[["41999","0.5"], ...],"a":[["42001","0.3"], ...]}}
 //! ```
 
 use std::sync::Arc;
@@ -82,13 +87,13 @@ impl XtFutAdapter {
             .connect().await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
-        // Subscribe: each symbol ticker channel.
+        // Subscribe: each symbol depth@5 channel (top-of-book from level-5
+        // snapshot). Batch size 50 to stay well under XT's per-connection
+        // depth subscription rate limit.
         let xt_symbols: Vec<String> = self.universe.per_venue[Venue::XtFut.idx()]
             .keys().cloned().collect();
-        // XT docs limit at ~10 depth pairs/conn but ticker is lighter — we
-        // conservatively batch in groups of 50.
         for chunk in xt_symbols.chunks(50) {
-            let params: Vec<String> = chunk.iter().map(|s| format!("ticker@{}", s)).collect();
+            let params: Vec<String> = chunk.iter().map(|s| format!("depth@{},5", s)).collect();
             let sub = format!(
                 r#"{{"method":"subscribe","params":[{}],"id":"{}"}}"#,
                 params.iter().map(|p| format!("\"{}\"", p)).collect::<Vec<_>>().join(","),
@@ -114,6 +119,10 @@ impl XtFutAdapter {
                         return Err(Error::WebSocket("stream closed".into()));
                     };
                     let msg = msg.map_err(|e| Error::WebSocket(format!("recv: {}", e)))?;
+                    // ANY frame proves TCP alive — update before filters to avoid
+                    // false-positive reconnect during market-quiet windows.
+                    last_frame_at = std::time::Instant::now();
+
                     if msg.is_close() { return Ok(()); }
                     if !msg.is_text() { continue; }
 
@@ -124,23 +133,21 @@ impl XtFutAdapter {
                     // Subscribe ack: {"id":"...","code":0} → skip.
                     let Ok(topic_lv) = sonic_rs::get(text, &["topic"]) else { continue };
                     let Some(topic) = topic_lv.as_str() else { continue };
-                    if topic != "ticker" { continue; }
+                    if topic != "depth" { continue; }
 
                     let t0 = std::time::Instant::now();
-                    let _ = parse_and_apply(text, |sym, bid, ask, qv| {
+                    let _ = parse_and_apply(text, |sym, bid, ask| {
                         if let Some(id) = self.universe.lookup(Venue::XtFut, sym) {
                             let ts = now_ns();
                             store.slot(Venue::XtFut, id).commit(
                                 bid, Qty::from_f64(1.0), ask, Qty::from_f64(1.0), ts
                             );
                             self.stale.cell(Venue::XtFut, id).update(ts);
-                            if qv > 0.0 { self.vol.set(Venue::XtFut, id, qv); }
                             Metrics::init().record_ingest(Venue::XtFut, t0.elapsed().as_nanos() as u64);
                         } else {
                             debug!(symbol = sym, "xt-fut: not in universe");
                         }
                     });
-                    last_frame_at = std::time::Instant::now();
                 }
                 _ = tokio::time::sleep_until((last_frame_at + Duration::from_secs(60)).into()) => {
                     return Err(Error::WebSocket("silent disconnect xt-fut".into()));
@@ -152,29 +159,23 @@ impl XtFutAdapter {
 
 fn parse_and_apply<F>(json: &str, f: F) -> Result<()>
 where
-    F: FnOnce(&str, Price, Price, f64),
+    F: FnOnce(&str, Price, Price),
 {
-    // XT futures ticker fields (observed on wire):
-    //   data.s symbol ("btc_usdt"), data.c close/last,
-    //   data.a amount 24h (contracts), data.v volume 24h (USDT-ish)
+    // XT futures depth@{sym},5 frame — same shape as spot:
+    //   {"topic":"depth","event":"depth@btc_usdt,5",
+    //    "data":{"s":"btc_usdt","b":[["px","qty"], ...],"a":[["px","qty"], ...]}}
     let s_lv = sonic_rs::get(json, &["data", "s"])
         .map_err(|e| Error::Decode(format!("data.s: {}", e)))?;
     let sym = s_lv.as_str().ok_or_else(|| Error::Decode("data.s not str".into()))?;
 
-    let get_num = |k: &str| -> f64 {
-        sonic_rs::get(json, &["data", k])
-            .ok()
-            .and_then(|lv| lv.as_str().and_then(|s| s.parse::<f64>().ok()))
-            .unwrap_or(0.0)
-    };
-    let mut bp = get_num("bp");
-    let mut ap = get_num("ap");
-    if bp <= 0.0 || ap <= 0.0 {
-        let c = get_num("c");
-        if c > 0.0 { bp = c; ap = c; } else { return Ok(()); }
-    }
-    let qvol = get_num("v");
-    f(sym, Price::from_f64(bp), Price::from_f64(ap), qvol);
+    let bid_s = sonic_rs::get(json, sonic_rs::pointer!["data", "b", 0, 0])
+        .ok().and_then(|lv| lv.as_str().map(|s| s.to_string())).unwrap_or_default();
+    let ask_s = sonic_rs::get(json, sonic_rs::pointer!["data", "a", 0, 0])
+        .ok().and_then(|lv| lv.as_str().map(|s| s.to_string())).unwrap_or_default();
+    let bid_f = bid_s.parse::<f64>().unwrap_or(0.0);
+    let ask_f = ask_s.parse::<f64>().unwrap_or(0.0);
+    if bid_f <= 0.0 || ask_f <= 0.0 { return Ok(()); }
+    f(sym, Price::from_f64(bid_f), Price::from_f64(ask_f));
     Ok(())
 }
 
@@ -183,15 +184,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_xt_fut_ticker_fallback() {
-        // Wire format observed: {data:{s, c, o, h, l, a, v, r, t}} — no bp/ap.
-        let js = r#"{"topic":"ticker","event":"ticker@btc_usdt","data":{"s":"btc_usdt","o":"74653.8","c":"77169.7","h":"78272.7","l":"74510.4","a":"280131849","v":"2147604990","r":"0.03","t":1}}"#;
-        let mut got: Option<(String, Price, Price, f64)> = None;
-        parse_and_apply(js, |s, b, a, v| got = Some((s.into(), b, a, v))).unwrap();
-        let (s, b, a, v) = got.unwrap();
+    fn parse_xt_fut_depth_top_of_book() {
+        let js = r#"{"topic":"depth","event":"depth@btc_usdt,5","data":{"s":"btc_usdt","b":[["77169.5","1.2"],["77169.0","5.0"]],"a":[["77170.1","0.8"],["77170.5","2.3"]]}}"#;
+        let mut got: Option<(String, Price, Price)> = None;
+        parse_and_apply(js, |s, b, a| got = Some((s.into(), b, a))).unwrap();
+        let (s, b, a) = got.unwrap();
         assert_eq!(s, "btc_usdt");
-        assert_eq!(b, Price::from_f64(77169.7));
-        assert_eq!(a, Price::from_f64(77169.7));
-        assert_eq!(v, 2_147_604_990.0);
+        assert_eq!(b, Price::from_f64(77169.5));
+        assert_eq!(a, Price::from_f64(77170.1));
     }
 }

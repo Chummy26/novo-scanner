@@ -43,6 +43,8 @@ pub async fn run(
                 poll_kucoin_spot(&h, &u, &v),
                 poll_kucoin_fut(&h, &u, &v),
                 poll_mexc_spot(&h, &u, &v),
+                poll_xt_spot(&h, &u, &v),
+                poll_xt_fut(&h, &u, &v),
             );
         });
     }
@@ -296,4 +298,58 @@ async fn poll_gate_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore)
         }
     }
     debug!(updated = n, "gate-fut vol ok");
+}
+
+// ---- XT spot + fut (WS depth channel carries no 24h volume, so we REST it) ----
+#[derive(Debug, Deserialize)]
+struct XtSpotResp { result: Vec<XtSpotTicker> }
+#[derive(Debug, Deserialize)]
+struct XtSpotTicker {
+    #[serde(default)] s: String,
+    // `v` is quote-currency 24h volume in XT's v4 spot schema.
+    #[serde(default)] v: String,
+}
+
+async fn poll_xt_spot(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore) {
+    let r = http.get("https://sapi.xt.com/v4/public/ticker/24h").send().await;
+    let r = match r { Ok(r) => r, Err(e) => { debug!("xt-spot vol: {}", e); return; } };
+    let wrap: XtSpotResp = match r.json().await {
+        Ok(w) => w, Err(e) => { debug!("xt-spot parse: {}", e); return; }
+    };
+    let mut n = 0u32;
+    for t in wrap.result {
+        if let Some(id) = u.lookup(Venue::XtSpot, &t.s) {
+            if let Ok(qv) = t.v.parse::<f64>() {
+                if qv > 0.0 { v.set(Venue::XtSpot, id, qv); n += 1; }
+            }
+        }
+    }
+    debug!(updated = n, "xt-spot vol ok");
+}
+
+#[derive(Debug, Deserialize)]
+struct XtFutResp { result: Vec<XtFutTicker> }
+#[derive(Debug, Deserialize)]
+struct XtFutTicker {
+    #[serde(default)] s: String,
+    // `v` is quote-currency 24h volume (USDT) on XT perp ticker.
+    #[serde(default)] v: String,
+}
+
+async fn poll_xt_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore) {
+    // `/future/market/v1/public/q/ticker` with no params returns all contracts.
+    let r = http.get("https://fapi.xt.com/future/market/v1/public/q/ticker").send().await;
+    let r = match r { Ok(r) => r, Err(e) => { debug!("xt-fut vol: {}", e); return; } };
+    let wrap: XtFutResp = match r.json().await {
+        Ok(w) => w, Err(e) => { debug!("xt-fut parse: {}", e); return; }
+    };
+    let mut n = 0u32;
+    for t in wrap.result {
+        if let Some(id) = u.lookup(Venue::XtFut, &t.s) {
+            if let Ok(qv) = t.v.parse::<f64>() {
+                if qv > 0.0 { v.set(Venue::XtFut, id, qv); n += 1; }
+            }
+        }
+    }
+    debug!(updated = n, "xt-fut vol ok");
 }

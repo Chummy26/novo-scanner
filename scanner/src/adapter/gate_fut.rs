@@ -97,6 +97,10 @@ impl GateFutAdapter {
                         return Err(Error::WebSocket("stream closed".into()));
                     };
                     let msg = msg.map_err(|e| Error::WebSocket(format!("recv: {}", e)))?;
+                    // ANY frame proves TCP alive — update before filters to avoid
+                    // false-positive reconnect during market-quiet windows.
+                    last_frame_at = std::time::Instant::now();
+
                     if msg.is_close() { return Ok(()); }
                     if !msg.is_text() { continue; }
 
@@ -123,7 +127,6 @@ impl GateFutAdapter {
                             debug!(symbol = sym, "gate-fut: not in universe");
                         }
                     });
-                    last_frame_at = std::time::Instant::now();
                 }
                 _ = tokio::time::sleep_until((last_frame_at + Duration::from_secs(60)).into()) => {
                     return Err(Error::WebSocket("silent disconnect gate-fut".into()));
@@ -134,9 +137,14 @@ impl GateFutAdapter {
 }
 
 /// Gate futures.tickers `result` is typically an ARRAY of ticker objects.
-/// Fields of interest: contract (symbol), last, highest_bid, lowest_ask.
-/// Futures tickers may not include the latter two — we fall back to `last`
-/// as a midpoint when bid/ask are absent.
+/// Fields of interest: contract (symbol), highest_bid, lowest_ask.
+///
+/// We deliberately do NOT fall back to `last` (last-trade price) when bid/ask
+/// are missing: on illiquid contracts Gate can go minutes without a new
+/// trade, so `last` stays frozen while the BBO on peer venues moves,
+/// generating phantom 5-30% cross-venue spreads. Skipping the frame leaves
+/// the slot un-updated — the per-venue staleness threshold will then mark it
+/// stale and the spread engine will drop the leg cleanly.
 fn parse_and_apply<F>(json: &str, mut f: F) -> Result<()>
 where
     F: FnMut(&str, Price, Price),
@@ -150,11 +158,9 @@ where
         let Some(sym) = obj.get(&"contract").and_then(|x| x.as_str()) else { return; };
         let bid = obj.get(&"highest_bid").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
         let ask = obj.get(&"lowest_ask").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
-        let last = obj.get(&"last").and_then(|x| x.as_str()).and_then(|s| s.parse::<f64>().ok());
-        let (bid, ask) = match (bid, ask, last) {
-            (Some(b), Some(a), _) if b > 0.0 && a > 0.0 => (b, a),
-            (_, _, Some(lp)) if lp > 0.0 => (lp, lp), // fallback: no depth → flat spread
-            _ => return,
+        let (bid, ask) = match (bid, ask) {
+            (Some(b), Some(a)) if b > 0.0 && a > 0.0 => (b, a),
+            _ => return, // no live BBO → do NOT substitute `last` (see header comment)
         };
         f(sym, Price::from_f64(bid), Price::from_f64(ask));
     };
@@ -192,12 +198,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_futures_fallback_to_last() {
+    fn parse_futures_skips_when_no_bbo() {
+        // No highest_bid / lowest_ask → must skip entirely (no flat-spread
+        // substitution from `last`), otherwise illiquid contracts pollute
+        // the book with stale last-trade prices.
         let js = r#"{"channel":"futures.tickers","event":"update","time":1,
             "result":[{"contract":"XYZ_USDT","last":"100"}]}"#;
-        let mut seen = Vec::new();
+        let mut seen: Vec<(String, Price, Price)> = Vec::new();
         parse_and_apply(js, |s, b, a| seen.push((s.to_string(), b, a))).unwrap();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].1, seen[0].2);
+        assert!(seen.is_empty(), "contracts with no BBO must be skipped, not flattened to last");
     }
 }

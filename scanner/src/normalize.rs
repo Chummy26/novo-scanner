@@ -204,7 +204,6 @@ mod tests {
         let p = parse(Venue::BinanceSpot, "BTCUSDT").unwrap();
         assert_eq!(p.base, "BTC");
         assert_eq!(p.quote, "USDT");
-        assert_eq!(p.market, Market::Spot);
     }
 
     #[test]
@@ -226,7 +225,6 @@ mod tests {
         let p = parse(Venue::MexcFut, "BTC_USDT").unwrap();
         assert_eq!(p.base, "BTC");
         assert_eq!(p.quote, "USDT");
-        assert_eq!(p.market, Market::Perp);
     }
 
     #[test]

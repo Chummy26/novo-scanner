@@ -111,6 +111,12 @@ impl BinanceSpotAdapter {
                         return Err(Error::WebSocket("ws stream closed by peer".into()));
                     };
                     let msg = msg.map_err(|e| Error::WebSocket(format!("recv: {}", e)))?;
+                    // ANY received frame (including protocol pings and
+                    // subscribe acks) counts as proof-of-life. Update the
+                    // watchdog BEFORE filtering so we don't false-positive
+                    // reconnect during market-quiet windows when the only
+                    // traffic is server pings.
+                    last_frame_at = std::time::Instant::now();
 
                     n_frames += 1;
                     if n_frames <= 3 || n_frames % 5000 == 0 {
@@ -153,7 +159,6 @@ impl BinanceSpotAdapter {
                             debug!(symbol = symbol, "unknown symbol (not in universe)");
                         }
                     });
-                    last_frame_at = std::time::Instant::now();
                 }
                 _ = tokio::time::sleep_until((last_frame_at + Duration::from_secs(60)).into()) => {
                     return Err(Error::WebSocket(format!("silent disconnect (>60s no frames, received {})", n_frames)));

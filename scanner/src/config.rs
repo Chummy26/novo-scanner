@@ -16,7 +16,8 @@ pub struct Config {
     pub entry_threshold_pct: f64,
 
     /// Upper bound on emitted spreads. Anything above this is treated as a
-    /// data glitch (new listing, stuck quote). Default 10%.
+    /// data glitch or ticker collision (different tokens sharing a base
+    /// symbol on different venues). Default 30%.
     #[serde(default = "default_max_spread")]
     pub max_spread_pct: f64,
 
@@ -25,6 +26,16 @@ pub struct Config {
     /// only symbols that are liquid enough to actually trade.
     #[serde(default = "default_min_vol_usd")]
     pub min_vol_usd: f64,
+
+    /// Median-deviation cutoff (%) used as a ticker-collision detector.
+    /// When a symbol has book snapshots from at least 3 venues, we compute
+    /// the median mid-price and drop any venue whose mid deviates by more
+    /// than this fraction. Different tokens sharing a ticker (e.g. "SIREN"
+    /// as a meme coin on exchange A and as a protocol token on exchange B)
+    /// diverge far beyond any legitimate arbitrage spread — this gate
+    /// exploits that to separate them.
+    #[serde(default = "default_median_dev")]
+    pub median_deviation_pct: f64,
 
     /// Optional path to a directory of static files (frontend build output)
     /// that the broadcast server will also serve under `/`. Leave unset to
@@ -139,7 +150,8 @@ pub enum BitgetMode {
 fn default_bind()            -> String { "0.0.0.0:8000".into() }
 fn default_broadcast_ms()    -> u64    { 150 }
 fn default_entry_threshold() -> f64    { 0.20 } // 0.20%
-fn default_max_spread()      -> f64    { 100.0 }  // 100% (only hard glitches filtered)
+fn default_max_spread()      -> f64    { 30.0 }
+fn default_median_dev()      -> f64    { 50.0 }
 fn default_min_vol_usd()     -> f64    { 100_000.0 } // $100k min per leg
 fn default_max_symbols()     -> u32    { 4000 }
 fn default_max_levels()      -> u16    { 20 }
@@ -177,11 +189,9 @@ impl Config {
             bind:                "0.0.0.0:8000".into(),
             broadcast_ms:        150,
             entry_threshold_pct: 0.20,
-            // 100% = basically no clamp. Real arbitrage spreads in crypto
-            // can exceed 20-30% briefly on illiquid listings, and we don't
-            // want to silently hide them — only clip the 1000%+ wire glitches.
-            max_spread_pct:      100.0,
+            max_spread_pct:      30.0,
             min_vol_usd:         100_000.0,
+            median_deviation_pct: 50.0,
             frontend_dir:        default_frontend_dir(),
             venues:              VenueToggles::default_enabled(),
             limits:              Limits::default(),
@@ -217,7 +227,7 @@ mod tests {
         assert_eq!(cfg.bind, "0.0.0.0:8000");
         assert_eq!(cfg.broadcast_ms, 150);
         assert!(cfg.venues.is_enabled(Venue::BinanceSpot));
-        assert!(!cfg.venues.is_enabled(Venue::Kucoin));
+        assert!(cfg.venues.is_enabled(Venue::KucoinSpot));
     }
 
     #[test]
@@ -246,7 +256,7 @@ kucoin       = true
         let cfg: Config = toml::from_str(t2).expect("parse");
         assert_eq!(cfg.broadcast_ms, 200);
         assert_eq!(cfg.kucoin_mode, KucoinMode::ProBeta);
-        assert!(cfg.venues.is_enabled(Venue::Kucoin));
+        assert!(cfg.venues.is_enabled(Venue::KucoinSpot));
         // ignore t to silence unused-var lint
         let _ = t;
     }

@@ -416,13 +416,18 @@ async fn rest_debug(State(state): State<BroadcastState>) -> impl IntoResponse {
         "latest_total":      latest.len(),
         "top_spreads":       top,
         "spread_histogram":  histogram,
-        // XT emits only last-price on the ticker channel (no bid/ask fields).
-        // MEXC spot miniTickers (legacy WS Protobuf adapter) is the same — but
-        // we run the REST adapter which has real bid/ask, so not flagged.
-        "last_price_only_venues": ["xt_spot", "xt_fut"],
+        // All 14 venues now expose real BBO to the book store:
+        //   - XT spot/fut:   depth@{sym},5 (M24)
+        //   - MEXC fut:      bid1/ask1 with skip-if-empty (M21, M25)
+        //   - Gate fut:      highest_bid/lowest_ask with skip-if-empty (M25)
+        //   - MEXC spot:     REST /ticker/bookTicker 1Hz
+        //   - others:        dedicated bookTicker / best-bid-ask channels
+        "last_price_only_venues": [],
         "notes": {
-            "xt_last_price": "XT ticker channel lacks bid/ask; bid=ask=last_trade. Spreads involving XT are computed against last-trade price, which can be stale by up to the 1s frame cadence.",
-            "mexc_fut_fix":  "Since M21: subscribes sub.ticker per-symbol and reads bid1/ask1 (not maxBidPrice/minAskPrice which are ±10% circuit breakers).",
+            "xt_depth":      "M24: XT spot uses {\"sub\":\"depth@sym,5\"} (futures-style method/params wrapper silently drops on spot). XT fut keeps method/params since that works there.",
+            "mexc_fut_fix":  "M21+M25: sub.ticker per-symbol, bid1/ask1 only; no lastPrice fallback.",
+            "gate_fut_fix":  "M25: highest_bid/lowest_ask only; no `last` fallback.",
+            "bingx_bbo_driven":"BingX spot/fut subscribe {sym}@bookTicker which is BBO-driven (no heartbeat on illiquid pairs). The fix is a different channel — not a tighter threshold.",
         }
     }))
 }

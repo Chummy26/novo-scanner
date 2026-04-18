@@ -25,6 +25,9 @@ pub struct ScanCounters {
     pub dropped_low_vol:         AtomicU64,
     pub dropped_spot_spot:       AtomicU64,
     pub dropped_uninit_side:     AtomicU64,
+    /// Venues kicked off a scan because their mid-price deviated from the
+    /// cross-venue median. Symptomatic of ticker collisions.
+    pub dropped_median_outlier:  AtomicU64,
 }
 
 impl ScanCounters {
@@ -40,6 +43,7 @@ impl ScanCounters {
             "dropped_low_vol":         g(&self.dropped_low_vol),
             "dropped_spot_spot":       g(&self.dropped_spot_spot),
             "dropped_uninit_side":     g(&self.dropped_uninit_side),
+            "dropped_median_outlier":  g(&self.dropped_median_outlier),
         })
     }
 }
@@ -98,6 +102,7 @@ pub fn scan_once(
     threshold_pct: f64,
     max_spread_pct: f64,
     min_vol_usd: f64,
+    median_deviation_pct: f64,
     counters:  &ScanCounters,
     out:       &mut Vec<Opportunity>,
 ) {
@@ -131,6 +136,36 @@ pub fn scan_once(
             };
             let age = st.age_ms(now);
             snaps[v.idx()] = (Some(snap), age);
+        }
+
+        // Ticker-collision guard: when ≥3 venues quote this symbol, require
+        // each venue's mid to sit within `median_deviation_pct` of the group
+        // median. A "SIREN" that's a meme coin on XT/Gate spot and a protocol
+        // token on Binance/BingX/Bitget futures will split into two clusters
+        // with mid-prices an order of magnitude apart; this cut removes the
+        // minority-cluster snapshots for THIS scan without polluting state.
+        let populated: Vec<(Venue, f64)> = snaps.iter().enumerate().filter_map(|(i, (s, _))| {
+            let s = s.as_ref()?;
+            let mid = (s.bid_px.to_f64() + s.ask_px.to_f64()) * 0.5;
+            if mid > 0.0 {
+                Some((Venue::ALL[i], mid))
+            } else { None }
+        }).collect();
+        if populated.len() >= 3 && median_deviation_pct > 0.0 {
+            let mut mids: Vec<f64> = populated.iter().map(|(_, m)| *m).collect();
+            mids.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median = mids[mids.len() / 2];
+            let tol = median_deviation_pct / 100.0;
+            for (v, mid) in &populated {
+                // Deviation relative to the median — symmetric in log-space
+                // but we use a simple relative check because `mid` and
+                // `median` are both positive.
+                let dev = ((mid / median) - 1.0).abs();
+                if dev > tol {
+                    snaps[v.idx()] = (None, 0);
+                    counters.dropped_median_outlier.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
 
         // Try each directed pair (buy from A's ask, sell on B's bid).
@@ -249,7 +284,7 @@ mod tests {
 
         let mut out = Vec::new();
         let c = ScanCounters::default();
-        scan_once(&u, &store, &stale, &vol, 0.3, 100.0, 0.0, &c, &mut out);
+        scan_once(&u, &store, &stale, &vol, 0.3, 100.0, 0.0, 0.0, &c, &mut out);
         assert!(out.is_empty(), "should find no ops below 0.3% threshold");
     }
 
@@ -269,8 +304,44 @@ mod tests {
         let vol = make_vol(&u);
         let mut out = Vec::new();
         let c = ScanCounters::default();
-        scan_once(&u, &store, &stale, &vol, 0.3, 100.0, 0.0, &c, &mut out);
+        scan_once(&u, &store, &stale, &vol, 0.3, 100.0, 0.0, 0.0, &c, &mut out);
         assert!(out.is_empty(), "spot↔spot should be filtered; got {} ops", out.len());
+    }
+
+    #[test]
+    fn ticker_collision_filtered_by_median_gate() {
+        // BTC on 4 venues ≈ $100; one outlier at $50 (different token sharing
+        // the ticker). The outlier must be kicked off by the median gate.
+        let mut per_venue: Vec<Vec<crate::discovery::VenueSymbol>> =
+            (0..VENUE_COUNT).map(|_| Vec::new()).collect();
+        let btc = CanonicalPair::of("BTC", "USDT");
+        for v in [Venue::BinanceFut, Venue::MexcFut, Venue::GateFut, Venue::BingxFut, Venue::BitgetFut] {
+            per_venue[v.idx()].push(crate::discovery::VenueSymbol {
+                venue: v, raw: "BTCUSDT".into(), canonical: btc.clone(),
+            });
+        }
+        let u = SymbolUniverse::from_venue_symbols(per_venue);
+        let store = BookStore::with_capacity(u.len() as u32);
+        let stale = StaleTable::with_capacity(u.len() as u32);
+        let vol = make_vol(&u);
+        let now = now_ns();
+        for v in [Venue::BinanceFut, Venue::MexcFut, Venue::GateFut, Venue::BingxFut] {
+            store.slot(v, SymbolId(0))
+                .commit(Price::from_f64(99.5), Qty::from_f64(1.0), Price::from_f64(100.0), Qty::from_f64(1.0), now);
+            stale.cell(v, SymbolId(0)).update(now);
+        }
+        // Outlier: same ticker, different token → half the price.
+        store.slot(Venue::BitgetFut, SymbolId(0))
+            .commit(Price::from_f64(49.5), Qty::from_f64(1.0), Price::from_f64(50.0), Qty::from_f64(1.0), now);
+        stale.cell(Venue::BitgetFut, SymbolId(0)).update(now);
+
+        let mut out = Vec::new();
+        let c = ScanCounters::default();
+        scan_once(&u, &store, &stale, &vol, 0.3, 100.0, 0.0, 50.0, &c, &mut out);
+        // The outlier venue (bitget) must not appear in any emitted op.
+        assert!(!out.iter().any(|o| o.buy_from == "bitget" || o.sell_to == "bitget"),
+                "collision outlier must be removed; got: {:?}", out);
+        assert!(c.dropped_median_outlier.load(Ordering::Relaxed) > 0);
     }
 
     #[test]
@@ -290,14 +361,17 @@ mod tests {
         let stale = StaleTable::with_capacity(u.len() as u32);
         let vol = make_vol(&u);
 
+        let now = now_ns();
         store.slot(Venue::BinanceSpot, SymbolId(0))
-            .commit(Price::from_f64(99.9), Qty::from_f64(1.0), Price::from_f64(100.0), Qty::from_f64(1.0), now_ns());
+            .commit(Price::from_f64(99.9), Qty::from_f64(1.0), Price::from_f64(100.0), Qty::from_f64(1.0), now);
+        stale.cell(Venue::BinanceSpot, SymbolId(0)).update(now);
         store.slot(Venue::MexcFut, SymbolId(0))
-            .commit(Price::from_f64(101.0), Qty::from_f64(1.0), Price::from_f64(101.1), Qty::from_f64(1.0), now_ns());
+            .commit(Price::from_f64(101.0), Qty::from_f64(1.0), Price::from_f64(101.1), Qty::from_f64(1.0), now);
+        stale.cell(Venue::MexcFut, SymbolId(0)).update(now);
 
         let mut out = Vec::new();
         let c = ScanCounters::default();
-        scan_once(&u, &store, &stale, &vol, 0.3, 100.0, 0.0, &c, &mut out);
+        scan_once(&u, &store, &stale, &vol, 0.3, 100.0, 0.0, 0.0, &c, &mut out);
         let op = out.iter().find(|o| o.buy_from == "binance" && o.sell_to == "mexc")
             .expect("cross-market spot→perp op not emitted");
         assert_eq!(op.buy_type,  "SPOT");

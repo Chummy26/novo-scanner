@@ -166,6 +166,10 @@ impl KucoinAdapter {
                         return Err(Error::WebSocket("stream closed".into()));
                     };
                     let msg = msg.map_err(|e| Error::WebSocket(format!("recv: {}", e)))?;
+                    // ANY frame proves TCP alive — update before filters to avoid
+                    // false-positive reconnect during market-quiet windows.
+                    last_frame_at = std::time::Instant::now();
+
                     if msg.is_close() { return Ok(()); }
                     if !msg.is_text() { continue; }
 
@@ -193,7 +197,6 @@ impl KucoinAdapter {
                             debug!(symbol = sym, "kucoin: not in universe");
                         }
                     });
-                    last_frame_at = std::time::Instant::now();
                 }
                 _ = tokio::time::sleep_until((last_frame_at + Duration::from_secs(60)).into()) => {
                     return Err(Error::WebSocket("silent disconnect kucoin".into()));

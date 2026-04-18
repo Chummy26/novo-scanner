@@ -89,7 +89,7 @@ unsafe impl Sync for StaleState {}
 /// | Gate Fut         | WS futures.tickers `!all`                  |  30 s     |
 /// | KuCoin Spot      | WS /market/ticker:all                      |  30 s     |
 /// | KuCoin Fut       | WS tickerV2                                |  30 s     |
-/// | XT Spot/Fut      | WS ticker (1s frames, last-price only)     |  30 s     |
+/// | XT Spot/Fut      | WS depth@{sym},5 (1s push cadence)         |  30 s     |
 /// | Bitget Spot/Fut  | WS ticker                                  |  30 s     |
 pub const fn stale_threshold_ms(v: Venue) -> u64 {
     match v {

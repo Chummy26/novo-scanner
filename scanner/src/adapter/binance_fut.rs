@@ -82,6 +82,10 @@ impl BinanceFutAdapter {
                         return Err(Error::WebSocket("stream closed".into()));
                     };
                     let msg = msg.map_err(|e| Error::WebSocket(format!("recv: {}", e)))?;
+                    // ANY frame proves TCP alive — update before filters to avoid
+                    // false-positive reconnect during market-quiet windows.
+                    last_frame_at = std::time::Instant::now();
+
                     if msg.is_ping() {
                         client.send(Message::pong(msg.into_payload())).await
                             .map_err(|e| Error::WebSocket(format!("pong: {}", e)))?;
@@ -104,7 +108,6 @@ impl BinanceFutAdapter {
                             debug!(symbol = sym, "binance-fut: not in universe");
                         }
                     });
-                    last_frame_at = std::time::Instant::now();
                 }
                 // 10-minute idle = stream dead.
                 _ = tokio::time::sleep_until((last_frame_at + Duration::from_secs(600)).into()) => {
