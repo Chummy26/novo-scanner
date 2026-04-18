@@ -1,0 +1,32 @@
+# Rust
+target/
+**/target/
+*.rs.bk
+*.pdb
+
+# Logs
+*.log
+logs/
+
+# Configs locais / segredos
+config.toml
+.env
+.env.*
+*.key
+*.pem
+secrets/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Claude / agentes
+.claude/

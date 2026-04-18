@@ -1,0 +1,135 @@
+/* ========================================
+ * TeamOp Logo (Black/Light variant)
+ * SVG logo component for light theme
+ * ======================================== */
+
+import { a as React } from "./index-Bx06KCE-.js";
+
+const TeamOpLogoBlack = (props) =>
+  React.createElement(
+    "svg",
+    {
+      xmlns: "http://www.w3.org/2000/svg",
+      viewBox: "0 0 95.513 110.866",
+      "xmlns:bx": "https://boxy-svg.com",
+      ...props,
+    },
+    React.createElement(
+      "defs",
+      null,
+      React.createElement("bx:guide", { x: 177.241, y: -29.094, angle: 90 }),
+    ),
+    React.createElement(
+      "g",
+      { id: "svg1", transform: "matrix(1, 0, 0, 1, -107.255379, 40.615444)" },
+      React.createElement(
+        "g",
+        {
+          id: "layer1-8",
+          transform: "matrix(1, 0, 0, 1, 219.936111, -34.573868)",
+        },
+        React.createElement(
+          "g",
+          {
+            id: "g23-2-1",
+            style: { fill: "rgb(8, 0, 41)", fillOpacity: 1 },
+            transform:
+              "matrix(1.123595, 0, 0, 1.123595, 290.640106, 495.618439)",
+          },
+          React.createElement(
+            "g",
+            {
+              id: "layer1-4",
+              transform:
+                "matrix(0.264583, 0, 0, 0.264583, 17.058146, 129.751389)",
+            },
+            React.createElement(
+              "g",
+              {
+                id: "layer1-2",
+                transform: "matrix(0.990881, 0, 0, 1, -43.218922, -105.263351)",
+                style: {},
+              },
+              React.createElement(
+                "g",
+                { id: "layer1-1", transform: "translate(162.15808,227.20999)" },
+                React.createElement(
+                  "g",
+                  {
+                    id: "svg-1",
+                    transform:
+                      "matrix(0.758629, 0, 0, 0.758629, -863.085327, -675.94281)",
+                    style: {},
+                  },
+                  React.createElement(
+                    "g",
+                    {
+                      id: "layer1",
+                      transform:
+                        "matrix(3.394742, 0, 0, 3.363785, 292.405853, -4034.063477)",
+                    },
+                    React.createElement(
+                      "g",
+                      {
+                        id: "group-1",
+                        transform: "translate(-270.39718,66.736666)",
+                      },
+                      React.createElement(
+                        "g",
+                        {
+                          id: "group-2",
+                          style: { fill: "#080029", fillOpacity: 1 },
+                          transform:
+                            "matrix(3.7795279,0,0,3.7795279,90.864482,-20.612298)",
+                        },
+                        React.createElement(
+                          "g",
+                          {
+                            id: "group-3",
+                            transform:
+                              "matrix(0.26458331,0,0,0.26458331,-22.839982,131.78011)",
+                          },
+                          React.createElement(
+                            "g",
+                            {
+                              id: "group-4",
+                              transform: "translate(-50.397165,-105.26335)",
+                            },
+                            React.createElement(
+                              "g",
+                              {
+                                id: "group-5",
+                                transform: "translate(162.15808,227.20999)",
+                              },
+                              React.createElement(
+                                "g",
+                                {
+                                  id: "layer1-8-7",
+                                  transform: "translate(16.205645,-58.526693)",
+                                },
+                                React.createElement("path", {
+                                  id: "rect42-3-8",
+                                  style: {
+                                    fillOpacity: 1,
+                                    strokeWidth: 1.33237,
+                                    fill: "rgb(0, 0, 0)",
+                                  },
+                                  d: "m -151.94508,-44.892437 -63.87439,35.8485516 V 67.225611 l 56.53796,34.408639 V 49.106612 h -14.03082 V 70.284391 L -196.3679,56.838811 V 1.6523713 l 42.7724,-24.5670733 v 15.7886101 h 0.005 l -0.002,-15.7780801 42.77238,24.5670721 V 56.84724 l -23.05557,13.44558 V 49.106612 h -13.03929 V 101.62793 L -90.374691,67.225611 V -9.0438854 Z m -7.33643,47.266871 -14.03082,6.1028234 V 30.023448 h 14.03082 z m 12.36562,0.4399838 V 30.023448 h 13.03928 V 8.4856868 Z",
+                                }),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+
+export { TeamOpLogoBlack as S };

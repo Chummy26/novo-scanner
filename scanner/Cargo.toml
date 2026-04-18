@@ -1,0 +1,89 @@
+[package]
+name        = "scanner"
+version     = "0.1.0"
+edition     = "2021"
+description = "Cross-exchange price-spread scanner (Rust, sub-ms)"
+license     = "proprietary"
+
+[[bin]]
+name = "scanner"
+path = "src/main.rs"
+
+[lib]
+name = "scanner"
+path = "src/lib.rs"
+
+[profile.release]
+opt-level     = 3
+lto           = "fat"
+codegen-units = 1
+panic         = "abort"
+debug         = 1
+incremental   = false
+
+[profile.bench]
+opt-level     = 3
+lto           = "fat"
+debug         = true
+
+[dependencies]
+tokio             = { version = "1", features = ["full", "parking_lot"] }
+tokio-websockets  = { version = "0.11", features = ["client", "simd", "rand", "native-tls", "sha1_smol"] }
+bytes             = "1"
+http              = "1"
+
+# Parsing / encoding
+sonic-rs          = "0.3"
+quick-protobuf    = "0.8"
+libdeflater       = "1"
+base64            = "0.22"
+serde             = { version = "1", features = ["derive"] }
+serde_json        = "1"
+
+# HTTP (symbol discovery, REST fallback)
+reqwest           = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }
+url               = "2"
+
+# Concurrency / lock primitives
+parking_lot       = "0.12"
+crossbeam-utils   = "0.8"
+arc-swap          = "1"
+core_affinity     = "0.8"
+
+# Data structures / utilities
+ahash             = "0.8"
+smallvec          = { version = "1", features = ["const_generics", "union"] }
+once_cell         = "1"
+
+# Observability
+prometheus        = { version = "0.13", features = ["process"] }
+hdrhistogram      = "7"
+fastrace          = { version = "0.7", features = ["enable"] }
+fastrace-jaeger   = "0.7"
+tracing           = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Broadcast server
+axum              = { version = "0.7", features = ["ws"] }
+tower             = "0.5"
+tower-http        = { version = "0.6", features = ["cors", "trace", "fs"] }
+
+# Error / config
+anyhow            = "1"
+thiserror         = "1"
+toml              = "0.8"
+clap              = { version = "4", features = ["derive"] }
+
+# Async utilities
+async-trait       = "0.1"
+futures           = "0.3"
+futures-util      = "0.3"
+pin-project-lite  = "0.2"
+
+[dev-dependencies]
+criterion         = "0.5"
+tokio             = { version = "1", features = ["full", "test-util"] }
+proptest          = "1"
+
+[build-dependencies]
+pb-rs             = "0.10"

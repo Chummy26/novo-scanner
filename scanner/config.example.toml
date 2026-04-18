@@ -1,0 +1,53 @@
+# Scanner configuration. Fields left unset use default values.
+
+# Bind address for the broadcast HTTP+WS server (/ws/scanner, /api/spread/*).
+bind = "0.0.0.0:8000"
+
+# Broadcast cadence to WS clients. 150ms matches the existing frontend contract.
+broadcast_ms = 150
+
+# Minimum entry spread (in percent) to emit as an opportunity. Spreads below
+# this are computed but not broadcast. Use 0.30 for production conservative,
+# 0.05 for noisy dev.
+entry_threshold_pct = 0.30
+
+# PhD#5 D-13: KuCoin Pro/UTA API is documented as BETA by the exchange.
+# Values: "classic" (default, opt-in), "probeta", "disabled".
+kucoin_mode = "disabled"
+
+# PhD#5 D-16: v2 = market-data (current); v3 = UTA order placement.
+# Values: "v2" (default), "v3uta".
+bitget_mode = "v2"
+
+[venues]
+binance_spot = true
+binance_fut  = true
+mexc_spot    = true
+mexc_fut     = true
+bingx_spot   = true
+bingx_fut    = true
+gate_spot    = true
+gate_fut     = true
+kucoin       = false  # off by default (see kucoin_mode)
+xt_spot      = true
+xt_fut       = true
+bitget       = true
+
+[limits]
+# Upper bound on universe size. Book store allocates VENUE_COUNT * max_symbols
+# TopOfBook slots at 64B each, so 4000 * 12 * 64 = ~3 MiB RAM for best-of-book.
+max_symbols  = 4000
+
+# Orderbook depth levels per side. 5 is enough for best bid/ask;
+# 20 permits slippage estimation. PhD#2 cap is 64.
+max_levels   = 20
+
+# Per-pair history ring buffer length (for /api/spread/history/:symbol).
+history_len  = 512
+
+[core_pinning]
+# Enable core affinity pinning for adapter and spread-engine threads.
+# Recommended in production to stabilize seqlock L1 behavior (PhD#2 C1).
+enabled             = false
+# Dedicated core index for the spread engine loop. Omit = automatic.
+# spread_engine_core = 11
