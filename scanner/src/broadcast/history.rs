@@ -95,7 +95,9 @@ mod tests {
 
     fn op(sym: &str, entry: f64) -> OpportunityDto {
         OpportunityDto {
+            id: format!("{sym}-USDT-binance-spot-gate-future"),
             symbol: sym.into(),
+            current: "USDT".into(),
             buy_from: "binance".into(), sell_to: "gate".into(),
             buy_type: "SPOT".into(), sell_type: "FUTURES".into(),
             buy_price: 100.0, sell_price: 100.5,

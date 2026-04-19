@@ -89,10 +89,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let threshold = cfg.entry_threshold_pct;
     let max_spread = cfg.max_spread_pct;
     let min_vol = cfg.min_vol_usd;
-    let median_dev = cfg.median_deviation_pct;
     let broadcast_ms = cfg.broadcast_ms;
     let c_engine = Arc::clone(&counters);
-    run_spread_engine(u_engine, s_engine, st_engine, v_engine, c_engine, threshold, max_spread, min_vol, median_dev, broadcast_ms, bstate).await;
+    run_spread_engine(u_engine, s_engine, st_engine, v_engine, c_engine, threshold, max_spread, min_vol, broadcast_ms, bstate).await;
     Ok(())
 }
 
@@ -248,7 +247,6 @@ async fn run_spread_engine(
     threshold_pct: f64,
     max_spread_pct: f64,
     min_vol_usd:   f64,
-    median_deviation_pct: f64,
     broadcast_ms:  u64,
     bstate:        BroadcastState,
 ) {
@@ -259,7 +257,7 @@ async fn run_spread_engine(
         tick.tick().await;
         let t0 = std::time::Instant::now();
         buf.clear();
-        scan_once(&universe, &store, &stale, &vol, threshold_pct, max_spread_pct, min_vol_usd, median_deviation_pct, &counters, &mut buf);
+        scan_once(&universe, &store, &stale, &vol, threshold_pct, max_spread_pct, min_vol_usd, &counters, &mut buf);
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
         obs::Metrics::init().record_cycle(elapsed_ns);
 

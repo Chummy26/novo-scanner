@@ -1434,10 +1434,70 @@ const Kn = ({ state: e }) =>
     const a = e.toLowerCase();
     return Gn[a] ?? e;
   },
-  Jn = (e) => {
-    const t = `${e.symbol || e.code || "-"}-${e.buyFrom || ""}-${e.sellTo || ""}`;
-    return e.code || e.id || t;
+  opQuote = (e) =>
+    (
+      e.current ||
+      (typeof e.coin == "string" && e.coin.includes("/")
+        ? e.coin.split("/")[1]
+        : "") ||
+      "USDT"
+    )
+      .toString()
+      .trim()
+      .toUpperCase() || "USDT",
+  opKey = (e) => {
+    const a = (
+        e.symbol ||
+        e.coinName ||
+        e.code ||
+        (typeof e.coin == "string" ? e.coin.split("/")[0] : "") ||
+        "-"
+      )
+        .toString()
+        .trim()
+        .toUpperCase() || "-",
+      t = opQuote(e),
+      r = ne(e.buyFrom || e.buyExchange || ""),
+      n = ne(e.sellTo || e.sellExchange || ""),
+      l = A(e.buyType || e.buyMarket),
+      c = A(e.sellType || e.sellMarket);
+    return `${a}-${t}-${r}-${l}-${n}-${c}`;
   },
+  marketAliasKey = (e) => {
+    const a = (
+        e.symbol ||
+        e.coinName ||
+        e.code ||
+        (typeof e.coin == "string" ? e.coin.split("/")[0] : "") ||
+        "-"
+      )
+        .toString()
+        .trim()
+        .toUpperCase() || "-",
+      t = ne(e.buyFrom || e.buyExchange || ""),
+      r = ne(e.sellTo || e.sellExchange || ""),
+      n = A(e.buyType || e.buyMarket),
+      l = A(e.sellType || e.sellMarket);
+    return `${a}-${t}-${n}-${r}-${l}`;
+  },
+  legacyOpKey = (e) => {
+    const a = (
+      e.symbol ||
+      e.coinName ||
+      e.code ||
+      (typeof e.coin == "string" ? e.coin.split("/")[0] : "") ||
+      "-"
+    )
+      .toString()
+      .trim()
+      .toUpperCase() || "-";
+    return `${a}-${ne(e.buyFrom || e.buyExchange || "")}-${ne(e.sellTo || e.sellExchange || "")}`;
+  },
+  hasStoredAlias = (e, a) =>
+    [e.pinKey, ...(Array.isArray(e.pinAliases) ? e.pinAliases : [])].some((t) =>
+      a.has(t),
+    ),
+  Jn = (e) => e.id || opKey(e),
   Je = (e) => {
     const a = (e || "").toUpperCase();
     return a.includes("FUTURE") || a.includes("FUTURO") ? "FUTURO" : "SPOT";
@@ -1519,9 +1579,13 @@ const Kn = ({ state: e }) =>
         new Set(
           [
             t,
+            opKey(e),
+            marketAliasKey(e),
             e.id,
             e.code,
-            `${e.symbol || e.code || "-"}-${e.buyFrom || ""}-${e.sellTo || ""}`,
+            e.pinKey,
+            ...(Array.isArray(e.pinAliases) ? e.pinAliases : []),
+            legacyOpKey(e),
           ].filter(Boolean),
         ),
       ),
@@ -2572,26 +2636,43 @@ const tr = (e, a) => {
       e((n) => {
         if (!t.length || !r.length) return n;
         const l = Date.now(),
-          c = r.reduce(
-            (u, o) => (
-              o?.pinKey &&
-                (u[o.pinKey] = {
-                  ...o,
-                  isPinned: !0,
-                  lastSeen: o.lastSeen ?? l,
-                  muteAlert: n.mutedAlerts.has(o.pinKey),
-                }),
-              u
-            ),
-            {},
-          ),
-          d = ie(c),
-          m = hs(t).filter((u) => !!c[u]);
+          c = {},
+          d = new Map();
+        r.forEach((u) => {
+          if (!u) return;
+          const o = opKey(u),
+            f = Array.from(
+              new Set(
+                [
+                  o,
+                  ...(Array.isArray(u.pinAliases) ? u.pinAliases : []),
+                  u.pinKey,
+                  u.id,
+                  u.code,
+                  legacyOpKey(u),
+                ].filter(Boolean),
+              ),
+            );
+          c[o] = {
+            ...u,
+            id: o,
+            pinKey: o,
+            pinAliases: f,
+            buyMarket: u.buyMarket ?? A(u.buyType),
+            sellMarket: u.sellMarket ?? A(u.sellType),
+            isPinned: !0,
+            lastSeen: u.lastSeen ?? l,
+            muteAlert: f.some((h) => n.mutedAlerts.has(h)),
+          };
+          f.forEach((h) => d.set(h, o));
+        });
+        const m = ie(c),
+          u = hs(t.map((o) => d.get(o) || o)).filter((o) => !!c[o]);
         return {
           ...n,
           pinnedById: c,
-          pinnedOrder: m,
-          pinnedAliasSet: d,
+          pinnedOrder: u,
+          pinnedAliasSet: m,
         };
       }),
     hydrateRemovedSignals: (t) =>
@@ -2656,7 +2737,7 @@ const tr = (e, a) => {
         Object.keys(d).forEach((u) => {
           d[u] = {
             ...d[u],
-            muteAlert: c.has(u),
+            muteAlert: hasStoredAlias(d[u], c),
           };
         });
         const m = {
@@ -2666,7 +2747,7 @@ const tr = (e, a) => {
           Object.keys(m).forEach((u) => {
             m[u] = {
               ...m[u],
-              muteAlert: c.has(u),
+              muteAlert: hasStoredAlias(m[u], c),
             };
           }),
           {
@@ -2693,7 +2774,7 @@ const tr = (e, a) => {
           (t.forEach((o) => {
             if (o.pinAliases.some((g) => r.removedSet.has(g))) return;
             const h = o.pinAliases.some((g) => r.pinnedAliasSet.has(g)),
-              x = r.mutedAlerts.has(o.pinKey),
+              x = hasStoredAlias(o, r.mutedAlerts),
               S = {
                 ...o,
                 lastSeen: o.lastSeen ?? m,
@@ -2743,7 +2824,7 @@ const tr = (e, a) => {
         t.forEach((x) => {
           if (x.pinAliases.some((C) => d.has(C))) return;
           const g = x.pinAliases.some((C) => r.pinnedAliasSet.has(C)),
-            y = r.mutedAlerts.has(x.pinKey),
+            y = hasStoredAlias(x, r.mutedAlerts),
             N = {
               ...x,
               lastSeen: x.lastSeen ?? m,
@@ -2870,7 +2951,7 @@ const tr = (e, a) => {
         const l = {
             ...t,
             lastSeen: t.lastSeen ?? Date.now(),
-            muteAlert: r.mutedAlerts.has(n),
+            muteAlert: hasStoredAlias(t, r.mutedAlerts),
           },
           c = [n, ...r.removedIds],
           d = {
@@ -2917,7 +2998,7 @@ const tr = (e, a) => {
               ...c,
               isPinned: !1,
               lastSeen: c.lastSeen ?? Date.now(),
-              muteAlert: r.mutedAlerts.has(t),
+              muteAlert: hasStoredAlias(c, r.mutedAlerts),
             }),
           {
             ...r,
@@ -2928,32 +3009,38 @@ const tr = (e, a) => {
           }
         );
       }),
-    toggleMuteAlert: (t) =>
-      e((r) => {
-        const n = new Set(r.mutedAlerts);
-        n.has(t) ? n.delete(t) : n.add(t);
-        const l = {
-            ...r.signalsById,
+    toggleMuteAlert: (t, r = []) =>
+      e((n) => {
+        const l = Array.from(
+            new Set([t, ...(Array.isArray(r) ? r : [])].filter(Boolean)),
+          ),
+          c = new Set(n.mutedAlerts),
+          d = l.some((u) => c.has(u));
+        d ? l.forEach((u) => c.delete(u)) : c.add(t);
+        const m = {
+            ...n.signalsById,
           },
-          c = {
-            ...r.pinnedById,
+          u = {
+            ...n.pinnedById,
           };
         return (
-          l[t] &&
-            (l[t] = {
-              ...l[t],
-              muteAlert: n.has(t),
-            }),
-          c[t] &&
-            (c[t] = {
-              ...c[t],
-              muteAlert: n.has(t),
-            }),
+          Object.keys(m).forEach((o) => {
+            m[o] = {
+              ...m[o],
+              muteAlert: hasStoredAlias(m[o], c),
+            };
+          }),
+          Object.keys(u).forEach((o) => {
+            u[o] = {
+              ...u[o],
+              muteAlert: hasStoredAlias(u[o], c),
+            };
+          }),
           {
-            ...r,
-            mutedAlerts: n,
-            signalsById: l,
-            pinnedById: c,
+            ...n,
+            mutedAlerts: c,
+            signalsById: m,
+            pinnedById: u,
           }
         );
       }),
@@ -3033,7 +3120,7 @@ const tr = (e, a) => {
       u = e.map((o) => {
         const f = o.pinAliases.some((N) => a.removedSet.has(N)),
           h = o.pinAliases.some((N) => a.pinnedAliasSet.has(N)),
-          x = a.mutedAlerts.has(o.pinKey);
+          x = hasStoredAlias(o, a.mutedAlerts);
         if (f || x || h)
           return {
             ...o,
@@ -4324,7 +4411,7 @@ function xa() {
     Fe = j((i) => i.toggleMuteAlert),
     gt = p.useCallback(
       (i) => {
-        Fe(i.pinKey);
+        Fe(i.pinKey, i.pinAliases);
       },
       [Fe],
     ),

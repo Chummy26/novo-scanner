@@ -270,7 +270,9 @@ fn scanner_frame(dtos: &[OpportunityDto]) -> String {
     let ts = chrono_iso_now();
     // Transform ages ms → seconds to match the frontend's expectation.
     let data: Vec<serde_json::Value> = dtos.iter().map(|d| serde_json::json!({
+        "id":            d.id,
         "symbol":        d.symbol,
+        "current":       d.current,
         "buyFrom":       d.buy_from,
         "sellTo":        d.sell_to,
         "buyType":       d.buy_type,

@@ -8,7 +8,9 @@ use crate::spread::Opportunity;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpportunityDto {
+    pub id:            String,
     pub symbol:        String,
+    pub current:       String,
     pub buy_from:      String,
     pub sell_to:       String,
     pub buy_type:      String,
@@ -23,10 +25,39 @@ pub struct OpportunityDto {
     pub sell_book_age: u64,
 }
 
+fn market_key(market: &str) -> &'static str {
+    if market.eq_ignore_ascii_case("FUTURES") || market.eq_ignore_ascii_case("FUTURO") {
+        "future"
+    } else {
+        "spot"
+    }
+}
+
+fn opportunity_id(
+    symbol: &str,
+    current: &str,
+    buy_from: &str,
+    buy_type: &str,
+    sell_to: &str,
+    sell_type: &str,
+) -> String {
+    format!(
+        "{}-{}-{}-{}-{}-{}",
+        symbol.trim().to_uppercase(),
+        current.trim().to_uppercase(),
+        buy_from.trim().to_ascii_lowercase(),
+        market_key(buy_type),
+        sell_to.trim().to_ascii_lowercase(),
+        market_key(sell_type),
+    )
+}
+
 impl From<&Opportunity> for OpportunityDto {
     fn from(o: &Opportunity) -> Self {
         Self {
+            id:            opportunity_id(&o.symbol, &o.current, o.buy_from, o.buy_type, o.sell_to, o.sell_type),
             symbol:        o.symbol.clone(),
+            current:       o.current.clone(),
             buy_from:      o.buy_from.to_string(),
             sell_to:       o.sell_to.to_string(),
             buy_type:      o.buy_type.to_string(),
@@ -83,7 +114,9 @@ mod tests {
     #[test]
     fn camel_case_serialization() {
         let dto = OpportunityDto {
+            id:            "BTC-USDT-binance-spot-gate-future".into(),
             symbol:        "BTC".into(),
+            current:       "USDT".into(),
             buy_from:      "binance".into(),
             sell_to:       "gate".into(),
             buy_type:      "SPOT".into(),
@@ -98,6 +131,8 @@ mod tests {
             sell_book_age: 78,
         };
         let json = serde_json::to_string(&dto).unwrap();
+        assert!(json.contains(r#""id":"BTC-USDT-binance-spot-gate-future""#));
+        assert!(json.contains(r#""current":"USDT""#));
         assert!(json.contains(r#""buyFrom":"binance""#));
         assert!(json.contains(r#""sellTo":"gate""#));
         assert!(json.contains(r#""buyPrice":43567.12"#));

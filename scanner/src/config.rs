@@ -27,16 +27,6 @@ pub struct Config {
     #[serde(default = "default_min_vol_usd")]
     pub min_vol_usd: f64,
 
-    /// Median-deviation cutoff (%) used as a ticker-collision detector.
-    /// When a symbol has book snapshots from at least 3 venues, we compute
-    /// the median mid-price and drop any venue whose mid deviates by more
-    /// than this fraction. Different tokens sharing a ticker (e.g. "SIREN"
-    /// as a meme coin on exchange A and as a protocol token on exchange B)
-    /// diverge far beyond any legitimate arbitrage spread — this gate
-    /// exploits that to separate them.
-    #[serde(default = "default_median_dev")]
-    pub median_deviation_pct: f64,
-
     /// Optional path to a directory of static files (frontend build output)
     /// that the broadcast server will also serve under `/`. Leave unset to
     /// disable static serving (backend-only).
@@ -151,7 +141,6 @@ fn default_bind()            -> String { "0.0.0.0:8000".into() }
 fn default_broadcast_ms()    -> u64    { 150 }
 fn default_entry_threshold() -> f64    { 0.20 } // 0.20%
 fn default_max_spread()      -> f64    { 30.0 }
-fn default_median_dev()      -> f64    { 50.0 }
 fn default_min_vol_usd()     -> f64    { 100_000.0 } // $100k min per leg
 fn default_max_symbols()     -> u32    { 4000 }
 fn default_max_levels()      -> u16    { 20 }
@@ -191,7 +180,6 @@ impl Config {
             entry_threshold_pct: 0.20,
             max_spread_pct:      30.0,
             min_vol_usd:         100_000.0,
-            median_deviation_pct: 50.0,
             frontend_dir:        default_frontend_dir(),
             venues:              VenueToggles::default_enabled(),
             limits:              Limits::default(),
