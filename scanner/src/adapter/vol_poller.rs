@@ -103,8 +103,14 @@ fn bingx_qvol(v: &serde_json::Value) -> f64 {
 }
 
 async fn poll_bingx_spot(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore) {
-    // BingX spot: GET /openApi/spot/v1/ticker/24hr (returns array under data)
-    let r = http.get("https://open-api.bingx.com/openApi/spot/v1/ticker/24hr").send().await;
+    // BingX spot: GET /openApi/spot/v1/ticker/24hr (returns array under data).
+    // Despite being a public endpoint, the v1 `ticker/24hr` route now rejects
+    // requests without a `timestamp` query parameter (code 100400).
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis()).unwrap_or(0);
+    let url = format!("https://open-api.bingx.com/openApi/spot/v1/ticker/24hr?timestamp={}", ms);
+    let r = http.get(&url).send().await;
     let r = match r { Ok(r) => r, Err(e) => { debug!("bingx-spot vol: {}", e); return; } };
     let wrap: BingxResp<Vec<BingxTicker>> = match r.json().await {
         Ok(v) => v, Err(e) => { debug!("bingx-spot parse: {}", e); return; }
@@ -337,8 +343,9 @@ struct XtFutTicker {
 }
 
 async fn poll_xt_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore) {
-    // `/future/market/v1/public/q/ticker` with no params returns all contracts.
-    let r = http.get("https://fapi.xt.com/future/market/v1/public/q/ticker").send().await;
+    // `/q/tickers` (plural) returns ALL contracts; `/q/ticker` (singular)
+    // requires `?symbol=X` and rejects with `invalid_symbol` otherwise.
+    let r = http.get("https://fapi.xt.com/future/market/v1/public/q/tickers").send().await;
     let r = match r { Ok(r) => r, Err(e) => { debug!("xt-fut vol: {}", e); return; } };
     let wrap: XtFutResp = match r.json().await {
         Ok(w) => w, Err(e) => { debug!("xt-fut parse: {}", e); return; }

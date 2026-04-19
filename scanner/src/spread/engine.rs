@@ -207,8 +207,19 @@ pub fn scan_once(
                     continue;
                 }
 
-                // exit_spread is the reverse trip (inverse direction).
-                let exit_spread = (buy.bid_px.to_f64() / sell.ask_px.to_f64() - 1.0) * 100.0;
+                // exit_spread: the reverse trip measured with the SAME
+                // denominator as entry_spread (buy_ask). This keeps both
+                // metrics on a common base so the invariant |entry| ≤ |exit|
+                // holds whenever the market is free of free-lunches —
+                // i.e. the scanner cannot produce the algebraic artifact of
+                // "|entry| > |exit|" that arises purely from x + 1/x convexity
+                // when entry and exit are normalized by different prices.
+                //
+                // Formula: (buy_bid - sell_ask) / buy_ask × 100.
+                // Note this field is purely DISPLAY — it is never used as a
+                // filter in the engine (only entry_spread drives emission),
+                // so changing the denominator cannot drop any opportunity.
+                let exit_spread = (buy.bid_px.to_f64() - sell.ask_px.to_f64()) / buy_ask * 100.0;
 
                 out.push(Opportunity {
                     symbol:       canonical.base.clone(),
