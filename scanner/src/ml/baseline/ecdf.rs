@@ -1,8 +1,9 @@
-//! Baseline A3 — implementação ECDF pareada.
+//! Baseline A3 — implementação ECDF marginal degradada.
 //!
 //! Ver `mod.rs` para limitações documentadas. O baseline continua sendo
-//! safety-net, mas já usa estatísticas conjuntivas do par `entry+exit`
-//! para não cair no trap de marginais independentes.
+//! safety-net. Ele ancora o lucro no `entry` acionável atual e usa a
+//! distribuição marginal futura de `exit`, sem tratar `entry(t)+exit(t)`
+//! simultâneo como label econômico.
 
 use crate::ml::contract::{
     AbstainDiagnostic, AbstainReason, CalibStatus, ReasonKind, Recommendation, RouteId,
@@ -103,16 +104,14 @@ impl BaselineA3 {
     /// 2. Se `toxicity_hint == Toxic`, emite `Abstain(LowConfidence)`.
     /// 3. Checa tail_ratio p99/p95 > threshold → `Abstain(LongTail)`.
     /// 4. Gate tático: `current_entry ≥ p50(entry)` senão `NoOpportunity`.
-    /// 5. `enter_at_min` derivado economicamente sobre LUCRO BRUTO COTADO:
-    ///    `max(floor_pct − exit_typical, p50_entry)`. Operador ajusta
-    ///    `floor_pct` para absorver expectativa de fees/slippage, mas o
-    ///    modelo NÃO computa esses termos (fronteira explícita).
-    /// 6. Se `gross_p10 < floor_pct` → `NoOpportunity` com diagnóstico.
-    /// 8. `historical_base_rate_24h` (expostada como `realization_probability`
-    ///    no tipo; DTO renomeia) é taxa empírica incondicional; IC Wilson com
-    ///    n_eff desconto de autocorrelação 10× (conservador).
-    /// 9. Emite `TradeSetup` com `toxicity_level` recebido e
-    ///    `calibration_status: Degraded`.
+    /// 5. `enter_at_min` derivado sobre LUCRO BRUTO COTADO:
+    ///    `max(floor_pct − exit_typical, p50_entry)`.
+    /// 6. Gate econômico degradado: `current_entry + exit_typical ≥ floor`.
+    /// 7. Quantis de gross são proxy marginal:
+    ///    `enter_typical + quantile(exit)`, não `entry(t)+exit(t)`.
+    /// 8. `realization_probability` é `P(exit ≥ floor − enter_typical)`.
+    /// 9. Emite `TradeSetup` com `calibration_status: Degraded`; o modelo A2
+    ///    deve substituir isso por labels forward-looking reais.
     pub fn recommend(
         &self,
         route: RouteId,
@@ -205,14 +204,7 @@ impl BaselineA3 {
                 diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
             },
         };
-        let (_p10_x, _p25_x, p50_x, _p75_x, _p90_x, _p95_x) = match all_quantiles_exit(&self.cache, route) {
-            Some(qs) => qs,
-            None => return Recommendation::Abstain {
-                reason: AbstainReason::InsufficientData,
-                diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
-            },
-        };
-        let (g10, g25, g50, g75, g90, g95) = match all_quantiles_gross(&self.cache, route) {
+        let (p10_x, p25_x, p50_x, p75_x, p90_x, p95_x) = match all_quantiles_exit(&self.cache, route) {
             Some(qs) => qs,
             None => return Recommendation::Abstain {
                 reason: AbstainReason::InsufficientData,
@@ -230,22 +222,17 @@ impl BaselineA3 {
         // expectativa desses custos externos na sua operação.
         let floor_gross = self.cfg.floor_pct;
 
-        // Gross profit quantis via distribuição conjunta pareada.
-        let gross_p10 = g10;
-        let gross_p25 = g25;
-        let gross_median = g50;
-        let gross_p75 = g75;
-        let gross_p90 = g90;
-        let gross_p95 = g95;
-
-        // Gate 3: gross_p10 abaixo do floor BRUTO → não vale.
-        if gross_p10 + quantile_tolerance < floor_gross {
+        // Gate 3: baseline degradado usa o entry acionável atual mais a
+        // saída marginal típica. Não usa `entry(t)+exit(t)` simultâneo, pois
+        // essa identidade mede reversão imediata, não saída futura.
+        let gross_typical_if_enter_now = current_entry + exit_typical;
+        if gross_typical_if_enter_now + quantile_tolerance < floor_gross {
             return Recommendation::Abstain {
                 reason: AbstainReason::NoOpportunity,
                 diagnostic: AbstainDiagnostic {
                     n_observations: n.min(u32::MAX as u64) as u32,
                     ci_width_if_emitted: None,
-                    nearest_feasible_utility: Some(gross_median),
+                    nearest_feasible_utility: Some(gross_typical_if_enter_now),
                     tail_ratio_p99_p95: None,
                     model_version: self.cfg.model_version.to_string(),
                     regime_posterior: [1.0, 0.0, 0.0],
@@ -261,12 +248,20 @@ impl BaselineA3 {
         let enter_at_min_derivado = floor_gross - exit_typical;
         let enter_at_min = enter_at_min_derivado.max(p50_e);
         // Preservar invariante contratual `enter_at_min ≤ enter_typical ≤ enter_peak_p95`.
-        let enter_typical = enter_at_min.max(p50_e);
+        let enter_typical = current_entry.max(enter_at_min);
         let enter_peak_p95 = enter_typical.max(p95_e);
         // exit_at_min simétrico: mínimo exit que fechamento garante floor_gross
         // dado enter_typical.
-        let exit_at_min_derivado = floor_gross - enter_typical;
-        let exit_at_min = exit_at_min_derivado.min(p50_x);
+        let exit_at_min = floor_gross - enter_typical;
+
+        // Proxy marginal da distribuição de lucro bruto:
+        // `G_proxy(t0,t1) = enter_typical(t0) + S_saida(t1)`.
+        let gross_p10 = enter_typical + p10_x;
+        let gross_p25 = enter_typical + p25_x;
+        let gross_median = enter_typical + p50_x;
+        let gross_p75 = enter_typical + p75_x;
+        let gross_p90 = enter_typical + p90_x;
+        let gross_p95 = enter_typical + p95_x;
 
         let (p_enter_hit, _, _) = match self.cache.probability_entry_ge(route, enter_at_min) {
             Some(stats) => stats,
@@ -275,22 +270,17 @@ impl BaselineA3 {
                 diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
             },
         };
-        let (p_exit_hit, _, _) = match self.cache.probability_exit_ge(route, exit_at_min) {
-            Some(stats) => stats,
-            None => return Recommendation::Abstain {
-                reason: AbstainReason::InsufficientData,
-                diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
-            },
-        };
-        // Probabilidade histórica de gross >= floor BRUTO.
-        let (p_realize, success_count, total_count) =
-            match self.cache.probability_gross_ge(route, floor_gross) {
+        let (p_exit_hit, exit_success_count, exit_total_count) =
+            match self.cache.probability_exit_ge(route, exit_at_min) {
                 Some(stats) => stats,
                 None => return Recommendation::Abstain {
                     reason: AbstainReason::InsufficientData,
                     diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
                 },
             };
+        let p_realize = p_exit_hit;
+        let success_count = exit_success_count;
+        let total_count = exit_total_count;
         // Wilson IC com desconto de autocorrelação (Newey-West aproximado).
         // n_eff = n / 10 respeita que observações de spread cross-exchange
         // têm autocorrelação ρ ≈ 0.9 em janelas de segundos (Lahiri 2003);
@@ -300,14 +290,12 @@ impl BaselineA3 {
             success_count, total_count, n_eff_divisor,
         );
 
-        // Horizon: duração empírica dos runs favoráveis acima do floor BRUTO.
-        // Se ainda não houver run suficiente, usa uma heurística conservadora
-        // baseada na validade da recomendação, não um número fixo.
+        // Horizon degradado: sem labels forward-looking, não usamos runs de
+        // `entry(t)+exit(t)` simultâneo. A2 substituirá por T real rotulado.
         let fallback = self.cfg.valid_for_s.max(1);
-        let (horizon_p05_s, horizon_median_s, horizon_p95_s) = self
-            .cache
-            .gross_run_duration_quantiles(route, floor_gross)
-            .unwrap_or((fallback / 2, fallback, fallback.saturating_mul(2)));
+        let horizon_p05_s = fallback / 2;
+        let horizon_median_s = fallback;
+        let horizon_p95_s = fallback.saturating_mul(2);
 
         // Haircut empírico default — será calibrado em shadow (ADR-013 Fase 2).
         let haircut = self.cfg.default_haircut;
@@ -351,8 +339,8 @@ impl BaselineA3 {
             reason: TradeReason {
                 kind: ReasonKind::Tail,
                 detail: format!(
-                    "entry {:.2}% ≥ p50 {:.2}% | floor_gross {:.2}% | n={}",
-                    current_entry, p50_entry, floor_gross, n
+                    "entry {:.2}% + exit_typical {:.2}% ≥ floor_gross {:.2}% | n={} | degraded_marginal_proxy",
+                    current_entry, exit_typical, floor_gross, n
                 ),
             },
             model_version: self.cfg.model_version.to_string(),
@@ -392,20 +380,6 @@ fn all_quantiles_exit(
         cache.quantile_exit(route, 0.75)?,
         cache.quantile_exit(route, 0.90)?,
         cache.quantile_exit(route, 0.95)?,
-    ))
-}
-
-fn all_quantiles_gross(
-    cache: &HotQueryCache,
-    route: RouteId,
-) -> Option<(f32, f32, f32, f32, f32, f32)> {
-    Some((
-        cache.quantile_gross(route, 0.10)?,
-        cache.quantile_gross(route, 0.25)?,
-        cache.quantile_gross(route, 0.50)?,
-        cache.quantile_gross(route, 0.75)?,
-        cache.quantile_gross(route, 0.90)?,
-        cache.quantile_gross(route, 0.95)?,
     ))
 }
 
@@ -588,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn emit_trade_when_joint_gross_survives_floor_even_if_marginals_are_misaligned() {
+    fn emit_trade_when_current_entry_plus_marginal_exit_survives_floor() {
         let cache = mk_cache();
         let cfg = BaselineConfig {
             floor_pct: 0.5,
@@ -610,13 +584,13 @@ mod tests {
                 assert!(setup.realization_probability > 0.5);
             }
             Recommendation::Abstain { reason, .. } => {
-                panic!("joint distribution should permit trade, got Abstain({reason:?})")
+                panic!("marginal exit proxy should permit trade, got Abstain({reason:?})")
             }
         }
     }
 
     #[test]
-    fn realization_probability_and_ci_follow_observed_joint_success_rate() {
+    fn realization_probability_and_ci_follow_exit_threshold_rate() {
         let cache = mk_cache();
         let cfg = BaselineConfig {
             floor_pct: 0.5,
@@ -634,8 +608,7 @@ mod tests {
         let rec = a3.recommend(route, 2.1, -0.4, 1_700_000_000_000_000_000, ToxicityLevel::Unknown);
         match rec {
             Recommendation::Trade(setup) => {
-                // Taxa empírica bruta continua em 1.0 (100% das observações
-                // tinham gross >= floor).
+                // Taxa degradada segue P(exit >= floor - enter_typical).
                 assert!(
                     (setup.realization_probability - 1.0).abs() < f32::EPSILON,
                     "expected empirical success rate of 1.0, got {}",
@@ -655,6 +628,45 @@ mod tests {
             }
             Recommendation::Abstain { reason, .. } => {
                 panic!("expected Trade on saturated success set, got Abstain({reason:?})")
+            }
+        }
+    }
+
+    #[test]
+    fn emits_from_current_entry_plus_marginal_exit_when_instant_gross_is_below_floor() {
+        let cache = mk_cache();
+        let cfg = BaselineConfig {
+            floor_pct: 0.8,
+            n_min: 50,
+            ..BaselineConfig::default()
+        };
+        let a3 = BaselineA3::new(cache.clone(), cfg);
+        let route = mk_route();
+
+        let mut samples = Vec::with_capacity(100);
+        for _ in 0..60 {
+            samples.push((0.4, 0.0));
+        }
+        for _ in 0..40 {
+            samples.push((2.0, -1.5));
+        }
+        observe_samples(&cache, route, &samples);
+
+        let rec = a3.recommend(
+            route,
+            2.0,
+            -1.5,
+            1_700_000_000_000_000_000,
+            ToxicityLevel::Unknown,
+        );
+        match rec {
+            Recommendation::Trade(setup) => {
+                assert!(setup.gross_profit_p10 < cfg.floor_pct);
+                assert!(setup.gross_profit_median >= cfg.floor_pct);
+                assert_eq!(setup.calibration_status, CalibStatus::Degraded);
+            }
+            Recommendation::Abstain { reason, .. } => {
+                panic!("marginal exit safety-net should emit, got Abstain({reason:?})")
             }
         }
     }

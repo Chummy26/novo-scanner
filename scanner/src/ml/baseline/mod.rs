@@ -1,9 +1,10 @@
-//! Baseline A3 — ECDF + bootstrap empírico pareado.
+//! Baseline A3 — ECDF marginal degradado.
 //!
 //! Implementa o **baseline shadow** definido em ADR-001: ECDF empírica
 //! sobre histórico da rota, emitindo `TradeSetup` (ADR-016) sem treino
-//! de modelo ML. Usa a distribuição conjunta do par `entry+exit` para
-//! evitar o trap de marginais independentes. Serve como:
+//! de modelo ML. Usa o `entry` acionável atual mais a distribuição marginal
+//! futura de `exit`; não usa `entry(t)+exit(t)` simultâneo como lucro
+//! econômico. Serve como:
 //!
 //! 1. **Safety-net do kill switch**: quando modelo A2 composta falha
 //!    (ECE alto, panic, latência), fallback para A3 garante que sistema
@@ -17,15 +18,13 @@
 //!
 //! A3 continua sendo baseline/fallback, então mantém `calibration_status`
 //! como `Degraded` e usa aproximações conservadoras para horizonte e
-//! metadados táticos. O que foi corrigido é a parte mais importante do
-//! contrato: `P(realize)` e os quantis de lucro bruto agora usam a
-//! distribuição conjunta empírica do par `entry+exit`, não soma de
-//! marginais.
+//! metadados táticos. A correção atual evita o bug crítico de interpretar
+//! `entry(t)+exit(t)` instantâneo como label de `G(t0,t1)`.
 //!
-//! - `HotQueryCache` mantém entry/exit/gross para o mesmo histórico de
-//!   rota.
+//! - A3 deriva `G_proxy(t0,t1) = entry_atual(t0) + S_saida(t1)` via ECDF
+//!   marginal de saída.
 //! - Modelo A2 (Marco 2) continua sendo o caminho para calibração e
-//!   CDF unificada completa de `G(t,t')` (ADR-008).
+//!   CDF unificada completa de `G(t0,t1)` com labels forward-looking.
 //! - `calibration_status = Degraded` continua sinalizando fallback.
 //!
 //! Vide `docs/ml/01_decisions/ADR-016-output-contract-refined.md` para
