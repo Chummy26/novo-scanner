@@ -35,7 +35,9 @@ use crate::ml::persistence::{
 };
 use crate::ml::serving::MlServer;
 use crate::ml::trigger::SamplingTrigger;
-use crate::spread::engine::{new_stale_table, scan_once, Opportunity, ScanCounters, StaleTable};
+use crate::spread::engine::{
+    new_stale_table, scan_once_with_observer, Opportunity, ScanCounters, StaleTable,
+};
 use crate::types::now_ns;
 
 #[inline]
@@ -361,13 +363,26 @@ async fn run_spread_engine(
     ml_broadcaster:   RecommendationBroadcaster,
 ) {
     let mut buf: Vec<Opportunity> = Vec::with_capacity(1024);
+    let mut ml_observations: Vec<Opportunity> = Vec::with_capacity(4096);
     let mut tick = tokio::time::interval(Duration::from_millis(broadcast_ms));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let t0 = std::time::Instant::now();
         buf.clear();
-        scan_once(&universe, &store, &stale, &vol, threshold_pct, max_spread_pct, min_vol_usd, &counters, &mut buf);
+        ml_observations.clear();
+        scan_once_with_observer(
+            &universe,
+            &store,
+            &stale,
+            &vol,
+            threshold_pct,
+            max_spread_pct,
+            min_vol_usd,
+            &counters,
+            &mut buf,
+            |opp| ml_observations.push(opp.clone()),
+        );
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
         obs::Metrics::init().record_cycle(elapsed_ns);
 
@@ -450,6 +465,35 @@ async fn run_spread_engine(
                     }
                 }
             }
+        }
+
+        // Feed ML/cache with valid route observations that were below the UI
+        // opportunity threshold. This runs after the thresholded
+        // `on_opportunity` pass to preserve point-in-time behavior for
+        // recommendations emitted this cycle.
+        for opp in &ml_observations {
+            if opp.entry_spread >= threshold_pct {
+                continue;
+            }
+            let route = RouteId {
+                symbol_id:  opp.symbol_id,
+                buy_venue:  opp.buy_venue,
+                sell_venue: opp.sell_venue,
+            };
+            let symbol_name = universe.canonical_name_of(opp.symbol_id);
+            ml_server.observe_background(
+                cycle_seq,
+                route,
+                &symbol_name,
+                opp.entry_spread as f32,
+                opp.exit_spread as f32,
+                opp.buy_book_age.min(u32::MAX as u64) as u32,
+                opp.sell_book_age.min(u32::MAX as u64) as u32,
+                opp.buy_vol24,
+                opp.sell_vol24,
+                false,
+                now,
+            );
         }
 
         // Move buf contents into DTOs; reuse allocation on next cycle.

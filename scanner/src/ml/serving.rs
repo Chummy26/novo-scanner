@@ -420,6 +420,105 @@ impl MlServer {
         (self.cycle_seq.fetch_add(1, Ordering::Relaxed) & 0xFFFF_FFFF) as u32
     }
 
+    /// Observa uma rota válida que não necessariamente é uma oportunidade
+    /// acima do threshold do scanner.
+    ///
+    /// Isto alimenta o histórico PIT do ML e resolve trades pendentes sem
+    /// emitir `Recommendation` nem `AcceptedSample`. É essencial para labels
+    /// futuros: `exitSpread(t1)` pode melhorar depois que `entrySpread` caiu
+    /// abaixo do threshold de UI, e esse caminho não pode desaparecer do
+    /// dataset de treinamento.
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_background(
+        &self,
+        cycle_seq: u32,
+        route: RouteId,
+        symbol_name: &str,
+        entry_spread: f32,
+        exit_spread: f32,
+        buy_book_age_ms: u32,
+        sell_book_age_ms: u32,
+        buy_vol24_usd: f64,
+        sell_vol24_usd: f64,
+        halt_active_external: bool,
+        now_ns: u64,
+    ) -> SampleDecision {
+        let halt_proxy = detect_halt_proxy(
+            route.buy_venue,
+            route.sell_venue,
+            buy_book_age_ms,
+            sell_book_age_ms,
+        );
+        let halt_active = halt_active_external || halt_proxy;
+
+        self.listing.record_seen(route, now_ns);
+        let clean = self.trigger.is_clean_data(
+            route.buy_venue,
+            route.sell_venue,
+            buy_book_age_ms,
+            sell_book_age_ms,
+            buy_vol24_usd,
+            sell_vol24_usd,
+            halt_active,
+        );
+        let sample_dec = self.trigger.evaluate(
+            route,
+            entry_spread,
+            buy_book_age_ms,
+            sell_book_age_ms,
+            buy_vol24_usd,
+            sell_vol24_usd,
+            halt_active,
+            self.baseline.cache(),
+        );
+        self.bump_sample_metric(sample_dec);
+
+        if let Some(raw_writer) = self.raw_writer.as_ref() {
+            if self.raw_decimator.should_persist(route) {
+                let raw = RawSample::new(
+                    now_ns,
+                    cycle_seq,
+                    route,
+                    symbol_name,
+                    entry_spread,
+                    exit_spread,
+                    buy_book_age_ms,
+                    sell_book_age_ms,
+                    buy_vol24_usd,
+                    sell_vol24_usd,
+                    halt_active,
+                    sample_dec,
+                );
+                match raw_writer.try_send(raw) {
+                    Ok(()) => {
+                        self.metrics.raw_samples_emitted.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(crate::ml::persistence::RawWriterSendError::ChannelFull) => {
+                        self.metrics
+                            .raw_samples_dropped_channel_full
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(crate::ml::persistence::RawWriterSendError::ChannelClosed) => {
+                        self.metrics
+                            .raw_samples_dropped_channel_closed
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        if clean {
+            self.baseline
+                .cache()
+                .observe(route, entry_spread, exit_spread, now_ns);
+            self.economic
+                .lock()
+                .resolve_route(route, entry_spread, exit_spread, now_ns);
+        }
+
+        sample_dec
+    }
+
     /// Processa uma oportunidade do scanner.
     ///
     /// Retorna `(Recommendation, SampleDecision)`:
@@ -727,6 +826,38 @@ mod tests {
             _ => panic!("expected Abstain on first observation"),
         }
         assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
+    }
+
+    #[test]
+    fn background_observations_prime_cache_without_recommendation_output() {
+        let server = mk_server();
+        let route = mk_route();
+        assert_eq!(server.baseline.cache().n_observations(route), 0);
+
+        for i in 0..10 {
+            let dec = server.observe_background(
+                i,
+                route,
+                "BTC-USDT",
+                0.1 + i as f32 * 0.01,
+                -0.8,
+                50,
+                50,
+                1e6,
+                1e6,
+                false,
+                1_000_000_000 + i as u64,
+            );
+            assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
+        }
+
+        assert_eq!(server.baseline.cache().n_observations(route), 10);
+        assert_eq!(
+            server.metrics.opportunities_seen.load(Ordering::Relaxed),
+            0,
+            "background observations are data collection, not UI opportunities"
+        );
+        assert_eq!(server.metrics.rec_trade_total.load(Ordering::Relaxed), 0);
     }
 
     #[test]

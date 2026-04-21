@@ -118,6 +118,41 @@ pub fn scan_once(
     counters:  &ScanCounters,
     out:       &mut Vec<Opportunity>,
 ) {
+    scan_once_with_observer(
+        universe,
+        store,
+        stale,
+        vol,
+        threshold_pct,
+        max_spread_pct,
+        min_vol_usd,
+        counters,
+        out,
+        |_| {},
+    );
+}
+
+/// Scan the universe once and also reports every valid route observation to
+/// `observe`, including observations below the UI/scanner entry threshold.
+///
+/// The `out` vector keeps the original scanner semantics: only opportunities
+/// with `entry_spread >= threshold_pct` and passing the regular gates are
+/// pushed. The observer exists for ML data collection, where future `exit`
+/// labels require seeing the route after the entry opportunity has faded.
+pub fn scan_once_with_observer<F>(
+    universe:  &SymbolUniverse,
+    store:     &BookStore,
+    stale:     &StaleTable,
+    vol:       &VolStore,
+    threshold_pct: f64,
+    max_spread_pct: f64,
+    min_vol_usd: f64,
+    counters:  &ScanCounters,
+    out:       &mut Vec<Opportunity>,
+    mut observe: F,
+) where
+    F: FnMut(&Opportunity),
+{
     let now = now_ns();
     for (i, canonical) in universe.by_id.iter().enumerate() {
         let sym_id = SymbolId(i as u32);
@@ -190,10 +225,6 @@ pub fn scan_once(
                 let sell_bid = sell.bid_px.to_f64();
                 if buy_ask <= 0.0 || sell_bid <= 0.0 { continue; }
                 let entry_spread = (sell_bid / buy_ask - 1.0) * 100.0;
-                if entry_spread < threshold_pct {
-                    counters.dropped_below_threshold.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
                 // Sanity clamp: only cut truly absurd spreads (default 100%).
                 // 5–50% spreads are real on illiquid new listings and are
                 // intentionally emitted so the trader can decide.
@@ -231,7 +262,7 @@ pub fn scan_once(
                 // so changing the denominator cannot drop any opportunity.
                 let exit_spread = (buy.bid_px.to_f64() - sell.ask_px.to_f64()) / buy_ask * 100.0;
 
-                out.push(Opportunity {
+                let opp = Opportunity {
                     symbol:       canonical.base.clone(),
                     current:      canonical.quote.clone(),
                     buy_from:     buy_v.as_str(),
@@ -250,7 +281,16 @@ pub fn scan_once(
                     symbol_id:    sym_id,
                     buy_venue:    buy_v,
                     sell_venue:   sell_v,
-                });
+                };
+
+                observe(&opp);
+
+                if entry_spread < threshold_pct {
+                    counters.dropped_below_threshold.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
+                out.push(opp);
                 counters.emitted.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -355,6 +395,54 @@ mod tests {
         assert_eq!(op.buy_type,  "SPOT");
         assert_eq!(op.sell_type, "FUTURES");
         assert!(op.entry_spread > 0.9 && op.entry_spread < 1.1);
+    }
+
+    #[test]
+    fn observer_sees_cross_market_route_below_threshold_without_emitting() {
+        let mut per_venue: Vec<Vec<crate::discovery::VenueSymbol>> =
+            (0..VENUE_COUNT).map(|_| Vec::new()).collect();
+        let btc = CanonicalPair::of("BTC", "USDT");
+        per_venue[Venue::BinanceSpot.idx()].push(crate::discovery::VenueSymbol {
+            venue: Venue::BinanceSpot, raw: "BTCUSDT".into(), canonical: btc.clone(),
+        });
+        per_venue[Venue::MexcFut.idx()].push(crate::discovery::VenueSymbol {
+            venue: Venue::MexcFut, raw: "BTC_USDT".into(), canonical: btc,
+        });
+        let u = SymbolUniverse::from_venue_symbols(per_venue);
+        let store = BookStore::with_capacity(u.len() as u32);
+        let stale = StaleTable::with_capacity(u.len() as u32);
+        let vol = make_vol(&u);
+
+        let now = now_ns();
+        store.slot(Venue::BinanceSpot, SymbolId(0))
+            .commit(Price::from_f64(99.9), Qty::from_f64(1.0), Price::from_f64(100.0), Qty::from_f64(1.0), now);
+        stale.cell(Venue::BinanceSpot, SymbolId(0)).update(now);
+        store.slot(Venue::MexcFut, SymbolId(0))
+            .commit(Price::from_f64(100.1), Qty::from_f64(1.0), Price::from_f64(100.2), Qty::from_f64(1.0), now);
+        stale.cell(Venue::MexcFut, SymbolId(0)).update(now);
+
+        let mut out = Vec::new();
+        let mut observed = Vec::new();
+        let c = ScanCounters::default();
+        scan_once_with_observer(
+            &u,
+            &store,
+            &stale,
+            &vol,
+            0.3,
+            100.0,
+            0.0,
+            &c,
+            &mut out,
+            |opp| observed.push(opp.clone()),
+        );
+
+        assert!(out.is_empty(), "below-threshold route must not be emitted to UI");
+        let op = observed
+            .iter()
+            .find(|o| o.buy_type == "SPOT" && o.sell_type == "FUTURES")
+            .expect("ML observer must still see valid SPOT/FUT route");
+        assert!(op.entry_spread > 0.0 && op.entry_spread < 0.3);
     }
 
     #[test]

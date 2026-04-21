@@ -65,6 +65,14 @@ O modelo ML **não** deve modelar nem otimizar taker fees, maker fees, slippage,
 
 O único objetivo do ML é responder se a oportunidade de spread bruto merece recomendação agora: `enter`, `exit`, `lucro bruto = enter + exit`, `P`, `T`, e intervalo de confiança. O risco que o ML controla é apenas o risco de **recomendação errada**: baixa probabilidade de realização, má calibração, pouca evidência, baixa confiança ou lucro bruto insuficiente. Nesses casos, a saída correta é abstenção.
 
+### Dataset mínimo correto para treinar o ML
+
+`AcceptedSample` no instante `t0` **não é label supervisionado**. É apenas candidato de entrada. Para treinar o objetivo central, o dataset precisa ter, para cada candidato, observações futuras suficientes para reconstruir `exitSpread(t1)`, `lucro bruto = entry(t0) + exit(t1)`, `realizou/não realizou`, `tempo até realização T`, e censura quando a rota desaparece antes do horizonte.
+
+O stream de ML não pode depender apenas das oportunidades emitidas para UI (`entrySpread >= threshold`). Depois de uma entrada válida, a saída pode melhorar quando `entrySpread` já caiu abaixo do threshold. Portanto, a coleta correta deve alimentar o ML com observações válidas da rota também abaixo do threshold de UI, preservando point-in-time: primeiro decide/recomenda usando histórico anterior, depois atualiza o histórico com a observação corrente.
+
+São necessários para treino: `entrySpread`, `exitSpread`, rota, mercados, símbolo canônico, timestamps, qualidade/freshness do book, volumes como filtros de qualidade, decisão de amostragem, versão do scanner, histórico prévio point-in-time, labels futuros de lucro bruto e splits temporais/por rota/venue com embargo. Não são necessários no label/modelo: taker fee, maker fee, slippage, funding, stop, posição, margem, execução parcial ou PnL líquido.
+
 **Stack default Rust.** Python tem burden-of-proof (gap Rust >2× provado ou biblioteca inexistente).
 
 ---
