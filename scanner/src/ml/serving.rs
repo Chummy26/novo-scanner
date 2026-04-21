@@ -620,6 +620,19 @@ impl MlServer {
         self.bump_rec_metric(&rec);
         let entry_p50_pre_observe = self.baseline.cache().quantile_entry(route, 0.50);
         let exit_p50_pre_observe = self.baseline.cache().quantile_exit(route, 0.50);
+        // Fix pós-auditoria: popular `tail_ratio_p99_p95` usando o mesmo
+        // cache pré-observe (PIT). Feature contínua que o baseline já
+        // computa para o gate LongTail; expor como input do modelo
+        // permite aprender regimes de cauda sem re-derivar. None se
+        // histórico insuficiente ou p95 ≈ 0 (divisão instável).
+        let tail_ratio_pre_observe = {
+            let p99 = self.baseline.cache().quantile_entry(route, 0.99);
+            let p95 = self.baseline.cache().quantile_entry(route, 0.95);
+            match (p99, p95) {
+                (Some(p99v), Some(p95v)) if p95v.abs() > 1e-6 => Some(p99v / p95v),
+                _ => None,
+            }
+        };
 
         if clean {
             self.baseline
@@ -673,7 +686,7 @@ impl MlServer {
             let features_t0 = FeaturesT0 {
                 buy_vol24: buy_vol24_usd,
                 sell_vol24: sell_vol24_usd,
-                tail_ratio_p99_p95: None,
+                tail_ratio_p99_p95: tail_ratio_pre_observe,
                 entry_p50_24h: entry_p50_pre_observe,
                 exit_p50_24h: exit_p50_pre_observe,
             };
