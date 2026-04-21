@@ -62,6 +62,7 @@ impl LabelOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CensorReason {
     RouteVanished,
+    IncompleteWindow,
     Shutdown,
 }
 
@@ -69,6 +70,7 @@ impl CensorReason {
     pub fn as_str(self) -> &'static str {
         match self {
             CensorReason::RouteVanished => "route_vanished",
+            CensorReason::IncompleteWindow => "incomplete_window",
             CensorReason::Shutdown => "shutdown",
         }
     }

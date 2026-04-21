@@ -30,8 +30,9 @@ env/
 logs/
 
 # ML data outputs
-**/data/ml/raw_samples/
-**/data/ml/accepted_samples/
+**/data/ml/
+!**/data/ml/README.md
+!**/data/ml/.gitkeep
 
 # Configs locais / segredos
 config.toml

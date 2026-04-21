@@ -285,7 +285,8 @@ impl LabelResolver {
                         continue;
                     }
                     let deadline = slot.deadline_ns(t_emit);
-                    if now_ns >= deadline {
+                    if now_ns > deadline {
+                        slot.observed_until_ns = deadline;
                         slot.closed = true;
                         closed_idx.push(idx);
                         continue;
@@ -304,6 +305,10 @@ impl LabelResolver {
                     if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
                         slot.first_exit_ge_floor_ts_ns = Some(now_ns);
                         slot.first_exit_ge_floor_pct = Some(exit_spread);
+                    }
+                    if now_ns == deadline {
+                        slot.closed = true;
+                        closed_idx.push(idx);
                     }
                 }
                 if !closed_idx.is_empty() {
@@ -370,7 +375,13 @@ impl LabelResolver {
                             } else {
                                 LabelOutcome::from_pending(&snap, idx)
                             };
-                            to_write.push((snap.clone(), idx, final_outcome, reason));
+                            let final_reason =
+                                if matches!(final_outcome, LabelOutcome::Censored) {
+                                    reason.or(Some(CensorReason::IncompleteWindow))
+                                } else {
+                                    reason
+                                };
+                            to_write.push((snap.clone(), idx, final_outcome, final_reason));
                         }
                     }
                 }
@@ -530,9 +541,7 @@ impl LabelOutcome {
         } else if slot.observed_until_ns >= deadline {
             LabelOutcome::Miss
         } else {
-            // Observada janela incompleta e sem first-hit → miss com caveat.
-            // Se sweeper detectar rota_vanished, outcome é sobrescrito para Censored.
-            LabelOutcome::Miss
+            LabelOutcome::Censored
         }
     }
 }
@@ -602,15 +611,6 @@ mod tests {
         (resolver, tmp, task)
     }
 
-    async fn drain_writer_to_disk(task: tokio::task::JoinHandle<()>) {
-        // Aguarda writer fazer flushes periódicos.
-        sleep(Duration::from_millis(200)).await;
-        // Força drop do handle + join.
-        // (LabelResolver clona o handle internamente; para o teste, ao
-        // dropar o resolver o último handle cai e o writer sai do loop).
-        drop(task);
-    }
-
     #[tokio::test]
     async fn realized_when_first_hit_occurs_within_horizon() {
         let cfg = ResolverConfig {
@@ -671,6 +671,32 @@ mod tests {
         let m = resolver.metrics();
         assert!(m.labels_written_miss_total.load(Ordering::Relaxed) >= 1);
         assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 0);
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn expired_incomplete_horizon_is_censored_not_miss() {
+        let cfg = ResolverConfig {
+            horizons_s: [10, 20, 30],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t_emit = 1_000_000_000u64;
+        resolver.on_accepted(
+            "sid_incomplete".into(), t_emit, 1, mk_route(), "BTC-USDT".into(),
+            2.5, -1.2, mk_features(), 10.0, mk_policy(),
+            "allowlist", 1.0, 0,
+        );
+        resolver.on_clean_observation(mk_route(), t_emit + 5_000_000_000, 2.0, -2.0);
+        resolver.sweep(t_emit + 12_000_000_000);
+        sleep(Duration::from_millis(150)).await;
+        let m = resolver.metrics();
+        assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.labels_written_miss_total.load(Ordering::Relaxed), 0);
         drop(resolver);
         drop(tmp);
     }

@@ -31,7 +31,8 @@ use crate::ml::feature_store::HotQueryCache;
 use crate::ml::metrics::MlPrometheusMetrics;
 use crate::ml::persistence::{
     JsonlWriter, LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, RawSampleWriter,
-    RawWriterConfig, ResolverConfig, RouteRanking, WriterConfig, WriterHandle, WriterSendError,
+    RawWriterConfig, ResolverConfig, RouteDecimator, RouteRanking, WriterConfig, WriterHandle,
+    WriterSendError,
 };
 use crate::ml::serving::MlServer;
 use crate::ml::trigger::SamplingTrigger;
@@ -43,6 +44,10 @@ use crate::types::now_ns;
 #[inline]
 fn should_mark_sample_recommended(rec: &crate::ml::contract::Recommendation) -> bool {
     matches!(rec, crate::ml::contract::Recommendation::Trade(_))
+}
+
+fn route_decimator_from_ml_config(ml: &config::MlConfig) -> RouteDecimator {
+    RouteDecimator::with_modulus(ml.raw_decimation_mod.max(1))
 }
 
 /// Top-level entry point. Wires: discovery → book store → adapters →
@@ -148,6 +153,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         cap = labeled_writer_cfg.channel_capacity,
         "ML labeled-trade writer — path absoluto"
     );
+    let label_flush_interval = labeled_writer_cfg.flush_interval;
     let (labeled_writer, labeled_handle) = LabeledJsonlWriter::create(labeled_writer_cfg);
     tokio::spawn(async move { labeled_writer.run().await; });
 
@@ -163,6 +169,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let ml_server = Arc::new(
         MlServer::new(ml_baseline, SamplingTrigger::with_defaults())
+            .with_raw_decimator(route_decimator_from_ml_config(&cfg.ml))
             .with_raw_writer(ml_raw_writer_handle)
             .with_route_ranking(Arc::clone(&ranker))
             .with_label_resolver(Arc::clone(&label_resolver))
@@ -310,7 +317,45 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let ml_engine = Arc::clone(&ml_server);
     let ml_writer_engine = ml_writer_handle.clone();
     let ml_broadcaster_engine = ml_broadcaster.clone();
-    run_spread_engine(u_engine, s_engine, st_engine, v_engine, c_engine, threshold, max_spread, min_vol, broadcast_ms, bstate, ml_engine, ml_writer_engine, ml_broadcaster_engine).await;
+    let label_resolver_shutdown = Arc::clone(&label_resolver);
+    let mut engine_task = tokio::spawn(async move {
+        run_spread_engine(
+            u_engine,
+            s_engine,
+            st_engine,
+            v_engine,
+            c_engine,
+            threshold,
+            max_spread,
+            min_vol,
+            broadcast_ms,
+            bstate,
+            ml_engine,
+            ml_writer_engine,
+            ml_broadcaster_engine,
+        )
+        .await;
+    });
+    tokio::select! {
+        result = &mut engine_task => {
+            if let Err(e) = result {
+                warn!(error = %e, "spread engine task terminou com erro");
+            }
+        }
+        signal = tokio::signal::ctrl_c() => {
+            match signal {
+                Ok(()) => {
+                    let n = label_resolver_shutdown.shutdown_flush(now_ns());
+                    info!(n_closed = n, "shutdown: labels pendentes censurados");
+                    tokio::time::sleep(label_flush_interval + Duration::from_millis(250)).await;
+                }
+                Err(e) => {
+                    warn!(error = %e, "falha aguardando sinal de shutdown");
+                }
+            }
+            engine_task.abort();
+        }
+    }
     Ok(())
 }
 
@@ -685,5 +730,15 @@ mod tests {
     fn only_trade_recommendations_mark_samples_as_recommended() {
         assert!(super::should_mark_sample_recommended(&mk_trade()));
         assert!(!super::should_mark_sample_recommended(&mk_abstain()));
+    }
+
+    #[test]
+    fn route_decimator_uses_configured_raw_decimation_mod() {
+        let mut ml = crate::config::MlConfig::default();
+        ml.raw_decimation_mod = 7;
+
+        let decimator = super::route_decimator_from_ml_config(&ml);
+
+        assert_eq!(decimator.modulus(), 7);
     }
 }

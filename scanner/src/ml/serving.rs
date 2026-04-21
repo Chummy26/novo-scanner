@@ -765,6 +765,8 @@ impl MlServer {
             Some(&self.metrics.rec_invariant_blocked),
         );
         self.bump_rec_metric(&rec);
+        let entry_p50_pre_observe = self.baseline.cache().quantile_entry(route, 0.50);
+        let exit_p50_pre_observe = self.baseline.cache().quantile_exit(route, 0.50);
 
         if clean {
             self.baseline
@@ -825,8 +827,8 @@ impl MlServer {
                 toxicity_level: toxicity,
                 halt_active,
                 tail_ratio_p99_p95: None,
-                entry_p50_24h: self.baseline.cache().quantile_entry(route, 0.50),
-                exit_p50_24h: self.baseline.cache().quantile_exit(route, 0.50),
+                entry_p50_24h: entry_p50_pre_observe,
+                exit_p50_24h: exit_p50_pre_observe,
             };
             let policy = PolicyMetadata {
                 baseline_model_version: self
@@ -1334,6 +1336,92 @@ mod tests {
         assert_eq!(
             v["sample_decision"], "insufficient_history",
             "veredito do trigger preservado PIT no RawSample",
+        );
+    }
+
+    #[tokio::test]
+    async fn labeled_trade_features_t0_use_pre_observation_quantiles() {
+        use crate::ml::persistence::{
+            LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, ResolverConfig,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let (writer, handle) = LabeledJsonlWriter::create(LabeledWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 1024,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(50),
+            file_prefix: "pit-label".into(),
+        });
+        let task = tokio::spawn(writer.run());
+        let resolver = Arc::new(LabelResolver::new(
+            ResolverConfig {
+                horizons_s: [1, 2, 3],
+                close_slack_ns: 1_000_000_000,
+                route_vanish_idle_ns: 60 * 1_000_000_000,
+                max_pending_per_route: 100,
+                sweeper_interval: Duration::from_secs(10),
+            },
+            handle,
+        ));
+
+        let server = mk_server_with_min_history(2);
+        let route = mk_route();
+        let t0 = 1_745_159_400u64 * 1_000_000_000;
+        server.on_opportunity(0, route, "BTC-USDT", 1.0, -1.0, 50, 50, 1e6, 1e6, false, t0);
+        server.on_opportunity(
+            1,
+            route,
+            "BTC-USDT",
+            9.0,
+            2.0,
+            50,
+            50,
+            1e6,
+            1e6,
+            false,
+            t0 + 1,
+        );
+        let pre_entry_p50 = server.baseline.cache().quantile_entry(route, 0.50).unwrap();
+
+        let server = server
+            .with_label_resolver(Arc::clone(&resolver))
+            .with_label_params(0, 0.8)
+            .with_raw_decimator(RouteDecimator::with_modulus(1));
+        let (_rec, dec, accepted) = server.on_opportunity(
+            2,
+            route,
+            "BTC-USDT",
+            9.0,
+            2.5,
+            50,
+            50,
+            1e6,
+            1e6,
+            false,
+            t0 + 2_000_000_000,
+        );
+        assert_eq!(dec, SampleDecision::Accept);
+        assert!(accepted.is_some());
+        resolver.on_clean_observation(route, t0 + 3_000_000_000, 8.0, 2.6);
+        resolver.sweep(t0 + 6_000_000_000);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        drop(server);
+        drop(resolver);
+        task.await.expect("task join");
+
+        let hour_dir = tmp.path().join("year=2025/month=04/day=20/hour=14");
+        let files: Vec<_> = std::fs::read_dir(&hour_dir).unwrap().collect();
+        let content = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
+        let line = content.lines().next().expect("at least 1 label");
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        let label_entry_p50 = v["features_t0"]["entry_p50_24h"].as_f64().unwrap() as f32;
+        assert!(
+            (label_entry_p50 - pre_entry_p50).abs() < 0.05,
+            "features_t0 must use pre-observe p50; got {label_entry_p50}, pre was {pre_entry_p50}"
         );
     }
 }
