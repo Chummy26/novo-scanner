@@ -45,4 +45,4 @@ pub use raw_writer::{
     RawSampleWriter, RawWriterConfig, RawWriterHandle, RawWriterSendError,
 };
 pub use sample::{AcceptedSample, ACCEPTED_SAMPLE_SCHEMA_VERSION};
-pub use writer::{JsonlWriter, WriterConfig, WriterHandle};
+pub use writer::{JsonlWriter, WriterConfig, WriterHandle, WriterSendError};

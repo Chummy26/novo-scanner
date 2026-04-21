@@ -37,7 +37,7 @@ use ahash::AHashMap;
 use parking_lot::Mutex;
 use crate::ml::baseline::BaselineA3;
 use crate::ml::contract::{
-    AbstainDiagnostic, AbstainReason, Recommendation, RouteId, TradeSetup,
+    AbstainDiagnostic, AbstainReason, Recommendation, RouteId, ToxicityLevel, TradeSetup,
 };
 use crate::ml::eval::verify_tradesetup;
 use crate::ml::economic::{
@@ -46,6 +46,71 @@ use crate::ml::economic::{
 use crate::ml::listing_history::ListingHistory;
 use crate::ml::persistence::{AcceptedSample, RawSample, RawWriterHandle, RouteDecimator};
 use crate::ml::trigger::{SampleDecision, SamplingTrigger};
+use crate::types::Venue;
+
+/// Horizonte mínimo (ns) antes de um trade pending poder ser resolvido.
+///
+/// Fix pós-auditoria 2026-04-21: a identidade estrutural §2 da skill
+/// (`S_entrada(t) + S_saída(t) = -(bid_ask_A + bid_ask_B)/ref`) é
+/// sempre negativa no mesmo instante. Permitir resolução intra-tick
+/// (quando `now == emitted_at`) fabrica `Realized` com
+/// `horizon_observed_s = 0` violando física da estratégia.
+///
+/// Default: 1 ciclo do scanner = 150 ms. Trade só pode realizar em
+/// tick posterior ao da emissão.
+pub const MIN_HORIZON_NS: u64 = 150_000_000;
+
+/// Detecta halt via book_age — proxy conservador.
+///
+/// Fix pós-auditoria: `halt_active` era hardcoded `false` em `lib.rs`,
+/// fazendo halts contaminarem o HotQueryCache com spreads anômalos.
+/// Proxy: se book_age exceder 10× o limite típico da venue, assume-se
+/// halt (WS parou de emitir, book está congelado). É defensivo:
+/// prefere over-reject que under-reject (precision-first).
+#[inline]
+pub fn detect_halt_proxy(
+    buy_venue: Venue,
+    sell_venue: Venue,
+    buy_book_age_ms: u32,
+    sell_book_age_ms: u32,
+) -> bool {
+    const HALT_MULTIPLIER: u32 = 10;
+    let buy_limit = buy_venue.max_book_age_ms().saturating_mul(HALT_MULTIPLIER);
+    let sell_limit = sell_venue.max_book_age_ms().saturating_mul(HALT_MULTIPLIER);
+    buy_book_age_ms > buy_limit || sell_book_age_ms > sell_limit
+}
+
+/// Detecta `ToxicityLevel` rudimentar a partir do book_age.
+///
+/// Fix pós-auditoria: antes, `ToxicityLevel::Healthy` era hardcoded no
+/// baseline — falso positivo estrutural. Detector MVP:
+/// - Book age ≤ limite da venue → `Healthy` (entrada legítima).
+/// - Book age entre `limite` e `3× limite` → `Suspicious` (staleness possível).
+/// - Book age > `3× limite` → `Toxic` (staleness confirmada).
+///
+/// Ref: Foucault, Kozhan & Tham 2017 RFS 30(4) "Toxic arbitrage and
+/// the design of limit order markets" — book age elevado correlaciona
+/// com adverse selection.
+#[inline]
+pub fn classify_toxicity(
+    buy_venue: Venue,
+    sell_venue: Venue,
+    buy_book_age_ms: u32,
+    sell_book_age_ms: u32,
+) -> ToxicityLevel {
+    let buy_limit = buy_venue.max_book_age_ms();
+    let sell_limit = sell_venue.max_book_age_ms();
+    let buy_ratio = (buy_book_age_ms as f32) / (buy_limit.max(1) as f32);
+    let sell_ratio = (sell_book_age_ms as f32) / (sell_limit.max(1) as f32);
+    let worst = buy_ratio.max(sell_ratio);
+    if worst > 3.0 {
+        ToxicityLevel::Toxic
+    } else if worst > 1.0 {
+        ToxicityLevel::Suspicious
+    } else {
+        ToxicityLevel::Healthy
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MlServer
@@ -80,6 +145,7 @@ pub struct MlServer {
 fn enforce_recommendation_invariants(
     rec: Recommendation,
     n_observations: u32,
+    invariant_blocked_counter: Option<&AtomicU64>,
 ) -> Recommendation {
     match rec {
         Recommendation::Trade(setup) => {
@@ -91,6 +157,9 @@ fn enforce_recommendation_invariants(
                     error = ?err,
                     "blocked invalid TradeSetup before broadcast"
                 );
+                if let Some(c) = invariant_blocked_counter {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }
                 Recommendation::Abstain {
                     reason: AbstainReason::LowConfidence,
                     diagnostic: AbstainDiagnostic {
@@ -124,12 +193,27 @@ pub struct ServerMetrics {
     pub rec_abstain_insufficient_data: AtomicU64,
     pub rec_abstain_low_confidence: AtomicU64,
     pub rec_abstain_long_tail: AtomicU64,
+    /// Fix pós-auditoria: `enforce_recommendation_invariants` bloqueou
+    /// um `TradeSetup` inválido (violação de monotonicidade ou IC). Separar
+    /// dos LowConfidence naturais dá visibilidade sobre bugs do baseline.
+    pub rec_invariant_blocked: AtomicU64,
     /// ADR-025: RawSample enviado ao writer (fast path).
     pub raw_samples_emitted: AtomicU64,
     /// ADR-025: canal cheio — sample descartada.
     pub raw_samples_dropped_channel_full: AtomicU64,
     /// ADR-025: writer encerrado — sample descartada.
     pub raw_samples_dropped_channel_closed: AtomicU64,
+    /// Fix pós-auditoria: AcceptedSample descartada por canal JSONL cheio.
+    pub accepted_samples_dropped_channel_full: AtomicU64,
+    /// Fix pós-auditoria: AcceptedSample descartada — canal JSONL fechado.
+    pub accepted_samples_dropped_channel_closed: AtomicU64,
+    /// Toxicity detector (fix pós-auditoria): rota classificada Toxic
+    /// no momento da observação (rejeita trade).
+    pub toxicity_toxic_detected: AtomicU64,
+    /// Toxicity Suspicious — emite Trade com flag warning para UI.
+    pub toxicity_suspicious_detected: AtomicU64,
+    /// Halt proxy detectado via book_age elevado (fix pós-auditoria).
+    pub halt_proxy_detected: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +243,16 @@ impl PendingEconomicTrade {
         entry_spread: f32,
         exit_spread: f32,
     ) -> Option<EconomicEvent> {
+        // Fix pós-auditoria: grace period de MIN_HORIZON_NS respeita a
+        // identidade estrutural §2 da skill (`S_entrada(t) + S_saída(t) < 0`
+        // no mesmo instante). Trade recém-emitido não pode realizar antes
+        // do próximo tick do scanner — viola física da estratégia.
+        if now_ns < self.setup.emitted_at.saturating_add(MIN_HORIZON_NS) {
+            // Apenas registra último exit observado; não avalia hit ainda.
+            self.last_exit_pct = exit_spread;
+            return None;
+        }
+
         self.last_exit_pct = exit_spread;
         if self.entry_hit_ns.is_none() && entry_spread >= self.setup.enter_at_min {
             self.entry_hit_ns = Some(now_ns);
@@ -230,6 +324,13 @@ impl EconomicTracker {
         now_ns: u64,
         rec: &Recommendation,
     ) {
+        // Resolve APENAS trades pendentes ANTERIORES ao push.
+        // Fix pós-auditoria: a segunda chamada pós-push resolvia o trade
+        // recém-criado no mesmo tick em que foi emitido → viola §2 da
+        // skill (identidade estrutural de horizon > 0).
+        // `PendingEconomicTrade::observe` agora aplica MIN_HORIZON_NS,
+        // então mesmo se alguém chamar resolve_route aqui, o novo trade
+        // só resolve a partir do próximo tick.
         self.resolve_route(route, entry_spread, exit_spread, now_ns);
         if let Recommendation::Trade(setup) = rec {
             self.pending_by_route
@@ -237,7 +338,6 @@ impl EconomicTracker {
                 .or_default()
                 .push_back(PendingEconomicTrade::new(setup.clone()));
         }
-        self.resolve_route(route, entry_spread, exit_spread, now_ns);
     }
 
     fn resolve_route(
@@ -358,10 +458,50 @@ impl MlServer {
         sell_book_age_ms: u32,
         buy_vol24_usd: f64,
         sell_vol24_usd: f64,
-        halt_active: bool,
+        halt_active_external: bool,
         now_ns: u64,
     ) -> (Recommendation, SampleDecision, Option<AcceptedSample>) {
         self.metrics.opportunities_seen.fetch_add(1, Ordering::Relaxed);
+
+        // Fix pós-auditoria: halt proxy via book_age 10× — antes `lib.rs`
+        // passava `halt_active = false` hardcoded, permitindo halts
+        // contaminarem o histograma. Proxy OR externo cobre ambos os casos.
+        let halt_proxy = detect_halt_proxy(
+            route.buy_venue,
+            route.sell_venue,
+            buy_book_age_ms,
+            sell_book_age_ms,
+        );
+        let halt_active = halt_active_external || halt_proxy;
+        if halt_proxy {
+            self.metrics
+                .halt_proxy_detected
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        // Fix pós-auditoria: classificação de toxicity explícita antes de
+        // chamar baseline. Se Toxic, baseline abstém; Suspicious emite
+        // com warning; Healthy prossegue normal. Antes era hardcoded
+        // `Healthy` — falso positivo estrutural.
+        let toxicity = classify_toxicity(
+            route.buy_venue,
+            route.sell_venue,
+            buy_book_age_ms,
+            sell_book_age_ms,
+        );
+        match toxicity {
+            ToxicityLevel::Toxic => {
+                self.metrics
+                    .toxicity_toxic_detected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ToxicityLevel::Suspicious => {
+                self.metrics
+                    .toxicity_suspicious_detected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
 
         // 0. **C5** — registra lifecycle da rota (first_seen / last_seen).
         //    Anti-survivorship; alimenta feature `listing_age_days`.
@@ -436,16 +576,20 @@ impl MlServer {
             }
         }
 
-        // 3. Gera recomendação.
+        // 3. Gera recomendação — agora com toxicity já classificada.
         let rec = self
             .baseline
-            .recommend(route, entry_spread, exit_spread, now_ns);
+            .recommend(route, entry_spread, exit_spread, now_ns, toxicity);
         let n_observations = self
             .baseline
             .cache()
             .n_observations(route)
             .min(u32::MAX as u64) as u32;
-        let rec = enforce_recommendation_invariants(rec, n_observations);
+        let rec = enforce_recommendation_invariants(
+            rec,
+            n_observations,
+            Some(&self.metrics.rec_invariant_blocked),
+        );
         self.bump_rec_metric(&rec);
 
         if clean {
@@ -666,8 +810,9 @@ mod tests {
     fn invalid_trade_setup_is_downgraded_before_broadcast() {
         use crate::ml::contract::Recommendation;
 
+        let counter = AtomicU64::new(0);
         let rec = Recommendation::Trade(mk_invalid_setup());
-        let sanitized = enforce_recommendation_invariants(rec, 42);
+        let sanitized = enforce_recommendation_invariants(rec, 42, Some(&counter));
         match sanitized {
             Recommendation::Abstain { reason, diagnostic } => {
                 assert_eq!(reason, AbstainReason::LowConfidence);
@@ -676,6 +821,7 @@ mod tests {
             }
             other => panic!("expected Abstain, got {:?}", other),
         }
+        assert_eq!(counter.load(Ordering::Relaxed), 1, "contador de invariants blocked deve subir");
     }
 
     #[test]
@@ -734,26 +880,80 @@ mod tests {
 
     #[test]
     fn economic_tracker_resolves_a_trade_in_sequence() {
+        // Semântica pós-auditoria: requer 3 ticks.
+        // t0: populate cache + abstain InsufficientHistory
+        // t1: emite Trade (cache tem 1 sample, n_min=1)
+        // t2: tick com entry hitting enter_at_min + exit hitting exit_at_min
+        //     → trade realiza (horizon = t2 - t1 ≥ MIN_HORIZON_NS)
         let server = mk_server_with_min_history(1);
         let route = mk_route();
 
+        let t0: u64 = 1_000_000_000;
+        let t1: u64 = t0 + 1_000_000_000;
+        let t2: u64 = t1 + 1_000_000_000;
+
+        // Tick 0: populate cache (entry=3.0, exit=0.5 → gross=3.5, bem acima do floor).
         let (_rec, dec, _) = server.on_opportunity(
-            0, route, "BTC-USDT", 2.0, -1.0, 50, 50, 1e6, 1e6, false, 1,
+            0, route, "BTC-USDT", 3.0, 0.5, 50, 50, 1e6, 1e6, false, t0,
         );
         assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
 
+        // Tick 1: agora cache tem 1 sample ≥ n_min. Emite Trade.
         let (rec, _dec, _accepted) = server.on_opportunity(
-            1, route, "BTC-USDT", 3.4, -1.4, 50, 50, 1e6, 1e6, false, 2,
+            1, route, "BTC-USDT", 3.0, 0.5, 50, 50, 1e6, 1e6, false, t1,
         );
-        assert!(matches!(rec, Recommendation::Trade(_)));
+        let setup = match rec {
+            Recommendation::Trade(s) => s,
+            Recommendation::Abstain { reason, .. } => panic!("esperava Trade, got {:?}", reason),
+        };
+
+        // Tick 2: entry ≥ enter_at_min E exit ≥ exit_at_min deve realizar.
+        // Observar tick com os mesmos valores garante hit (identidade esperada:
+        // setup.enter_at_min ≤ 3.0 e setup.exit_at_min ≤ 0.5).
+        assert!(setup.enter_at_min <= 3.0 + 0.01);
+        assert!(setup.exit_at_min <= 0.5 + 0.01);
 
         let (_rec, _dec, _accepted) = server.on_opportunity(
-            2, route, "BTC-USDT", 1.0, 0.2, 50, 50, 1e6, 1e6, false, 3,
+            2, route, "BTC-USDT", 3.0, 0.5, 50, 50, 1e6, 1e6, false, t2,
         );
 
         let econ = server.economic_metrics();
-        assert!(econ.n_emissions_total.load(Ordering::Relaxed) >= 1);
-        assert_eq!(econ.n_realized_total.load(Ordering::Relaxed), 1);
+        assert_eq!(econ.n_emissions_total.load(Ordering::Relaxed), 1,
+                   "1 emissão esperada no tick 1");
+        assert_eq!(econ.n_realized_total.load(Ordering::Relaxed), 1,
+                   "1 realização esperada no tick 2 (após grace period)");
+    }
+
+    #[test]
+    fn economic_tracker_refuses_intra_tick_resolution() {
+        // Fix pós-auditoria: trade recém-emitido não pode "realizar" no
+        // mesmo tick em que foi emitido (viola identidade estrutural §2).
+        let server = mk_server_with_min_history(1);
+        let route = mk_route();
+
+        let t0: u64 = 1_000_000_000;
+        let t_emit: u64 = t0 + 1_000_000_000;
+
+        // Primeiro popula cache.
+        let _ = server.on_opportunity(
+            0, route, "BTC-USDT", 3.0, 0.5, 50, 50, 1e6, 1e6, false, t0,
+        );
+
+        // Tick de emissão: entry E exit já favoráveis no MESMO tick.
+        let (rec, _, _) = server.on_opportunity(
+            1, route, "BTC-USDT", 3.5, 0.5, 50, 50, 1e6, 1e6, false, t_emit,
+        );
+        assert!(matches!(rec, Recommendation::Trade(_)),
+                "cache populado deve emitir Trade no 2º tick");
+
+        // SEM fix, trade realizaria no mesmo tick em horizon=0s
+        // (violando skill §2). COM fix, grace MIN_HORIZON_NS bloqueia.
+        let econ = server.economic_metrics();
+        let realized_after_emit = econ.n_realized_total.load(Ordering::Relaxed);
+        assert_eq!(
+            realized_after_emit, 0,
+            "trade NÃO deve realizar intra-tick (horizon > 0 é obrigatório)"
+        );
     }
 
     #[tokio::test]

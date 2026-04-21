@@ -384,6 +384,11 @@ async fn handle_ml_socket(mut socket: WebSocket, state: BroadcastState) {
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
+                        // Fix pós-auditoria: registra drops na métrica
+                        // `lagged_frames_total` — antes era só warn, invisível
+                        // em dashboards. Consumer lento perde frames quando
+                        // o canal (cap 8192) sobrescreve mensagens antigas.
+                        bcast.metrics().record_lagged(n);
                         warn!("ws ml client lagged {} frames", n);
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -421,6 +426,7 @@ async fn rest_ml_rec_status(State(state): State<BroadcastState>) -> impl IntoRes
                 "abstain_published_total": m.abstain_published_total.load(Ordering::Relaxed),
                 "no_subscribers_total":   m.no_subscribers_total.load(Ordering::Relaxed),
                 "was_recommended_publications": m.was_recommended_publications.load(Ordering::Relaxed),
+                "lagged_frames_total":    m.lagged_frames_total.load(Ordering::Relaxed),
             })
         }
         None => serde_json::json!({ "broadcaster_configured": false }),

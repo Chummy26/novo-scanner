@@ -99,6 +99,10 @@ pub struct EconomicEvent {
     pub gross_pnl_usd: f64,
     /// `true` se foi recomendação do modelo A2; `false` se baseline A3.
     pub from_model: bool,
+    /// Fix pós-auditoria: probabilidade reportada no setup original.
+    /// Usada pelo `CalibrationAccumulator` para calcular ECE.
+    /// Preservada junto ao outcome para auditoria de calibração.
+    pub forecast_probability: f32,
 }
 
 impl EconomicEvent {
@@ -118,6 +122,7 @@ impl EconomicEvent {
             gross_pnl_pct: gross_pct,
             gross_pnl_usd: (gross_pct as f64 / 100.0) * CAPITAL_HYPOTHETICAL_USD,
             from_model,
+            forecast_probability: setup.realization_probability,
         }
     }
 
@@ -228,6 +233,10 @@ pub struct EconomicAccumulator {
     max_events: usize,
     /// Metrics atómicos para Prometheus.
     metrics: Arc<EconomicMetrics>,
+    /// Fix pós-auditoria: calibration tracker rolling por bucket.
+    /// Registra `(p_forecast, realized)` para cada outcome resolvido.
+    /// Exposto via `calibration_ece()` + `reliability_points()`.
+    calibration: CalibrationAccumulator,
 }
 
 /// Contadores atômicos para Prometheus (exportado via `ml/metrics.rs`).
@@ -240,6 +249,86 @@ pub struct EconomicMetrics {
     /// PnL agregado USD × 1e4 (inteiro para evitar float atômico).
     /// Divide por 1e4 ao ler.
     pub pnl_aggregated_usd_times_10k: AtomicI64,
+    /// Fix pós-auditoria 2026-04-21: Expected Calibration Error em bps (×1e4).
+    /// Atualizado periodicamente por `EconomicAccumulator::update_calibration`.
+    /// ECE = Σ |conf_bucket − freq_bucket| × (n_bucket / n_total).
+    /// Meta CLAUDE.md: ECE < 0.10 (1000 bps) em janela 24h.
+    pub calibration_ece_bps: std::sync::atomic::AtomicU64,
+    /// Número total de pares (P_emitida, y_realized) observados.
+    pub calibration_observations: std::sync::atomic::AtomicU64,
+}
+
+// ---------------------------------------------------------------------------
+// CalibrationAccumulator (ECE bucket-based)
+// ---------------------------------------------------------------------------
+
+/// Acumulador de calibração: 10 buckets de `P_forecast` em [0, 1].
+///
+/// Para cada par `(p_predicted, y_realized)` observado, coloca em
+/// `bucket = floor(p * 10)`. ECE (Expected Calibration Error) =
+/// `Σ |mid_conf − observed_freq| × (n_bucket / N)` — quanto menor,
+/// mais calibrado. DeGroot & Fienberg 1983 (reliability).
+///
+/// Uso: chamar `record(p, y)` quando um `EconomicEvent` fechar.
+/// Chamar `ece()` para snapshot atual.
+#[derive(Debug, Default)]
+pub struct CalibrationAccumulator {
+    /// `(n_emitted, n_realized)` por decil de `realization_probability`.
+    /// bucket[0] = [0.0, 0.1), bucket[9] = [0.9, 1.0].
+    pub buckets: [(u64, u64); 10],
+}
+
+impl CalibrationAccumulator {
+    pub fn record(&mut self, p_forecast: f32, realized: bool) {
+        let p = p_forecast.clamp(0.0, 0.9999);
+        let idx = ((p * 10.0) as usize).min(9);
+        self.buckets[idx].0 = self.buckets[idx].0.saturating_add(1);
+        if realized {
+            self.buckets[idx].1 = self.buckets[idx].1.saturating_add(1);
+        }
+    }
+
+    /// Total de observações registradas.
+    pub fn total(&self) -> u64 {
+        self.buckets.iter().map(|(n, _)| *n).sum()
+    }
+
+    /// Expected Calibration Error ∈ [0, 1].
+    ///
+    /// Retorna 0 se não há observações suficientes (< 10 amostras totais).
+    pub fn ece(&self) -> f32 {
+        let total = self.total();
+        if total < 10 {
+            return 0.0;
+        }
+        let total_f = total as f32;
+        let mut ece = 0.0_f32;
+        for (i, (n, k)) in self.buckets.iter().enumerate() {
+            if *n == 0 {
+                continue;
+            }
+            let conf_mid = (i as f32 + 0.5) / 10.0;
+            let freq = (*k as f32) / (*n as f32);
+            let weight = (*n as f32) / total_f;
+            ece += (conf_mid - freq).abs() * weight;
+        }
+        ece
+    }
+
+    /// Reliability diagram data — para dashboard.
+    /// Retorna `(mid_conf_i, freq_i, n_i)` para cada bucket não vazio.
+    pub fn reliability_points(&self) -> Vec<(f32, f32, u64)> {
+        let mut pts = Vec::new();
+        for (i, (n, k)) in self.buckets.iter().enumerate() {
+            if *n == 0 {
+                continue;
+            }
+            let conf_mid = (i as f32 + 0.5) / 10.0;
+            let freq = (*k as f32) / (*n as f32);
+            pts.push((conf_mid, freq, *n));
+        }
+        pts
+    }
 }
 
 impl EconomicAccumulator {
@@ -252,6 +341,7 @@ impl EconomicAccumulator {
             events: VecDeque::with_capacity(max_events.min(1024)),
             max_events,
             metrics: Arc::new(EconomicMetrics::default()),
+            calibration: CalibrationAccumulator::default(),
         }
     }
 
@@ -259,9 +349,21 @@ impl EconomicAccumulator {
         Arc::clone(&self.metrics)
     }
 
-    /// Adiciona evento resolvido ao buffer + atualiza métricas atômicas.
+    /// ECE atual (bucket-based). Ver [`CalibrationAccumulator::ece`].
+    pub fn calibration_ece(&self) -> f32 {
+        self.calibration.ece()
+    }
+
+    /// Reliability diagram data para dashboard.
+    pub fn reliability_points(&self) -> Vec<(f32, f32, u64)> {
+        self.calibration.reliability_points()
+    }
+
+    /// Adiciona evento resolvido ao buffer + atualiza métricas atômicas
+    /// + calibration tracker.
     pub fn push(&mut self, evt: EconomicEvent) {
         self.metrics.n_emissions_total.fetch_add(1, Ordering::Relaxed);
+        let realized_bool = matches!(evt.outcome, TradeOutcome::Realized { .. });
         match evt.outcome {
             TradeOutcome::Realized { .. } => {
                 self.metrics.n_realized_total.fetch_add(1, Ordering::Relaxed);
@@ -278,6 +380,19 @@ impl EconomicAccumulator {
         self.metrics
             .pnl_aggregated_usd_times_10k
             .fetch_add(pnl_scaled, Ordering::Relaxed);
+
+        // Fix pós-auditoria: registra par (P_forecast, realized) no tracker
+        // de calibração. Atualiza métricas Prometheus.
+        self.calibration
+            .record(evt.forecast_probability, realized_bool);
+        let ece_bps = (self.calibration.ece() * 10_000.0) as u64;
+        self.metrics
+            .calibration_ece_bps
+            .store(ece_bps, Ordering::Relaxed);
+        self.metrics.calibration_observations.store(
+            self.calibration.total(),
+            Ordering::Relaxed,
+        );
 
         self.events.push_back(evt);
         while self.events.len() > self.max_events {

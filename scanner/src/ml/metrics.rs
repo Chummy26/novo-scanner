@@ -57,9 +57,18 @@ pub struct MlPrometheusMetrics {
     broadcaster_published_total: IntCounterVec,
     broadcaster_no_subscribers_total: IntCounter,
     broadcaster_was_recommended_total: IntCounter,
+    broadcaster_lagged_frames_total: IntCounter,
     economic_emissions_total: IntCounter,
     economic_outcomes_total: IntCounterVec,
     economic_pnl_aggregated_usd: Gauge,
+
+    // Wave U (pós-auditoria 2026-04-21).
+    accepted_samples_dropped_total: IntCounterVec,
+    rec_invariant_blocked_total: IntCounter,
+    toxicity_detected_total: IntCounterVec,
+    halt_proxy_detected_total: IntCounter,
+    calibration_ece: Gauge,
+    calibration_observations: IntGauge,
 
     // Snapshots do último update (para computar delta → Counter.inc_by).
     last_seen: ServerMetricsSnapshot,
@@ -84,6 +93,13 @@ struct ServerMetricsSnapshot {
     raw_samples_emitted: u64,
     raw_samples_dropped_channel_full: u64,
     raw_samples_dropped_channel_closed: u64,
+    // Wave U pós-auditoria.
+    rec_invariant_blocked: u64,
+    accepted_samples_dropped_channel_full: u64,
+    accepted_samples_dropped_channel_closed: u64,
+    toxicity_toxic_detected: u64,
+    toxicity_suspicious_detected: u64,
+    halt_proxy_detected: u64,
 }
 
 #[derive(Default)]
@@ -93,6 +109,7 @@ struct BroadcasterSnapshot {
     abstain_published_total: u64,
     no_subscribers_total: u64,
     was_recommended_publications: u64,
+    lagged_frames_total: u64,
 }
 
 #[derive(Default)]
@@ -180,6 +197,42 @@ impl MlPrometheusMetrics {
             "PnL bruto simulado agregado em USD (capital hipotético 10k)",
         ))?;
 
+        // Wave U — Fix pós-auditoria 2026-04-21.
+        let broadcaster_lagged_frames_total = IntCounter::with_opts(Opts::new(
+            "ml_broadcaster_lagged_frames_total",
+            "Frames sobrescritos por consumer WS lento (RecvError::Lagged)",
+        ))?;
+        let accepted_samples_dropped_total = IntCounterVec::new(
+            Opts::new(
+                "ml_accepted_samples_dropped_total",
+                "AcceptedSamples descartadas por backpressure do writer JSONL",
+            ),
+            &["reason"],
+        )?;
+        let rec_invariant_blocked_total = IntCounter::with_opts(Opts::new(
+            "ml_rec_invariant_blocked_total",
+            "TradeSetup bloqueado pelo verificador de invariantes (downgrade para Abstain)",
+        ))?;
+        let toxicity_detected_total = IntCounterVec::new(
+            Opts::new(
+                "ml_toxicity_detected_total",
+                "Classificação de toxicity por observação (Suspicious/Toxic)",
+            ),
+            &["level"],
+        )?;
+        let halt_proxy_detected_total = IntCounter::with_opts(Opts::new(
+            "ml_halt_proxy_detected_total",
+            "Halt proxy detectado via book_age 10× (fix pós-auditoria)",
+        ))?;
+        let calibration_ece = Gauge::with_opts(Opts::new(
+            "ml_calibration_ece",
+            "Expected Calibration Error em [0,1] — meta CLAUDE.md: < 0.10",
+        ))?;
+        let calibration_observations = IntGauge::with_opts(Opts::new(
+            "ml_calibration_observations",
+            "Total de pares (P_forecast, realized) registrados no tracker de calibração",
+        ))?;
+
         registry.register(Box::new(opportunities_seen_total.clone()))?;
         registry.register(Box::new(sample_decisions_total.clone()))?;
         registry.register(Box::new(recommendations_total.clone()))?;
@@ -192,6 +245,14 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(economic_emissions_total.clone()))?;
         registry.register(Box::new(economic_outcomes_total.clone()))?;
         registry.register(Box::new(economic_pnl_aggregated_usd.clone()))?;
+        // Wave U pós-auditoria.
+        registry.register(Box::new(broadcaster_lagged_frames_total.clone()))?;
+        registry.register(Box::new(accepted_samples_dropped_total.clone()))?;
+        registry.register(Box::new(rec_invariant_blocked_total.clone()))?;
+        registry.register(Box::new(toxicity_detected_total.clone()))?;
+        registry.register(Box::new(halt_proxy_detected_total.clone()))?;
+        registry.register(Box::new(calibration_ece.clone()))?;
+        registry.register(Box::new(calibration_observations.clone()))?;
 
         // Pre-touch todos os labels — garante que aparecem em `gather()`
         // desde o primeiro scrape Prometheus, mesmo sem incrementos ainda.
@@ -228,6 +289,15 @@ impl MlPrometheusMetrics {
         for outcome in &["realized", "window_miss", "exit_miss"] {
             economic_outcomes_total.with_label_values(&[outcome]).inc_by(0);
         }
+        // Wave U pre-touch.
+        for reason in &["channel_full", "channel_closed"] {
+            accepted_samples_dropped_total
+                .with_label_values(&[reason])
+                .inc_by(0);
+        }
+        for level in &["suspicious", "toxic"] {
+            toxicity_detected_total.with_label_values(&[level]).inc_by(0);
+        }
 
         Ok(Self {
             opportunities_seen_total,
@@ -242,6 +312,13 @@ impl MlPrometheusMetrics {
             economic_emissions_total,
             economic_outcomes_total,
             economic_pnl_aggregated_usd,
+            broadcaster_lagged_frames_total,
+            accepted_samples_dropped_total,
+            rec_invariant_blocked_total,
+            toxicity_detected_total,
+            halt_proxy_detected_total,
+            calibration_ece,
+            calibration_observations,
             last_seen: ServerMetricsSnapshot::default(),
             last_broadcaster: BroadcasterSnapshot::default(),
             last_economic: EconomicSnapshot::default(),
@@ -322,6 +399,23 @@ impl MlPrometheusMetrics {
             .with_label_values(&["channel_closed"])
             .inc_by(diff!(raw_samples_dropped_channel_closed));
 
+        // Wave U pós-auditoria — novos contadores do ServerMetrics.
+        self.rec_invariant_blocked_total
+            .inc_by(diff!(rec_invariant_blocked));
+        self.accepted_samples_dropped_total
+            .with_label_values(&["channel_full"])
+            .inc_by(diff!(accepted_samples_dropped_channel_full));
+        self.accepted_samples_dropped_total
+            .with_label_values(&["channel_closed"])
+            .inc_by(diff!(accepted_samples_dropped_channel_closed));
+        self.toxicity_detected_total
+            .with_label_values(&["suspicious"])
+            .inc_by(diff!(toxicity_suspicious_detected));
+        self.toxicity_detected_total
+            .with_label_values(&["toxic"])
+            .inc_by(diff!(toxicity_toxic_detected));
+        self.halt_proxy_detected_total.inc_by(diff!(halt_proxy_detected));
+
         let economic = server.economic_metrics();
         self.update_from_economic(&economic);
 
@@ -370,12 +464,18 @@ impl MlPrometheusMetrics {
         self.broadcaster_no_subscribers_total.inc_by(d_no_subs);
         self.broadcaster_was_recommended_total.inc_by(d_rec);
 
+        // Wave U — lagged frames.
+        let lagged = bm.lagged_frames_total.load(Ordering::Relaxed);
+        let d_lagged = lagged.saturating_sub(self.last_broadcaster.lagged_frames_total);
+        self.broadcaster_lagged_frames_total.inc_by(d_lagged);
+
         self.last_broadcaster.trade_published_total = trade;
         self.last_broadcaster.abstain_published_total = abstain;
         self.last_broadcaster.no_subscribers_total = no_subs;
         self.last_broadcaster.was_recommended_publications = recommended;
         self.last_broadcaster.published_total =
             bm.published_total.load(Ordering::Relaxed);
+        self.last_broadcaster.lagged_frames_total = lagged;
     }
 
     /// Atualiza métricas econômicas a partir de `EconomicMetrics`.
@@ -405,6 +505,12 @@ impl MlPrometheusMetrics {
         // Gauge = valor absoluto atual em USD (divide /10_000 para reverter scaling).
         let pnl_usd = (pnl_x10k as f64) / 10_000.0;
         self.economic_pnl_aggregated_usd.set(pnl_usd);
+
+        // Wave U — ECE e obs count (gauges absolutos).
+        let ece_bps = em.calibration_ece_bps.load(Ordering::Relaxed);
+        self.calibration_ece.set((ece_bps as f64) / 10_000.0);
+        let obs = em.calibration_observations.load(Ordering::Relaxed);
+        self.calibration_observations.set(obs as i64);
 
         self.last_economic.n_emissions_total = emissions;
         self.last_economic.n_realized_total = realized;
@@ -437,6 +543,17 @@ fn snapshot(m: &Arc<ServerMetrics>) -> ServerMetricsSnapshot {
         raw_samples_dropped_channel_closed: m
             .raw_samples_dropped_channel_closed
             .load(Ordering::Relaxed),
+        // Wave U.
+        rec_invariant_blocked: m.rec_invariant_blocked.load(Ordering::Relaxed),
+        accepted_samples_dropped_channel_full: m
+            .accepted_samples_dropped_channel_full
+            .load(Ordering::Relaxed),
+        accepted_samples_dropped_channel_closed: m
+            .accepted_samples_dropped_channel_closed
+            .load(Ordering::Relaxed),
+        toxicity_toxic_detected: m.toxicity_toxic_detected.load(Ordering::Relaxed),
+        toxicity_suspicious_detected: m.toxicity_suspicious_detected.load(Ordering::Relaxed),
+        halt_proxy_detected: m.halt_proxy_detected.load(Ordering::Relaxed),
     }
 }
 

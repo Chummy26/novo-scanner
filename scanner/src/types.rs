@@ -164,6 +164,7 @@ impl Venue {
             | Venue::XtSpot | Venue::XtFut => 2000,
         }
     }
+
 }
 
 impl fmt::Display for Venue {

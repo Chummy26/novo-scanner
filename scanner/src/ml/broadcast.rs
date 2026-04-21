@@ -21,9 +21,15 @@ use tokio::sync::broadcast;
 use crate::ml::contract::{Recommendation, RouteId};
 use crate::ml::dto::RecommendationDto;
 
-/// Capacidade default do canal broadcast. Tamanho escolhido para cobrir
-/// até ~3 s de lag (2600 rotas × 0.2 s ciclo ÷ 2 = 500 mensagens).
-pub const DEFAULT_CHANNEL_CAPACITY: usize = 512;
+/// Capacidade default do canal broadcast.
+///
+/// Fix pós-auditoria 2026-04-21: o valor anterior de 512 era severamente
+/// subdimensionado — 2600 rotas ativas a 150 ms produz até 17k mensagens/s;
+/// qualquer consumer com latência > 30 ms lotava o canal. `tokio::sync::broadcast`
+/// sobrescreve mensagens antigas silenciosamente quando lotado, e até o
+/// fix do `lagged_frames_total` tais perdas eram invisíveis.
+/// 8192 cobre ~3 ciclos completos do scanner com margem para 4+ consumers.
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 8192;
 
 /// Frame publicado no canal broadcast.
 ///
@@ -61,43 +67,37 @@ impl RecommendationFrame {
         serde_json::to_string(&self.dto)
     }
 
-    /// Serializa um envelope compatível com a UI legado do scanner.
+    /// Serializa envelope do canal ML com tipo `"ml_recommendation"`.
     ///
-    /// A tela atual ainda consome o dialeto "opportunity" do scanner bruto.
-    /// Para evitar reescrever a SPA neste momento, o websocket de ML emite
-    /// um envelope equivalente, com o `RecommendationDto` preservado em `ml`
-    /// para consumidores mais novos.
+    /// **Fix pós-auditoria 2026-04-21**: o envelope anterior reusava
+    /// `"type": "opportunity"` e preenchia `buyPrice`/`sellPrice` com
+    /// `enter_typical`/`exit_typical` (valores de SPREAD predito em %),
+    /// que no schema original do scanner representavam **preços reais**
+    /// do orderbook. Isso confundia a UI legada (risco de execução com
+    /// preço 2.4 USDT em ativo que vale 0.00123). Agora usa envelope
+    /// dedicado, sem mistura de semântica.
+    ///
+    /// Frontend ML deve consumir o schema explícito `ml_recommendation`.
+    /// UI legada do scanner continua no WS `/ws/spread` sem alterações.
     pub fn to_scanner_like_json_string(&self) -> Result<String, serde_json::Error> {
         let timestamp = iso8601_from_ns(self.emitted_at_ns);
-        let body = match &self.dto {
-            RecommendationDto::Trade(setup) => serde_json::json!({
-                "type": "opportunity",
-                "timestamp": timestamp,
-                "data": [{
-                    "symbol": &self.symbol_name,
-                    "current": "USDT",
-                    "buyFrom": setup.route_id.buy_venue,
-                    "sellTo": setup.route_id.sell_venue,
-                    "buyType": setup.route_id.buy_market,
-                    "sellType": setup.route_id.sell_market,
-                    "buyPrice": setup.enter_typical,
-                    "sellPrice": setup.exit_typical,
-                    "entrySpread": setup.enter_at_min,
-                    "exitSpread": setup.exit_at_min,
-                    "buyVol24": 0.0,
-                    "sellVol24": 0.0,
-                    "buyBookAge": 0,
-                    "sellBookAge": 0,
-                    "ml": &self.dto,
-                }],
-            }),
-            RecommendationDto::Abstain { .. } => serde_json::json!({
-                "type": "opportunity",
-                "timestamp": timestamp,
-                "data": [],
-                "ml": &self.dto,
-            }),
-        };
+        let body = serde_json::json!({
+            "type": "ml_recommendation",
+            "timestamp": timestamp,
+            "cycle_seq": self.cycle_seq,
+            "symbol": &self.symbol_name,
+            "route": {
+                "buy_venue": match &self.dto {
+                    RecommendationDto::Trade(s) => s.route_id.buy_venue,
+                    RecommendationDto::Abstain { .. } => "",
+                },
+                "sell_venue": match &self.dto {
+                    RecommendationDto::Trade(s) => s.route_id.sell_venue,
+                    RecommendationDto::Abstain { .. } => "",
+                },
+            },
+            "ml": &self.dto,
+        });
         serde_json::to_string(&body)
     }
 }
@@ -123,6 +123,21 @@ pub struct BroadcasterMetrics {
     /// Quando `publish` encontrou ≥ 1 consumer no instante do envio.
     /// É proxy de entrega, não confirmação de leitura humana.
     pub was_recommended_publications: AtomicU64,
+    /// Fix pós-auditoria 2026-04-21: número agregado de frames
+    /// sobrescritos por consumers lentos (`RecvError::Lagged(n)`).
+    /// Incrementado pelo handler WS em `broadcast/server.rs`.
+    /// Observabilidade antes ausente — consumers lentos causavam perda
+    /// silenciosa de recomendações.
+    pub lagged_frames_total: AtomicU64,
+}
+
+impl BroadcasterMetrics {
+    /// Incrementa `lagged_frames_total` pela quantidade `n` reportada
+    /// por `RecvError::Lagged(n)` do tokio broadcast.
+    #[inline]
+    pub fn record_lagged(&self, n: u64) {
+        self.lagged_frames_total.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 impl RecommendationBroadcaster {
@@ -321,7 +336,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scanner_like_json_contains_legacy_opportunity_envelope() {
+    async fn ml_recommendation_envelope_is_distinct_from_scanner() {
+        // Fix pós-auditoria: envelope ML não reusa "opportunity" do scanner
+        // bruto (evita confusão de semântica preço vs spread).
         let b = RecommendationBroadcaster::new();
         let mut rx = b.subscribe();
         b.publish(7, 1_700_000_000_000_000_000, mk_route(), "BTC-USDT", &mk_trade());
@@ -329,11 +346,20 @@ mod tests {
         let s = frame.to_scanner_like_json_string().unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
 
-        assert_eq!(v["type"], "opportunity");
-        assert_eq!(v["data"][0]["symbol"], "BTC-USDT");
-        assert_eq!(v["data"][0]["buyFrom"], "mexc");
-        assert_eq!(v["data"][0]["sellTo"], "bingx");
-        assert_eq!(v["data"][0]["ml"]["kind"], "trade");
+        assert_eq!(v["type"], "ml_recommendation");
+        assert_eq!(v["symbol"], "BTC-USDT");
+        assert_eq!(v["route"]["buy_venue"], "mexc");
+        assert_eq!(v["route"]["sell_venue"], "bingx");
+        assert_eq!(v["ml"]["kind"], "trade");
+        assert_eq!(v["cycle_seq"], 7);
+    }
+
+    #[test]
+    fn lagged_frames_total_is_tracked() {
+        let m = BroadcasterMetrics::default();
+        m.record_lagged(5);
+        m.record_lagged(3);
+        assert_eq!(m.lagged_frames_total.load(Ordering::Relaxed), 8);
     }
 }
 

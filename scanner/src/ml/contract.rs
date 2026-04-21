@@ -190,8 +190,18 @@ pub struct AbstainDiagnostic {
 /// `enter_peak_p95` existe, mas um pico só é *oportunidade legítima* se
 /// `toxicity_level = Healthy`. Picos `Suspicious` ou `Toxic` devem ser
 /// ignorados pelo operador mesmo que tecnicamente atinjam threshold.
+///
+/// `Unknown` é o default honesto quando o detector não executou (MVP):
+/// UI deve tratar como "não medido" — NÃO assumir Healthy. Falso
+/// "Healthy" hardcoded é falso positivo estrutural que viola o critério
+/// precision-first do CLAUDE.md.
+///
+/// Ref: Foucault, Kozhan & Tham 2017 RFS 30(4) "Toxic arbitrage".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToxicityLevel {
+    /// Detector não executou ou sem informação suficiente.
+    /// UI deve exibir "?" ou suprimir a recomendação.
+    Unknown,
     /// Cauda normal — pico é oportunidade legítima.
     Healthy,
     /// `book_age` elevado em uma das pernas; staleness possível.

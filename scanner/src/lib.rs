@@ -31,6 +31,7 @@ use crate::ml::feature_store::HotQueryCache;
 use crate::ml::metrics::MlPrometheusMetrics;
 use crate::ml::persistence::{
     JsonlWriter, RawSampleWriter, RawWriterConfig, WriterConfig, WriterHandle,
+    WriterSendError,
 };
 use crate::ml::serving::MlServer;
 use crate::ml::trigger::SamplingTrigger;
@@ -118,8 +119,21 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // Stream contínuo pré-trigger, decimado 1-in-10 por rota, para medição
     // não-enviesada dos gates empíricos E1/E2/E4/E6/E8/E10/E11 do Marco 0.
     // Paralelo ao AcceptedSample writer; ambos usam Hive-style partitioning.
+    //
+    // Fix pós-auditoria: log ABSOLUTO do path data_dir no startup.
+    // Default é relativo ("data/ml/..."), dependendo do CWD — primeira
+    // coleta podia "sumir" silenciosamente no disco errado.
+    let raw_writer_cfg = RawWriterConfig::default();
+    let raw_writer_abs = std::env::current_dir()
+        .map(|cwd| cwd.join(&raw_writer_cfg.data_dir))
+        .unwrap_or_else(|_| raw_writer_cfg.data_dir.clone());
+    info!(
+        abs_path = %raw_writer_abs.display(),
+        cap = raw_writer_cfg.channel_capacity,
+        "ML raw writer — path absoluto"
+    );
     let (ml_raw_writer, ml_raw_writer_handle) =
-        RawSampleWriter::create(RawWriterConfig::default());
+        RawSampleWriter::create(raw_writer_cfg);
     tokio::spawn(async move { ml_raw_writer.run().await; });
 
     let ml_server = Arc::new(
@@ -157,7 +171,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // horária em `{data_dir}/year=YYYY/month=MM/day=DD/hour=HH/`. Alimenta
     // o dataset de treino do modelo A2 (Marco 2). Canal bounded 100k
     // amortece picos de ~100 min a 17 req/s.
-    let (ml_writer, ml_writer_handle) = JsonlWriter::create(WriterConfig::default());
+    //
+    // Fix pós-auditoria: log ABSOLUTO do path.
+    let writer_cfg = WriterConfig::default();
+    let writer_abs = std::env::current_dir()
+        .map(|cwd| cwd.join(&writer_cfg.data_dir))
+        .unwrap_or_else(|_| writer_cfg.data_dir.clone());
+    info!(
+        abs_path = %writer_abs.display(),
+        cap = writer_cfg.channel_capacity,
+        "ML accepted writer — path absoluto"
+    );
+    let (ml_writer, ml_writer_handle) = JsonlWriter::create(writer_cfg);
     tokio::spawn(async move { ml_writer.run().await; });
 
     // --- Spread engine loop (150ms) ---
@@ -372,6 +397,11 @@ async fn run_spread_engine(
             // Sem isso, SymbolId muda entre runs e dados ficam inúteis
             // retrospectivamente.
             let symbol_name = universe.canonical_name_of(opp.symbol_id);
+            // Fix pós-auditoria: `halt_active_external=false` aqui é OK
+            // porque `MlServer::on_opportunity` computa o proxy de halt
+            // internamente via `detect_halt_proxy(buy_age, sell_age)`.
+            // Hook operacional externo (admin halts manuais) pode ser
+            // ligado via campo dedicado no futuro.
             let (rec, _dec, accepted) = ml_server.on_opportunity(
                 cycle_seq,
                 route,
@@ -382,7 +412,7 @@ async fn run_spread_engine(
                 opp.sell_book_age.min(u32::MAX as u64) as u32,
                 opp.buy_vol24,
                 opp.sell_vol24,
-                false, // halt_active — hook operacional fica em iteração futura
+                false, // halt_active_external; interno via book_age proxy
                 now,
             );
             // Publica recomendação no canal broadcast para consumers WS /
@@ -395,11 +425,30 @@ async fn run_spread_engine(
             // quando trigger aceitou, com flag `was_recommended`
             // refletindo a emissão real de `TradeSetup`, não o estado do
             // WebSocket/UI no instante.
+            //
+            // Fix pós-auditoria: drops do canal agora contados em métricas
+            // `accepted_samples_dropped_channel_full/closed`. Antes eram
+            // silenciosos (`let _ = ...`), causando perdas invisíveis
+            // durante bursts ou writer travado.
             if let Some(mut sample) = accepted {
                 if should_mark_sample_recommended(&rec) {
                     sample.mark_recommended();
                 }
-                let _ = ml_writer.try_send(sample);
+                if let Err(e) = ml_writer.try_send(sample) {
+                    let metrics = ml_server.metrics();
+                    match e {
+                        WriterSendError::ChannelFull => {
+                            metrics
+                                .accepted_samples_dropped_channel_full
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        WriterSendError::ChannelClosed => {
+                            metrics
+                                .accepted_samples_dropped_channel_closed
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
             }
         }
 

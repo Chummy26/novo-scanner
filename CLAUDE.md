@@ -49,7 +49,7 @@ O modelo orbita em torno desse output — **é o objetivo máximo, tudo deve gir
 - **Precision-first**: falso positivo é catastrófico (operador abre e fica preso). Recall baixo é aceitável — melhor perder 70% das oportunidades e ter 95% de precisão nos 30% emitidos do que o contrário.
 - **Calibração rigorosa**: se o modelo diz 80% de probabilidade, ~80% dos trades precisam realizar-se empiricamente (ECE baixa, reliability diagram calibrado).
 - **Abstenção é resposta válida**: sem confiança suficiente, não emitir nada — melhor silêncio do que ruído. Distinguir três tipos: `NO_OPPORTUNITY`, `INSUFFICIENT_DATA`, `LOW_CONFIDENCE`.
-- **Honestidade sobre lucro bruto**: o modelo não pode viciar em micro-spreads do tipo `enter 0.3%, exit −0.2%, lucro 0.1%` com P=95% — fees destroem isso mesmo com alta probabilidade. Floor econômico obrigatório no design da função de utilidade.
+- **Honestidade sobre lucro bruto**: o modelo não pode viciar em micro-spreads do tipo `enter 0.3%, exit −0.2%, lucro 0.1%` com P=95%. Floor econômico obrigatório no design da função de utilidade, mas sempre como filtro/penalização sobre **lucro bruto cotado**. Não transformar isso em cálculo de PnL líquido.
 
 Detalhamento das 12 armadilhas críticas (T1–T12) em `plans/ml_stack_research_prompt.md` §3.5 e `docs/ml/02_traps/`.
 
@@ -58,6 +58,12 @@ Detalhamento das 12 armadilhas críticas (T1–T12) em `plans/ml_stack_research_
 ## Escopo fechado
 
 O modelo automatiza **apenas a detecção e recomendação**. Execução de ordens, dimensionamento de posição, stop-loss, quando fechar efetivamente, rebalanceamento entre venues, cálculo de PnL líquido (fees/funding/slippage) — tudo isso continua 100% humano. O operador confia no número do modelo e executa; o resto é problema dele.
+
+### Fronteira explícita do ML
+
+O modelo ML **não** deve modelar nem otimizar taker fees, maker fees, slippage, funding, withdrawal fees, tamanho de posição, margem, liquidação, stop-loss, rebalanceamento, execução parcial, latência de ordem, fill probability ou PnL líquido. Esses temas existem na estratégia/operação, mas ficam fora do objetivo do modelo.
+
+O único objetivo do ML é responder se a oportunidade de spread bruto merece recomendação agora: `enter`, `exit`, `lucro bruto = enter + exit`, `P`, `T`, e intervalo de confiança. O risco que o ML controla é apenas o risco de **recomendação errada**: baixa probabilidade de realização, má calibração, pouca evidência, baixa confiança ou lucro bruto insuficiente. Nesses casos, a saída correta é abstenção.
 
 **Stack default Rust.** Python tem burden-of-proof (gap Rust >2× provado ou biblioteca inexistente).
 

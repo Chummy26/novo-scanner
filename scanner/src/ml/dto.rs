@@ -90,7 +90,15 @@ pub struct TradeSetupDto {
     pub gross_profit_p90: f32,
     pub gross_profit_p95: f32,
 
-    pub realization_probability: f32,
+    /// **Rebrand ADR-auditoria 2026-04-21**: o baseline A3 emite a
+    /// frequência empírica BRUTA da janela 24h (`#{gross ≥ floor} / n`),
+    /// que é *prior marginal não-condicional*, não `P(realize | state_t₀)`.
+    /// Renomeamos o campo para refletir semântica real e evitar que a UI
+    /// apresente esse número como "probabilidade agora" (trap T2+T6).
+    /// O valor em `[0,1]` continua válido — só o NOME mudou.
+    /// Um modelo condicional emitirá `realization_probability_conditional`
+    /// separado quando entrar em produção.
+    pub historical_base_rate_24h: f32,
     pub confidence_interval_lo: f32,
     pub confidence_interval_hi: f32,
 
@@ -132,13 +140,14 @@ impl From<&TradeSetup> for TradeSetupDto {
             gross_profit_p75: s.gross_profit_p75,
             gross_profit_p90: s.gross_profit_p90,
             gross_profit_p95: s.gross_profit_p95,
-            realization_probability: s.realization_probability,
+            historical_base_rate_24h: s.realization_probability,
             confidence_interval_lo: s.confidence_interval.0,
             confidence_interval_hi: s.confidence_interval.1,
             horizon_p05_s: s.horizon_p05_s,
             horizon_median_s: s.horizon_median_s,
             horizon_p95_s: s.horizon_p95_s,
             toxicity_level: match s.toxicity_level {
+                ToxicityLevel::Unknown => "unknown",
                 ToxicityLevel::Healthy => "healthy",
                 ToxicityLevel::Suspicious => "suspicious",
                 ToxicityLevel::Toxic => "toxic",
@@ -369,6 +378,7 @@ mod tests {
     #[test]
     fn all_toxicity_levels_serialize_to_distinct_labels() {
         for (level, label) in [
+            (ToxicityLevel::Unknown, "unknown"),
             (ToxicityLevel::Healthy, "healthy"),
             (ToxicityLevel::Suspicious, "suspicious"),
             (ToxicityLevel::Toxic, "toxic"),
