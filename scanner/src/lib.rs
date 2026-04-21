@@ -30,8 +30,8 @@ use crate::ml::contract::RouteId;
 use crate::ml::feature_store::HotQueryCache;
 use crate::ml::metrics::MlPrometheusMetrics;
 use crate::ml::persistence::{
-    JsonlWriter, RawSampleWriter, RawWriterConfig, WriterConfig, WriterHandle,
-    WriterSendError,
+    JsonlWriter, LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, RawSampleWriter,
+    RawWriterConfig, ResolverConfig, RouteRanking, WriterConfig, WriterHandle, WriterSendError,
 };
 use crate::ml::serving::MlServer;
 use crate::ml::trigger::SamplingTrigger;
@@ -138,10 +138,116 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         RawSampleWriter::create(raw_writer_cfg);
     tokio::spawn(async move { ml_raw_writer.run().await; });
 
+    // --- Wave V: Labeled trade writer + resolver + ranker ---
+    let labeled_writer_cfg = LabeledWriterConfig::default();
+    let labeled_writer_abs = std::env::current_dir()
+        .map(|cwd| cwd.join(&labeled_writer_cfg.data_dir))
+        .unwrap_or_else(|_| labeled_writer_cfg.data_dir.clone());
+    info!(
+        abs_path = %labeled_writer_abs.display(),
+        cap = labeled_writer_cfg.channel_capacity,
+        "ML labeled-trade writer — path absoluto"
+    );
+    let (labeled_writer, labeled_handle) = LabeledJsonlWriter::create(labeled_writer_cfg);
+    tokio::spawn(async move { labeled_writer.run().await; });
+
+    let resolver_cfg = ResolverConfig {
+        horizons_s: cfg.ml.label_horizons_s,
+        sweeper_interval: Duration::from_secs(cfg.ml.label_sweeper_interval_s),
+        ..ResolverConfig::default()
+    };
+    let label_resolver = Arc::new(LabelResolver::new(resolver_cfg, labeled_handle));
+
+    // Ranker rolling — 24h de buckets × 15 min.
+    let ranker = Arc::new(RouteRanking::new(now_ns(), cfg.ml.raw_sampling_target_coverage));
+
     let ml_server = Arc::new(
         MlServer::new(ml_baseline, SamplingTrigger::with_defaults())
-            .with_raw_writer(ml_raw_writer_handle),
+            .with_raw_writer(ml_raw_writer_handle)
+            .with_route_ranking(Arc::clone(&ranker))
+            .with_label_resolver(Arc::clone(&label_resolver))
+            .with_label_params(cfg.ml.label_stride_s, cfg.ml.label_floor_pct),
     );
+
+    // --- Allowlist Wave V: resolver símbolos em rotas engine-elegíveis ---
+    // Precede qualquer outra atividade para tier_0 funcionar desde o 1º tick.
+    {
+        use std::collections::HashSet;
+        let mut allow_routes: HashSet<ml::contract::RouteId> = HashSet::new();
+        for symbol_name in &cfg.ml.raw_allowlist_symbols {
+            if let Some(sym_id) = universe.find_canonical(symbol_name) {
+                // Para cada par (buy, sell) cross-venue elegível pelo engine
+                // (qualquer venue coberta pelo símbolo, nas 2 direções).
+                let coverage = &universe.coverage[sym_id.0 as usize];
+                for buy_v in crate::types::Venue::ALL {
+                    if !coverage[buy_v.idx()] {
+                        continue;
+                    }
+                    for sell_v in crate::types::Venue::ALL {
+                        if sell_v == buy_v || !coverage[sell_v.idx()] {
+                            continue;
+                        }
+                        // Skip spot/spot e spot-as-sell (regra do engine).
+                        if buy_v.market() == crate::types::Market::Spot
+                            && sell_v.market() == crate::types::Market::Spot
+                        {
+                            continue;
+                        }
+                        if sell_v.market() == crate::types::Market::Spot {
+                            continue;
+                        }
+                        allow_routes.insert(ml::contract::RouteId {
+                            symbol_id: sym_id,
+                            buy_venue: buy_v,
+                            sell_venue: sell_v,
+                        });
+                    }
+                }
+            }
+        }
+        let n_routes = allow_routes.len();
+        ml_server.raw_decimator().set_allowlist(allow_routes);
+        info!(
+            n_allowlist_routes = n_routes,
+            n_allowlist_symbols = cfg.ml.raw_allowlist_symbols.len(),
+            "ML allowlist carregada"
+        );
+    }
+
+    // Task rerank (configurável via `raw_rerank_interval_s`).
+    {
+        let ranker_clone = Arc::clone(&ranker);
+        let decimator = ml_server.raw_decimator().clone();
+        let rerank_interval = Duration::from_secs(cfg.ml.raw_rerank_interval_s.max(60));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(rerank_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let priority = ranker_clone.snapshot_priority_set();
+                let n = priority.len();
+                decimator.set_priority_set(priority);
+                info!(n_priority_routes = n, "ML rerank atualizou priority_set");
+            }
+        });
+    }
+
+    // Task sweeper do label resolver.
+    {
+        let resolver_clone = Arc::clone(&label_resolver);
+        let sweeper_interval = Duration::from_secs(cfg.ml.label_sweeper_interval_s.max(1));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(sweeper_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let n = resolver_clone.sweep(now_ns());
+                if n > 0 {
+                    tracing::debug!(n_closed = n, "label_resolver sweep");
+                }
+            }
+        });
+    }
     let ml_metrics_opt = match MlPrometheusMetrics::register(&obs::Metrics::init().registry) {
         Ok(m) => {
             info!("ML prometheus metrics registered");
@@ -155,14 +261,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     if let Some(mut metrics) = ml_metrics_opt {
         let server_for_metrics = Arc::clone(&ml_server);
         let broadcaster_for_metrics = ml_broadcaster.clone();
+        let resolver_for_metrics = Arc::clone(&label_resolver);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tick.tick().await;
+                let economic = server_for_metrics.economic_metrics();
+                let resolver_metrics = resolver_for_metrics.metrics();
                 metrics.update_from_runtime(
                     &server_for_metrics,
                     Some(&broadcaster_for_metrics),
-                    None,
+                    Some(economic.as_ref()),
+                    Some(resolver_metrics.as_ref()),
                 );
             }
         });

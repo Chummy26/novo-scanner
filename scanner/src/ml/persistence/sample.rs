@@ -4,6 +4,7 @@
 //! Vide `mod.rs` para racional de formato.
 
 use crate::ml::contract::RouteId;
+use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::trigger::SampleDecision;
 
 /// Versão atual do schema. Bump quando adicionar/remover/renomear campos.
@@ -19,7 +20,10 @@ use crate::ml::trigger::SampleDecision;
 ///   Motivação: `symbol_id` é atribuído dinamicamente em discovery e NÃO é
 ///   estável entre runs → join retrospectivo de dados diários exige nome
 ///   canonical. Sem v2, 30 dias de coleta viram inúteis se universo mudar.
-pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 2;
+/// - **v3** (Wave V dataset PhD, 2026-04-21): adiciona `sample_id` (hash
+///   determinístico FNV-1a hex16) para join cross-schema com `RawSample`
+///   e `LabeledTrade`. Correção PhD Q5.
+pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 3;
 
 /// Versão do scanner no momento da serialização. Injetado pelo crate
 /// via `env!("CARGO_PKG_VERSION")`. Permite debugging retrospectivo de
@@ -44,6 +48,10 @@ pub struct AcceptedSample {
     /// **v2** — versão do scanner que gerou a amostra. Útil para excluir
     /// dados gerados por versões bugadas retrospectivamente.
     pub scanner_version: &'static str,
+    /// **v3** — hash determinístico da tupla canonical (ts_ns+cycle_seq+
+    /// symbol+venues+markets). Chave de join cross-schema com RawSample
+    /// e LabeledTrade. Computado via `sample_id_of()` — função única.
+    pub sample_id: String,
     pub entry_spread: f32,
     pub exit_spread: f32,
     pub buy_book_age_ms: u32,
@@ -76,13 +84,22 @@ impl AcceptedSample {
         sell_vol24: f64,
         sample_decision: SampleDecision,
     ) -> Self {
+        let symbol_name = symbol_name.into();
+        let sample_id = sample_id_of(
+            ts_ns,
+            cycle_seq,
+            &symbol_name,
+            route_id.buy_venue,
+            route_id.sell_venue,
+        );
         Self {
             ts_ns,
             cycle_seq,
             schema_version: ACCEPTED_SAMPLE_SCHEMA_VERSION,
             route_id,
-            symbol_name: symbol_name.into(),
+            symbol_name,
             scanner_version: SCANNER_VERSION,
+            sample_id,
             entry_spread,
             exit_spread,
             buy_book_age_ms,
@@ -106,7 +123,7 @@ impl AcceptedSample {
         format!(
             concat!(
                 r#"{{"ts_ns":{},"cycle_seq":{},"schema_version":{},"#,
-                r#""scanner_version":"{}","#,
+                r#""scanner_version":"{}","sample_id":"{}","#,
                 r#""symbol_id":{},"symbol_name":"{}","#,
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
@@ -119,6 +136,7 @@ impl AcceptedSample {
             self.cycle_seq,
             self.schema_version,
             self.scanner_version,
+            self.sample_id,
             self.route_id.symbol_id.0,
             escape_json_string(&self.symbol_name),
             self.route_id.buy_venue.as_str(),
@@ -209,9 +227,10 @@ mod tests {
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, ACCEPTED_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(s.schema_version, 2);
+        assert_eq!(s.schema_version, 3);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
+        assert_eq!(s.sample_id.len(), 16);
         assert!(!s.was_recommended);
     }
 
@@ -242,7 +261,8 @@ mod tests {
         assert_eq!(v["sample_decision"], "accept");
         assert_eq!(v["was_recommended"], false);
         assert!(v["scanner_version"].is_string());
-        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["sample_id"].as_str().unwrap().len(), 16);
     }
 
     #[test]

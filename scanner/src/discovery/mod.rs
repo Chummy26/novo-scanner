@@ -54,6 +54,17 @@ impl SymbolUniverse {
     pub fn len(&self) -> usize { self.by_id.len() }
     pub fn is_empty(&self) -> bool { self.by_id.is_empty() }
 
+    /// Resolve `symbol_name` canonical (e.g. "BTC-USDT") para SymbolId.
+    /// Usado para resolver allowlist ML em RouteIds.
+    pub fn find_canonical(&self, symbol_name: &str) -> Option<SymbolId> {
+        // symbol_name vem no formato "BASE-QUOTE". Reconstruir CanonicalPair.
+        let mut parts = symbol_name.splitn(2, '-');
+        let base = parts.next()?;
+        let quote = parts.next()?;
+        let pair = crate::types::CanonicalPair::of(base, quote);
+        self.by_canonical.get(&pair).copied()
+    }
+
     /// Build the universe from per-venue discovery results. Only pairs listed
     /// on ≥ 2 venues are assigned a SymbolId (the coverage requirement).
     pub fn from_venue_symbols(per_venue: Vec<Vec<VenueSymbol>>) -> Self {

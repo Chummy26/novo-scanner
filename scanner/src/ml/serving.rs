@@ -44,7 +44,10 @@ use crate::ml::economic::{
     EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome,
 };
 use crate::ml::listing_history::ListingHistory;
-use crate::ml::persistence::{AcceptedSample, RawSample, RawWriterHandle, RouteDecimator};
+use crate::ml::persistence::{
+    AcceptedSample, FeaturesT0, LabelResolver, PolicyMetadata, RawSample, RawWriterHandle,
+    RouteDecimator, RouteRanking,
+};
 use crate::ml::trigger::{SampleDecision, SamplingTrigger};
 use crate::types::Venue;
 
@@ -134,12 +137,20 @@ pub struct MlServer {
     // (spread engine) a cada tick. Permite desambiguar snapshots do mesmo
     // timestamp em `AcceptedSample.cycle_seq`.
     cycle_seq: AtomicU64,
-    // ADR-025: stream contínuo pré-trigger, decimado 1-in-10 por rota.
-    // `None` quando desabilitado (tests/CLI flag). `Some((decimator,
-    // handle))` em produção para alimentar gates empíricos E1/E2/E4/E6/E8
-    // /E10/E11 do Marco 0.
+    // ADR-025: stream contínuo pré-trigger. Wave V: decimator em 3 tiers
+    // (allowlist / priority / uniform). Seleção em `decide()`.
     raw_decimator: RouteDecimator,
     raw_writer: Option<RawWriterHandle>,
+    // Wave V — rankeador rolling que atualiza `raw_decimator` priority_set.
+    // `None` quando desabilitado (tests minimalistas).
+    route_ranking: Option<Arc<RouteRanking>>,
+    // Wave V — resolvedor de labels supervisionados (LabeledTrade).
+    // `None` = label disabled (tests legados). Usa `Arc` porque o sweeper
+    // task também segura uma cópia.
+    label_resolver: Option<Arc<LabelResolver>>,
+    // Wave V — parâmetros de labeling (stride, floor).
+    label_stride_s: u32,
+    label_floor_pct: f32,
 }
 
 fn enforce_recommendation_invariants(
@@ -376,6 +387,10 @@ impl MlServer {
             cycle_seq: AtomicU64::new(0),
             raw_decimator: RouteDecimator::new(),
             raw_writer: None,
+            route_ranking: None,
+            label_resolver: None,
+            label_stride_s: 60,
+            label_floor_pct: 0.8,
         }
     }
 
@@ -391,6 +406,34 @@ impl MlServer {
     pub fn with_raw_decimator(mut self, decimator: RouteDecimator) -> Self {
         self.raw_decimator = decimator;
         self
+    }
+
+    /// Wave V: conecta ranker rolling (top-N dinâmico por
+    /// `accept_count_24h`) para o tier Priority do `RouteDecimator`.
+    pub fn with_route_ranking(mut self, ranker: Arc<RouteRanking>) -> Self {
+        self.route_ranking = Some(ranker);
+        self
+    }
+
+    /// Wave V: conecta resolvedor de labels supervisionados.
+    pub fn with_label_resolver(mut self, resolver: Arc<LabelResolver>) -> Self {
+        self.label_resolver = Some(resolver);
+        self
+    }
+
+    /// Wave V: ajusta parâmetros de labeling.
+    pub fn with_label_params(mut self, stride_s: u32, floor_pct: f32) -> Self {
+        self.label_stride_s = stride_s;
+        self.label_floor_pct = floor_pct;
+        self
+    }
+
+    pub fn raw_decimator(&self) -> &RouteDecimator {
+        &self.raw_decimator
+    }
+
+    pub fn route_ranking(&self) -> Option<Arc<RouteRanking>> {
+        self.route_ranking.as_ref().map(Arc::clone)
     }
 
     pub fn baseline(&self) -> &BaselineA3 {
@@ -473,9 +516,18 @@ impl MlServer {
         );
         self.bump_sample_metric(sample_dec);
 
+        // Wave V — ranker observa (candidate, accepted).
+        if let Some(ranker) = self.route_ranking.as_ref() {
+            let accepted = matches!(sample_dec, SampleDecision::Accept);
+            let vol = buy_vol24_usd.min(sell_vol24_usd);
+            ranker.observe(route, now_ns, accepted, vol);
+        }
+
+        // Wave V — decimator em tiers.
         if let Some(raw_writer) = self.raw_writer.as_ref() {
-            if self.raw_decimator.should_persist(route) {
-                let raw = RawSample::new(
+            let dr = self.raw_decimator.decide(route);
+            if dr.should_persist {
+                let raw = RawSample::with_tier(
                     now_ns,
                     cycle_seq,
                     route,
@@ -488,6 +540,8 @@ impl MlServer {
                     sell_vol24_usd,
                     halt_active,
                     sample_dec,
+                    dr.tier,
+                    dr.probability,
                 );
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
@@ -514,6 +568,12 @@ impl MlServer {
             self.economic
                 .lock()
                 .resolve_route(route, entry_spread, exit_spread, now_ns);
+            // Wave V — resolvedor de LabeledTrade recebe APENAS observações
+            // limpas (correção PhD Q2: best_exit supervisionado não é
+            // contaminado por stale/halt/dirty; raw guarda tudo).
+            if let Some(resolver) = self.label_resolver.as_ref() {
+                resolver.on_clean_observation(route, now_ns, entry_spread, exit_spread);
+            }
         }
 
         sample_dec
@@ -637,13 +697,20 @@ impl MlServer {
         );
         self.bump_sample_metric(sample_dec);
 
-        // 2a. **ADR-025** — emite `RawSample` pré-trigger se a rota está
-        //     no conjunto decimado. Sample carrega `sample_dec` congelado
-        //     (PIT rigoroso; regra do trigger do momento da observação).
-        //     `try_send` é não-bloqueante; canal cheio → drop + métrica.
-        if let Some(raw_writer) = self.raw_writer.as_ref() {
-            if self.raw_decimator.should_persist(route) {
-                let raw = RawSample::new(
+        // Wave V — ranker observa (candidate, accepted).
+        if let Some(ranker) = self.route_ranking.as_ref() {
+            let accepted = matches!(sample_dec, SampleDecision::Accept);
+            let vol = buy_vol24_usd.min(sell_vol24_usd);
+            ranker.observe(route, now_ns, accepted, vol);
+        }
+
+        // 2a. **ADR-025 + Wave V tier** — emite `RawSample` pré-trigger
+        //     se o decimator (com 3 tiers) aprovar. `sample_id` e
+        //     `sampling_tier` inclusos no schema v3.
+        let tier_snapshot = if let Some(raw_writer) = self.raw_writer.as_ref() {
+            let dr = self.raw_decimator.decide(route);
+            if dr.should_persist {
+                let raw = RawSample::with_tier(
                     now_ns,
                     cycle_seq,
                     route,
@@ -656,6 +723,8 @@ impl MlServer {
                     sell_vol24_usd,
                     halt_active,
                     sample_dec,
+                    dr.tier,
+                    dr.probability,
                 );
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
@@ -673,7 +742,13 @@ impl MlServer {
                     }
                 }
             }
-        }
+            Some((dr.tier, dr.probability))
+        } else {
+            // Sem raw_writer, ainda calcula o tier para alimentar o label
+            // resolver (correção B1 — label persiste mesmo sem raw).
+            let dr = self.raw_decimator.decide(route);
+            Some((dr.tier, dr.probability))
+        };
 
         // 3. Gera recomendação — agora com toxicity já classificada.
         let rec = self
@@ -698,6 +773,10 @@ impl MlServer {
             self.economic
                 .lock()
                 .process(route, entry_spread, exit_spread, now_ns, &rec);
+            // Wave V — resolvedor supervisionado consome obs limpa.
+            if let Some(resolver) = self.label_resolver.as_ref() {
+                resolver.on_clean_observation(route, now_ns, entry_spread, exit_spread);
+            }
         }
 
         // 4. **C4** — emite `AcceptedSample` se o trigger aceitou.
@@ -721,6 +800,64 @@ impl MlServer {
         } else {
             None
         };
+
+        // Wave V — enfileira `PendingLabel` quando sample é Accept.
+        // Stride configurável (`label_stride_s`); supression rates saem em
+        // métricas do resolver (`stride_skipped_total`).
+        if let (Some(resolver), Some(accepted_sample), Some((tier, prob))) =
+            (self.label_resolver.as_ref(), accepted.as_ref(), tier_snapshot)
+        {
+            let (baseline_recommended, baseline_p, baseline_enter_at_min, baseline_exit_at_min) =
+                match &rec {
+                    Recommendation::Trade(ts) => (
+                        true,
+                        Some(ts.realization_probability),
+                        Some(ts.enter_at_min),
+                        Some(ts.exit_at_min),
+                    ),
+                    Recommendation::Abstain { .. } => (false, None, None, None),
+                };
+            let features_t0 = FeaturesT0 {
+                buy_book_age_ms,
+                sell_book_age_ms,
+                buy_vol24: buy_vol24_usd,
+                sell_vol24: sell_vol24_usd,
+                toxicity_level: toxicity,
+                halt_active,
+                tail_ratio_p99_p95: None,
+                entry_p50_24h: self.baseline.cache().quantile_entry(route, 0.50),
+                exit_p50_24h: self.baseline.cache().quantile_exit(route, 0.50),
+            };
+            let policy = PolicyMetadata {
+                baseline_model_version: self
+                    .baseline
+                    .config()
+                    .model_version
+                    .to_string(),
+                baseline_recommended,
+                baseline_p_forecast: baseline_p,
+                baseline_derived_enter_at_min: baseline_enter_at_min,
+                baseline_derived_exit_at_min: baseline_exit_at_min,
+                baseline_floor_pct: self.baseline.config().floor_pct,
+                label_stride_s: self.label_stride_s,
+                label_sampling_probability: prob,
+            };
+            resolver.on_accepted(
+                accepted_sample.sample_id.clone(),
+                now_ns,
+                cycle_seq,
+                route,
+                accepted_sample.symbol_name.clone(),
+                entry_spread,
+                exit_spread,
+                features_t0,
+                self.label_floor_pct,
+                policy,
+                tier.as_str(),
+                prob,
+                self.label_stride_s,
+            );
+        }
 
         (rec, sample_dec, accepted)
     }

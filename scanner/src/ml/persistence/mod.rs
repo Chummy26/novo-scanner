@@ -33,13 +33,33 @@
 //! Em Marco 2, ao trocar para Parquet, o *mesmo* schema de `AcceptedSample`
 //! é mapeado para Arrow RecordBatch. Zero mudança no produtor (MlServer).
 
+pub mod label_resolver;
+pub mod labeled_trade;
+pub mod labeled_writer;
 pub mod raw_sample;
 pub mod raw_writer;
+pub mod route_ranking;
 pub mod sample;
+pub mod sample_id;
 pub mod writer;
 
+pub use label_resolver::{
+    LabelResolver, PendingHorizon, PendingLabel, ResolverConfig, ResolverMetrics,
+    DEFAULT_HORIZONS_S,
+};
+pub use labeled_trade::{
+    CensorReason, FeaturesT0, LabelOutcome, LabeledTrade, PolicyMetadata,
+    LABELED_TRADE_SCHEMA_VERSION,
+};
+pub use labeled_writer::{
+    LabeledJsonlWriter, LabeledWriterConfig, LabeledWriterHandle, LabeledWriterSendError,
+};
+pub use route_ranking::{RouteRanking, RouteScore};
+pub use sample_id::sample_id_of;
+
 pub use raw_sample::{
-    RawSample, RouteDecimator, RAW_SAMPLE_SCHEMA_VERSION, ROUTE_DECIMATION_MOD,
+    DecisionResult, RawSample, RouteDecimator, SamplingTier,
+    RAW_SAMPLE_SCHEMA_VERSION, ROUTE_DECIMATION_MOD,
 };
 pub use raw_writer::{
     RawSampleWriter, RawWriterConfig, RawWriterHandle, RawWriterSendError,

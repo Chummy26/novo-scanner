@@ -34,6 +34,7 @@ use prometheus::{
 
 use crate::ml::broadcast::{BroadcasterMetrics, RecommendationBroadcaster};
 use crate::ml::economic::EconomicMetrics;
+use crate::ml::persistence::ResolverMetrics;
 use crate::ml::serving::{MlServer, ServerMetrics};
 
 // ---------------------------------------------------------------------------
@@ -70,10 +71,32 @@ pub struct MlPrometheusMetrics {
     calibration_ece: Gauge,
     calibration_observations: IntGauge,
 
+    // Wave V — labels supervisionados + decimator tiers.
+    labels_created_total: IntCounter,
+    labels_stride_skipped_total: IntCounter,
+    labels_written_total: IntCounterVec,
+    labels_dropped_writer_total: IntCounterVec,
+    labels_dropped_capacity_total: IntCounter,
+    shutdown_lost_pending_total: IntCounter,
+
     // Snapshots do último update (para computar delta → Counter.inc_by).
     last_seen: ServerMetricsSnapshot,
     last_broadcaster: BroadcasterSnapshot,
     last_economic: EconomicSnapshot,
+    last_resolver: ResolverSnapshot,
+}
+
+#[derive(Default)]
+struct ResolverSnapshot {
+    pending_created: u64,
+    stride_skipped: u64,
+    written_realized: u64,
+    written_miss: u64,
+    written_censored: u64,
+    dropped_channel_full: u64,
+    dropped_channel_closed: u64,
+    dropped_capacity_overflow: u64,
+    shutdown_lost: u64,
 }
 
 #[derive(Default)]
@@ -233,6 +256,38 @@ impl MlPrometheusMetrics {
             "Total de pares (P_forecast, realized) registrados no tracker de calibração",
         ))?;
 
+        // Wave V — labels supervisionados + tiers.
+        let labels_created_total = IntCounter::with_opts(Opts::new(
+            "ml_labels_created_total",
+            "PendingLabels criados (1 por AcceptedSample elegível após stride)",
+        ))?;
+        let labels_stride_skipped_total = IntCounter::with_opts(Opts::new(
+            "ml_labels_stride_skipped_total",
+            "AcceptedSamples pulados por label_stride dentro da janela",
+        ))?;
+        let labels_written_total = IntCounterVec::new(
+            Opts::new(
+                "ml_labels_written_total",
+                "LabeledTrades persistidos (1 por horizonte fechado) — labeled por outcome",
+            ),
+            &["outcome"],
+        )?;
+        let labels_dropped_writer_total = IntCounterVec::new(
+            Opts::new(
+                "ml_labels_dropped_writer_total",
+                "LabeledTrades descartados por writer indisponível",
+            ),
+            &["reason"],
+        )?;
+        let labels_dropped_capacity_total = IntCounter::with_opts(Opts::new(
+            "ml_labels_dropped_capacity_total",
+            "PendingLabels descartados por overflow do cap por rota",
+        ))?;
+        let shutdown_lost_pending_total = IntCounter::with_opts(Opts::new(
+            "ml_shutdown_lost_pending_total",
+            "PendingLabels forçados censored{shutdown} ao encerrar",
+        ))?;
+
         registry.register(Box::new(opportunities_seen_total.clone()))?;
         registry.register(Box::new(sample_decisions_total.clone()))?;
         registry.register(Box::new(recommendations_total.clone()))?;
@@ -253,6 +308,13 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(halt_proxy_detected_total.clone()))?;
         registry.register(Box::new(calibration_ece.clone()))?;
         registry.register(Box::new(calibration_observations.clone()))?;
+        // Wave V
+        registry.register(Box::new(labels_created_total.clone()))?;
+        registry.register(Box::new(labels_stride_skipped_total.clone()))?;
+        registry.register(Box::new(labels_written_total.clone()))?;
+        registry.register(Box::new(labels_dropped_writer_total.clone()))?;
+        registry.register(Box::new(labels_dropped_capacity_total.clone()))?;
+        registry.register(Box::new(shutdown_lost_pending_total.clone()))?;
 
         // Pre-touch todos os labels — garante que aparecem em `gather()`
         // desde o primeiro scrape Prometheus, mesmo sem incrementos ainda.
@@ -298,6 +360,17 @@ impl MlPrometheusMetrics {
         for level in &["suspicious", "toxic"] {
             toxicity_detected_total.with_label_values(&[level]).inc_by(0);
         }
+        // Wave V pre-touch.
+        for outcome in &["realized", "miss", "censored"] {
+            labels_written_total
+                .with_label_values(&[outcome])
+                .inc_by(0);
+        }
+        for reason in &["channel_full", "channel_closed"] {
+            labels_dropped_writer_total
+                .with_label_values(&[reason])
+                .inc_by(0);
+        }
 
         Ok(Self {
             opportunities_seen_total,
@@ -319,9 +392,16 @@ impl MlPrometheusMetrics {
             halt_proxy_detected_total,
             calibration_ece,
             calibration_observations,
+            labels_created_total,
+            labels_stride_skipped_total,
+            labels_written_total,
+            labels_dropped_writer_total,
+            labels_dropped_capacity_total,
+            shutdown_lost_pending_total,
             last_seen: ServerMetricsSnapshot::default(),
             last_broadcaster: BroadcasterSnapshot::default(),
             last_economic: EconomicSnapshot::default(),
+            last_resolver: ResolverSnapshot::default(),
         })
     }
 
@@ -424,7 +504,7 @@ impl MlPrometheusMetrics {
 
     /// Atualiza o snapshot Prometheus completo do runtime ML.
     ///
-    /// `server` é obrigatório; broadcaster e acumulador econômico são
+    /// `server` é obrigatório; broadcaster, economic e resolver são
     /// opcionais porque podem não estar conectados em alguns modos de
     /// execução/teste.
     pub fn update_from_runtime(
@@ -432,6 +512,7 @@ impl MlPrometheusMetrics {
         server: &MlServer,
         broadcaster: Option<&RecommendationBroadcaster>,
         economic: Option<&EconomicMetrics>,
+        resolver: Option<&ResolverMetrics>,
     ) {
         self.update_from_server(server);
         if let Some(b) = broadcaster {
@@ -441,6 +522,61 @@ impl MlPrometheusMetrics {
         if let Some(e) = economic {
             self.update_from_economic(e);
         }
+        if let Some(r) = resolver {
+            self.update_from_resolver(r);
+        }
+    }
+
+    /// Wave V — atualiza métricas do `LabelResolver`.
+    pub fn update_from_resolver(&mut self, rm: &ResolverMetrics) {
+        let pending = rm.pending_created_total.load(Ordering::Relaxed);
+        let stride = rm.stride_skipped_total.load(Ordering::Relaxed);
+        let _written_total = rm.labels_written_total.load(Ordering::Relaxed);
+        let written_realized = rm.labels_written_realized_total.load(Ordering::Relaxed);
+        let written_miss = rm.labels_written_miss_total.load(Ordering::Relaxed);
+        let written_censored = rm.labels_written_censored_total.load(Ordering::Relaxed);
+        let drop_full = rm.labels_dropped_channel_full_total.load(Ordering::Relaxed);
+        let drop_closed = rm.labels_dropped_channel_closed_total.load(Ordering::Relaxed);
+        let drop_cap = rm
+            .labels_dropped_capacity_overflow_total
+            .load(Ordering::Relaxed);
+        let shutdown = rm.shutdown_lost_pending_total.load(Ordering::Relaxed);
+
+        self.labels_created_total
+            .inc_by(pending.saturating_sub(self.last_resolver.pending_created));
+        self.labels_stride_skipped_total
+            .inc_by(stride.saturating_sub(self.last_resolver.stride_skipped));
+        self.labels_written_total
+            .with_label_values(&["realized"])
+            .inc_by(written_realized.saturating_sub(self.last_resolver.written_realized));
+        self.labels_written_total
+            .with_label_values(&["miss"])
+            .inc_by(written_miss.saturating_sub(self.last_resolver.written_miss));
+        self.labels_written_total
+            .with_label_values(&["censored"])
+            .inc_by(written_censored.saturating_sub(self.last_resolver.written_censored));
+        self.labels_dropped_writer_total
+            .with_label_values(&["channel_full"])
+            .inc_by(drop_full.saturating_sub(self.last_resolver.dropped_channel_full));
+        self.labels_dropped_writer_total
+            .with_label_values(&["channel_closed"])
+            .inc_by(drop_closed.saturating_sub(self.last_resolver.dropped_channel_closed));
+        self.labels_dropped_capacity_total
+            .inc_by(drop_cap.saturating_sub(self.last_resolver.dropped_capacity_overflow));
+        self.shutdown_lost_pending_total
+            .inc_by(shutdown.saturating_sub(self.last_resolver.shutdown_lost));
+
+        self.last_resolver = ResolverSnapshot {
+            pending_created: pending,
+            stride_skipped: stride,
+            written_realized,
+            written_miss,
+            written_censored,
+            dropped_channel_full: drop_full,
+            dropped_channel_closed: drop_closed,
+            dropped_capacity_overflow: drop_cap,
+            shutdown_lost: shutdown,
+        };
     }
 
     /// Atualiza métricas do broadcaster a partir de `BroadcasterMetrics`.
@@ -707,7 +843,7 @@ mod tests {
         assert!(broadcaster.publish(7, 123, route, "BTC-USDT", &rec));
         let _ = rx.recv().await.expect("frame");
 
-        m.update_from_runtime(&server, Some(&broadcaster), None);
+        m.update_from_runtime(&server, Some(&broadcaster), None, None);
 
         assert_eq!(
             m.broadcaster_published_total

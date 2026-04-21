@@ -47,7 +47,76 @@ pub struct Config {
 
     #[serde(default)]
     pub bitget_mode: BitgetMode,
+
+    /// Config ML/dataset (Wave V).
+    #[serde(default)]
+    pub ml: MlConfig,
 }
+
+/// Configuração ML — Wave V (correções PhD).
+///
+/// Todos campos têm defaults razoáveis. Operadores podem sobrescrever
+/// via TOML `[ml]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MlConfig {
+    /// Símbolos (canonical "BASE-QUOTE") sempre persistidos no RawSample,
+    /// independentemente de ranking. Ex.: `["BTC-USDT", "ETH-USDT"]`.
+    #[serde(default)]
+    pub raw_allowlist_symbols: Vec<String>,
+
+    /// Fração de `accept_count_24h` coberta pelo priority_set. Default 0.95.
+    #[serde(default = "default_raw_target_coverage")]
+    pub raw_sampling_target_coverage: f64,
+
+    /// Decimator residual uniforme: 1-em-N. Default 10.
+    #[serde(default = "default_raw_decimation_mod")]
+    pub raw_decimation_mod: u64,
+
+    /// Intervalo entre reranks do `RouteRanking` (s). Default 3600 (1h).
+    #[serde(default = "default_raw_rerank_interval_s")]
+    pub raw_rerank_interval_s: u64,
+
+    /// Stride mínimo entre labels da mesma rota (s). Default 60.
+    #[serde(default = "default_label_stride_s")]
+    pub label_stride_s: u32,
+
+    /// Horizontes em segundos. Default `[900, 1800, 7200]`.
+    #[serde(default = "default_label_horizons_s")]
+    pub label_horizons_s: [u32; 3],
+
+    /// Intervalo do sweeper global de labels (s). Default 10.
+    #[serde(default = "default_label_sweeper_interval_s")]
+    pub label_sweeper_interval_s: u64,
+
+    /// Floor percentual bruto usado pelo baseline A3 + labels derivados.
+    /// Default 0.8% — filtro sobre LUCRO BRUTO COTADO (fees/funding ficam
+    /// fora, fronteira ML explícita).
+    #[serde(default = "default_label_floor_pct")]
+    pub label_floor_pct: f32,
+}
+
+impl Default for MlConfig {
+    fn default() -> Self {
+        Self {
+            raw_allowlist_symbols: Vec::new(),
+            raw_sampling_target_coverage: default_raw_target_coverage(),
+            raw_decimation_mod: default_raw_decimation_mod(),
+            raw_rerank_interval_s: default_raw_rerank_interval_s(),
+            label_stride_s: default_label_stride_s(),
+            label_horizons_s: default_label_horizons_s(),
+            label_sweeper_interval_s: default_label_sweeper_interval_s(),
+            label_floor_pct: default_label_floor_pct(),
+        }
+    }
+}
+
+fn default_raw_target_coverage()     -> f64      { 0.95 }
+fn default_raw_decimation_mod()      -> u64      { 10 }
+fn default_raw_rerank_interval_s()   -> u64      { 3600 }
+fn default_label_stride_s()          -> u32      { 60 }
+fn default_label_horizons_s()        -> [u32; 3] { [900, 1800, 7200] }
+fn default_label_sweeper_interval_s()-> u64      { 10 }
+fn default_label_floor_pct()         -> f32      { 0.8 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VenueToggles {
@@ -186,6 +255,7 @@ impl Config {
             core_pinning:        CorePinning::default(),
             kucoin_mode:         KucoinMode::Classic,
             bitget_mode:         BitgetMode::V2,
+            ml:                  MlConfig::default(),
         }
     }
 }
