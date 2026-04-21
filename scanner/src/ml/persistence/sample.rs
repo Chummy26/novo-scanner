@@ -13,8 +13,7 @@ use crate::ml::trigger::SampleDecision;
 ///
 /// - **v1** (original): `ts_ns, cycle_seq, schema_version, symbol_id,
 ///   buy_venue, sell_venue, buy_market, sell_market, entry_spread,
-///   exit_spread, buy/sell_book_age_ms, buy/sell_vol24, sample_decision,
-///   was_recommended`.
+///   exit_spread, buy/sell_vol24, sample_decision, was_recommended`.
 /// - **v2** (ADR-029, 2026-04-21): adiciona `symbol_name` (string canonical
 ///   "BASE-QUOTE", ex: "BTC-USDT") e `scanner_version` (env `CARGO_PKG_VERSION`).
 ///   Motivação: `symbol_id` é atribuído dinamicamente em discovery e NÃO é
@@ -23,7 +22,9 @@ use crate::ml::trigger::SampleDecision;
 /// - **v3** (Wave V dataset PhD, 2026-04-21): adiciona `sample_id` (hash
 ///   determinístico FNV-1a hex16) para join cross-schema com `RawSample`
 ///   e `LabeledTrade`. Correção PhD Q5.
-pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 3;
+/// - **v4** (2026-04-21): remove `buy/sell_book_age_ms`; book age é
+///   diagnóstico operacional de corretora, não dado do dataset ML.
+pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 4;
 
 /// Versão do scanner no momento da serialização. Injetado pelo crate
 /// via `env!("CARGO_PKG_VERSION")`. Permite debugging retrospectivo de
@@ -54,8 +55,6 @@ pub struct AcceptedSample {
     pub sample_id: String,
     pub entry_spread: f32,
     pub exit_spread: f32,
-    pub buy_book_age_ms: u32,
-    pub sell_book_age_ms: u32,
     pub buy_vol24: f64,
     pub sell_vol24: f64,
     pub sample_decision: SampleDecision,
@@ -78,8 +77,6 @@ impl AcceptedSample {
         symbol_name: impl Into<String>,
         entry_spread: f32,
         exit_spread: f32,
-        buy_book_age_ms: u32,
-        sell_book_age_ms: u32,
         buy_vol24: f64,
         sell_vol24: f64,
         sample_decision: SampleDecision,
@@ -102,8 +99,6 @@ impl AcceptedSample {
             sample_id,
             entry_spread,
             exit_spread,
-            buy_book_age_ms,
-            sell_book_age_ms,
             buy_vol24,
             sell_vol24,
             sample_decision,
@@ -128,7 +123,6 @@ impl AcceptedSample {
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
                 r#""entry_spread":{},"exit_spread":{},"#,
-                r#""buy_book_age_ms":{},"sell_book_age_ms":{},"#,
                 r#""buy_vol24":{},"sell_vol24":{},"#,
                 r#""sample_decision":"{}","was_recommended":{}}}"#,
             ),
@@ -145,8 +139,6 @@ impl AcceptedSample {
             self.route_id.sell_venue.market().as_str(),
             format_f32(self.entry_spread),
             format_f32(self.exit_spread),
-            self.buy_book_age_ms,
-            self.sell_book_age_ms,
             format_f64(self.buy_vol24),
             format_f64(self.sell_vol24),
             decision,
@@ -220,14 +212,12 @@ mod tests {
             "BTC-USDT",
             2.5,
             -0.8,
-            50,
-            80,
             1e6,
             2e6,
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, ACCEPTED_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(s.schema_version, 3);
+        assert_eq!(s.schema_version, 4);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
         assert_eq!(s.sample_id.len(), 16);
@@ -243,8 +233,6 @@ mod tests {
             "BTC-USDT",
             2.5,
             -0.8,
-            50,
-            80,
             1e6,
             2e6,
             SampleDecision::Accept,
@@ -261,14 +249,22 @@ mod tests {
         assert_eq!(v["sample_decision"], "accept");
         assert_eq!(v["was_recommended"], false);
         assert!(v["scanner_version"].is_string());
-        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["schema_version"], 4);
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 16);
+        assert!(
+            v.get("buy_book_age_ms").is_none(),
+            "book age não deve sair no dataset ML"
+        );
+        assert!(
+            v.get("sell_book_age_ms").is_none(),
+            "book age não deve sair no dataset ML"
+        );
     }
 
     #[test]
     fn non_finite_floats_serialize_as_null() {
         let mut s = AcceptedSample::new(
-            1, 0, mk_route(), "BTC-USDT", f32::NAN, f32::INFINITY, 50, 50,
+            1, 0, mk_route(), "BTC-USDT", f32::NAN, f32::INFINITY,
             f64::NEG_INFINITY, 1e6,
             SampleDecision::Accept,
         );
@@ -284,7 +280,7 @@ mod tests {
     #[test]
     fn schema_version_in_output_matches_const() {
         let s = AcceptedSample::new(
-            1, 0, mk_route(), "ETH-USDT", 1.0, -1.0, 50, 50, 1e6, 1e6,
+            1, 0, mk_route(), "ETH-USDT", 1.0, -1.0, 1e6, 1e6,
             SampleDecision::Accept,
         );
         let line = s.to_json_line();
@@ -300,7 +296,7 @@ mod tests {
         // Defensivo — nomes canonical normalmente não têm aspas/backslash,
         // mas garantimos que o escaping não quebra JSON.
         let s = AcceptedSample::new(
-            1, 0, mk_route(), "XYZ\"EVIL", 1.0, -1.0, 50, 50, 1e6, 1e6,
+            1, 0, mk_route(), "XYZ\"EVIL", 1.0, -1.0, 1e6, 1e6,
             SampleDecision::Accept,
         );
         let line = s.to_json_line();
@@ -312,7 +308,7 @@ mod tests {
     fn empty_symbol_name_is_handled_gracefully() {
         // Caso fallback — universe lookup falhou retorna "".
         let s = AcceptedSample::new(
-            1, 0, mk_route(), "", 1.0, -1.0, 50, 50, 1e6, 1e6,
+            1, 0, mk_route(), "", 1.0, -1.0, 1e6, 1e6,
             SampleDecision::Accept,
         );
         let line = s.to_json_line();

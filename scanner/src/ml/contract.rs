@@ -108,10 +108,7 @@ pub struct TradeSetup {
     /// Pior caso longo (exceeds T_max → timeout).
     pub horizon_p95_s: u32,
 
-    // --- Contextos microestruturais (Q1 emendas) -------------------------
-    /// Rotula região da cauda direita como potencialmente tóxica
-    /// (Foucault, Kozhan & Tham 2017 RFS 30(4)).
-    pub toxicity_level: ToxicityLevel,
+    // --- Contexto de correlação (Q1 emendas) -----------------------------
     /// Se rota pertence a um cluster de correlação, ID do cluster.
     /// Previne interpretação errada de N setups correlacionados como N
     /// oportunidades independentes (Diebold-Yilmaz 2012).
@@ -182,33 +179,8 @@ pub struct AbstainDiagnostic {
 }
 
 // ---------------------------------------------------------------------------
-// Microestrutura (Q1 emendas em ADR-016)
+// Calibração
 // ---------------------------------------------------------------------------
-
-/// Nível de toxicidade da região de cauda direita do entry spread.
-///
-/// `enter_peak_p95` existe, mas um pico só é *oportunidade legítima* se
-/// `toxicity_level = Healthy`. Picos `Suspicious` ou `Toxic` devem ser
-/// ignorados pelo operador mesmo que tecnicamente atinjam threshold.
-///
-/// `Unknown` é o default honesto quando o detector não executou (MVP):
-/// UI deve tratar como "não medido" — NÃO assumir Healthy. Falso
-/// "Healthy" hardcoded é falso positivo estrutural que viola o critério
-/// precision-first do CLAUDE.md.
-///
-/// Ref: Foucault, Kozhan & Tham 2017 RFS 30(4) "Toxic arbitrage".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToxicityLevel {
-    /// Detector não executou ou sem informação suficiente.
-    /// UI deve exibir "?" ou suprimir a recomendação.
-    Unknown,
-    /// Cauda normal — pico é oportunidade legítima.
-    Healthy,
-    /// `book_age` elevado em uma das pernas; staleness possível.
-    Suspicious,
-    /// Staleness confirmada OU outage OU spike de sample único.
-    Toxic,
-}
 
 /// Status da calibração global do modelo no momento da emissão.
 ///
@@ -337,7 +309,6 @@ mod tests {
             horizon_p05_s: 720,
             horizon_median_s: 1680,
             horizon_p95_s: 6000,
-            toxicity_level: ToxicityLevel::Healthy,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
@@ -367,14 +338,6 @@ mod tests {
         assert_ne!(b, c);
         assert_ne!(c, d);
         assert_ne!(a, d);
-    }
-
-    #[test]
-    fn toxicity_ordering_makes_sense() {
-        // Healthy é o único estado sem flag para operador.
-        assert_eq!(ToxicityLevel::Healthy, ToxicityLevel::Healthy);
-        assert_ne!(ToxicityLevel::Healthy, ToxicityLevel::Suspicious);
-        assert_ne!(ToxicityLevel::Suspicious, ToxicityLevel::Toxic);
     }
 
     #[test]
@@ -425,7 +388,6 @@ mod tests {
             horizon_p05_s: 720,
             horizon_median_s: 1680,
             horizon_p95_s: 6000,
-            toxicity_level: ToxicityLevel::Healthy,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,

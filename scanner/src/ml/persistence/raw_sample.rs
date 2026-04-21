@@ -10,10 +10,9 @@
 //! empírica — gates E1/E2/E4/E6/E8/E10/E11 (ADR-018) e ADRs 019/020/023
 //! exigem a distribuição **pré-filtro** para evitar viés de seleção:
 //!
-//! - Hill tail (E1): remover `book_age > limite` decepa a cauda.
 //! - Persistência D_{x=2%} (E4): precisa todos os cruzamentos em 2%.
-//! - LOVO per-venue (E11): filtro de staleness remove venues lentas
-//!   desigualmente → venue aparece "generalizável" sem ter sido vista.
+//! - LOVO per-venue (E11): precisa cobertura por venue sem depender apenas
+//!   de samples já aceitos.
 //! - Simulação pnl_bruto (ADR-019): precisa `exit_spread(t₁)` para todo
 //!   par `(rota, t₀)` candidato.
 //!
@@ -47,7 +46,9 @@ use crate::ml::trigger::SampleDecision;
 /// - **v3** (Wave V dataset PhD, 2026-04-21): adiciona `sample_id`,
 ///   `sampling_tier`, `sampling_probability`. Decimator agora em 3 tiers
 ///   (allowlist + priority + uniforme); auditoria de amostragem.
-pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 3;
+/// - **v4** (2026-04-21): remove `buy/sell_book_age_ms` e `halt_active`.
+///   Esses campos são diagnósticos operacionais, não dataset ML.
+pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 4;
 
 /// Versão do scanner — mesmo que em `sample.rs`.
 pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,7 +64,7 @@ pub const ROUTE_DECIMATION_MOD: u64 = 10;
 /// | Campo | RawSample | AcceptedSample |
 /// |---|---|---|
 /// | Quando emite | toda obs (se rota selecionada) | só `SampleDecision::Accept` |
-/// | `halt_active` | ✅ campo explícito | implícito em `sample_decision` |
+/// | Campos operacionais (`book_age`, `halt`) | ❌ ausentes | ❌ ausentes |
 /// | `was_recommended` | ❌ ausente | ✅ presente |
 /// | `sample_decision` | ✅ veredito congelado | ✅ sempre `Accept` |
 ///
@@ -86,11 +87,8 @@ pub struct RawSample {
     pub sample_id: String,
     pub entry_spread: f32,
     pub exit_spread: f32,
-    pub buy_book_age_ms: u32,
-    pub sell_book_age_ms: u32,
     pub buy_vol24: f64,
     pub sell_vol24: f64,
-    pub halt_active: bool,
     pub sample_decision: SampleDecision,
     /// **v3** — tier que aprovou persistência. "allowlist" | "priority"
     /// | "decimated_uniform".
@@ -109,19 +107,16 @@ impl RawSample {
         symbol_name: impl Into<String>,
         entry_spread: f32,
         exit_spread: f32,
-        buy_book_age_ms: u32,
-        sell_book_age_ms: u32,
         buy_vol24: f64,
         sell_vol24: f64,
-        halt_active: bool,
         sample_decision: SampleDecision,
     ) -> Self {
         // Default tier "decimated_uniform" + probabilidade 1.0 (a API legada
         // não sabe tier). Caminhos novos devem usar [`RawSample::with_tier`].
         Self::with_tier(
             ts_ns, cycle_seq, route_id, symbol_name,
-            entry_spread, exit_spread, buy_book_age_ms, sell_book_age_ms,
-            buy_vol24, sell_vol24, halt_active, sample_decision,
+            entry_spread, exit_spread,
+            buy_vol24, sell_vol24, sample_decision,
             SamplingTier::DecimatedUniform, 1.0,
         )
     }
@@ -135,11 +130,8 @@ impl RawSample {
         symbol_name: impl Into<String>,
         entry_spread: f32,
         exit_spread: f32,
-        buy_book_age_ms: u32,
-        sell_book_age_ms: u32,
         buy_vol24: f64,
         sell_vol24: f64,
-        halt_active: bool,
         sample_decision: SampleDecision,
         sampling_tier: SamplingTier,
         sampling_probability: f32,
@@ -159,11 +151,8 @@ impl RawSample {
             sample_id,
             entry_spread,
             exit_spread,
-            buy_book_age_ms,
-            sell_book_age_ms,
             buy_vol24,
             sell_vol24,
-            halt_active,
             sample_decision,
             sampling_tier: sampling_tier.as_str(),
             sampling_probability,
@@ -180,9 +169,8 @@ impl RawSample {
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
                 r#""entry_spread":{},"exit_spread":{},"#,
-                r#""buy_book_age_ms":{},"sell_book_age_ms":{},"#,
                 r#""buy_vol24":{},"sell_vol24":{},"#,
-                r#""halt_active":{},"sample_decision":"{}","#,
+                r#""sample_decision":"{}","#,
                 r#""sampling_tier":"{}","sampling_probability":{}}}"#,
             ),
             self.ts_ns,
@@ -198,11 +186,8 @@ impl RawSample {
             self.route_id.sell_venue.market().as_str(),
             format_f32(self.entry_spread),
             format_f32(self.exit_spread),
-            self.buy_book_age_ms,
-            self.sell_book_age_ms,
             format_f64(self.buy_vol24),
             format_f64(self.sell_vol24),
-            self.halt_active,
             self.sample_decision.reason_label(),
             self.sampling_tier,
             format_f32(self.sampling_probability),
@@ -433,22 +418,19 @@ mod tests {
             "BTC-USDT",
             2.5,
             -0.8,
-            50,
-            80,
             1e6,
             2e6,
-            false,
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, RAW_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 3);
+        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 4);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
         assert_eq!(s.sample_id.len(), 16);
     }
 
     #[test]
-    fn json_line_is_single_line_valid_json_with_halt() {
+    fn json_line_is_single_line_valid_json_without_operational_quality_fields() {
         let s = RawSample::new(
             1_700_000_000_000_000_000,
             17,
@@ -456,12 +438,9 @@ mod tests {
             "BTC-USDT",
             2.5,
             -0.8,
-            50,
-            80,
             1e6,
             2e6,
-            true, // halt_active
-            SampleDecision::RejectHalt,
+            SampleDecision::Accept,
         );
         let line = s.to_json_line();
         assert!(!line.contains('\n'));
@@ -470,13 +449,15 @@ mod tests {
         assert_eq!(v["symbol_name"], "BTC-USDT");
         assert_eq!(v["buy_venue"], "mexc");
         assert_eq!(v["sell_venue"], "bingx");
-        assert_eq!(v["halt_active"], true);
-        assert_eq!(v["sample_decision"], "halt");
-        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["sample_decision"], "accept");
+        assert_eq!(v["schema_version"], 4);
         assert!(v["scanner_version"].is_string());
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 16);
         assert_eq!(v["sampling_tier"], "decimated_uniform");
         assert!(v["sampling_probability"].as_f64().is_some());
+        assert!(v.get("buy_book_age_ms").is_none());
+        assert!(v.get("sell_book_age_ms").is_none());
+        assert!(v.get("halt_active").is_none());
     }
 
     #[test]
@@ -485,10 +466,9 @@ mod tests {
             1, 0,
             mk_route(7, Venue::MexcFut, Venue::BingxFut),
             "ETH-USDT",
-            f32::NAN, f32::INFINITY, 50, 50,
+            f32::NAN, f32::INFINITY,
             f64::NEG_INFINITY, 1e6,
-            false,
-            SampleDecision::RejectStale,
+            SampleDecision::RejectLowVolume,
         );
         let line = s.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -649,8 +629,8 @@ mod tests {
         let r = mk_route(42, Venue::MexcFut, Venue::BingxFut);
         let s = RawSample::with_tier(
             1_700_000_000_000_000_000, 17, r, "BTC-USDT",
-            2.5, -0.8, 50, 80, 1e6, 2e6,
-            false, SampleDecision::Accept,
+            2.5, -0.8, 1e6, 2e6,
+            SampleDecision::Accept,
             SamplingTier::Allowlist, 1.0,
         );
         assert_eq!(s.sampling_tier, "allowlist");
@@ -668,7 +648,7 @@ mod tests {
         let r = mk_route(1, Venue::MexcFut, Venue::BingxFut);
         let s = RawSample::new(
             100, 1, r, "BTC-USDT",
-            2.0, -1.0, 50, 50, 1e6, 1e6, false,
+            2.0, -1.0, 1e6, 1e6,
             SampleDecision::Accept,
         );
         assert_eq!(s.sampling_tier, "decimated_uniform");

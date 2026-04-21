@@ -223,8 +223,7 @@ impl Default for RecommendationBroadcaster {
 mod tests {
     use super::*;
     use crate::ml::contract::{
-        AbstainDiagnostic, AbstainReason, CalibStatus, ReasonKind, ToxicityLevel,
-        TradeReason, TradeSetup,
+        AbstainDiagnostic, AbstainReason, CalibStatus, ReasonKind, TradeReason, TradeSetup,
     };
     use crate::types::{SymbolId, Venue};
 
@@ -245,7 +244,7 @@ mod tests {
             gross_profit_p75: 1.5, gross_profit_p90: 2.3, gross_profit_p95: 2.8,
             realization_probability: 0.77, confidence_interval: (0.70, 0.82),
             horizon_p05_s: 720, horizon_median_s: 1680, horizon_p95_s: 6000,
-            toxicity_level: ToxicityLevel::Healthy, cluster_id: None,
+            cluster_id: None,
             cluster_size: 1, cluster_rank: 1,
             haircut_predicted: 0.25, gross_profit_realizable_median: 0.75,
             calibration_status: CalibStatus::Ok,

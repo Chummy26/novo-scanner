@@ -477,7 +477,7 @@ impl Default for EconomicAccumulator {
 mod tests {
     use super::*;
     use crate::ml::contract::{
-        CalibStatus, ReasonKind, ToxicityLevel, TradeReason,
+        CalibStatus, ReasonKind, TradeReason,
     };
     use crate::types::{SymbolId, Venue};
 
@@ -506,7 +506,6 @@ mod tests {
             horizon_p05_s: 60,
             horizon_median_s: 600,
             horizon_p95_s: 3600,
-            toxicity_level: ToxicityLevel::Healthy,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,

@@ -30,10 +30,10 @@
 //! Proibido por CLAUDE.md + skill §Fronteira: fees, funding, slippage,
 //! PnL líquido, position sizing. Label só mede **lucro bruto cotado**.
 
-use crate::ml::contract::{RouteId, ToxicityLevel};
+use crate::ml::contract::RouteId;
 
 /// Versão atual do schema do LabeledTrade.
-pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 1;
+pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 2;
 
 /// Scanner version — mesma convenção dos outros schemas.
 pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -79,12 +79,8 @@ impl CensorReason {
 /// Features observadas em t0 (estado estrutural; features_t0 mínimas).
 #[derive(Debug, Clone)]
 pub struct FeaturesT0 {
-    pub buy_book_age_ms: u32,
-    pub sell_book_age_ms: u32,
     pub buy_vol24: f64,
     pub sell_vol24: f64,
-    pub toxicity_level: ToxicityLevel,
-    pub halt_active: bool,
     pub tail_ratio_p99_p95: Option<f32>,
     pub entry_p50_24h: Option<f32>,
     pub exit_p50_24h: Option<f32>,
@@ -155,12 +151,6 @@ pub struct LabeledTrade {
 impl LabeledTrade {
     /// Serializa para linha JSON (sem newline).
     pub fn to_json_line(&self) -> String {
-        let tox_label = match self.features_t0.toxicity_level {
-            ToxicityLevel::Unknown => "unknown",
-            ToxicityLevel::Healthy => "healthy",
-            ToxicityLevel::Suspicious => "suspicious",
-            ToxicityLevel::Toxic => "toxic",
-        };
         let censor_str = self
             .censor_reason
             .map(|r| format!("\"{}\"", r.as_str()))
@@ -174,9 +164,7 @@ impl LabeledTrade {
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
                 r#""entry_locked_pct":{},"exit_start_pct":{},"#,
-                r#""features_t0":{{"buy_book_age_ms":{},"sell_book_age_ms":{},"#,
-                r#""buy_vol24":{},"sell_vol24":{},"#,
-                r#""toxicity_level":"{}","halt_active":{},"#,
+                r#""features_t0":{{"buy_vol24":{},"sell_vol24":{},"#,
                 r#""tail_ratio_p99_p95":{},"entry_p50_24h":{},"exit_p50_24h":{}}},"#,
                 r#""best_exit_pct":{},"best_exit_ts_ns":{},"best_gross_pct":{},"#,
                 r#""t_to_best_s":{},"n_clean_future_samples":{},"#,
@@ -205,12 +193,8 @@ impl LabeledTrade {
             self.route_id.sell_venue.market().as_str(),
             f32_or_null(self.entry_locked_pct),
             f32_or_null(self.exit_start_pct),
-            self.features_t0.buy_book_age_ms,
-            self.features_t0.sell_book_age_ms,
             f64_or_null(self.features_t0.buy_vol24),
             f64_or_null(self.features_t0.sell_vol24),
-            tox_label,
-            self.features_t0.halt_active,
             opt_f32(self.features_t0.tail_ratio_p99_p95),
             opt_f32(self.features_t0.entry_p50_24h),
             opt_f32(self.features_t0.exit_p50_24h),
@@ -326,12 +310,8 @@ mod tests {
             entry_locked_pct: 2.5,
             exit_start_pct: -1.2,
             features_t0: FeaturesT0 {
-                buy_book_age_ms: 50,
-                sell_book_age_ms: 80,
                 buy_vol24: 1e6,
                 sell_vol24: 2e6,
-                toxicity_level: ToxicityLevel::Healthy,
-                halt_active: false,
                 tail_ratio_p99_p95: Some(1.8),
                 entry_p50_24h: Some(2.0),
                 exit_p50_24h: Some(-1.1),
@@ -375,7 +355,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["sample_id"], "abcdef0123456789");
         assert_eq!(v["horizon_s"], 900);
-        assert_eq!(v["schema_version"], 1);
+        assert_eq!(v["schema_version"], 2);
         assert_eq!(v["symbol_name"], "BTC-USDT");
         assert_eq!(v["entry_locked_pct"], 2.5);
         assert_eq!(v["outcome"], "realized");
@@ -383,6 +363,10 @@ mod tests {
         assert_eq!(v["label_floor_pct"], 0.8);
         assert_eq!(v["policy_metadata"]["baseline_model_version"], "baseline-a3-0.2.0");
         assert_eq!(v["sampling_tier"], "allowlist");
+        assert!(v["features_t0"].get("buy_book_age_ms").is_none());
+        assert!(v["features_t0"].get("sell_book_age_ms").is_none());
+        assert!(v["features_t0"].get("halt_active").is_none());
+        assert!(v["features_t0"].get("toxicity_level").is_none());
     }
 
     #[test]
@@ -428,12 +412,4 @@ mod tests {
         assert!(l.closed_ts_ns <= l.written_ts_ns);
     }
 
-    #[test]
-    fn toxicity_unknown_serializes_correctly() {
-        let mut l = mk_label();
-        l.features_t0.toxicity_level = ToxicityLevel::Unknown;
-        let line = l.to_json_line();
-        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["features_t0"]["toxicity_level"], "unknown");
-    }
 }

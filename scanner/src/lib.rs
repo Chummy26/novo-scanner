@@ -567,22 +567,14 @@ async fn run_spread_engine(
             // Sem isso, SymbolId muda entre runs e dados ficam inúteis
             // retrospectivamente.
             let symbol_name = universe.canonical_name_of(opp.symbol_id);
-            // Fix pós-auditoria: `halt_active_external=false` aqui é OK
-            // porque `MlServer::on_opportunity` computa o proxy de halt
-            // internamente via `detect_halt_proxy(buy_age, sell_age)`.
-            // Hook operacional externo (admin halts manuais) pode ser
-            // ligado via campo dedicado no futuro.
             let (rec, _dec, accepted) = ml_server.on_opportunity(
                 cycle_seq,
                 route,
                 &symbol_name,
                 opp.entry_spread as f32,
                 opp.exit_spread as f32,
-                opp.buy_book_age.min(u32::MAX as u64) as u32,
-                opp.sell_book_age.min(u32::MAX as u64) as u32,
                 opp.buy_vol24,
                 opp.sell_vol24,
-                false, // halt_active_external; interno via book_age proxy
                 now,
             );
             // Publica recomendação no canal broadcast para consumers WS /
@@ -642,11 +634,8 @@ async fn run_spread_engine(
                 &symbol_name,
                 opp.entry_spread as f32,
                 opp.exit_spread as f32,
-                opp.buy_book_age.min(u32::MAX as u64) as u32,
-                opp.sell_book_age.min(u32::MAX as u64) as u32,
                 opp.buy_vol24,
                 opp.sell_vol24,
-                false,
                 now,
             );
         }
@@ -662,7 +651,7 @@ async fn run_spread_engine(
 mod tests {
     use crate::ml::contract::{
         AbstainDiagnostic, AbstainReason, CalibStatus, ReasonKind, Recommendation,
-        RouteId, ToxicityLevel, TradeReason, TradeSetup,
+        RouteId, TradeReason, TradeSetup,
     };
     use crate::types::{SymbolId, Venue};
 
@@ -695,7 +684,6 @@ mod tests {
             horizon_p05_s: 720,
             horizon_median_s: 1680,
             horizon_p95_s: 6000,
-            toxicity_level: ToxicityLevel::Healthy,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,

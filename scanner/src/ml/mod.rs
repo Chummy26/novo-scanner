@@ -16,8 +16,8 @@
 //! - `feature_store/` — redb hot buffer + HotQueryCache + QuestDB + PIT API
 //!   (ADR-012).
 //! - `baseline/` — A3 ECDF + bootstrap emitindo `TradeSetup` (ADR-001).
-//! - `trigger.rs` — gatilho de amostragem `book_age < 200ms + min_vol24 ≥
-//!   $50k + NOT halt + entrySpread ≥ P95(24h)` (ADR-009 + ADR-014).
+//! - `trigger.rs` — gatilho de amostragem `min_vol24 ≥ $50k +
+//!   entrySpread ≥ P95(24h)` (ADR-009 + ADR-014).
 //! - `serving.rs` — A2 thread dedicada com `crossbeam::bounded(1)` +
 //!   `ArcSwap<[TradeSetup; N]>` + circuit breaker (ADR-010).
 //! - `eval/` — 5 testes CI de leakage audit (ADR-006).
@@ -52,7 +52,6 @@ pub use contract::{
     Recommendation,
     RouteId,
     TacticalSignal,
-    ToxicityLevel,
     TradeReason,
     TradeSetup,
 };

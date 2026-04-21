@@ -37,7 +37,7 @@ use ahash::AHashMap;
 use parking_lot::Mutex;
 use crate::ml::baseline::BaselineA3;
 use crate::ml::contract::{
-    AbstainDiagnostic, AbstainReason, Recommendation, RouteId, ToxicityLevel, TradeSetup,
+    AbstainDiagnostic, AbstainReason, Recommendation, RouteId, TradeSetup,
 };
 use crate::ml::eval::verify_tradesetup;
 use crate::ml::economic::{
@@ -49,7 +49,6 @@ use crate::ml::persistence::{
     RouteDecimator, RouteRanking,
 };
 use crate::ml::trigger::{SampleDecision, SamplingTrigger};
-use crate::types::Venue;
 
 /// Horizonte mínimo (ns) antes de um trade pending poder ser resolvido.
 ///
@@ -62,58 +61,6 @@ use crate::types::Venue;
 /// Default: 1 ciclo do scanner = 150 ms. Trade só pode realizar em
 /// tick posterior ao da emissão.
 pub const MIN_HORIZON_NS: u64 = 150_000_000;
-
-/// Detecta halt via book_age — proxy conservador.
-///
-/// Fix pós-auditoria: `halt_active` era hardcoded `false` em `lib.rs`,
-/// fazendo halts contaminarem o HotQueryCache com spreads anômalos.
-/// Proxy: se book_age exceder 10× o limite típico da venue, assume-se
-/// halt (WS parou de emitir, book está congelado). É defensivo:
-/// prefere over-reject que under-reject (precision-first).
-#[inline]
-pub fn detect_halt_proxy(
-    buy_venue: Venue,
-    sell_venue: Venue,
-    buy_book_age_ms: u32,
-    sell_book_age_ms: u32,
-) -> bool {
-    const HALT_MULTIPLIER: u32 = 10;
-    let buy_limit = buy_venue.max_book_age_ms().saturating_mul(HALT_MULTIPLIER);
-    let sell_limit = sell_venue.max_book_age_ms().saturating_mul(HALT_MULTIPLIER);
-    buy_book_age_ms > buy_limit || sell_book_age_ms > sell_limit
-}
-
-/// Detecta `ToxicityLevel` rudimentar a partir do book_age.
-///
-/// Fix pós-auditoria: antes, `ToxicityLevel::Healthy` era hardcoded no
-/// baseline — falso positivo estrutural. Detector MVP:
-/// - Book age ≤ limite da venue → `Healthy` (entrada legítima).
-/// - Book age entre `limite` e `3× limite` → `Suspicious` (staleness possível).
-/// - Book age > `3× limite` → `Toxic` (staleness confirmada).
-///
-/// Ref: Foucault, Kozhan & Tham 2017 RFS 30(4) "Toxic arbitrage and
-/// the design of limit order markets" — book age elevado correlaciona
-/// com adverse selection.
-#[inline]
-pub fn classify_toxicity(
-    buy_venue: Venue,
-    sell_venue: Venue,
-    buy_book_age_ms: u32,
-    sell_book_age_ms: u32,
-) -> ToxicityLevel {
-    let buy_limit = buy_venue.max_book_age_ms();
-    let sell_limit = sell_venue.max_book_age_ms();
-    let buy_ratio = (buy_book_age_ms as f32) / (buy_limit.max(1) as f32);
-    let sell_ratio = (sell_book_age_ms as f32) / (sell_limit.max(1) as f32);
-    let worst = buy_ratio.max(sell_ratio);
-    if worst > 3.0 {
-        ToxicityLevel::Toxic
-    } else if worst > 1.0 {
-        ToxicityLevel::Suspicious
-    } else {
-        ToxicityLevel::Healthy
-    }
-}
 
 // ---------------------------------------------------------------------------
 // MlServer
@@ -194,11 +141,9 @@ fn enforce_recommendation_invariants(
 pub struct ServerMetrics {
     pub opportunities_seen: AtomicU64,
     pub sample_accepts: AtomicU64,
-    pub sample_rejects_stale: AtomicU64,
     pub sample_rejects_low_volume: AtomicU64,
     pub sample_rejects_insufficient_history: AtomicU64,
     pub sample_rejects_below_tail: AtomicU64,
-    pub sample_rejects_halt: AtomicU64,
     pub rec_trade_total: AtomicU64,
     pub rec_abstain_no_opportunity: AtomicU64,
     pub rec_abstain_insufficient_data: AtomicU64,
@@ -218,13 +163,6 @@ pub struct ServerMetrics {
     pub accepted_samples_dropped_channel_full: AtomicU64,
     /// Fix pós-auditoria: AcceptedSample descartada — canal JSONL fechado.
     pub accepted_samples_dropped_channel_closed: AtomicU64,
-    /// Toxicity detector (fix pós-auditoria): rota classificada Toxic
-    /// no momento da observação (rejeita trade).
-    pub toxicity_toxic_detected: AtomicU64,
-    /// Toxicity Suspicious — emite Trade com flag warning para UI.
-    pub toxicity_suspicious_detected: AtomicU64,
-    /// Halt proxy detectado via book_age elevado (fix pós-auditoria).
-    pub halt_proxy_detected: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -479,39 +417,17 @@ impl MlServer {
         symbol_name: &str,
         entry_spread: f32,
         exit_spread: f32,
-        buy_book_age_ms: u32,
-        sell_book_age_ms: u32,
         buy_vol24_usd: f64,
         sell_vol24_usd: f64,
-        halt_active_external: bool,
         now_ns: u64,
     ) -> SampleDecision {
-        let halt_proxy = detect_halt_proxy(
-            route.buy_venue,
-            route.sell_venue,
-            buy_book_age_ms,
-            sell_book_age_ms,
-        );
-        let halt_active = halt_active_external || halt_proxy;
-
         self.listing.record_seen(route, now_ns);
-        let clean = self.trigger.is_clean_data(
-            route.buy_venue,
-            route.sell_venue,
-            buy_book_age_ms,
-            sell_book_age_ms,
-            buy_vol24_usd,
-            sell_vol24_usd,
-            halt_active,
-        );
+        let clean = self.trigger.is_clean_data(buy_vol24_usd, sell_vol24_usd);
         let sample_dec = self.trigger.evaluate(
             route,
             entry_spread,
-            buy_book_age_ms,
-            sell_book_age_ms,
             buy_vol24_usd,
             sell_vol24_usd,
-            halt_active,
             self.baseline.cache(),
         );
         self.bump_sample_metric(sample_dec);
@@ -534,11 +450,8 @@ impl MlServer {
                     symbol_name,
                     entry_spread,
                     exit_spread,
-                    buy_book_age_ms,
-                    sell_book_age_ms,
                     buy_vol24_usd,
                     sell_vol24_usd,
-                    halt_active,
                     sample_dec,
                     dr.tier,
                     dr.probability,
@@ -569,8 +482,8 @@ impl MlServer {
                 .lock()
                 .resolve_route(route, entry_spread, exit_spread, now_ns);
             // Wave V — resolvedor de LabeledTrade recebe APENAS observações
-            // limpas (correção PhD Q2: best_exit supervisionado não é
-            // contaminado por stale/halt/dirty; raw guarda tudo).
+            // com liquidez mínima; best_exit supervisionado fica no domínio
+            // de spread bruto e não recebe diagnósticos operacionais.
             if let Some(resolver) = self.label_resolver.as_ref() {
                 resolver.on_clean_observation(route, now_ns, entry_spread, exit_spread);
             }
@@ -613,86 +526,29 @@ impl MlServer {
         symbol_name: &str,
         entry_spread: f32,
         exit_spread: f32,
-        buy_book_age_ms: u32,
-        sell_book_age_ms: u32,
         buy_vol24_usd: f64,
         sell_vol24_usd: f64,
-        halt_active_external: bool,
         now_ns: u64,
     ) -> (Recommendation, SampleDecision, Option<AcceptedSample>) {
         self.metrics.opportunities_seen.fetch_add(1, Ordering::Relaxed);
-
-        // Fix pós-auditoria: halt proxy via book_age 10× — antes `lib.rs`
-        // passava `halt_active = false` hardcoded, permitindo halts
-        // contaminarem o histograma. Proxy OR externo cobre ambos os casos.
-        let halt_proxy = detect_halt_proxy(
-            route.buy_venue,
-            route.sell_venue,
-            buy_book_age_ms,
-            sell_book_age_ms,
-        );
-        let halt_active = halt_active_external || halt_proxy;
-        if halt_proxy {
-            self.metrics
-                .halt_proxy_detected
-                .fetch_add(1, Ordering::Relaxed);
-        }
-
-        // Fix pós-auditoria: classificação de toxicity explícita antes de
-        // chamar baseline. Se Toxic, baseline abstém; Suspicious emite
-        // com warning; Healthy prossegue normal. Antes era hardcoded
-        // `Healthy` — falso positivo estrutural.
-        let toxicity = classify_toxicity(
-            route.buy_venue,
-            route.sell_venue,
-            buy_book_age_ms,
-            sell_book_age_ms,
-        );
-        match toxicity {
-            ToxicityLevel::Toxic => {
-                self.metrics
-                    .toxicity_toxic_detected
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            ToxicityLevel::Suspicious => {
-                self.metrics
-                    .toxicity_suspicious_detected
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
 
         // 0. **C5** — registra lifecycle da rota (first_seen / last_seen).
         //    Anti-survivorship; alimenta feature `listing_age_days`.
         self.listing.record_seen(route, now_ns);
 
         // 1. **C2 fix** — só alimenta histograma se dado é LIMPO.
-        //    Snapshots stale/low-vol/halt NÃO devem poluir o P95 que o
+        //    Snapshots low-vol NÃO devem poluir o P95 que o
         //    próprio trigger consulta. Antes deste fix, havia dependência
         //    circular: histograma contaminado → P95 enviesado → trigger
         //    inconsistente.
-        //
-        //    Per-venue book-age threshold (C3 fix) vem via
-        //    [`Venue::max_book_age_ms`] dentro de `is_clean_data`.
-        let clean = self.trigger.is_clean_data(
-            route.buy_venue,
-            route.sell_venue,
-            buy_book_age_ms,
-            sell_book_age_ms,
-            buy_vol24_usd,
-            sell_vol24_usd,
-            halt_active,
-        );
+        let clean = self.trigger.is_clean_data(buy_vol24_usd, sell_vol24_usd);
 
         // 2. Avalia trigger de amostragem completo (inclui n_min + tail).
         let sample_dec = self.trigger.evaluate(
             route,
             entry_spread,
-            buy_book_age_ms,
-            sell_book_age_ms,
             buy_vol24_usd,
             sell_vol24_usd,
-            halt_active,
             self.baseline.cache(),
         );
         self.bump_sample_metric(sample_dec);
@@ -717,11 +573,8 @@ impl MlServer {
                     symbol_name,
                     entry_spread,
                     exit_spread,
-                    buy_book_age_ms,
-                    sell_book_age_ms,
                     buy_vol24_usd,
                     sell_vol24_usd,
-                    halt_active,
                     sample_dec,
                     dr.tier,
                     dr.probability,
@@ -750,10 +603,10 @@ impl MlServer {
             Some((dr.tier, dr.probability))
         };
 
-        // 3. Gera recomendação — agora com toxicity já classificada.
+        // 3. Gera recomendação apenas a partir dos spreads e histórico PIT.
         let rec = self
             .baseline
-            .recommend(route, entry_spread, exit_spread, now_ns, toxicity);
+            .recommend(route, entry_spread, exit_spread, now_ns);
         let n_observations = self
             .baseline
             .cache()
@@ -793,8 +646,6 @@ impl MlServer {
                 symbol_name,
                 entry_spread,
                 exit_spread,
-                buy_book_age_ms,
-                sell_book_age_ms,
                 buy_vol24_usd,
                 sell_vol24_usd,
                 sample_dec,
@@ -820,12 +671,8 @@ impl MlServer {
                     Recommendation::Abstain { .. } => (false, None, None, None),
                 };
             let features_t0 = FeaturesT0 {
-                buy_book_age_ms,
-                sell_book_age_ms,
                 buy_vol24: buy_vol24_usd,
                 sell_vol24: sell_vol24_usd,
-                toxicity_level: toxicity,
-                halt_active,
                 tail_ratio_p99_p95: None,
                 entry_p50_24h: entry_p50_pre_observe,
                 exit_p50_24h: exit_p50_pre_observe,
@@ -867,13 +714,11 @@ impl MlServer {
     fn bump_sample_metric(&self, d: SampleDecision) {
         let counter = match d {
             SampleDecision::Accept => &self.metrics.sample_accepts,
-            SampleDecision::RejectStale => &self.metrics.sample_rejects_stale,
             SampleDecision::RejectLowVolume => &self.metrics.sample_rejects_low_volume,
             SampleDecision::RejectInsufficientHistory => {
                 &self.metrics.sample_rejects_insufficient_history
             }
             SampleDecision::RejectBelowTail => &self.metrics.sample_rejects_below_tail,
-            SampleDecision::RejectHalt => &self.metrics.sample_rejects_halt,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -955,7 +800,7 @@ mod tests {
         let server = mk_server();
         let route = mk_route();
         let (rec, dec, _accepted) = server.on_opportunity(
-            0, route, "BTC-USDT", 2.5, -0.8, 50, 50, 1e6, 1e6, false, 1,
+            0, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6, 1,
         );
         use crate::ml::contract::AbstainReason;
         match rec {
@@ -980,11 +825,8 @@ mod tests {
                 "BTC-USDT",
                 0.1 + i as f32 * 0.01,
                 -0.8,
-                50,
-                50,
                 1e6,
                 1e6,
-                false,
                 1_000_000_000 + i as u64,
             );
             assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
@@ -1004,7 +846,7 @@ mod tests {
         let server = mk_server_with_min_history(1);
         let route = mk_route();
         let (rec, dec, accepted) = server.on_opportunity(
-            0, route, "BTC-USDT", 3.2, -0.4, 50, 50, 1e6, 1e6, false, 1,
+            0, route, "BTC-USDT", 3.2, -0.4, 1e6, 1e6, 1,
         );
         match rec {
             Recommendation::Abstain { reason, .. } => {
@@ -1023,7 +865,7 @@ mod tests {
         // 10 observações — todas rejeitadas (insufficient).
         for i in 0..10 {
             server.on_opportunity(
-                i as u32, route, "BTC-USDT", 2.5, -0.8, 50, 50, 1e6, 1e6, false, i,
+                i as u32, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6, i,
             );
         }
         let m = server.metrics();
@@ -1034,7 +876,7 @@ mod tests {
 
     fn mk_invalid_setup() -> crate::ml::contract::TradeSetup {
         use crate::ml::contract::{
-            CalibStatus, ReasonKind, TradeReason, ToxicityLevel, TradeSetup,
+            CalibStatus, ReasonKind, TradeReason, TradeSetup,
         };
 
         let mut setup = TradeSetup {
@@ -1057,7 +899,6 @@ mod tests {
             horizon_p05_s: 60,
             horizon_median_s: 600,
             horizon_p95_s: 3600,
-            toxicity_level: ToxicityLevel::Healthy,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
@@ -1107,17 +948,14 @@ mod tests {
                 "BTC-USDT",
                 2.0 + t * 2.0,
                 -1.0 + t * 1.5,
-                50,
-                50,
                 1e6,
                 1e6,
-                false,
                 i,
             );
         }
         // Agora tenta emitir com current_entry alto.
         let (rec, _, _) = server.on_opportunity(
-            201, route, "BTC-USDT", 3.8, 0.2, 50, 50, 1e6, 1e6, false, 201,
+            201, route, "BTC-USDT", 3.8, 0.2, 1e6, 1e6, 201,
         );
         match rec {
             Recommendation::Trade(setup) => {
@@ -1128,24 +966,6 @@ mod tests {
                 panic!("expected Trade, got Abstain({:?})", reason);
             }
         }
-    }
-
-    #[test]
-    fn halt_rejects_sample_even_with_good_spread() {
-        let server = mk_server();
-        let route = mk_route();
-        // Popula histórico suficiente.
-        for i in 0..200 {
-            server.on_opportunity(
-                i as u32, route, "BTC-USDT", 2.0, -1.0, 50, 50, 1e6, 1e6, false, i,
-            );
-        }
-        // Spread alto, mas halt_active=true → sample rejeitado.
-        let (_rec, dec, accepted) = server.on_opportunity(
-            201, route, "BTC-USDT", 3.5, -0.5, 50, 50, 1e6, 1e6, true, 201,
-        );
-        assert!(accepted.is_none(), "halt não gera AcceptedSample");
-        assert_eq!(dec, SampleDecision::RejectHalt);
     }
 
     #[test]
@@ -1164,13 +984,13 @@ mod tests {
 
         // Tick 0: populate cache (entry=3.0, exit=0.5 → gross=3.5, bem acima do floor).
         let (_rec, dec, _) = server.on_opportunity(
-            0, route, "BTC-USDT", 3.0, 0.5, 50, 50, 1e6, 1e6, false, t0,
+            0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0,
         );
         assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
 
         // Tick 1: agora cache tem 1 sample ≥ n_min. Emite Trade.
         let (rec, _dec, _accepted) = server.on_opportunity(
-            1, route, "BTC-USDT", 3.0, 0.5, 50, 50, 1e6, 1e6, false, t1,
+            1, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t1,
         );
         let setup = match rec {
             Recommendation::Trade(s) => s,
@@ -1184,7 +1004,7 @@ mod tests {
         assert!(setup.exit_at_min <= 0.5 + 0.01);
 
         let (_rec, _dec, _accepted) = server.on_opportunity(
-            2, route, "BTC-USDT", 3.0, 0.5, 50, 50, 1e6, 1e6, false, t2,
+            2, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t2,
         );
 
         let econ = server.economic_metrics();
@@ -1206,12 +1026,12 @@ mod tests {
 
         // Primeiro popula cache.
         let _ = server.on_opportunity(
-            0, route, "BTC-USDT", 3.0, 0.5, 50, 50, 1e6, 1e6, false, t0,
+            0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0,
         );
 
         // Tick de emissão: entry E exit já favoráveis no MESMO tick.
         let (rec, _, _) = server.on_opportunity(
-            1, route, "BTC-USDT", 3.5, 0.5, 50, 50, 1e6, 1e6, false, t_emit,
+            1, route, "BTC-USDT", 3.5, 0.5, 1e6, 1e6, t_emit,
         );
         assert!(matches!(rec, Recommendation::Trade(_)),
                 "cache populado deve emitir Trade no 2º tick");
@@ -1252,7 +1072,7 @@ mod tests {
         // (n_min=100), mas todas devem aparecer no RawSample dataset.
         for i in 0..50 {
             server.on_opportunity(
-                i as u32, route, "BTC-USDT", 2.5, -0.8, 50, 50, 1e6, 1e6, false,
+                i as u32, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6,
                 1_745_159_400u64 * 1_000_000_000 + i as u64,
             );
         }
@@ -1319,7 +1139,7 @@ mod tests {
         // Observação que o trigger sinaliza RejectInsufficientHistory
         // (sem histórico acumulado).
         let (_, sample_dec, _) = server.on_opportunity(
-            0, route, "BTC-USDT", 2.5, -0.8, 50, 50, 1e6, 1e6, false,
+            0, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6,
             1_745_159_400u64 * 1_000_000_000,
         );
         assert_eq!(sample_dec, SampleDecision::RejectInsufficientHistory);
@@ -1370,18 +1190,15 @@ mod tests {
         let server = mk_server_with_min_history(2);
         let route = mk_route();
         let t0 = 1_745_159_400u64 * 1_000_000_000;
-        server.on_opportunity(0, route, "BTC-USDT", 1.0, -1.0, 50, 50, 1e6, 1e6, false, t0);
+        server.on_opportunity(0, route, "BTC-USDT", 1.0, -1.0, 1e6, 1e6, t0);
         server.on_opportunity(
             1,
             route,
             "BTC-USDT",
             9.0,
             2.0,
-            50,
-            50,
             1e6,
             1e6,
-            false,
             t0 + 1,
         );
         let pre_entry_p50 = server.baseline.cache().quantile_entry(route, 0.50).unwrap();
@@ -1396,11 +1213,8 @@ mod tests {
             "BTC-USDT",
             9.0,
             2.5,
-            50,
-            50,
             1e6,
             1e6,
-            false,
             t0 + 2_000_000_000,
         );
         assert_eq!(dec, SampleDecision::Accept);

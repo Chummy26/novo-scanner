@@ -10,35 +10,31 @@
 //! brutos**. Treinar em dados brutos é:
 //! - Caro (dataset gigante).
 //! - Ruidoso (maioria é "não-oportunidade" trivial; modelo aprende o óbvio).
-//! - Contaminado por qualidade de dado ruim (stale, rota ilíquida).
+//! - Contaminado por rotas ilíquidas.
 //!
 //! O trigger filtra para manter apenas snapshots **operacionalmente
 //! relevantes** — aqueles que passam critérios mínimos de qualidade e
 //! estão na cauda superior da distribuição da rota.
 //!
-//! # Quatro gates (ordenados por custo ascendente)
+//! # Três gates (ordenados por custo ascendente)
 //!
-//! 1. **Book freshness** (`buy_book_age < 200ms` AND `sell_book_age < 200ms`)
-//!    — book velho = staleness, rota possivelmente em halt.
-//! 2. **Min volume** (`min(vol24) ≥ $50k USD`) — rota ilíquida não é
+//! 1. **Min volume** (`min(vol24) ≥ $50k USD`) — rota ilíquida não é
 //!    operacionalmente interessante (T11 execution feasibility).
-//! 3. **Historical sufficiency** (`n_observations ≥ 500` por rota) —
+//! 2. **Historical sufficiency** (`n_observations ≥ 500` por rota) —
 //!    sem histórico, percentil p95 é mal estimado.
-//! 4. **Tail quality** (`entry_spread ≥ P95(rota, 24h)`) — apenas cauda
+//! 3. **Tail quality** (`entry_spread ≥ P95(rota, 24h)`) — apenas cauda
 //!    superior é oportunidade; resto é regime normal.
 //!
 //! Gates 3–4 dependem de `HotQueryCache` (ADR-012 Camada 1b).
 //!
 //! # Correção ADR-014 aplicada
 //!
-//! `book_age`, `vol24` e `halt_active` vivem aqui como **filtros de
-//! trigger**, não como features do modelo. A amostra só entra no dataset
-//! após passar os gates; modelo A2 não precisa aprender "rota ilíquida
-//! = ignorar" (é decidido antes).
+//! `book_age`, `halt_active` e `toxicity_level` são diagnósticos operacionais,
+//! não features ou filtros do ML/dataset. O trigger conserva apenas filtros
+//! diretamente ligados à oportunidade bruta: liquidez, histórico e cauda.
 
 use crate::ml::contract::RouteId;
 use crate::ml::feature_store::HotQueryCache;
-use crate::types::Venue;
 
 // ---------------------------------------------------------------------------
 // Configuração
@@ -46,16 +42,8 @@ use crate::types::Venue;
 
 /// Parâmetros do trigger. Defaults de `DECISIONS_APPROVED.md` Tema B.
 ///
-/// A partir de Fase 0 (Ação C3), `max_book_age_ms` funciona como **teto
-/// global opcional** aplicado sobre o threshold per-venue de
-/// [`Venue::max_book_age_ms`]. Uso típico: default `u32::MAX` (sem override),
-/// deixando venue decidir; operador pode apertar via CLI.
 #[derive(Debug, Clone, Copy)]
 pub struct SamplingConfig {
-    /// Teto global para book age (ms). Default `u32::MAX` = desabilitado
-    /// (usa apenas per-venue). Se ajustado via CLI, aplicado como `min`
-    /// com o threshold per-venue.
-    pub max_book_age_ms: u32,
     /// Volume 24h mínimo USD por perna (default 50_000).
     pub min_vol24_usd: f64,
     /// Quantil histórico que o spread atual deve superar (default 0.95).
@@ -67,7 +55,6 @@ pub struct SamplingConfig {
 impl Default for SamplingConfig {
     fn default() -> Self {
         Self {
-            max_book_age_ms: u32::MAX, // desabilitado — use per-venue
             min_vol24_usd: 50_000.0,
             tail_quantile: 0.95,
             n_min: 500,
@@ -89,16 +76,12 @@ impl Default for SamplingConfig {
 pub enum SampleDecision {
     /// Snapshot passou todos os gates — entra no dataset.
     Accept,
-    /// `buy_book_age` ou `sell_book_age` excedeu `max_book_age_ms`.
-    RejectStale,
     /// `min(buy_vol24, sell_vol24) < min_vol24_usd`.
     RejectLowVolume,
     /// `n_observations < n_min` — sem p95 confiável.
     RejectInsufficientHistory,
     /// `entry_spread < P95(rota, histórico)` — não é cauda superior.
     RejectBelowTail,
-    /// Halt explícito sinalizado pelo scanner (flag externo).
-    RejectHalt,
 }
 
 impl SampleDecision {
@@ -106,11 +89,9 @@ impl SampleDecision {
     pub fn reason_label(self) -> &'static str {
         match self {
             Self::Accept => "accept",
-            Self::RejectStale => "stale",
             Self::RejectLowVolume => "low_volume",
             Self::RejectInsufficientHistory => "insufficient_history",
             Self::RejectBelowTail => "below_tail",
-            Self::RejectHalt => "halt",
         }
     }
 
@@ -144,38 +125,13 @@ impl SamplingTrigger {
         self.cfg
     }
 
-    /// Gate de **qualidade do dado bruto** — halt + book freshness + volume.
+    /// Gate mínimo para alimentar o `HotQueryCache`.
     ///
-    /// Retorna `true` se o snapshot é limpo o suficiente para **alimentar o
-    /// HotQueryCache** (entra no histograma usado para calcular P95).
-    ///
-    /// Importante (C2 fix — ordem): este gate deve ser chamado **antes**
-    /// de `cache.observe(...)`, caso contrário snapshots stale/low-vol
-    /// contaminam o P95 que o próprio trigger consulta depois (dependência
-    /// circular). Fase 0 corrige a ordem em `MlServer::on_opportunity`.
-    ///
-    /// Per-venue book-age thresholds (C3 fix): usa
-    /// [`Venue::max_book_age_ms`] em vez de threshold universal 200ms,
-    /// capado opcionalmente por `cfg.max_book_age_ms`.
+    /// `book_age` e `halt` ficam fora do ML/dataset. Aqui filtramos apenas
+    /// liquidez mínima para evitar rotas economicamente irrelevantes no
+    /// histórico usado para quantis de spread.
     #[inline]
-    pub fn is_clean_data(
-        &self,
-        buy_venue: Venue,
-        sell_venue: Venue,
-        buy_book_age_ms: u32,
-        sell_book_age_ms: u32,
-        buy_vol24_usd: f64,
-        sell_vol24_usd: f64,
-        halt_active: bool,
-    ) -> bool {
-        if halt_active {
-            return false;
-        }
-        let buy_limit = buy_venue.max_book_age_ms().min(self.cfg.max_book_age_ms);
-        let sell_limit = sell_venue.max_book_age_ms().min(self.cfg.max_book_age_ms);
-        if buy_book_age_ms > buy_limit || sell_book_age_ms > sell_limit {
-            return false;
-        }
+    pub fn is_clean_data(&self, buy_vol24_usd: f64, sell_vol24_usd: f64) -> bool {
         if buy_vol24_usd < self.cfg.min_vol24_usd
             || sell_vol24_usd < self.cfg.min_vol24_usd
         {
@@ -184,11 +140,7 @@ impl SamplingTrigger {
         true
     }
 
-    /// Aplica os 4 gates e classifica o snapshot com `SampleDecision`.
-    ///
-    /// `halt_active` é flag explícito (venue em halt sinalizado fora do
-    /// scanner — futuro hook de monitoramento operacional; MVP passa
-    /// `false`).
+    /// Aplica os gates e classifica o snapshot com `SampleDecision`.
     ///
     /// Ordem dos checks maximiza short-circuit: gates baratos (primitives)
     /// antes de lookups no cache.
@@ -196,39 +148,24 @@ impl SamplingTrigger {
         &self,
         route: RouteId,
         entry_spread: f32,
-        buy_book_age_ms: u32,
-        sell_book_age_ms: u32,
         buy_vol24_usd: f64,
         sell_vol24_usd: f64,
-        halt_active: bool,
         cache: &HotQueryCache,
     ) -> SampleDecision {
-        // Gate 0 — halt explícito (mais barato: flag booleana).
-        if halt_active {
-            return SampleDecision::RejectHalt;
-        }
-
-        // Gate 1 — book freshness per-venue (C3 fix).
-        let buy_limit = route.buy_venue.max_book_age_ms().min(self.cfg.max_book_age_ms);
-        let sell_limit = route.sell_venue.max_book_age_ms().min(self.cfg.max_book_age_ms);
-        if buy_book_age_ms > buy_limit || sell_book_age_ms > sell_limit {
-            return SampleDecision::RejectStale;
-        }
-
-        // Gate 2 — volume mínimo (evita rotas ilíquidas cedo).
+        // Gate 1 — volume mínimo (evita rotas ilíquidas cedo).
         if buy_vol24_usd < self.cfg.min_vol24_usd
             || sell_vol24_usd < self.cfg.min_vol24_usd
         {
             return SampleDecision::RejectLowVolume;
         }
 
-        // Gate 3 — histórico suficiente no cache.
+        // Gate 2 — histórico suficiente no cache.
         let n = cache.n_observations(route);
         if n < self.cfg.n_min {
             return SampleDecision::RejectInsufficientHistory;
         }
 
-        // Gate 4 — cauda superior.
+        // Gate 3 — cauda superior.
         let p_tail = match cache.quantile_entry(route, self.cfg.tail_quantile) {
             Some(v) => v,
             None => return SampleDecision::RejectInsufficientHistory,
@@ -272,68 +209,10 @@ mod tests {
     }
 
     #[test]
-    fn reject_halt_first() {
-        let cache = mk_cache();
+    fn is_clean_data_checks_only_liquidity_for_ml() {
         let trig = SamplingTrigger::with_defaults();
-        let route = mk_route();
-        // Tudo OK exceto halt — ainda rejeita.
-        populate(&cache, route, 1000);
-        let d = trig.evaluate(route, 2.9, 50, 50, 1e6, 1e6, true, &cache);
-        assert_eq!(d, SampleDecision::RejectHalt);
-    }
-
-    #[test]
-    fn reject_stale_on_buy_leg() {
-        // MexcFut limit = 500ms; 800 > 500 = stale
-        let cache = mk_cache();
-        let trig = SamplingTrigger::with_defaults();
-        let route = mk_route();
-        let d = trig.evaluate(route, 2.9, 800, 50, 1e6, 1e6, false, &cache);
-        assert_eq!(d, SampleDecision::RejectStale);
-    }
-
-    #[test]
-    fn reject_stale_on_sell_leg() {
-        // BingxFut limit = 2000ms; 2500 > 2000 = stale
-        let cache = mk_cache();
-        let trig = SamplingTrigger::with_defaults();
-        let route = mk_route();
-        let d = trig.evaluate(route, 2.9, 50, 2500, 1e6, 1e6, false, &cache);
-        assert_eq!(d, SampleDecision::RejectStale);
-    }
-
-    #[test]
-    fn is_clean_data_composites_all_gates() {
-        let trig = SamplingTrigger::with_defaults();
-        // Tudo OK — aceito.
-        assert!(trig.is_clean_data(
-            Venue::MexcFut, Venue::BingxFut, 50, 50, 1e6, 1e6, false
-        ));
-        // Halt — não limpo.
-        assert!(!trig.is_clean_data(
-            Venue::MexcFut, Venue::BingxFut, 50, 50, 1e6, 1e6, true
-        ));
-        // Book age MEXC 600 > 500 limit — não limpo.
-        assert!(!trig.is_clean_data(
-            Venue::MexcFut, Venue::BingxFut, 600, 50, 1e6, 1e6, false
-        ));
-        // Book age BingX 1500 < 2000 limit — ok.
-        assert!(trig.is_clean_data(
-            Venue::MexcFut, Venue::BingxFut, 50, 1500, 1e6, 1e6, false
-        ));
-        // Low volume — não limpo.
-        assert!(!trig.is_clean_data(
-            Venue::MexcFut, Venue::BingxFut, 50, 50, 10_000.0, 1e6, false
-        ));
-    }
-
-    #[test]
-    fn per_venue_book_age_distinct() {
-        // Venues diferentes têm limites distintos.
-        assert_eq!(Venue::BinanceSpot.max_book_age_ms(), 100);
-        assert_eq!(Venue::MexcFut.max_book_age_ms(), 500);
-        assert_eq!(Venue::BingxFut.max_book_age_ms(), 2000);
-        assert_eq!(Venue::GateSpot.max_book_age_ms(), 1000);
+        assert!(trig.is_clean_data(1e6, 1e6));
+        assert!(!trig.is_clean_data(10_000.0, 1e6));
     }
 
     #[test]
@@ -342,7 +221,7 @@ mod tests {
         let trig = SamplingTrigger::with_defaults();
         let route = mk_route();
         // 10k < 50k threshold.
-        let d = trig.evaluate(route, 2.9, 50, 50, 10_000.0, 1e6, false, &cache);
+        let d = trig.evaluate(route, 2.9, 10_000.0, 1e6, &cache);
         assert_eq!(d, SampleDecision::RejectLowVolume);
     }
 
@@ -352,7 +231,7 @@ mod tests {
         let trig = SamplingTrigger::with_defaults();
         let route = mk_route();
         populate(&cache, route, 100); // < n_min=500
-        let d = trig.evaluate(route, 2.9, 50, 50, 1e6, 1e6, false, &cache);
+        let d = trig.evaluate(route, 2.9, 1e6, 1e6, &cache);
         assert_eq!(d, SampleDecision::RejectInsufficientHistory);
     }
 
@@ -363,7 +242,7 @@ mod tests {
         let route = mk_route();
         populate(&cache, route, 1000);
         // p95 ≈ 2.9; current 1.5 bem abaixo.
-        let d = trig.evaluate(route, 1.5, 50, 50, 1e6, 1e6, false, &cache);
+        let d = trig.evaluate(route, 1.5, 1e6, 1e6, &cache);
         assert_eq!(d, SampleDecision::RejectBelowTail);
     }
 
@@ -373,8 +252,8 @@ mod tests {
         let trig = SamplingTrigger::with_defaults();
         let route = mk_route();
         populate(&cache, route, 1000);
-        // 3.0 > p95≈2.9, volume 1M, book fresh — aceito.
-        let d = trig.evaluate(route, 3.0, 50, 50, 1e6, 1e6, false, &cache);
+        // 3.0 > p95≈2.9 e volume 1M — aceito.
+        let d = trig.evaluate(route, 3.0, 1e6, 1e6, &cache);
         assert_eq!(d, SampleDecision::Accept);
     }
 
@@ -382,13 +261,11 @@ mod tests {
     fn reason_labels_stable() {
         // Labels são contratos com Prometheus — não devem mudar sem warning.
         assert_eq!(SampleDecision::Accept.reason_label(), "accept");
-        assert_eq!(SampleDecision::RejectStale.reason_label(), "stale");
         assert_eq!(SampleDecision::RejectLowVolume.reason_label(), "low_volume");
         assert_eq!(
             SampleDecision::RejectInsufficientHistory.reason_label(),
             "insufficient_history"
         );
         assert_eq!(SampleDecision::RejectBelowTail.reason_label(), "below_tail");
-        assert_eq!(SampleDecision::RejectHalt.reason_label(), "halt");
     }
 }

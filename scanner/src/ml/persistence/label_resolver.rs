@@ -553,7 +553,6 @@ impl LabelOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ml::contract::ToxicityLevel;
     use crate::ml::persistence::labeled_writer::{LabeledJsonlWriter, LabeledWriterConfig};
     use crate::types::{SymbolId, Venue};
     use std::time::Duration;
@@ -569,12 +568,8 @@ mod tests {
 
     fn mk_features() -> FeaturesT0 {
         FeaturesT0 {
-            buy_book_age_ms: 50,
-            sell_book_age_ms: 80,
             buy_vol24: 1e6,
             sell_vol24: 2e6,
-            toxicity_level: ToxicityLevel::Healthy,
-            halt_active: false,
             tail_ratio_p99_p95: None,
             entry_p50_24h: None,
             exit_p50_24h: None,

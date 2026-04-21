@@ -66,8 +66,6 @@ pub struct MlPrometheusMetrics {
     // Wave U (pós-auditoria 2026-04-21).
     accepted_samples_dropped_total: IntCounterVec,
     rec_invariant_blocked_total: IntCounter,
-    toxicity_detected_total: IntCounterVec,
-    halt_proxy_detected_total: IntCounter,
     calibration_ece: Gauge,
     calibration_observations: IntGauge,
 
@@ -103,11 +101,9 @@ struct ResolverSnapshot {
 struct ServerMetricsSnapshot {
     opportunities_seen: u64,
     sample_accepts: u64,
-    sample_rejects_stale: u64,
     sample_rejects_low_volume: u64,
     sample_rejects_insufficient_history: u64,
     sample_rejects_below_tail: u64,
-    sample_rejects_halt: u64,
     rec_trade_total: u64,
     rec_abstain_no_opportunity: u64,
     rec_abstain_insufficient_data: u64,
@@ -120,9 +116,6 @@ struct ServerMetricsSnapshot {
     rec_invariant_blocked: u64,
     accepted_samples_dropped_channel_full: u64,
     accepted_samples_dropped_channel_closed: u64,
-    toxicity_toxic_detected: u64,
-    toxicity_suspicious_detected: u64,
-    halt_proxy_detected: u64,
 }
 
 #[derive(Default)]
@@ -236,17 +229,6 @@ impl MlPrometheusMetrics {
             "ml_rec_invariant_blocked_total",
             "TradeSetup bloqueado pelo verificador de invariantes (downgrade para Abstain)",
         ))?;
-        let toxicity_detected_total = IntCounterVec::new(
-            Opts::new(
-                "ml_toxicity_detected_total",
-                "Classificação de toxicity por observação (Suspicious/Toxic)",
-            ),
-            &["level"],
-        )?;
-        let halt_proxy_detected_total = IntCounter::with_opts(Opts::new(
-            "ml_halt_proxy_detected_total",
-            "Halt proxy detectado via book_age 10× (fix pós-auditoria)",
-        ))?;
         let calibration_ece = Gauge::with_opts(Opts::new(
             "ml_calibration_ece",
             "Expected Calibration Error em [0,1] — meta CLAUDE.md: < 0.10",
@@ -304,8 +286,6 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(broadcaster_lagged_frames_total.clone()))?;
         registry.register(Box::new(accepted_samples_dropped_total.clone()))?;
         registry.register(Box::new(rec_invariant_blocked_total.clone()))?;
-        registry.register(Box::new(toxicity_detected_total.clone()))?;
-        registry.register(Box::new(halt_proxy_detected_total.clone()))?;
         registry.register(Box::new(calibration_ece.clone()))?;
         registry.register(Box::new(calibration_observations.clone()))?;
         // Wave V
@@ -320,14 +300,7 @@ impl MlPrometheusMetrics {
         // desde o primeiro scrape Prometheus, mesmo sem incrementos ainda.
         // Dashboards Grafana funcionam com `rate()` / `increase()` e
         // precisam das séries existirem (mesmo que com valor 0).
-        for reason in &[
-            "accept",
-            "stale",
-            "low_volume",
-            "insufficient_history",
-            "below_tail",
-            "halt",
-        ] {
+        for reason in &["accept", "low_volume", "insufficient_history", "below_tail"] {
             sample_decisions_total
                 .with_label_values(&[reason])
                 .inc_by(0);
@@ -357,9 +330,6 @@ impl MlPrometheusMetrics {
                 .with_label_values(&[reason])
                 .inc_by(0);
         }
-        for level in &["suspicious", "toxic"] {
-            toxicity_detected_total.with_label_values(&[level]).inc_by(0);
-        }
         // Wave V pre-touch.
         for outcome in &["realized", "miss", "censored"] {
             labels_written_total
@@ -388,8 +358,6 @@ impl MlPrometheusMetrics {
             broadcaster_lagged_frames_total,
             accepted_samples_dropped_total,
             rec_invariant_blocked_total,
-            toxicity_detected_total,
-            halt_proxy_detected_total,
             calibration_ece,
             calibration_observations,
             labels_created_total,
@@ -436,9 +404,6 @@ impl MlPrometheusMetrics {
             .with_label_values(&["accept"])
             .inc_by(diff!(sample_accepts));
         self.sample_decisions_total
-            .with_label_values(&["stale"])
-            .inc_by(diff!(sample_rejects_stale));
-        self.sample_decisions_total
             .with_label_values(&["low_volume"])
             .inc_by(diff!(sample_rejects_low_volume));
         self.sample_decisions_total
@@ -447,9 +412,6 @@ impl MlPrometheusMetrics {
         self.sample_decisions_total
             .with_label_values(&["below_tail"])
             .inc_by(diff!(sample_rejects_below_tail));
-        self.sample_decisions_total
-            .with_label_values(&["halt"])
-            .inc_by(diff!(sample_rejects_halt));
 
         self.recommendations_total
             .with_label_values(&["trade"])
@@ -488,14 +450,6 @@ impl MlPrometheusMetrics {
         self.accepted_samples_dropped_total
             .with_label_values(&["channel_closed"])
             .inc_by(diff!(accepted_samples_dropped_channel_closed));
-        self.toxicity_detected_total
-            .with_label_values(&["suspicious"])
-            .inc_by(diff!(toxicity_suspicious_detected));
-        self.toxicity_detected_total
-            .with_label_values(&["toxic"])
-            .inc_by(diff!(toxicity_toxic_detected));
-        self.halt_proxy_detected_total.inc_by(diff!(halt_proxy_detected));
-
         let economic = server.economic_metrics();
         self.update_from_economic(&economic);
 
@@ -660,13 +614,11 @@ fn snapshot(m: &Arc<ServerMetrics>) -> ServerMetricsSnapshot {
     ServerMetricsSnapshot {
         opportunities_seen: m.opportunities_seen.load(Ordering::Relaxed),
         sample_accepts: m.sample_accepts.load(Ordering::Relaxed),
-        sample_rejects_stale: m.sample_rejects_stale.load(Ordering::Relaxed),
         sample_rejects_low_volume: m.sample_rejects_low_volume.load(Ordering::Relaxed),
         sample_rejects_insufficient_history: m
             .sample_rejects_insufficient_history
             .load(Ordering::Relaxed),
         sample_rejects_below_tail: m.sample_rejects_below_tail.load(Ordering::Relaxed),
-        sample_rejects_halt: m.sample_rejects_halt.load(Ordering::Relaxed),
         rec_trade_total: m.rec_trade_total.load(Ordering::Relaxed),
         rec_abstain_no_opportunity: m.rec_abstain_no_opportunity.load(Ordering::Relaxed),
         rec_abstain_insufficient_data: m.rec_abstain_insufficient_data.load(Ordering::Relaxed),
@@ -687,9 +639,6 @@ fn snapshot(m: &Arc<ServerMetrics>) -> ServerMetricsSnapshot {
         accepted_samples_dropped_channel_closed: m
             .accepted_samples_dropped_channel_closed
             .load(Ordering::Relaxed),
-        toxicity_toxic_detected: m.toxicity_toxic_detected.load(Ordering::Relaxed),
-        toxicity_suspicious_detected: m.toxicity_suspicious_detected.load(Ordering::Relaxed),
-        halt_proxy_detected: m.halt_proxy_detected.load(Ordering::Relaxed),
     }
 }
 
@@ -756,7 +705,7 @@ mod tests {
             sell_venue: Venue::BingxFut,
         };
         for i in 0..5 {
-            server.on_opportunity(i as u32, route, "BTC-USDT", 2.5, -0.8, 50, 50, 1e6, 1e6, false, i);
+            server.on_opportunity(i as u32, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6, i);
         }
         m.update_from_server(&server);
         assert_eq!(m.opportunities_seen_total.get(), 5);
@@ -778,7 +727,7 @@ mod tests {
             buy_venue: Venue::MexcFut,
             sell_venue: Venue::BingxFut,
         };
-        server.on_opportunity(0, route, "BTC-USDT", 2.5, -0.8, 50, 50, 1e6, 1e6, false, 1);
+        server.on_opportunity(0, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6, 1);
         m.update_from_server(&server);
         let before = m.opportunities_seen_total.get();
         // Chamar de novo sem nova observação — delta 0.
@@ -791,7 +740,7 @@ mod tests {
     async fn runtime_update_includes_broadcaster_counters() {
         use crate::ml::broadcast::RecommendationBroadcaster;
         use crate::ml::contract::{
-            CalibStatus, ReasonKind, Recommendation, ToxicityLevel, TradeReason, TradeSetup,
+            CalibStatus, ReasonKind, Recommendation, TradeReason, TradeSetup,
         };
 
         let registry = Registry::new();
@@ -824,7 +773,6 @@ mod tests {
             horizon_p05_s: 720,
             horizon_median_s: 1680,
             horizon_p95_s: 6000,
-            toxicity_level: ToxicityLevel::Healthy,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,

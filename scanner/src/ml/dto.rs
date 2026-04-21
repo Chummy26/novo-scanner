@@ -11,8 +11,7 @@ use serde::Serialize;
 
 use crate::ml::contract::{
     AbstainDiagnostic, AbstainReason, CalibStatus, EntryQuality, ExitQuality,
-    ReasonKind, Recommendation, RouteId, TacticalSignal, ToxicityLevel,
-    TradeSetup,
+    ReasonKind, Recommendation, RouteId, TacticalSignal, TradeSetup,
 };
 
 // ---------------------------------------------------------------------------
@@ -106,7 +105,6 @@ pub struct TradeSetupDto {
     pub horizon_median_s: u32,
     pub horizon_p95_s: u32,
 
-    pub toxicity_level: &'static str,
     pub cluster_id: Option<u32>,
     pub cluster_size: u8,
     pub cluster_rank: u8,
@@ -146,12 +144,6 @@ impl From<&TradeSetup> for TradeSetupDto {
             horizon_p05_s: s.horizon_p05_s,
             horizon_median_s: s.horizon_median_s,
             horizon_p95_s: s.horizon_p95_s,
-            toxicity_level: match s.toxicity_level {
-                ToxicityLevel::Unknown => "unknown",
-                ToxicityLevel::Healthy => "healthy",
-                ToxicityLevel::Suspicious => "suspicious",
-                ToxicityLevel::Toxic => "toxic",
-            },
             cluster_id: s.cluster_id,
             cluster_size: s.cluster_size,
             cluster_rank: s.cluster_rank,
@@ -311,7 +303,6 @@ mod tests {
             horizon_p05_s: 720,
             horizon_median_s: 1680,
             horizon_p95_s: 6000,
-            toxicity_level: ToxicityLevel::Healthy,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
@@ -337,7 +328,7 @@ mod tests {
         assert_eq!(v["route_id"]["symbol_id"], 42);
         assert_eq!(v["route_id"]["buy_venue"], "mexc");
         assert_eq!(v["route_id"]["buy_market"], "FUTURES");
-        assert_eq!(v["toxicity_level"], "healthy");
+        assert!(v.get("toxicity_level").is_none());
         assert_eq!(v["calibration_status"], "ok");
         assert_eq!(v["reason_kind"], "combined");
         assert_eq!(v["enter_at_min"], 1.8);
@@ -373,21 +364,6 @@ mod tests {
         assert_eq!(v["kind"], "abstain");
         assert_eq!(v["reason"], "low_confidence");
         assert_eq!(v["diagnostic"]["n_observations"], 800);
-    }
-
-    #[test]
-    fn all_toxicity_levels_serialize_to_distinct_labels() {
-        for (level, label) in [
-            (ToxicityLevel::Unknown, "unknown"),
-            (ToxicityLevel::Healthy, "healthy"),
-            (ToxicityLevel::Suspicious, "suspicious"),
-            (ToxicityLevel::Toxic, "toxic"),
-        ] {
-            let mut s = mk_setup();
-            s.toxicity_level = level;
-            let dto: TradeSetupDto = (&s).into();
-            assert_eq!(dto.toxicity_level, label);
-        }
     }
 
     #[test]

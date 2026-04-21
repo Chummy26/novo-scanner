@@ -253,14 +253,14 @@ mod tests {
         // Hora 14.
         let s1 = RawSample::new(
             1_745_159_400u64 * 1_000_000_000,
-            0, route, "BTC-USDT", 2.0, -1.0, 50, 50, 1e6, 1e6,
-            false, SampleDecision::Accept,
+            0, route, "BTC-USDT", 2.0, -1.0, 1e6, 1e6,
+            SampleDecision::Accept,
         );
         // Hora 15.
         let s2 = RawSample::new(
             1_745_161_200u64 * 1_000_000_000,
-            1, route, "BTC-USDT", 2.1, -1.1, 50, 50, 1e6, 1e6,
-            true, SampleDecision::RejectHalt,
+            1, route, "BTC-USDT", 2.1, -1.1, 1e6, 1e6,
+            SampleDecision::RejectBelowTail,
         );
         handle.try_send(s1).expect("send s1");
         handle.try_send(s2).expect("send s2");
@@ -279,7 +279,7 @@ mod tests {
         let lines: Vec<_> = content.lines().collect();
         assert_eq!(lines.len(), 1);
         let v: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(v["halt_active"], false);
+        assert!(v.get("halt_active").is_none());
         assert_eq!(v["sample_decision"], "accept");
         assert_eq!(
             v["schema_version"].as_u64().unwrap() as u16,
@@ -300,8 +300,8 @@ mod tests {
         let (_writer, handle) = RawSampleWriter::create(cfg);
         let s = RawSample::new(
             1_745_159_400u64 * 1_000_000_000,
-            0, mk_route(), "BTC-USDT", 2.0, -1.0, 50, 50, 1e6, 1e6,
-            false, SampleDecision::Accept,
+            0, mk_route(), "BTC-USDT", 2.0, -1.0, 1e6, 1e6,
+            SampleDecision::Accept,
         );
         assert!(handle.try_send(s.clone()).is_ok());
         match handle.try_send(s) {

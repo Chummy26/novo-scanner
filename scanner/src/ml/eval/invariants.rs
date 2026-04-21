@@ -171,7 +171,7 @@ pub fn verify_tradesetup(s: &TradeSetup) -> Result<(), InvariantError> {
 mod tests {
     use super::*;
     use crate::ml::contract::{
-        CalibStatus, ReasonKind, RouteId, ToxicityLevel, TradeReason,
+        CalibStatus, ReasonKind, RouteId, TradeReason,
     };
     use crate::types::{SymbolId, Venue};
 
@@ -200,7 +200,6 @@ mod tests {
             horizon_p05_s: 720,
             horizon_median_s: 1680,
             horizon_p95_s: 6000,
-            toxicity_level: ToxicityLevel::Healthy,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,

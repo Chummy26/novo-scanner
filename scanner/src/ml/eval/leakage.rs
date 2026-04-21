@@ -164,11 +164,8 @@ fn temporal_ordering_guard() -> bool {
         "BTC-USDT",
         3.2,
         -0.4,
-        50,
-        50,
         1e6,
         1e6,
-        false,
         1,
     );
     matches!(

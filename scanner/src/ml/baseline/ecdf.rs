@@ -7,7 +7,7 @@
 
 use crate::ml::contract::{
     AbstainDiagnostic, AbstainReason, CalibStatus, ReasonKind, Recommendation, RouteId,
-    ToxicityLevel, TradeReason, TradeSetup,
+    TradeReason, TradeSetup,
 };
 use crate::ml::feature_store::HotQueryCache;
 
@@ -96,21 +96,19 @@ impl BaselineA3 {
         &self.cache
     }
 
-    /// Emite recomendação para `route` dado estado (spread atual + toxicity
-    /// pré-computada em `serving`).
+    /// Emite recomendação para `route` dado estado de spread atual.
     ///
     /// **Fluxo pós-auditoria 2026-04-21**:
     /// 1. Checa `n_observations ≥ n_min` (senão `InsufficientData`).
-    /// 2. Se `toxicity_hint == Toxic`, emite `Abstain(LowConfidence)`.
-    /// 3. Checa tail_ratio p99/p95 > threshold → `Abstain(LongTail)`.
-    /// 4. Gate tático: `current_entry ≥ p50(entry)` senão `NoOpportunity`.
-    /// 5. `enter_at_min` derivado sobre LUCRO BRUTO COTADO:
+    /// 2. Checa tail_ratio p99/p95 > threshold → `Abstain(LongTail)`.
+    /// 3. Gate tático: `current_entry ≥ p50(entry)` senão `NoOpportunity`.
+    /// 4. `enter_at_min` derivado sobre LUCRO BRUTO COTADO:
     ///    `max(floor_pct − exit_typical, p50_entry)`.
-    /// 6. Gate econômico degradado: `current_entry + exit_typical ≥ floor`.
-    /// 7. Quantis de gross são proxy marginal:
+    /// 5. Gate econômico degradado: `current_entry + exit_typical ≥ floor`.
+    /// 6. Quantis de gross são proxy marginal:
     ///    `enter_typical + quantile(exit)`, não `entry(t)+exit(t)`.
-    /// 8. `realization_probability` é `P(exit ≥ floor − enter_typical)`.
-    /// 9. Emite `TradeSetup` com `calibration_status: Degraded`; o modelo A2
+    /// 7. `realization_probability` é `P(exit ≥ floor − enter_typical)`.
+    /// 8. Emite `TradeSetup` com `calibration_status: Degraded`; o modelo A2
     ///    deve substituir isso por labels forward-looking reais.
     pub fn recommend(
         &self,
@@ -118,7 +116,6 @@ impl BaselineA3 {
         current_entry: f32,
         _current_exit: f32,
         now_ns: u64,
-        toxicity_hint: ToxicityLevel,
     ) -> Recommendation {
         let n = self.cache.n_observations(route);
         // Quantis vêm de buckets de 1e-4; usa tolerância de um bucket para
@@ -133,25 +130,9 @@ impl BaselineA3 {
             };
         }
 
-        // Gate 1b: toxicity Toxic confirmada → recusa explícita.
-        // (Suspicious passa para o TradeSetup para o operador decidir.)
-        if matches!(toxicity_hint, ToxicityLevel::Toxic) {
-            return Recommendation::Abstain {
-                reason: AbstainReason::LowConfidence,
-                diagnostic: AbstainDiagnostic {
-                    n_observations: n.min(u32::MAX as u64) as u32,
-                    ci_width_if_emitted: None,
-                    nearest_feasible_utility: None,
-                    tail_ratio_p99_p95: None,
-                    model_version: self.cfg.model_version.to_string(),
-                    regime_posterior: [1.0, 0.0, 0.0],
-                },
-            };
-        }
-
-        // Gate 1c: LongTail — p99/p95 > threshold sinaliza spike anômalo.
-        // Detector pós-auditoria: evita emitir durante toxic arbitrage /
-        // halt iminente / manipulation / spike de 1-tick.
+        // Gate 1b: LongTail — p99/p95 > threshold sinaliza spike anômalo.
+        // Detector pós-auditoria: evita emitir durante cauda estatística
+        // extrema / manipulation / spike de 1-tick.
         let p99_entry_opt = self.cache.quantile_entry(route, 0.99);
         let p95_entry_opt_for_tail = self.cache.quantile_entry(route, 0.95);
         if let (Some(p99), Some(p95_t)) = (p99_entry_opt, p95_entry_opt_for_tail) {
@@ -323,10 +304,6 @@ impl BaselineA3 {
             horizon_p05_s,
             horizon_median_s,
             horizon_p95_s,
-            // Pós-auditoria: usa toxicity REAL detectada em serving.
-            // Unknown é default honesto, Suspicious emite com warning;
-            // Toxic foi rejeitado acima no Gate 1b.
-            toxicity_level: toxicity_hint,
             cluster_id: None,                       // detector vem em M1.3
             cluster_size: 1,
             cluster_rank: 1,
@@ -473,7 +450,7 @@ mod tests {
         let route = mk_route();
         populate(&cache, route, 100); // < n_min=500
 
-        let rec = a3.recommend(route, 2.0, -1.0, 1, ToxicityLevel::Unknown);
+        let rec = a3.recommend(route, 2.0, -1.0, 1);
         match rec {
             Recommendation::Abstain { reason, .. } => {
                 assert_eq!(reason, AbstainReason::InsufficientData);
@@ -490,7 +467,7 @@ mod tests {
         populate(&cache, route, 1000);
 
         // current_entry = 0.6% está abaixo do p50 esperado (~1.7%).
-        let rec = a3.recommend(route, 0.6, -1.0, 1, ToxicityLevel::Unknown);
+        let rec = a3.recommend(route, 0.6, -1.0, 1);
         match rec {
             Recommendation::Abstain { reason, .. } => {
                 assert_eq!(reason, AbstainReason::NoOpportunity);
@@ -513,7 +490,7 @@ mod tests {
         populate(&cache, route, 500);
 
         // current_entry 3.8% > p50 (~3.0%) → passa gate 2.
-        let rec = a3.recommend(route, 3.8, 0.2, 1_700_000_000_000_000_000, ToxicityLevel::Unknown);
+        let rec = a3.recommend(route, 3.8, 0.2, 1_700_000_000_000_000_000);
         match rec {
             Recommendation::Trade(setup) => {
                 // Sanity checks em campos-chave do ADR-016.
@@ -528,9 +505,6 @@ mod tests {
                 assert!(setup.realization_probability >= 0.0);
                 assert!(setup.realization_probability <= 1.0);
                 assert_eq!(setup.calibration_status, CalibStatus::Degraded);
-                // Pós-auditoria: toxicity é Unknown quando recommend recebe
-                // essa hint (serving decide). Baseline apenas propaga.
-                assert_eq!(setup.toxicity_level, ToxicityLevel::Unknown);
                 assert!(setup.valid_until > setup.emitted_at);
             }
             Recommendation::Abstain { reason, .. } => {
@@ -552,7 +526,7 @@ mod tests {
         let route = mk_route();
         populate(&cache, route, 500);
 
-        let rec = a3.recommend(route, 3.8, 0.2, 1, ToxicityLevel::Unknown);
+        let rec = a3.recommend(route, 3.8, 0.2, 1);
         match rec {
             Recommendation::Abstain { reason, .. } => {
                 assert_eq!(reason, AbstainReason::NoOpportunity);
@@ -577,7 +551,7 @@ mod tests {
             &[(4.0, -3.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0)],
         );
 
-        let rec = a3.recommend(route, 4.0, 1.0, 42, ToxicityLevel::Unknown);
+        let rec = a3.recommend(route, 4.0, 1.0, 42);
         match rec {
             Recommendation::Trade(setup) => {
                 assert!(setup.gross_profit_p10 >= 0.5);
@@ -605,7 +579,7 @@ mod tests {
         }
         observe_samples(&cache, route, &samples);
 
-        let rec = a3.recommend(route, 2.1, -0.4, 1_700_000_000_000_000_000, ToxicityLevel::Unknown);
+        let rec = a3.recommend(route, 2.1, -0.4, 1_700_000_000_000_000_000);
         match rec {
             Recommendation::Trade(setup) => {
                 // Taxa degradada segue P(exit >= floor - enter_typical).
@@ -652,13 +626,7 @@ mod tests {
         }
         observe_samples(&cache, route, &samples);
 
-        let rec = a3.recommend(
-            route,
-            2.0,
-            -1.5,
-            1_700_000_000_000_000_000,
-            ToxicityLevel::Unknown,
-        );
+        let rec = a3.recommend(route, 2.0, -1.5, 1_700_000_000_000_000_000);
         match rec {
             Recommendation::Trade(setup) => {
                 assert!(setup.gross_profit_p10 < cfg.floor_pct);

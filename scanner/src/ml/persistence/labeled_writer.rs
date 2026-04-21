@@ -198,7 +198,7 @@ impl LabeledJsonlWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ml::contract::{RouteId, ToxicityLevel};
+    use crate::ml::contract::RouteId;
     use crate::ml::persistence::labeled_trade::{
         CensorReason, FeaturesT0, LabelOutcome, LabeledTrade, PolicyMetadata,
         LABELED_TRADE_SCHEMA_VERSION, SCANNER_VERSION,
@@ -222,12 +222,8 @@ mod tests {
             entry_locked_pct: 2.5,
             exit_start_pct: -1.2,
             features_t0: FeaturesT0 {
-                buy_book_age_ms: 50,
-                sell_book_age_ms: 80,
                 buy_vol24: 1e6,
                 sell_vol24: 2e6,
-                toxicity_level: ToxicityLevel::Healthy,
-                halt_active: false,
                 tail_ratio_p99_p95: None,
                 entry_p50_24h: None,
                 exit_p50_24h: None,
