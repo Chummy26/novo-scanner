@@ -2230,6 +2230,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "sonic-rs",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-websockets",

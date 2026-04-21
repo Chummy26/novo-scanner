@@ -1,0 +1,512 @@
+//! Exports Prometheus do `MlServer` para dashboards Grafana.
+//!
+//! Registra contadores e gauges no registry Prometheus global do scanner
+//! (já inicializado em `scanner::obs::Metrics::init()`). As métricas
+//! aqui são agregadas por rótulo (reason, kind), não por rota — cobertura
+//! por rota seria cardinalidade catastrófica (2600 séries por métrica).
+//! Métricas per-route ficam em logs estruturados; dashboard usa agregados.
+//!
+//! # Métricas expostas (Wave T expansion pós-auditoria equipe)
+//!
+//! | Nome | Tipo | Labels | Descrição |
+//! |---|---|---|---|
+//! | `ml_opportunities_seen_total` | Counter | — | Total de oportunidades processadas pelo MlServer |
+//! | `ml_sample_decisions_total` | CounterVec | `reason` | Amostras aceitas/rejeitadas por gate do trigger |
+//! | `ml_recommendations_total` | CounterVec | `kind` | Trade / abstain por razão |
+//! | `ml_cache_routes_tracked` | IntGauge | — | Rotas distintas no HotQueryCache |
+//! | `ml_raw_samples_emitted_total` | Counter | — | RawSamples pré-trigger emitidos (ADR-025) |
+//! | `ml_raw_samples_dropped_total` | CounterVec | `reason` | RawSamples descartados (channel_full/closed) |
+//! | `ml_broadcaster_published_total` | CounterVec | `kind` | Recommendations publicadas ao broadcaster (ADR-026) |
+//! | `ml_broadcaster_no_subscribers_total` | Counter | — | Publicações sem consumers ativos |
+//! | `ml_broadcaster_was_recommended_total` | Counter | — | Publicações com ≥1 consumer — flipa was_recommended |
+//! | `ml_economic_emissions_total` | Counter | — | Eventos econômicos acumulados |
+//! | `ml_economic_outcomes_total` | CounterVec | `outcome` | realized/window_miss/exit_miss |
+//! | `ml_economic_pnl_aggregated_usd` | Gauge | — | PnL bruto simulado agregado (USD, capital hipotético 10k) |
+//!
+//! Alertmanager + Grafana consomem esses nomes (não mudar sem warning).
+
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+use prometheus::{
+    Gauge, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
+};
+
+use crate::ml::broadcast::BroadcasterMetrics;
+use crate::ml::economic::EconomicMetrics;
+use crate::ml::serving::{MlServer, ServerMetrics};
+
+// ---------------------------------------------------------------------------
+// MlPrometheusMetrics
+// ---------------------------------------------------------------------------
+
+/// Handles para todas as métricas ML registradas no Prometheus registry.
+///
+/// Instância única por processo. Passa pelo `scanner::obs::Metrics` via
+/// `register()`. Atualização periódica (ex: a cada 1 s) a partir de
+/// `ServerMetrics` via `update_from_server`.
+pub struct MlPrometheusMetrics {
+    opportunities_seen_total: IntCounter,
+    sample_decisions_total: IntCounterVec,
+    recommendations_total: IntCounterVec,
+    cache_routes_tracked: IntGauge,
+
+    // Wave T extensions — raw samples, broadcaster, economic.
+    raw_samples_emitted_total: IntCounter,
+    raw_samples_dropped_total: IntCounterVec,
+    broadcaster_published_total: IntCounterVec,
+    broadcaster_no_subscribers_total: IntCounter,
+    broadcaster_was_recommended_total: IntCounter,
+    economic_emissions_total: IntCounter,
+    economic_outcomes_total: IntCounterVec,
+    economic_pnl_aggregated_usd: Gauge,
+
+    // Snapshots do último update (para computar delta → Counter.inc_by).
+    last_seen: ServerMetricsSnapshot,
+    last_broadcaster: BroadcasterSnapshot,
+    last_economic: EconomicSnapshot,
+}
+
+#[derive(Default)]
+struct ServerMetricsSnapshot {
+    opportunities_seen: u64,
+    sample_accepts: u64,
+    sample_rejects_stale: u64,
+    sample_rejects_low_volume: u64,
+    sample_rejects_insufficient_history: u64,
+    sample_rejects_below_tail: u64,
+    sample_rejects_halt: u64,
+    rec_trade_total: u64,
+    rec_abstain_no_opportunity: u64,
+    rec_abstain_insufficient_data: u64,
+    rec_abstain_low_confidence: u64,
+    rec_abstain_long_tail: u64,
+    raw_samples_emitted: u64,
+    raw_samples_dropped_channel_full: u64,
+    raw_samples_dropped_channel_closed: u64,
+}
+
+#[derive(Default)]
+struct BroadcasterSnapshot {
+    published_total: u64,
+    trade_published_total: u64,
+    abstain_published_total: u64,
+    no_subscribers_total: u64,
+    was_recommended_publications: u64,
+}
+
+#[derive(Default)]
+struct EconomicSnapshot {
+    n_emissions_total: u64,
+    n_realized_total: u64,
+    n_window_miss_total: u64,
+    n_exit_miss_total: u64,
+    pnl_aggregated_usd_times_10k: u64,
+}
+
+impl MlPrometheusMetrics {
+    /// Registra todas as métricas no `Registry` fornecido.
+    ///
+    /// Devolve erro de `prometheus::Error` se alguma métrica já foi
+    /// registrada com o mesmo nome — chamada dupla da função é bug.
+    pub fn register(registry: &Registry) -> Result<Self, prometheus::Error> {
+        let opportunities_seen_total = IntCounter::with_opts(Opts::new(
+            "ml_opportunities_seen_total",
+            "Total de oportunidades processadas pelo MlServer",
+        ))?;
+        let sample_decisions_total = IntCounterVec::new(
+            Opts::new(
+                "ml_sample_decisions_total",
+                "Decisões do sampling trigger por razão",
+            ),
+            &["reason"],
+        )?;
+        let recommendations_total = IntCounterVec::new(
+            Opts::new(
+                "ml_recommendations_total",
+                "Recomendações emitidas por categoria",
+            ),
+            &["kind"],
+        )?;
+        let cache_routes_tracked = IntGauge::with_opts(Opts::new(
+            "ml_cache_routes_tracked",
+            "Rotas distintas no HotQueryCache (n_obs ≥ 1)",
+        ))?;
+
+        // Wave T — raw samples (ADR-025).
+        let raw_samples_emitted_total = IntCounter::with_opts(Opts::new(
+            "ml_raw_samples_emitted_total",
+            "RawSamples pré-trigger emitidos ao writer JSONL (ADR-025)",
+        ))?;
+        let raw_samples_dropped_total = IntCounterVec::new(
+            Opts::new(
+                "ml_raw_samples_dropped_total",
+                "RawSamples descartados por backpressure (ADR-025)",
+            ),
+            &["reason"],
+        )?;
+
+        // Wave T — broadcaster (ADR-026).
+        let broadcaster_published_total = IntCounterVec::new(
+            Opts::new(
+                "ml_broadcaster_published_total",
+                "Recommendations publicadas ao canal broadcast (ADR-026)",
+            ),
+            &["kind"],
+        )?;
+        let broadcaster_no_subscribers_total = IntCounter::with_opts(Opts::new(
+            "ml_broadcaster_no_subscribers_total",
+            "Publicações sem consumers ativos (ADR-026)",
+        ))?;
+        let broadcaster_was_recommended_total = IntCounter::with_opts(Opts::new(
+            "ml_broadcaster_was_recommended_total",
+            "Publicações que encontraram ≥1 consumer — flipa was_recommended",
+        ))?;
+
+        // Wave T — economic (ADR-019).
+        let economic_emissions_total = IntCounter::with_opts(Opts::new(
+            "ml_economic_emissions_total",
+            "Eventos econômicos acumulados (ADR-019)",
+        ))?;
+        let economic_outcomes_total = IntCounterVec::new(
+            Opts::new(
+                "ml_economic_outcomes_total",
+                "Outcomes resolvidos de recomendações (ADR-019)",
+            ),
+            &["outcome"],
+        )?;
+        let economic_pnl_aggregated_usd = Gauge::with_opts(Opts::new(
+            "ml_economic_pnl_aggregated_usd",
+            "PnL bruto simulado agregado em USD (capital hipotético 10k)",
+        ))?;
+
+        registry.register(Box::new(opportunities_seen_total.clone()))?;
+        registry.register(Box::new(sample_decisions_total.clone()))?;
+        registry.register(Box::new(recommendations_total.clone()))?;
+        registry.register(Box::new(cache_routes_tracked.clone()))?;
+        registry.register(Box::new(raw_samples_emitted_total.clone()))?;
+        registry.register(Box::new(raw_samples_dropped_total.clone()))?;
+        registry.register(Box::new(broadcaster_published_total.clone()))?;
+        registry.register(Box::new(broadcaster_no_subscribers_total.clone()))?;
+        registry.register(Box::new(broadcaster_was_recommended_total.clone()))?;
+        registry.register(Box::new(economic_emissions_total.clone()))?;
+        registry.register(Box::new(economic_outcomes_total.clone()))?;
+        registry.register(Box::new(economic_pnl_aggregated_usd.clone()))?;
+
+        // Pre-touch todos os labels — garante que aparecem em `gather()`
+        // desde o primeiro scrape Prometheus, mesmo sem incrementos ainda.
+        // Dashboards Grafana funcionam com `rate()` / `increase()` e
+        // precisam das séries existirem (mesmo que com valor 0).
+        for reason in &[
+            "accept",
+            "stale",
+            "low_volume",
+            "insufficient_history",
+            "below_tail",
+            "halt",
+        ] {
+            sample_decisions_total
+                .with_label_values(&[reason])
+                .inc_by(0);
+        }
+        for kind in &[
+            "trade",
+            "abstain_no_opportunity",
+            "abstain_insufficient_data",
+            "abstain_low_confidence",
+            "abstain_long_tail",
+        ] {
+            recommendations_total.with_label_values(&[kind]).inc_by(0);
+        }
+        // Pre-touch labels Wave T.
+        for reason in &["channel_full", "channel_closed"] {
+            raw_samples_dropped_total.with_label_values(&[reason]).inc_by(0);
+        }
+        for kind in &["trade", "abstain"] {
+            broadcaster_published_total.with_label_values(&[kind]).inc_by(0);
+        }
+        for outcome in &["realized", "window_miss", "exit_miss"] {
+            economic_outcomes_total.with_label_values(&[outcome]).inc_by(0);
+        }
+
+        Ok(Self {
+            opportunities_seen_total,
+            sample_decisions_total,
+            recommendations_total,
+            cache_routes_tracked,
+            raw_samples_emitted_total,
+            raw_samples_dropped_total,
+            broadcaster_published_total,
+            broadcaster_no_subscribers_total,
+            broadcaster_was_recommended_total,
+            economic_emissions_total,
+            economic_outcomes_total,
+            economic_pnl_aggregated_usd,
+            last_seen: ServerMetricsSnapshot::default(),
+            last_broadcaster: BroadcasterSnapshot::default(),
+            last_economic: EconomicSnapshot::default(),
+        })
+    }
+
+    /// Atualiza todos os valores Prometheus a partir do `MlServer`.
+    ///
+    /// Computa delta entre snapshot anterior e atual e chama `inc_by` nos
+    /// Counters (Prometheus Counters são monotonicamente crescentes; não
+    /// aceitam `set` direto). Gauges (`cache_routes_tracked`) recebem
+    /// valor absoluto.
+    ///
+    /// Chamar periodicamente — tipicamente via task tokio com interval
+    /// de 1 s. Chamar muito frequentemente não quebra nada (delta = 0).
+    pub fn update_from_server(&mut self, server: &MlServer) {
+        let metrics = server.metrics();
+        let current = snapshot(&metrics);
+
+        macro_rules! diff {
+            ($field:ident) => {{
+                let delta = current.$field.saturating_sub(self.last_seen.$field);
+                if delta > 0 {
+                    delta
+                } else {
+                    0
+                }
+            }};
+        }
+
+        self.opportunities_seen_total
+            .inc_by(diff!(opportunities_seen));
+
+        self.sample_decisions_total
+            .with_label_values(&["accept"])
+            .inc_by(diff!(sample_accepts));
+        self.sample_decisions_total
+            .with_label_values(&["stale"])
+            .inc_by(diff!(sample_rejects_stale));
+        self.sample_decisions_total
+            .with_label_values(&["low_volume"])
+            .inc_by(diff!(sample_rejects_low_volume));
+        self.sample_decisions_total
+            .with_label_values(&["insufficient_history"])
+            .inc_by(diff!(sample_rejects_insufficient_history));
+        self.sample_decisions_total
+            .with_label_values(&["below_tail"])
+            .inc_by(diff!(sample_rejects_below_tail));
+        self.sample_decisions_total
+            .with_label_values(&["halt"])
+            .inc_by(diff!(sample_rejects_halt));
+
+        self.recommendations_total
+            .with_label_values(&["trade"])
+            .inc_by(diff!(rec_trade_total));
+        self.recommendations_total
+            .with_label_values(&["abstain_no_opportunity"])
+            .inc_by(diff!(rec_abstain_no_opportunity));
+        self.recommendations_total
+            .with_label_values(&["abstain_insufficient_data"])
+            .inc_by(diff!(rec_abstain_insufficient_data));
+        self.recommendations_total
+            .with_label_values(&["abstain_low_confidence"])
+            .inc_by(diff!(rec_abstain_low_confidence));
+        self.recommendations_total
+            .with_label_values(&["abstain_long_tail"])
+            .inc_by(diff!(rec_abstain_long_tail));
+
+        self.cache_routes_tracked
+            .set(server.baseline().cache().routes_tracked() as i64);
+
+        // Raw samples do ServerMetrics.
+        self.raw_samples_emitted_total.inc_by(diff!(raw_samples_emitted));
+        self.raw_samples_dropped_total
+            .with_label_values(&["channel_full"])
+            .inc_by(diff!(raw_samples_dropped_channel_full));
+        self.raw_samples_dropped_total
+            .with_label_values(&["channel_closed"])
+            .inc_by(diff!(raw_samples_dropped_channel_closed));
+
+        self.last_seen = current;
+    }
+
+    /// Atualiza métricas do broadcaster a partir de `BroadcasterMetrics`.
+    pub fn update_from_broadcaster(&mut self, bm: &BroadcasterMetrics) {
+        let trade = bm.trade_published_total.load(Ordering::Relaxed);
+        let abstain = bm.abstain_published_total.load(Ordering::Relaxed);
+        let no_subs = bm.no_subscribers_total.load(Ordering::Relaxed);
+        let recommended = bm.was_recommended_publications.load(Ordering::Relaxed);
+
+        let d_trade = trade.saturating_sub(self.last_broadcaster.trade_published_total);
+        let d_abstain = abstain.saturating_sub(self.last_broadcaster.abstain_published_total);
+        let d_no_subs = no_subs.saturating_sub(self.last_broadcaster.no_subscribers_total);
+        let d_rec = recommended.saturating_sub(self.last_broadcaster.was_recommended_publications);
+
+        self.broadcaster_published_total
+            .with_label_values(&["trade"])
+            .inc_by(d_trade);
+        self.broadcaster_published_total
+            .with_label_values(&["abstain"])
+            .inc_by(d_abstain);
+        self.broadcaster_no_subscribers_total.inc_by(d_no_subs);
+        self.broadcaster_was_recommended_total.inc_by(d_rec);
+
+        self.last_broadcaster.trade_published_total = trade;
+        self.last_broadcaster.abstain_published_total = abstain;
+        self.last_broadcaster.no_subscribers_total = no_subs;
+        self.last_broadcaster.was_recommended_publications = recommended;
+        self.last_broadcaster.published_total =
+            bm.published_total.load(Ordering::Relaxed);
+    }
+
+    /// Atualiza métricas econômicas a partir de `EconomicMetrics`.
+    pub fn update_from_economic(&mut self, em: &EconomicMetrics) {
+        let emissions = em.n_emissions_total.load(Ordering::Relaxed);
+        let realized = em.n_realized_total.load(Ordering::Relaxed);
+        let window_miss = em.n_window_miss_total.load(Ordering::Relaxed);
+        let exit_miss = em.n_exit_miss_total.load(Ordering::Relaxed);
+        let pnl_x10k = em.pnl_aggregated_usd_times_10k.load(Ordering::Relaxed);
+
+        let d_emissions = emissions.saturating_sub(self.last_economic.n_emissions_total);
+        let d_realized = realized.saturating_sub(self.last_economic.n_realized_total);
+        let d_window_miss = window_miss.saturating_sub(self.last_economic.n_window_miss_total);
+        let d_exit_miss = exit_miss.saturating_sub(self.last_economic.n_exit_miss_total);
+
+        self.economic_emissions_total.inc_by(d_emissions);
+        self.economic_outcomes_total
+            .with_label_values(&["realized"])
+            .inc_by(d_realized);
+        self.economic_outcomes_total
+            .with_label_values(&["window_miss"])
+            .inc_by(d_window_miss);
+        self.economic_outcomes_total
+            .with_label_values(&["exit_miss"])
+            .inc_by(d_exit_miss);
+
+        // Gauge = valor absoluto atual em USD (divide /10_000 para reverter scaling).
+        let pnl_usd = (pnl_x10k as f64) / 10_000.0;
+        self.economic_pnl_aggregated_usd.set(pnl_usd);
+
+        self.last_economic.n_emissions_total = emissions;
+        self.last_economic.n_realized_total = realized;
+        self.last_economic.n_window_miss_total = window_miss;
+        self.last_economic.n_exit_miss_total = exit_miss;
+        self.last_economic.pnl_aggregated_usd_times_10k = pnl_x10k;
+    }
+}
+
+fn snapshot(m: &Arc<ServerMetrics>) -> ServerMetricsSnapshot {
+    ServerMetricsSnapshot {
+        opportunities_seen: m.opportunities_seen.load(Ordering::Relaxed),
+        sample_accepts: m.sample_accepts.load(Ordering::Relaxed),
+        sample_rejects_stale: m.sample_rejects_stale.load(Ordering::Relaxed),
+        sample_rejects_low_volume: m.sample_rejects_low_volume.load(Ordering::Relaxed),
+        sample_rejects_insufficient_history: m
+            .sample_rejects_insufficient_history
+            .load(Ordering::Relaxed),
+        sample_rejects_below_tail: m.sample_rejects_below_tail.load(Ordering::Relaxed),
+        sample_rejects_halt: m.sample_rejects_halt.load(Ordering::Relaxed),
+        rec_trade_total: m.rec_trade_total.load(Ordering::Relaxed),
+        rec_abstain_no_opportunity: m.rec_abstain_no_opportunity.load(Ordering::Relaxed),
+        rec_abstain_insufficient_data: m.rec_abstain_insufficient_data.load(Ordering::Relaxed),
+        rec_abstain_low_confidence: m.rec_abstain_low_confidence.load(Ordering::Relaxed),
+        rec_abstain_long_tail: m.rec_abstain_long_tail.load(Ordering::Relaxed),
+        raw_samples_emitted: m.raw_samples_emitted.load(Ordering::Relaxed),
+        raw_samples_dropped_channel_full: m
+            .raw_samples_dropped_channel_full
+            .load(Ordering::Relaxed),
+        raw_samples_dropped_channel_closed: m
+            .raw_samples_dropped_channel_closed
+            .load(Ordering::Relaxed),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ml::baseline::{BaselineA3, BaselineConfig};
+    use crate::ml::contract::RouteId;
+    use crate::ml::feature_store::HotQueryCache;
+    use crate::ml::trigger::{SamplingConfig, SamplingTrigger};
+    use crate::types::{SymbolId, Venue};
+
+    fn mk_server() -> MlServer {
+        use crate::ml::feature_store::hot_cache::CacheConfig;
+        let cache = HotQueryCache::with_config(CacheConfig::for_testing());
+        let baseline = BaselineA3::new(
+            cache,
+            BaselineConfig {
+                floor_pct: 0.5,
+                n_min: 100,
+                ..BaselineConfig::default()
+            },
+        );
+        let trigger = SamplingTrigger::new(SamplingConfig {
+            n_min: 100,
+            ..SamplingConfig::default()
+        });
+        MlServer::new(baseline, trigger)
+    }
+
+    #[test]
+    fn register_creates_all_metrics() {
+        let registry = Registry::new();
+        let _m = MlPrometheusMetrics::register(&registry).expect("register");
+        // Coleta e verifica nomes presentes.
+        let families = registry.gather();
+        let names: Vec<String> = families.iter().map(|f| f.get_name().to_string()).collect();
+        assert!(names.contains(&"ml_opportunities_seen_total".to_string()));
+        assert!(names.contains(&"ml_sample_decisions_total".to_string()));
+        assert!(names.contains(&"ml_recommendations_total".to_string()));
+        assert!(names.contains(&"ml_cache_routes_tracked".to_string()));
+    }
+
+    #[test]
+    fn double_register_fails() {
+        let registry = Registry::new();
+        let _m1 = MlPrometheusMetrics::register(&registry).expect("first");
+        let m2 = MlPrometheusMetrics::register(&registry);
+        assert!(m2.is_err(), "second register should fail");
+    }
+
+    #[test]
+    fn update_propagates_server_counters() {
+        let registry = Registry::new();
+        let mut m = MlPrometheusMetrics::register(&registry).expect("register");
+        let server = mk_server();
+        let route = RouteId {
+            symbol_id: SymbolId(1),
+            buy_venue: Venue::MexcFut,
+            sell_venue: Venue::BingxFut,
+        };
+        for i in 0..5 {
+            server.on_opportunity(i as u32, route, "BTC-USDT", 2.5, -0.8, 50, 50, 1e6, 1e6, false, i);
+        }
+        m.update_from_server(&server);
+        assert_eq!(m.opportunities_seen_total.get(), 5);
+        assert_eq!(
+            m.sample_decisions_total
+                .with_label_values(&["insufficient_history"])
+                .get(),
+            5
+        );
+    }
+
+    #[test]
+    fn update_idempotent_with_no_delta() {
+        let registry = Registry::new();
+        let mut m = MlPrometheusMetrics::register(&registry).expect("register");
+        let server = mk_server();
+        let route = RouteId {
+            symbol_id: SymbolId(1),
+            buy_venue: Venue::MexcFut,
+            sell_venue: Venue::BingxFut,
+        };
+        server.on_opportunity(0, route, "BTC-USDT", 2.5, -0.8, 50, 50, 1e6, 1e6, false, 1);
+        m.update_from_server(&server);
+        let before = m.opportunities_seen_total.get();
+        // Chamar de novo sem nova observação — delta 0.
+        m.update_from_server(&server);
+        let after = m.opportunities_seen_total.get();
+        assert_eq!(before, after, "idempotent update");
+    }
+}

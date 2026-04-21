@@ -22,6 +22,7 @@ use crate::broadcast::contract::OpportunityDto;
 use crate::broadcast::history::HistoryStore;
 use crate::discovery::SymbolUniverse;
 use crate::error::Result;
+use crate::ml::broadcast::RecommendationBroadcaster;
 use crate::spread::engine::StaleTable;
 use crate::spread::{Opportunity, ScanCounters};
 use crate::types::{now_ns, SymbolId, Venue};
@@ -46,6 +47,9 @@ pub struct BroadcastState {
     pub stale:    Option<Arc<StaleTable>>,
     pub counters: Option<Arc<ScanCounters>>,
     pub vol:      Option<Arc<crate::broadcast::VolStore>>,
+    /// Broadcaster de `Recommendation` (ADR-026, Wave T). `None` em testes
+    /// ou quando scanner roda sem pipeline ML. Injetado por `with_ml_broadcaster`.
+    pub ml_broadcaster: Option<RecommendationBroadcaster>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -79,6 +83,7 @@ impl BroadcastState {
             stale:    None,
             counters: None,
             vol:      None,
+            ml_broadcaster: None,
         }
     }
 
@@ -96,6 +101,14 @@ impl BroadcastState {
         self.stale    = Some(stale);
         self.counters = Some(counters);
         self.vol      = Some(vol);
+        self
+    }
+
+    /// Wire up o broadcaster de `Recommendation`. Necessário para ativar
+    /// o endpoint WS `/ws/ml/recommendations`. Se `None`, o endpoint
+    /// responde 503 Service Unavailable.
+    pub fn with_ml_broadcaster(mut self, b: RecommendationBroadcaster) -> Self {
+        self.ml_broadcaster = Some(b);
         self
     }
 
@@ -126,6 +139,8 @@ pub async fn serve(
 
     let mut app = Router::new()
         .route("/ws/scanner", get(ws_handler))
+        .route("/ws/ml/recommendations", get(ws_ml_recommendations))
+        .route("/api/ml/recommendations/status", get(rest_ml_rec_status))
         .route("/api/spread/opportunities", get(rest_opportunities))
         .route("/api/spread/status",        get(rest_status))
         .route("/api/spread/history/:symbol", get(rest_history))
@@ -326,6 +341,96 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u32, d as u32)
+}
+
+// ---------------------------------------------------------------------------
+// WS `/ws/ml/recommendations` — stream de Recommendations (ADR-026, Wave T)
+// ---------------------------------------------------------------------------
+
+async fn ws_ml_recommendations(
+    ws: WebSocketUpgrade,
+    State(state): State<BroadcastState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ml_socket(socket, state))
+}
+
+async fn handle_ml_socket(mut socket: WebSocket, state: BroadcastState) {
+    let bcast = match state.ml_broadcaster {
+        Some(b) => b,
+        None => {
+            // Sem broadcaster (ex: scanner sem pipeline ML) — retorna
+            // notice e fecha.
+            let msg = r#"{"type":"error","reason":"ml_broadcaster_not_configured"}"#;
+            let _ = socket.send(Message::Text(msg.into())).await;
+            return;
+        }
+    };
+    let mut rx = bcast.subscribe();
+
+    loop {
+        tokio::select! {
+            ev = rx.recv() => {
+                match ev {
+                    Ok(frame) => {
+                        match frame.to_json_string() {
+                            Ok(payload) => {
+                                // Envelope minimal: {type, cycle_seq, emitted_at_ns, payload}
+                                let msg = format!(
+                                    r#"{{"type":"ml.recommendation","cycle_seq":{},"emitted_at_ns":{},"payload":{}}}"#,
+                                    frame.cycle_seq,
+                                    frame.emitted_at_ns,
+                                    payload
+                                );
+                                if socket.send(Message::Text(msg)).await.is_err() { break; }
+                            }
+                            Err(e) => {
+                                warn!("ml rec json serialize failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("ws ml client lagged {} frames", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            inbound = socket.recv() => {
+                match inbound {
+                    Some(Ok(Message::Ping(p))) => { let _ = socket.send(Message::Pong(p)).await; }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                if socket.send(Message::Ping(Vec::new())).await.is_err() { break; }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REST `/api/ml/recommendations/status` — snapshot de contadores do broadcaster
+// ---------------------------------------------------------------------------
+
+async fn rest_ml_rec_status(State(state): State<BroadcastState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+    let body = match state.ml_broadcaster {
+        Some(b) => {
+            let m = b.metrics();
+            serde_json::json!({
+                "broadcaster_configured": true,
+                "active_receivers":       b.receiver_count(),
+                "published_total":        m.published_total.load(Ordering::Relaxed),
+                "trade_published_total":  m.trade_published_total.load(Ordering::Relaxed),
+                "abstain_published_total": m.abstain_published_total.load(Ordering::Relaxed),
+                "no_subscribers_total":   m.no_subscribers_total.load(Ordering::Relaxed),
+                "was_recommended_publications": m.was_recommended_publications.load(Ordering::Relaxed),
+            })
+        }
+        None => serde_json::json!({ "broadcaster_configured": false }),
+    };
+    Json(body)
 }
 
 async fn rest_opportunities(State(state): State<BroadcastState>) -> impl IntoResponse {

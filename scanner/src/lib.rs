@@ -5,6 +5,7 @@ pub mod config;
 pub mod decode;
 pub mod discovery;
 pub mod error;
+pub mod ml;
 pub mod normalize;
 pub mod obs;
 pub mod spread;
@@ -23,7 +24,18 @@ use crate::book::BookStore;
 use crate::broadcast::server::BroadcastState;
 use crate::broadcast::VolStore;
 use crate::discovery::SymbolUniverse;
+use crate::ml::baseline::{BaselineA3, BaselineConfig};
+use crate::ml::broadcast::RecommendationBroadcaster;
+use crate::ml::contract::RouteId;
+use crate::ml::feature_store::HotQueryCache;
+use crate::ml::metrics::MlPrometheusMetrics;
+use crate::ml::persistence::{
+    JsonlWriter, RawSampleWriter, RawWriterConfig, WriterConfig, WriterHandle,
+};
+use crate::ml::serving::MlServer;
+use crate::ml::trigger::SamplingTrigger;
 use crate::spread::engine::{new_stale_table, scan_once, Opportunity, ScanCounters, StaleTable};
+use crate::types::now_ns;
 
 /// Top-level entry point. Wires: discovery → book store → adapters →
 /// spread engine → broadcast server.
@@ -50,6 +62,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // --- Scan counters (shared with /api/spread/debug) ---
     let counters = Arc::new(ScanCounters::default());
 
+    // --- ML Recommendation broadcaster ---
+    // Criado cedo para ser anexado ao `BroadcastState` e ao engine.
+    // Canal `tokio::sync::broadcast` cap 512; não bloqueia em backpressure.
+    // Resolve lacuna "Recommendation descartada em lib.rs" (Wave T).
+    let ml_broadcaster = RecommendationBroadcaster::new();
+
     // --- Broadcast state + server ---
     let bstate = BroadcastState::new()
         .with_refs(
@@ -58,7 +76,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Arc::clone(&stale),
             Arc::clone(&counters),
             Arc::clone(&vol),
-        );
+        )
+        .with_ml_broadcaster(ml_broadcaster.clone());
     let addr: std::net::SocketAddr = cfg.bind.parse()
         .map_err(|e| Error::Config(format!("invalid bind {:?}: {}", cfg.bind, e)))?;
     {
@@ -81,6 +100,56 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         tokio::spawn(async move { adapter::vol_poller::run(u, v).await; });
     }
 
+    // --- ML recomendador (M1.7) ---
+    // Módulo `ml` roda inline no loop do spread engine — baseline A3 tem
+    // latência ~1–5 µs/opp, desprezível vs ciclo 150 ms. Não altera a
+    // lógica de emissão de oportunidades; apenas observa spreads no
+    // HotQueryCache e produz `Recommendation` (logadas; broadcast em
+    // iteração futura). Se o módulo ML falhar, scanner continua normal.
+    let ml_cache = HotQueryCache::new();
+    let ml_baseline = BaselineA3::new(ml_cache, BaselineConfig::default());
+
+    // --- ML RawSample writer (ADR-025) ---
+    // Stream contínuo pré-trigger, decimado 1-in-10 por rota, para medição
+    // não-enviesada dos gates empíricos E1/E2/E4/E6/E8/E10/E11 do Marco 0.
+    // Paralelo ao AcceptedSample writer; ambos usam Hive-style partitioning.
+    let (ml_raw_writer, ml_raw_writer_handle) =
+        RawSampleWriter::create(RawWriterConfig::default());
+    tokio::spawn(async move { ml_raw_writer.run().await; });
+
+    let ml_server = Arc::new(
+        MlServer::new(ml_baseline, SamplingTrigger::with_defaults())
+            .with_raw_writer(ml_raw_writer_handle),
+    );
+    let ml_metrics_opt = match MlPrometheusMetrics::register(&obs::Metrics::init().registry) {
+        Ok(m) => {
+            info!("ML prometheus metrics registered");
+            Some(m)
+        }
+        Err(e) => {
+            warn!("ML prometheus register failed: {} — métricas ML indisponíveis", e);
+            None
+        }
+    };
+    if let Some(mut metrics) = ml_metrics_opt {
+        let server_for_metrics = Arc::clone(&ml_server);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                metrics.update_from_server(&server_for_metrics);
+            }
+        });
+    }
+
+    // --- ML dataset writer (C1 fix) ---
+    // Consumer task que grava cada `AcceptedSample` em JSONL rotativa
+    // horária em `{data_dir}/year=YYYY/month=MM/day=DD/hour=HH/`. Alimenta
+    // o dataset de treino do modelo A2 (Marco 2). Canal bounded 100k
+    // amortece picos de ~100 min a 17 req/s.
+    let (ml_writer, ml_writer_handle) = JsonlWriter::create(WriterConfig::default());
+    tokio::spawn(async move { ml_writer.run().await; });
+
     // --- Spread engine loop (150ms) ---
     let u_engine  = Arc::clone(&universe);
     let s_engine  = Arc::clone(&store);
@@ -91,7 +160,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let min_vol = cfg.min_vol_usd;
     let broadcast_ms = cfg.broadcast_ms;
     let c_engine = Arc::clone(&counters);
-    run_spread_engine(u_engine, s_engine, st_engine, v_engine, c_engine, threshold, max_spread, min_vol, broadcast_ms, bstate).await;
+    let ml_engine = Arc::clone(&ml_server);
+    let ml_writer_engine = ml_writer_handle.clone();
+    let ml_broadcaster_engine = ml_broadcaster.clone();
+    run_spread_engine(u_engine, s_engine, st_engine, v_engine, c_engine, threshold, max_spread, min_vol, broadcast_ms, bstate, ml_engine, ml_writer_engine, ml_broadcaster_engine).await;
     Ok(())
 }
 
@@ -239,16 +311,19 @@ fn spawn_adapters(
 }
 
 async fn run_spread_engine(
-    universe:      Arc<SymbolUniverse>,
-    store:         Arc<BookStore>,
-    stale:         Arc<StaleTable>,
-    vol:           Arc<VolStore>,
-    counters:      Arc<ScanCounters>,
-    threshold_pct: f64,
-    max_spread_pct: f64,
-    min_vol_usd:   f64,
-    broadcast_ms:  u64,
-    bstate:        BroadcastState,
+    universe:         Arc<SymbolUniverse>,
+    store:            Arc<BookStore>,
+    stale:            Arc<StaleTable>,
+    vol:              Arc<VolStore>,
+    counters:         Arc<ScanCounters>,
+    threshold_pct:    f64,
+    max_spread_pct:   f64,
+    min_vol_usd:      f64,
+    broadcast_ms:     u64,
+    bstate:           BroadcastState,
+    ml_server:        Arc<MlServer>,
+    ml_writer:        WriterHandle,
+    ml_broadcaster:   RecommendationBroadcaster,
 ) {
     let mut buf: Vec<Opportunity> = Vec::with_capacity(1024);
     let mut tick = tokio::time::interval(Duration::from_millis(broadcast_ms));
@@ -265,6 +340,57 @@ async fn run_spread_engine(
         if count > 0 {
             obs::Metrics::init().opportunities_total.inc_by(count as u64);
         }
+
+        // --- ML pass (M1.7 shadow mode inline) ---
+        // Alimenta HotQueryCache + aciona baseline A3 + broadcast
+        // `Recommendation` via `RecommendationBroadcaster` (pós-Wave T:
+        // resolve lacuna de `_rec` descartado). Quando broadcaster tem
+        // consumer, o `AcceptedSample.was_recommended` é flipado para
+        // `true` antes da persistência.
+        //
+        // Latência ~1–5 µs por opp; para 50–200 opps por ciclo, overhead
+        // total <1 ms em budget de 150 ms.
+        let now = now_ns();
+        let cycle_seq = ml_server.begin_cycle();
+        for opp in &buf {
+            let route = RouteId {
+                symbol_id:  opp.symbol_id,
+                buy_venue:  opp.buy_venue,
+                sell_venue: opp.sell_venue,
+            };
+            // ADR-029: resolver nome canonical ESTÁVEL (entre runs) via universe.
+            // Sem isso, SymbolId muda entre runs e dados ficam inúteis
+            // retrospectivamente.
+            let symbol_name = universe.canonical_name_of(opp.symbol_id);
+            let (rec, _dec, accepted) = ml_server.on_opportunity(
+                cycle_seq,
+                route,
+                &symbol_name,
+                opp.entry_spread as f32,
+                opp.exit_spread as f32,
+                opp.buy_book_age.min(u32::MAX as u64) as u32,
+                opp.sell_book_age.min(u32::MAX as u64) as u32,
+                opp.buy_vol24,
+                opp.sell_vol24,
+                false, // halt_active — hook operacional fica em iteração futura
+                now,
+            );
+            // Publica recomendação no canal broadcast para consumers WS /
+            // REST. Retorna `true` se havia ao menos 1 consumer ativo —
+            // isso fecha o loop de `was_recommended`.
+            let was_shown_to_operator = ml_broadcaster.publish(cycle_seq, now, route, &rec);
+
+            // **C1 + C4 fix** — enfileira AcceptedSample para JSONL writer
+            // quando trigger aceitou, com flag `was_recommended` refletindo
+            // se algum consumer estava inscrito para receber.
+            if let Some(mut sample) = accepted {
+                if was_shown_to_operator {
+                    sample.mark_recommended();
+                }
+                let _ = ml_writer.try_send(sample);
+            }
+        }
+
         // Move buf contents into DTOs; reuse allocation on next cycle.
         let snapshot: Vec<Opportunity> = std::mem::take(&mut buf);
         buf = Vec::with_capacity(count.max(1024));

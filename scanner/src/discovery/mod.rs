@@ -111,6 +111,30 @@ impl SymbolUniverse {
     pub fn lookup(&self, venue: Venue, raw: &str) -> Option<SymbolId> {
         self.per_venue[venue.idx()].get(raw).copied()
     }
+
+    /// `SymbolId` → `CanonicalPair` (ex: BTC-USDT). Estável DENTRO de um run;
+    /// **NÃO é estável entre runs** porque a atribuição de IDs depende da
+    /// ordem de iteração de `AHashMap` e do universo de pairs descobertos
+    /// (que muda com listings/delistings).
+    ///
+    /// Consequência crítica para persistência ML (ADR-029): qualquer stream
+    /// JSONL **DEVE** persistir `symbol_name` canonical (via `.canonical()`)
+    /// ao lado do `symbol_id`, senão dados de dias diferentes não são
+    /// joinables retrospectivamente.
+    #[inline]
+    pub fn canonical_of(&self, id: SymbolId) -> Option<&CanonicalPair> {
+        self.by_id.get(id.0 as usize)
+    }
+
+    /// Conveniência: nome canonical como `String` (ex: "BTC-USDT"). Retorna
+    /// `String::new()` se SymbolId inválido — nunca panica. Persistência
+    /// JSONL usa este método.
+    #[inline]
+    pub fn canonical_name_of(&self, id: SymbolId) -> String {
+        self.canonical_of(id)
+            .map(|c| c.canonical())
+            .unwrap_or_default()
+    }
 }
 
 /// Fetch symbols from one venue via its REST list endpoint. This trait lets

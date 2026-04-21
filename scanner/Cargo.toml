@@ -84,6 +84,7 @@ pin-project-lite  = "0.2"
 criterion         = "0.5"
 tokio             = { version = "1", features = ["full", "test-util"] }
 proptest          = "1"
+tempfile          = "3"
 
 [build-dependencies]
 pb-rs             = "0.10"

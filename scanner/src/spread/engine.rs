@@ -51,6 +51,12 @@ impl ScanCounters {
 }
 
 /// Event emitted by the engine. Field names match the frontend WS/REST contract.
+///
+/// ML routing fields (`symbol_id`, `buy_venue`, `sell_venue`) foram adicionados
+/// em M1.7 para que o módulo `crate::ml` possa derivar `RouteId` sem precisar
+/// fazer lookup reverso via strings. Não afetam o wire format do broadcast
+/// (serialização via `OpportunityDto` continua usando apenas os campos
+/// originais — aditivo para o tipo interno, zero impacto no frontend).
 #[derive(Debug, Clone)]
 pub struct Opportunity {
     pub symbol:        String,
@@ -67,6 +73,10 @@ pub struct Opportunity {
     pub sell_vol24:    f64,
     pub buy_book_age:  u64,
     pub sell_book_age: u64,
+    // ML routing (M1.7) — tipos fortes para consumo pelo `crate::ml`.
+    pub symbol_id:     SymbolId,
+    pub buy_venue:     Venue,
+    pub sell_venue:    Venue,
 }
 
 /// Per-cell (venue, symbol) staleness state. Laid out as [venue][symbol] for
@@ -236,6 +246,10 @@ pub fn scan_once(
                     sell_vol24:   sell_vol,
                     buy_book_age: *buy_age,
                     sell_book_age:*sell_age,
+                    // M1.7 — ML routing fields. Vars já em escopo.
+                    symbol_id:    sym_id,
+                    buy_venue:    buy_v,
+                    sell_venue:   sell_v,
                 });
                 counters.emitted.fetch_add(1, Ordering::Relaxed);
             }

@@ -133,6 +133,37 @@ impl Venue {
             | Venue::GateFut  | Venue::XtFut | Venue::KucoinFut | Venue::BitgetFut => Market::Perp,
         }
     }
+
+    /// Limite superior para `book_age` (ms) considerado "fresco" para a venue.
+    ///
+    /// Cada venue tem cadência típica de updates WS distinta; um threshold
+    /// universal de 200 ms (primeiro design) rejeitava ~93% dos snapshots
+    /// longtail porque MEXC/BingX/XT fazem book update em ~500ms–2s por design.
+    /// Valores abaixo são heurísticos da microestrutura empírica (D2 §5.6)
+    /// e do comportamento observado em 15 min de dev-mode do scanner em
+    /// `docs/ml/06_labels_and_data/DATASET_ACTION_PLAN.md` §1.
+    ///
+    /// Trade-off: valores muito baixos rejeitam dados legítimos (C3 gap);
+    /// muito altos admitem staleness real. Revisar empiricamente após 30 dias
+    /// de coleta real com métricas `ml_sample_decisions_total{reason=stale}`
+    /// decomposto por venue.
+    #[inline(always)]
+    pub fn max_book_age_ms(self) -> u32 {
+        match self {
+            // Top-5 — book updates frequentes, baseline 100ms é adequado.
+            Venue::BinanceSpot | Venue::BinanceFut => 100,
+            // Kucoin, Bitget, Gate — updates regulares; 500ms cobre.
+            Venue::KucoinSpot | Venue::KucoinFut
+            | Venue::BitgetSpot | Venue::BitgetFut => 500,
+            Venue::GateSpot | Venue::GateFut => 1000,
+            // MEXC — WS spot via REST polling ~1s; fut ~500ms.
+            Venue::MexcSpot => 1500,
+            Venue::MexcFut => 500,
+            // BingX, XT — cadência lenta observada D2; 2s cobre folgadamente.
+            Venue::BingxSpot | Venue::BingxFut
+            | Venue::XtSpot | Venue::XtFut => 2000,
+        }
+    }
 }
 
 impl fmt::Display for Venue {
