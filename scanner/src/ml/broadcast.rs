@@ -35,6 +35,7 @@ pub struct RecommendationFrame {
     pub cycle_seq: u32,
     pub emitted_at_ns: u64,
     pub route_id: RouteId,
+    pub symbol_name: String,
     pub dto: RecommendationDto,
 }
 
@@ -43,12 +44,14 @@ impl RecommendationFrame {
         cycle_seq: u32,
         emitted_at_ns: u64,
         route_id: RouteId,
+        symbol_name: impl Into<String>,
         rec: &Recommendation,
     ) -> Self {
         Self {
             cycle_seq,
             emitted_at_ns,
             route_id,
+            symbol_name: symbol_name.into(),
             dto: RecommendationDto::from(rec),
         }
     }
@@ -56,6 +59,46 @@ impl RecommendationFrame {
     /// Serializa o DTO para linha JSON — usado pelo WS handler.
     pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(&self.dto)
+    }
+
+    /// Serializa um envelope compatível com a UI legado do scanner.
+    ///
+    /// A tela atual ainda consome o dialeto "opportunity" do scanner bruto.
+    /// Para evitar reescrever a SPA neste momento, o websocket de ML emite
+    /// um envelope equivalente, com o `RecommendationDto` preservado em `ml`
+    /// para consumidores mais novos.
+    pub fn to_scanner_like_json_string(&self) -> Result<String, serde_json::Error> {
+        let timestamp = iso8601_from_ns(self.emitted_at_ns);
+        let body = match &self.dto {
+            RecommendationDto::Trade(setup) => serde_json::json!({
+                "type": "opportunity",
+                "timestamp": timestamp,
+                "data": [{
+                    "symbol": &self.symbol_name,
+                    "current": "USDT",
+                    "buyFrom": setup.route_id.buy_venue,
+                    "sellTo": setup.route_id.sell_venue,
+                    "buyType": setup.route_id.buy_market,
+                    "sellType": setup.route_id.sell_market,
+                    "buyPrice": setup.enter_typical,
+                    "sellPrice": setup.exit_typical,
+                    "entrySpread": setup.enter_at_min,
+                    "exitSpread": setup.exit_at_min,
+                    "buyVol24": 0.0,
+                    "sellVol24": 0.0,
+                    "buyBookAge": 0,
+                    "sellBookAge": 0,
+                    "ml": &self.dto,
+                }],
+            }),
+            RecommendationDto::Abstain { .. } => serde_json::json!({
+                "type": "opportunity",
+                "timestamp": timestamp,
+                "data": [],
+                "ml": &self.dto,
+            }),
+        };
+        serde_json::to_string(&body)
     }
 }
 
@@ -113,10 +156,11 @@ impl RecommendationBroadcaster {
         cycle_seq: u32,
         emitted_at_ns: u64,
         route_id: RouteId,
+        symbol_name: impl Into<String>,
         rec: &Recommendation,
     ) -> bool {
         let frame = RecommendationFrame::from_recommendation(
-            cycle_seq, emitted_at_ns, route_id, rec,
+            cycle_seq, emitted_at_ns, route_id, symbol_name, rec,
         );
         match rec {
             Recommendation::Trade(_) => {
@@ -214,7 +258,7 @@ mod tests {
     async fn publish_without_subscribers_does_not_panic() {
         let b = RecommendationBroadcaster::new();
         let r = mk_trade();
-        let had_consumers = b.publish(1, 100, mk_route(), &r);
+        let had_consumers = b.publish(1, 100, mk_route(), "BTC-USDT", &r);
         assert!(!had_consumers);
         assert_eq!(b.metrics().published_total.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -228,11 +272,12 @@ mod tests {
         let b = RecommendationBroadcaster::new();
         let mut rx = b.subscribe();
         let r = mk_trade();
-        assert!(b.publish(42, 1_234, mk_route(), &r));
+        assert!(b.publish(42, 1_234, mk_route(), "BTC-USDT", &r));
 
         let frame = rx.recv().await.expect("frame recv");
         assert_eq!(frame.cycle_seq, 42);
         assert_eq!(frame.emitted_at_ns, 1_234);
+        assert_eq!(frame.symbol_name, "BTC-USDT");
         assert!(matches!(frame.dto, RecommendationDto::Trade(_)));
     }
 
@@ -240,8 +285,8 @@ mod tests {
     async fn abstain_increments_metrics_separately() {
         let b = RecommendationBroadcaster::new();
         let mut rx = b.subscribe();
-        b.publish(1, 1, mk_route(), &mk_trade());
-        b.publish(2, 2, mk_route(), &mk_abstain());
+        b.publish(1, 1, mk_route(), "BTC-USDT", &mk_trade());
+        b.publish(2, 2, mk_route(), "BTC-USDT", &mk_abstain());
         let _ = rx.recv().await;
         let _ = rx.recv().await;
 
@@ -256,7 +301,7 @@ mod tests {
     async fn frame_to_json_roundtrips() {
         let b = RecommendationBroadcaster::new();
         let mut rx = b.subscribe();
-        b.publish(1, 1, mk_route(), &mk_trade());
+        b.publish(1, 1, mk_route(), "BTC-USDT", &mk_trade());
         let frame = rx.recv().await.unwrap();
         let s = frame.to_json_string().unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -268,10 +313,55 @@ mod tests {
         let b = RecommendationBroadcaster::new();
         let mut rx1 = b.subscribe();
         let mut rx2 = b.subscribe();
-        b.publish(1, 1, mk_route(), &mk_trade());
+        b.publish(1, 1, mk_route(), "BTC-USDT", &mk_trade());
 
         let f1 = rx1.recv().await.unwrap();
         let f2 = rx2.recv().await.unwrap();
         assert_eq!(f1.cycle_seq, f2.cycle_seq);
     }
+
+    #[tokio::test]
+    async fn scanner_like_json_contains_legacy_opportunity_envelope() {
+        let b = RecommendationBroadcaster::new();
+        let mut rx = b.subscribe();
+        b.publish(7, 1_700_000_000_000_000_000, mk_route(), "BTC-USDT", &mk_trade());
+        let frame = rx.recv().await.unwrap();
+        let s = frame.to_scanner_like_json_string().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+
+        assert_eq!(v["type"], "opportunity");
+        assert_eq!(v["data"][0]["symbol"], "BTC-USDT");
+        assert_eq!(v["data"][0]["buyFrom"], "mexc");
+        assert_eq!(v["data"][0]["sellTo"], "bingx");
+        assert_eq!(v["data"][0]["ml"]["kind"], "trade");
+    }
+}
+
+fn iso8601_from_ns(ns: u64) -> String {
+    let secs = (ns / 1_000_000_000) as i64;
+    let ms = ((ns / 1_000_000) % 1000) as u32;
+    iso8601_from_secs(secs, ms)
+}
+
+fn iso8601_from_secs(secs: i64, ms: u32) -> String {
+    let (date_days, time_secs) = (secs.div_euclid(86400), secs.rem_euclid(86400));
+    let (y, m, d) = civil_from_days(date_days);
+    let h = time_secs / 3600;
+    let mi = (time_secs % 3600) / 60;
+    let s = time_secs % 60;
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, m, d, h, mi, s, ms)
+}
+
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as i64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
 }

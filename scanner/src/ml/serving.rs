@@ -31,12 +31,18 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::collections::VecDeque;
 
+use ahash::AHashMap;
+use parking_lot::Mutex;
 use crate::ml::baseline::BaselineA3;
 use crate::ml::contract::{
-    AbstainDiagnostic, AbstainReason, Recommendation, RouteId,
+    AbstainDiagnostic, AbstainReason, Recommendation, RouteId, TradeSetup,
 };
 use crate::ml::eval::verify_tradesetup;
+use crate::ml::economic::{
+    EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome,
+};
 use crate::ml::listing_history::ListingHistory;
 use crate::ml::persistence::{AcceptedSample, RawSample, RawWriterHandle, RouteDecimator};
 use crate::ml::trigger::{SampleDecision, SamplingTrigger};
@@ -56,6 +62,7 @@ pub struct MlServer {
     baseline: BaselineA3,
     trigger: SamplingTrigger,
     listing: ListingHistory,
+    economic: Mutex<EconomicTracker>,
     // Métricas mínimas (agregadas; cópia periódica para Prometheus em M1.8).
     metrics: Arc<ServerMetrics>,
     // Sequência monotônica por ciclo — preenchida pelo chamador
@@ -125,12 +132,146 @@ pub struct ServerMetrics {
     pub raw_samples_dropped_channel_closed: AtomicU64,
 }
 
+#[derive(Debug, Clone)]
+struct PendingEconomicTrade {
+    setup: TradeSetup,
+    entry_hit_ns: Option<u64>,
+    entry_hit_pct: Option<f32>,
+    last_exit_pct: f32,
+    from_model: bool,
+}
+
+impl PendingEconomicTrade {
+    fn new(setup: TradeSetup) -> Self {
+        let from_model = !setup.model_version.starts_with("baseline-");
+        Self {
+            setup,
+            entry_hit_ns: None,
+            entry_hit_pct: None,
+            last_exit_pct: 0.0,
+            from_model,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        now_ns: u64,
+        entry_spread: f32,
+        exit_spread: f32,
+    ) -> Option<EconomicEvent> {
+        self.last_exit_pct = exit_spread;
+        if self.entry_hit_ns.is_none() && entry_spread >= self.setup.enter_at_min {
+            self.entry_hit_ns = Some(now_ns);
+            self.entry_hit_pct = Some(entry_spread);
+        }
+
+        let entry_realized_pct = self.entry_hit_pct.unwrap_or(entry_spread);
+        if self.entry_hit_ns.is_some() && exit_spread >= self.setup.exit_at_min {
+            let horizon_observed_s = now_ns
+                .saturating_sub(self.setup.emitted_at)
+                .saturating_div(1_000_000_000)
+                .min(u32::MAX as u64) as u32;
+            return Some(EconomicEvent::new(
+                &self.setup,
+                TradeOutcome::Realized {
+                    enter_realized_pct: entry_realized_pct,
+                    exit_realized_pct: exit_spread,
+                    horizon_observed_s,
+                },
+                now_ns,
+                self.from_model,
+            ));
+        }
+
+        if now_ns >= self.setup.valid_until {
+            let outcome = if self.entry_hit_ns.is_none() {
+                TradeOutcome::WindowMiss
+            } else {
+                TradeOutcome::ExitMiss {
+                    enter_realized_pct: entry_realized_pct,
+                    forced_exit_pct: self.last_exit_pct,
+                }
+            };
+            return Some(EconomicEvent::new(
+                &self.setup,
+                outcome,
+                now_ns,
+                self.from_model,
+            ));
+        }
+
+        None
+    }
+}
+
+#[derive(Default)]
+struct EconomicTracker {
+    accumulator: EconomicAccumulator,
+    pending_by_route: AHashMap<RouteId, VecDeque<PendingEconomicTrade>>,
+}
+
+impl EconomicTracker {
+    fn new() -> Self {
+        Self {
+            accumulator: EconomicAccumulator::new(),
+            pending_by_route: AHashMap::new(),
+        }
+    }
+
+    fn metrics(&self) -> Arc<EconomicMetrics> {
+        self.accumulator.metrics()
+    }
+
+    fn process(
+        &mut self,
+        route: RouteId,
+        entry_spread: f32,
+        exit_spread: f32,
+        now_ns: u64,
+        rec: &Recommendation,
+    ) {
+        self.resolve_route(route, entry_spread, exit_spread, now_ns);
+        if let Recommendation::Trade(setup) = rec {
+            self.pending_by_route
+                .entry(route)
+                .or_default()
+                .push_back(PendingEconomicTrade::new(setup.clone()));
+        }
+        self.resolve_route(route, entry_spread, exit_spread, now_ns);
+    }
+
+    fn resolve_route(
+        &mut self,
+        route: RouteId,
+        entry_spread: f32,
+        exit_spread: f32,
+        now_ns: u64,
+    ) {
+        let Some(mut queue) = self.pending_by_route.remove(&route) else {
+            return;
+        };
+
+        let mut keep = VecDeque::with_capacity(queue.len());
+        while let Some(mut pending) = queue.pop_front() {
+            match pending.observe(now_ns, entry_spread, exit_spread) {
+                Some(evt) => self.accumulator.push(evt),
+                None => keep.push_back(pending),
+            }
+        }
+
+        if !keep.is_empty() {
+            self.pending_by_route.insert(route, keep);
+        }
+    }
+}
+
 impl MlServer {
     pub fn new(baseline: BaselineA3, trigger: SamplingTrigger) -> Self {
         Self {
             baseline,
             trigger,
             listing: ListingHistory::new(),
+            economic: Mutex::new(EconomicTracker::new()),
             metrics: Arc::new(ServerMetrics::default()),
             cycle_seq: AtomicU64::new(0),
             raw_decimator: RouteDecimator::new(),
@@ -168,6 +309,10 @@ impl MlServer {
         Arc::clone(&self.metrics)
     }
 
+    pub fn economic_metrics(&self) -> Arc<EconomicMetrics> {
+        self.economic.lock().metrics()
+    }
+
     /// Avança o `cycle_seq` — chamado uma vez pelo spread engine no início
     /// de cada ciclo 150ms. Thread-safe via `fetch_add`.
     pub fn begin_cycle(&self) -> u32 {
@@ -183,9 +328,10 @@ impl MlServer {
     ///   de treinamento (shadow mode M1.7).
     ///
     /// Internamente:
-    /// 1. Registra observação no `HotQueryCache` (histograma rolante).
-    /// 2. Avalia `SamplingTrigger` (4 gates).
-    /// 3. Gera `Recommendation` via `BaselineA3`.
+    /// 1. Avalia `SamplingTrigger` (4 gates) contra o cache anterior.
+    /// 2. Gera `Recommendation` via `BaselineA3` usando apenas histórico.
+    /// 3. Depois atualiza `HotQueryCache` e o ledger econômico com a
+    ///    observação atual, se o dado estiver limpo.
     /// 4. Atualiza métricas.
     ///
     /// Chamado a cada tick do scanner (150 ms) para cada rota emitida.
@@ -238,11 +384,6 @@ impl MlServer {
             sell_vol24_usd,
             halt_active,
         );
-        if clean {
-            self.baseline
-                .cache()
-                .observe(route, entry_spread, exit_spread, now_ns);
-        }
 
         // 2. Avalia trigger de amostragem completo (inclui n_min + tail).
         let sample_dec = self.trigger.evaluate(
@@ -300,12 +441,21 @@ impl MlServer {
             .baseline
             .recommend(route, entry_spread, exit_spread, now_ns);
         let n_observations = self
-            .metrics
-            .opportunities_seen
-            .load(Ordering::Relaxed)
+            .baseline
+            .cache()
+            .n_observations(route)
             .min(u32::MAX as u64) as u32;
         let rec = enforce_recommendation_invariants(rec, n_observations);
         self.bump_rec_metric(&rec);
+
+        if clean {
+            self.baseline
+                .cache()
+                .observe(route, entry_spread, exit_spread, now_ns);
+            self.economic
+                .lock()
+                .process(route, entry_spread, exit_spread, now_ns, &rec);
+        }
 
         // 4. **C4** — emite `AcceptedSample` se o trigger aceitou.
         //    `was_recommended` inicializa `false`; broadcast layer flipa
@@ -400,6 +550,24 @@ mod tests {
         MlServer::new(baseline, trigger)
     }
 
+    fn mk_server_with_min_history(n_min: u64) -> MlServer {
+        use crate::ml::feature_store::hot_cache::CacheConfig;
+        let cache = HotQueryCache::with_config(CacheConfig::for_testing());
+        let baseline = BaselineA3::new(
+            cache,
+            BaselineConfig {
+                floor_pct: 0.5,
+                n_min,
+                ..BaselineConfig::default()
+            },
+        );
+        let trigger = SamplingTrigger::new(SamplingConfig {
+            n_min,
+            ..SamplingConfig::default()
+        });
+        MlServer::new(baseline, trigger)
+    }
+
     #[test]
     fn first_observations_abstain_insufficient_data() {
         let server = mk_server();
@@ -415,6 +583,23 @@ mod tests {
             _ => panic!("expected Abstain on first observation"),
         }
         assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
+    }
+
+    #[test]
+    fn first_observation_does_not_self_prime_recommendation() {
+        let server = mk_server_with_min_history(1);
+        let route = mk_route();
+        let (rec, dec, accepted) = server.on_opportunity(
+            0, route, "BTC-USDT", 3.2, -0.4, 50, 50, 1e6, 1e6, false, 1,
+        );
+        match rec {
+            Recommendation::Abstain { reason, .. } => {
+                assert_eq!(reason, AbstainReason::InsufficientData);
+            }
+            other => panic!("expected abstain on first observation, got {:?}", other),
+        }
+        assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
+        assert!(accepted.is_none());
     }
 
     #[test]
@@ -545,6 +730,30 @@ mod tests {
         );
         assert!(accepted.is_none(), "halt não gera AcceptedSample");
         assert_eq!(dec, SampleDecision::RejectHalt);
+    }
+
+    #[test]
+    fn economic_tracker_resolves_a_trade_in_sequence() {
+        let server = mk_server_with_min_history(1);
+        let route = mk_route();
+
+        let (_rec, dec, _) = server.on_opportunity(
+            0, route, "BTC-USDT", 2.0, -1.0, 50, 50, 1e6, 1e6, false, 1,
+        );
+        assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
+
+        let (rec, _dec, _accepted) = server.on_opportunity(
+            1, route, "BTC-USDT", 3.4, -1.4, 50, 50, 1e6, 1e6, false, 2,
+        );
+        assert!(matches!(rec, Recommendation::Trade(_)));
+
+        let (_rec, _dec, _accepted) = server.on_opportunity(
+            2, route, "BTC-USDT", 1.0, 0.2, 50, 50, 1e6, 1e6, false, 3,
+        );
+
+        let econ = server.economic_metrics();
+        assert!(econ.n_emissions_total.load(Ordering::Relaxed) >= 1);
+        assert_eq!(econ.n_realized_total.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

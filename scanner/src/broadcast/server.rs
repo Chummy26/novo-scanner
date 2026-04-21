@@ -138,6 +138,7 @@ pub async fn serve(
     let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
 
     let mut app = Router::new()
+        .route("/ws", get(ws_handler))
         .route("/ws/scanner", get(ws_handler))
         .route("/ws/ml/recommendations", get(ws_ml_recommendations))
         .route("/api/ml/recommendations/status", get(rest_ml_rec_status))
@@ -372,15 +373,9 @@ async fn handle_ml_socket(mut socket: WebSocket, state: BroadcastState) {
             ev = rx.recv() => {
                 match ev {
                     Ok(frame) => {
-                        match frame.to_json_string() {
+                        match frame.to_scanner_like_json_string() {
                             Ok(payload) => {
-                                // Envelope minimal: {type, cycle_seq, emitted_at_ns, payload}
-                                let msg = format!(
-                                    r#"{{"type":"ml.recommendation","cycle_seq":{},"emitted_at_ns":{},"payload":{}}}"#,
-                                    frame.cycle_seq,
-                                    frame.emitted_at_ns,
-                                    payload
-                                );
+                                let msg = payload;
                                 if socket.send(Message::Text(msg)).await.is_err() { break; }
                             }
                             Err(e) => {

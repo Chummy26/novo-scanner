@@ -3549,7 +3549,7 @@ ${f}`;
                 d.current.readyState !== WebSocket.CLOSING &&
                 F(),
               t("connecting"));
-            const B = new WebSocket("ws://localhost:8000/ws/scanner");
+            const B = new WebSocket("ws://localhost:8000/ws/ml/recommendations");
             ((d.current = B),
               (B.onopen = () => {
                 (t("open"), l());
@@ -3615,7 +3615,7 @@ ${f}`;
               b
             ) {
               console.warn(
-                "[Scanner WS] Watchdog: no data for 45s, reconnecting...",
+                "[ML WS] Watchdog: no data for 45s, reconnecting...",
               );
               _wdLastData.current = 0;
               d.current &&

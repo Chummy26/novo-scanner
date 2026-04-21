@@ -32,7 +32,7 @@ use prometheus::{
     Gauge, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
 };
 
-use crate::ml::broadcast::BroadcasterMetrics;
+use crate::ml::broadcast::{BroadcasterMetrics, RecommendationBroadcaster};
 use crate::ml::economic::EconomicMetrics;
 use crate::ml::serving::{MlServer, ServerMetrics};
 
@@ -322,7 +322,31 @@ impl MlPrometheusMetrics {
             .with_label_values(&["channel_closed"])
             .inc_by(diff!(raw_samples_dropped_channel_closed));
 
+        let economic = server.economic_metrics();
+        self.update_from_economic(&economic);
+
         self.last_seen = current;
+    }
+
+    /// Atualiza o snapshot Prometheus completo do runtime ML.
+    ///
+    /// `server` é obrigatório; broadcaster e acumulador econômico são
+    /// opcionais porque podem não estar conectados em alguns modos de
+    /// execução/teste.
+    pub fn update_from_runtime(
+        &mut self,
+        server: &MlServer,
+        broadcaster: Option<&RecommendationBroadcaster>,
+        economic: Option<&EconomicMetrics>,
+    ) {
+        self.update_from_server(server);
+        if let Some(b) = broadcaster {
+            let metrics = b.metrics();
+            self.update_from_broadcaster(metrics.as_ref());
+        }
+        if let Some(e) = economic {
+            self.update_from_economic(e);
+        }
     }
 
     /// Atualiza métricas do broadcaster a partir de `BroadcasterMetrics`.
@@ -508,5 +532,72 @@ mod tests {
         m.update_from_server(&server);
         let after = m.opportunities_seen_total.get();
         assert_eq!(before, after, "idempotent update");
+    }
+
+    #[tokio::test]
+    async fn runtime_update_includes_broadcaster_counters() {
+        use crate::ml::broadcast::RecommendationBroadcaster;
+        use crate::ml::contract::{
+            CalibStatus, ReasonKind, Recommendation, ToxicityLevel, TradeReason, TradeSetup,
+        };
+
+        let registry = Registry::new();
+        let mut m = MlPrometheusMetrics::register(&registry).expect("register");
+        let server = mk_server();
+        let broadcaster = RecommendationBroadcaster::new();
+        let mut rx = broadcaster.subscribe();
+        let route = RouteId {
+            symbol_id: SymbolId(1),
+            buy_venue: Venue::MexcFut,
+            sell_venue: Venue::BingxFut,
+        };
+        let rec = Recommendation::Trade(TradeSetup {
+            route_id: route,
+            enter_at_min: 1.8,
+            enter_typical: 2.0,
+            enter_peak_p95: 2.8,
+            p_enter_hit: 0.9,
+            exit_at_min: -1.2,
+            exit_typical: -1.0,
+            p_exit_hit_given_enter: 0.85,
+            gross_profit_p10: 0.6,
+            gross_profit_p25: 0.7,
+            gross_profit_median: 1.0,
+            gross_profit_p75: 1.5,
+            gross_profit_p90: 2.3,
+            gross_profit_p95: 2.8,
+            realization_probability: 0.77,
+            confidence_interval: (0.70, 0.82),
+            horizon_p05_s: 720,
+            horizon_median_s: 1680,
+            horizon_p95_s: 6000,
+            toxicity_level: ToxicityLevel::Healthy,
+            cluster_id: None,
+            cluster_size: 1,
+            cluster_rank: 1,
+            haircut_predicted: 0.25,
+            gross_profit_realizable_median: 0.75,
+            calibration_status: CalibStatus::Ok,
+            reason: TradeReason {
+                kind: ReasonKind::Combined,
+                detail: "test".into(),
+            },
+            model_version: "a3-0.1.0".into(),
+            emitted_at: 1_700_000_000_000_000_000,
+            valid_until: 1_700_000_150_000_000_000,
+        });
+
+        assert!(broadcaster.publish(7, 123, route, "BTC-USDT", &rec));
+        let _ = rx.recv().await.expect("frame");
+
+        m.update_from_runtime(&server, Some(&broadcaster), None);
+
+        assert_eq!(
+            m.broadcaster_published_total
+                .with_label_values(&["trade"])
+                .get(),
+            1
+        );
+        assert_eq!(m.broadcaster_was_recommended_total.get(), 1);
     }
 }

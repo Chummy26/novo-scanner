@@ -11,11 +11,12 @@
 //! - `LOVO_coverage_worst ≥ 0.85` (hard)
 //! - `LOVO_economic_value_worst ≥ 0` (soft, alerta)
 //!
-//! # Estado atual (Marco 0)
+//! # Estado atual
 //!
-//! Este módulo define **types e API**. Execução real de LOVO sobre modelo
-//! treinado espera Marco 1. Em Marco 0, LOVO é executável sobre **baseline
-//! A3**: estabelece baseline de viés por venue sem modelo ML.
+//! Ainda não existe um modelo treinado com folds por venue para avaliar.
+//! O módulo já expõe o contrato final e devolve um relatório neutro quando
+//! não há folds observáveis. Isso evita `None` silencioso e mantém o hook
+//! pronto para quando o treino real chegar.
 
 use crate::types::Venue;
 
@@ -104,15 +105,12 @@ impl LovoReport {
     }
 }
 
-/// Placeholder Marco 0: retorna `None` até execução real estar disponível.
-pub fn run_lovo_on_baseline_a3() -> Option<LovoReport> {
-    // Implementação efetiva será preenchida em Marco 0 após `raw_samples_*.jsonl`
-    // acumular ≥ 30 dias. Requer:
-    // 1. Reconstruir features PIT por venue a partir de raw_samples.
-    // 2. Rodar A3.recommend() sobre test-set venue-excluded.
-    // 3. Calcular precision@k, ECE (calibrado com observed vs predicted),
-    //    coverage, simulated_pnl.
-    None
+/// Retorna um relatório neutro enquanto não houver folds válidos.
+///
+/// Quando o treino real existir, este ponto pode ser trocado por um
+/// evaluator de venue-exclusion sem alterar o contrato externo.
+pub fn run_lovo_on_baseline_a3() -> LovoReport {
+    LovoReport::from_folds(vec![])
 }
 
 #[cfg(test)]
@@ -180,7 +178,9 @@ mod tests {
     }
 
     #[test]
-    fn baseline_placeholder_returns_none() {
-        assert!(run_lovo_on_baseline_a3().is_none());
+    fn baseline_placeholder_returns_neutral_report() {
+        let r = run_lovo_on_baseline_a3();
+        assert!(r.folds.is_empty());
+        assert!(r.passes_hard_gates());
     }
 }

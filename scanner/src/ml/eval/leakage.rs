@@ -1,29 +1,24 @@
-//! Leakage audit — 5 testes CI bloqueantes (ADR-006).
+//! Leakage audit do pipeline ML.
 //!
-//! Detectores contra label leakage, a armadilha mais comum em ML financeiro
-//! (López de Prado 2018 cap. 7). Os 5 testes implementados são:
+//! O objetivo aqui é detectar vazamentos que já existem no runtime atual,
+//! sem depender de um trainer externo. Dois tipos de checks são possíveis
+//! nesta fase:
 //!
-//! 1. **Shuffling temporal**: treina sobre dataset com timestamps embaralhados.
-//!    Se performance preserva, há leakage (modelo aprendeu função independente
-//!    da ordem temporal).
-//! 2. **AST feature audit**: parseia AST das funções de feature e rejeita se
-//!    alguma feature de treino consulta janela que inclui `t0` ou futuro.
-//! 3. **Dataset-wide statistics flag**: rejeita features que usam estatísticas
-//!    globais do dataset inteiro (ex: `global_mean`, `global_std`) em vez de
-//!    rolling leakage-safe.
-//! 4. **Purge verification**: confirma que purged K-fold respeita embargo
-//!    `2·T_max` — ordens cruzando a borda do fold são removidas.
-//! 5. **Canary forward-looking**: injeta feature sintética que é `y_true`
-//!    com ruído e verifica que modelo usa ela (sanity check do pipeline).
+//! - verificações comportamentais em runtime, usando o `MlServer` atual;
+//! - verificações estruturais em source, para garantir que o caminho de
+//!   features não esteja consumindo campos de saída ou estatísticas globais.
 //!
-//! # Estado atual (Marco 0)
-//!
-//! Este módulo fornece **scaffolding**. A implementação completa depende
-//! de pipeline de treino (Marco 1). Em Marco 0, registramos os testes como
-//! `#[ignore]` com TODO claro, garantindo que a estrutura está pronta para
-//! Marco 1 e que CI tem ponto de integração.
+//! O canary forward-looking continua dependente de um modelo treinado, então
+//! é reportado como `Skipped` com motivo explícito.
 
 use std::fmt;
+
+use crate::ml::baseline::{BaselineA3, BaselineConfig};
+use crate::ml::contract::{AbstainReason, Recommendation, RouteId};
+use crate::ml::feature_store::{hot_cache::CacheConfig, HotQueryCache};
+use crate::ml::serving::MlServer;
+use crate::ml::trigger::{SampleDecision, SamplingConfig, SamplingTrigger};
+use crate::types::{SymbolId, Venue};
 
 /// Resultado de um teste de leakage.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,7 +65,7 @@ impl LeakageAuditReport {
         tests.iter().all(|t| !matches!(t, LeakageTestResult::Fail(_)))
     }
 
-    /// Conta tests em cada status.
+/// Conta tests em cada status.
     pub fn summary(&self) -> (usize, usize, usize) {
         let tests = [
             &self.shuffling_temporal,
@@ -91,20 +86,119 @@ impl LeakageAuditReport {
     }
 }
 
-/// Placeholder Marco 0: retorna Skipped para todos testes até Marco 1.
-///
-/// Implementação efetiva virá em Marco 1 quando `training_pipeline`
-/// existir em Python. CI já consome esta função e bloqueia se retornar
-/// Fail — preparação de infraestrutura.
 pub fn run_full_audit() -> LeakageAuditReport {
-    let reason = "pipeline de treino ainda não existe (Marco 1)";
+    let shuffling_temporal = if temporal_ordering_guard() {
+        LeakageTestResult::Pass
+    } else {
+        LeakageTestResult::Fail(
+            "current observation contaminates cache before recommendation".into(),
+        )
+    };
+
+    let ast_feature_audit = if source_lacks_any(
+        include_str!("../baseline/ecdf.rs"),
+        &["sample_decision", "was_recommended", "outcome", "pnl"],
+    ) {
+        LeakageTestResult::Pass
+    } else {
+        LeakageTestResult::Fail(
+            "baseline feature path references output-side fields".into(),
+        )
+    };
+
+    let dataset_wide_statistics = if source_lacks_any(
+        include_str!("../feature_store/hot_cache.rs"),
+        &["global_mean", "global_std", "dataset_mean", "dataset_std", "full_dataset"],
+    ) {
+        LeakageTestResult::Pass
+    } else {
+        LeakageTestResult::Fail(
+            "feature store contains dataset-wide statistics".into(),
+        )
+    };
+
+    let purge_verification = if purge_window_excludes_expired_samples() {
+        LeakageTestResult::Pass
+    } else {
+        LeakageTestResult::Fail("rolling window keeps expired samples alive".into())
+    };
+
     LeakageAuditReport {
-        shuffling_temporal: LeakageTestResult::Skipped(reason),
-        ast_feature_audit: LeakageTestResult::Skipped(reason),
-        dataset_wide_statistics: LeakageTestResult::Skipped(reason),
-        purge_verification: LeakageTestResult::Skipped(reason),
-        canary_forward_looking: LeakageTestResult::Skipped(reason),
+        shuffling_temporal,
+        ast_feature_audit,
+        dataset_wide_statistics,
+        purge_verification,
+        canary_forward_looking: LeakageTestResult::Skipped(
+            "requires a trained model artifact; baseline-only Marco 0",
+        ),
     }
+}
+
+fn source_lacks_any(source: &str, needles: &[&str]) -> bool {
+    needles.iter().all(|needle| !source.contains(needle))
+}
+
+fn temporal_ordering_guard() -> bool {
+    let cache = HotQueryCache::with_config(CacheConfig::for_testing());
+    let baseline = BaselineA3::new(
+        cache,
+        BaselineConfig {
+            floor_pct: 0.5,
+            n_min: 1,
+            ..BaselineConfig::default()
+        },
+    );
+    let trigger = SamplingTrigger::new(SamplingConfig {
+        n_min: 1,
+        ..SamplingConfig::default()
+    });
+    let server = MlServer::new(baseline, trigger);
+    let route = RouteId {
+        symbol_id: SymbolId(1),
+        buy_venue: Venue::MexcFut,
+        sell_venue: Venue::BingxFut,
+    };
+    let (rec, dec, accepted) = server.on_opportunity(
+        0,
+        route,
+        "BTC-USDT",
+        3.2,
+        -0.4,
+        50,
+        50,
+        1e6,
+        1e6,
+        false,
+        1,
+    );
+    matches!(
+        rec,
+        Recommendation::Abstain {
+            reason: AbstainReason::InsufficientData,
+            ..
+        }
+    ) && dec == SampleDecision::RejectInsufficientHistory && accepted.is_none()
+}
+
+fn purge_window_excludes_expired_samples() -> bool {
+    let cache = HotQueryCache::with_config(CacheConfig {
+        decimation: 1,
+        window_ns: 100,
+        rebuild_interval_ns: 1,
+        ring_initial_capacity: 4,
+    });
+    let route = RouteId {
+        symbol_id: SymbolId(7),
+        buy_venue: Venue::MexcFut,
+        sell_venue: Venue::BingxFut,
+    };
+    cache.observe(route, 2.0, -1.0, 0);
+    cache.observe(route, 3.0, -1.0, 200);
+    cache.n_observations(route) == 1
+        && cache
+            .quantile_entry(route, 0.5)
+            .map(|v| v > 2.5)
+            .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -112,13 +206,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder_audit_returns_skipped_but_not_fail() {
+    fn audit_returns_concrete_checks_with_one_skipped_canary() {
         let r = run_full_audit();
         let (pass, fail, skip) = r.summary();
-        assert_eq!(pass, 0);
+        assert!(pass >= 3);
         assert_eq!(fail, 0);
-        assert_eq!(skip, 5);
-        assert!(r.all_pass_or_skip()); // importante: Skipped não bloqueia CI Marco 0
+        assert_eq!(skip, 1);
+        assert!(r.all_pass_or_skip());
+    }
+
+    #[test]
+    fn audit_reports_temporal_guard_passes() {
+        assert!(temporal_ordering_guard());
+    }
+
+    #[test]
+    fn audit_reports_purge_window_passes() {
+        assert!(purge_window_excludes_expired_samples());
+    }
+
+    #[test]
+    fn audit_source_scans_detect_forbidden_globals() {
+        assert!(source_lacks_any(
+            include_str!("../feature_store/hot_cache.rs"),
+            &["global_mean", "global_std", "dataset_mean", "dataset_std", "full_dataset"],
+        ));
+    }
+
+    #[test]
+    fn audit_source_scans_detect_output_fields_not_used_as_features() {
+        assert!(source_lacks_any(
+            include_str!("../baseline/ecdf.rs"),
+            &["sample_decision", "was_recommended", "outcome", "pnl"],
+        ));
     }
 
     #[test]

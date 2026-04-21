@@ -4,9 +4,34 @@ target/
 *.rs.bk
 *.pdb
 
+# Node / frontend
+node_modules/
+dist/
+coverage/
+.next/
+.nuxt/
+.svelte-kit/
+.vite/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
 # Logs
 *.log
+**/logs/
 logs/
+
+# ML data outputs
+**/data/ml/raw_samples/
+**/data/ml/accepted_samples/
 
 # Configs locais / segredos
 config.toml

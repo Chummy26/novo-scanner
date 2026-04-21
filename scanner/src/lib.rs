@@ -37,6 +37,11 @@ use crate::ml::trigger::SamplingTrigger;
 use crate::spread::engine::{new_stale_table, scan_once, Opportunity, ScanCounters, StaleTable};
 use crate::types::now_ns;
 
+#[inline]
+fn should_mark_sample_recommended(rec: &crate::ml::contract::Recommendation) -> bool {
+    matches!(rec, crate::ml::contract::Recommendation::Trade(_))
+}
+
 /// Top-level entry point. Wires: discovery → book store → adapters →
 /// spread engine → broadcast server.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
@@ -133,11 +138,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     };
     if let Some(mut metrics) = ml_metrics_opt {
         let server_for_metrics = Arc::clone(&ml_server);
+        let broadcaster_for_metrics = ml_broadcaster.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tick.tick().await;
-                metrics.update_from_server(&server_for_metrics);
+                metrics.update_from_runtime(
+                    &server_for_metrics,
+                    Some(&broadcaster_for_metrics),
+                    None,
+                );
             }
         });
     }
@@ -376,17 +386,17 @@ async fn run_spread_engine(
                 now,
             );
             // Publica recomendação no canal broadcast para consumers WS /
-            // REST. Retorna `true` se havia ao menos 1 consumer ativo.
-            // Isso é um proxy de entrega, não confirmação de leitura.
-            let was_published_to_consumer =
-                ml_broadcaster.publish(cycle_seq, now, route, &rec);
+            // REST. Entrega ao consumer é observabilidade; o dataset não
+            // pode depender da presença de uma UI conectada.
+            let _had_active_consumers =
+                ml_broadcaster.publish(cycle_seq, now, route, symbol_name.as_str(), &rec);
 
             // **C1 + C4 fix** — enfileira AcceptedSample para JSONL writer
             // quando trigger aceitou, com flag `was_recommended`
-            // refletindo apenas que a recomendação foi entregue a algum
-            // consumer conectado no momento.
+            // refletindo a emissão real de `TradeSetup`, não o estado do
+            // WebSocket/UI no instante.
             if let Some(mut sample) = accepted {
-                if was_published_to_consumer {
+                if should_mark_sample_recommended(&rec) {
                     sample.mark_recommended();
                 }
                 let _ = ml_writer.try_send(sample);
@@ -397,5 +407,80 @@ async fn run_spread_engine(
         let snapshot: Vec<Opportunity> = std::mem::take(&mut buf);
         buf = Vec::with_capacity(count.max(1024));
         bstate.publish(snapshot);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ml::contract::{
+        AbstainDiagnostic, AbstainReason, CalibStatus, ReasonKind, Recommendation,
+        RouteId, ToxicityLevel, TradeReason, TradeSetup,
+    };
+    use crate::types::{SymbolId, Venue};
+
+    fn mk_route() -> RouteId {
+        RouteId {
+            symbol_id: SymbolId(1),
+            buy_venue: Venue::MexcFut,
+            sell_venue: Venue::BingxFut,
+        }
+    }
+
+    fn mk_trade() -> Recommendation {
+        Recommendation::Trade(TradeSetup {
+            route_id: mk_route(),
+            enter_at_min: 1.8,
+            enter_typical: 2.0,
+            enter_peak_p95: 2.8,
+            p_enter_hit: 0.9,
+            exit_at_min: -1.2,
+            exit_typical: -1.0,
+            p_exit_hit_given_enter: 0.85,
+            gross_profit_p10: 0.6,
+            gross_profit_p25: 0.7,
+            gross_profit_median: 1.0,
+            gross_profit_p75: 1.5,
+            gross_profit_p90: 2.3,
+            gross_profit_p95: 2.8,
+            realization_probability: 0.77,
+            confidence_interval: (0.70, 0.82),
+            horizon_p05_s: 720,
+            horizon_median_s: 1680,
+            horizon_p95_s: 6000,
+            toxicity_level: ToxicityLevel::Healthy,
+            cluster_id: None,
+            cluster_size: 1,
+            cluster_rank: 1,
+            haircut_predicted: 0.25,
+            gross_profit_realizable_median: 0.75,
+            calibration_status: CalibStatus::Ok,
+            reason: TradeReason {
+                kind: ReasonKind::Combined,
+                detail: "test".into(),
+            },
+            model_version: "a3-0.1.0".into(),
+            emitted_at: 1_700_000_000_000_000_000,
+            valid_until: 1_700_000_150_000_000_000,
+        })
+    }
+
+    fn mk_abstain() -> Recommendation {
+        Recommendation::Abstain {
+            reason: AbstainReason::LowConfidence,
+            diagnostic: AbstainDiagnostic {
+                n_observations: 100,
+                ci_width_if_emitted: Some(0.4),
+                nearest_feasible_utility: None,
+                tail_ratio_p99_p95: None,
+                model_version: "a3-0.1.0".into(),
+                regime_posterior: [0.6, 0.3, 0.1],
+            },
+        }
+    }
+
+    #[test]
+    fn only_trade_recommendations_mark_samples_as_recommended() {
+        assert!(super::should_mark_sample_recommended(&mk_trade()));
+        assert!(!super::should_mark_sample_recommended(&mk_abstain()));
     }
 }
