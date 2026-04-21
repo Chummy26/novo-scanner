@@ -18,7 +18,7 @@
 //! | `ml_raw_samples_dropped_total` | CounterVec | `reason` | RawSamples descartados (channel_full/closed) |
 //! | `ml_broadcaster_published_total` | CounterVec | `kind` | Recommendations publicadas ao broadcaster (ADR-026) |
 //! | `ml_broadcaster_no_subscribers_total` | Counter | — | Publicações sem consumers ativos |
-//! | `ml_broadcaster_was_recommended_total` | Counter | — | Publicações com ≥1 consumer — flipa was_recommended |
+//! | `ml_broadcaster_was_recommended_total` | Counter | — | Publicações com ≥1 consumer no envio — proxy de entrega |
 //! | `ml_economic_emissions_total` | Counter | — | Eventos econômicos acumulados |
 //! | `ml_economic_outcomes_total` | CounterVec | `outcome` | realized/window_miss/exit_miss |
 //! | `ml_economic_pnl_aggregated_usd` | Gauge | — | PnL bruto simulado agregado (USD, capital hipotético 10k) |
@@ -101,7 +101,7 @@ struct EconomicSnapshot {
     n_realized_total: u64,
     n_window_miss_total: u64,
     n_exit_miss_total: u64,
-    pnl_aggregated_usd_times_10k: u64,
+    pnl_aggregated_usd_times_10k: i64,
 }
 
 impl MlPrometheusMetrics {
@@ -160,7 +160,7 @@ impl MlPrometheusMetrics {
         ))?;
         let broadcaster_was_recommended_total = IntCounter::with_opts(Opts::new(
             "ml_broadcaster_was_recommended_total",
-            "Publicações que encontraram ≥1 consumer — flipa was_recommended",
+            "Publicações que encontraram ≥1 consumer no envio — proxy de entrega",
         ))?;
 
         // Wave T — economic (ADR-019).

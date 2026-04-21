@@ -77,7 +77,8 @@ pub struct BroadcasterMetrics {
     /// `broadcast::Sender::send` retorna Err(SendError) nesse caso;
     /// não é erro real, apenas sinaliza ausência de listeners.
     pub no_subscribers_total: AtomicU64,
-    /// Quando `was_recommended` é marcado como `true` antes de persistência.
+    /// Quando `publish` encontrou ≥ 1 consumer no instante do envio.
+    /// É proxy de entrega, não confirmação de leitura humana.
     pub was_recommended_publications: AtomicU64,
 }
 

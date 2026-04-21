@@ -38,7 +38,7 @@ docs/ml/
 
 Pastas vazias (03, 04, 05, 07, 08, 09) são placeholders para conteúdo empírico que só existe pós-deploy; mantidas para evitar criar depois e preservar estrutura.
 
-## Status de pesquisa (2026-04-19) — Programa COMPLETO
+## Status de pesquisa (2026-04-19) — Programa consolidado; implementação runtime ainda parcial
 
 ### Wave 1 — Fundacional ✅
 

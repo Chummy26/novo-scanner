@@ -1,7 +1,8 @@
-//! Baseline A3 — implementação ECDF marginal.
+//! Baseline A3 — implementação ECDF pareada.
 //!
-//! Ver `mod.rs` para limitações documentadas (MVP usa marginais
-//! independentes; A2 composta corrige em Marco 2).
+//! Ver `mod.rs` para limitações documentadas. O baseline continua sendo
+//! safety-net, mas já usa estatísticas conjuntivas do par `entry+exit`
+//! para não cair no trap de marginais independentes.
 
 use crate::ml::contract::{
     AbstainDiagnostic, AbstainReason, CalibStatus, ReasonKind, Recommendation, RouteId,
@@ -86,11 +87,11 @@ impl BaselineA3 {
     ///
     /// **Fluxo MVP**:
     /// 1. Checa `n_observations ≥ n_min` (senão `InsufficientData`).
-    /// 2. Lookup de quantis marginais entry/exit (p10, p25, p50, p75, p90, p95).
-    /// 3. `gross_profit_q = entry_q + exit_q` (SIMPLIFICAÇÃO MARGINAL).
+    /// 2. Lookup de quantis marginais entry/exit para os thresholds.
+    /// 3. Lookup de quantis da distribuição conjunta `gross = entry + exit`.
     /// 4. Se `gross_profit_p10 < floor` → `NoOpportunity`.
-    /// 5. `p_realize = p_enter_hit × p_exit_hit` (MARGINAL, sub-ótimo —
-    ///    ver `mod.rs`).
+    /// 5. `p_realize` é a taxa empírica de `gross ≥ floor`, com IC 95%
+    ///    binomial (Wilson) sobre o histórico da rota.
     /// 6. Emite `TradeSetup` com `calibration_status: Degraded` (sinaliza
     ///    operador que estamos em baseline, não modelo full).
     pub fn recommend(
@@ -101,6 +102,9 @@ impl BaselineA3 {
         now_ns: u64,
     ) -> Recommendation {
         let n = self.cache.n_observations(route);
+        // Quantis vêm de buckets de 1e-4; usa tolerância de um bucket para
+        // evitar decisões instáveis em igualdade numérica.
+        let quantile_tolerance = 1e-4_f32;
 
         // Gate 1: dados insuficientes.
         if n < self.cfg.n_min {
@@ -119,7 +123,7 @@ impl BaselineA3 {
                 diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
             },
         };
-        if current_entry < p50_entry {
+        if current_entry + quantile_tolerance < p50_entry {
             return Recommendation::Abstain {
                 reason: AbstainReason::NoOpportunity,
                 diagnostic: AbstainDiagnostic {
@@ -134,14 +138,21 @@ impl BaselineA3 {
         }
 
         // Lookup de quantis marginais.
-        let (p10_e, p25_e, p50_e, p75_e, p90_e, p95_e) = match all_quantiles_entry(&self.cache, route) {
+        let (p10_e, _p25_e, p50_e, _p75_e, _p90_e, p95_e) = match all_quantiles_entry(&self.cache, route) {
             Some(qs) => qs,
             None => return Recommendation::Abstain {
                 reason: AbstainReason::InsufficientData,
                 diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
             },
         };
-        let (p10_x, p25_x, p50_x, p75_x, p90_x, p95_x) = match all_quantiles_exit(&self.cache, route) {
+        let (p10_x, _p25_x, p50_x, _p75_x, _p90_x, _p95_x) = match all_quantiles_exit(&self.cache, route) {
+            Some(qs) => qs,
+            None => return Recommendation::Abstain {
+                reason: AbstainReason::InsufficientData,
+                diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+            },
+        };
+        let (g10, g25, g50, g75, g90, g95) = match all_quantiles_gross(&self.cache, route) {
             Some(qs) => qs,
             None => return Recommendation::Abstain {
                 reason: AbstainReason::InsufficientData,
@@ -156,16 +167,16 @@ impl BaselineA3 {
         let enter_peak_p95 = p95_e;
         let exit_typical = p50_x;
 
-        // Gross profit quantis via adição marginal (sub-ótimo).
-        let gross_p10 = enter_at_min + exit_at_min;
-        let gross_p25 = p25_e + p25_x;
-        let gross_median = enter_typical + exit_typical;
-        let gross_p75 = p75_e + p75_x;
-        let gross_p90 = p90_e + p90_x;
-        let gross_p95 = enter_peak_p95 + p95_x;
+        // Gross profit quantis via distribuição conjunta pareada.
+        let gross_p10 = g10;
+        let gross_p25 = g25;
+        let gross_median = g50;
+        let gross_p75 = g75;
+        let gross_p90 = g90;
+        let gross_p95 = g95;
 
         // Gate 3: gross_p10 abaixo do floor → não vale.
-        if gross_p10 < self.cfg.floor_pct {
+        if gross_p10 + quantile_tolerance < self.cfg.floor_pct {
             return Recommendation::Abstain {
                 reason: AbstainReason::NoOpportunity,
                 diagnostic: AbstainDiagnostic {
@@ -179,23 +190,38 @@ impl BaselineA3 {
             };
         }
 
-        // P_realize marginal (SUB-ÓTIMO, documentado — ADR-016 Q2-M2).
-        // Aproximação: probabilidade de entry hitting `enter_at_min`
-        // é ~0.9 por construção (é o p10 da distribuição); idem exit.
-        // Baseline retorna produto com haircut conservador.
-        let p_enter_hit = 0.90_f32;
-        let p_exit_hit = 0.85_f32;
-        let p_realize = p_enter_hit * p_exit_hit;
+        let (p_enter_hit, _, _) = match self.cache.probability_entry_ge(route, enter_at_min) {
+            Some(stats) => stats,
+            None => return Recommendation::Abstain {
+                reason: AbstainReason::InsufficientData,
+                diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+            },
+        };
+        let (p_exit_hit, _, _) = match self.cache.probability_exit_ge(route, exit_at_min) {
+            Some(stats) => stats,
+            None => return Recommendation::Abstain {
+                reason: AbstainReason::InsufficientData,
+                diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+            },
+        };
+        let (p_realize, success_count, total_count) =
+            match self.cache.probability_gross_ge(route, self.cfg.floor_pct) {
+                Some(stats) => stats,
+                None => return Recommendation::Abstain {
+                    reason: AbstainReason::InsufficientData,
+                    diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+                },
+            };
+        let (ic_low, ic_high) = wilson_interval(success_count, total_count);
 
-        // IC 95% via bootstrap simples: ±0.05 heurístico (proper CQR vem em M2).
-        let ic_low = (p_realize - 0.07).max(0.0);
-        let ic_high = (p_realize + 0.05).min(1.0);
-
-        // Horizon: placeholder até M1.1b ring buffer permitir first-passage empírico.
-        // MVP reporta médios reasonable para cripto longtail (D2).
-        let horizon_p05_s = 120; // 2 min — pior caso rápido
-        let horizon_median_s = 1_500; // 25 min
-        let horizon_p95_s = 7_200; // 2h
+        // Horizon: duração empírica dos runs favoráveis acima do floor.
+        // Se ainda não houver run suficiente, usa uma heurística conservadora
+        // baseada na validade da recomendação, não um número fixo.
+        let fallback = self.cfg.valid_for_s.max(1);
+        let (horizon_p05_s, horizon_median_s, horizon_p95_s) = self
+            .cache
+            .gross_run_duration_quantiles(route, self.cfg.floor_pct)
+            .unwrap_or((fallback / 2, fallback, fallback.saturating_mul(2)));
 
         // Haircut empírico default — será calibrado em shadow (ADR-013 Fase 2).
         let haircut = self.cfg.default_haircut;
@@ -229,9 +255,9 @@ impl BaselineA3 {
             cluster_rank: 1,
             haircut_predicted: haircut,
             gross_profit_realizable_median: gross_realizable_median,
-            // `Degraded` sinaliza que estamos em baseline, não modelo A2 —
-            // UI deve mostrar `?/100` até que calibração empírica seja
-            // estabelecida (ADR-013 shadow Fase 1).
+            // `Degraded` sinaliza que estamos em baseline/safety-net, não no
+            // modelo A2 completo. UI deve mostrar `?/100` até que a
+            // calibração do modelo principal esteja estabelecida.
             calibration_status: CalibStatus::Degraded,
             reason: TradeReason {
                 kind: ReasonKind::Tail,
@@ -280,6 +306,36 @@ fn all_quantiles_exit(
     ))
 }
 
+fn all_quantiles_gross(
+    cache: &HotQueryCache,
+    route: RouteId,
+) -> Option<(f32, f32, f32, f32, f32, f32)> {
+    Some((
+        cache.quantile_gross(route, 0.10)?,
+        cache.quantile_gross(route, 0.25)?,
+        cache.quantile_gross(route, 0.50)?,
+        cache.quantile_gross(route, 0.75)?,
+        cache.quantile_gross(route, 0.90)?,
+        cache.quantile_gross(route, 0.95)?,
+    ))
+}
+
+fn wilson_interval(successes: u64, total: u64) -> (f32, f32) {
+    if total == 0 {
+        return (0.0, 1.0);
+    }
+
+    let n = total as f64;
+    let s = successes as f64;
+    let z = 1.96_f64;
+    let z2 = z * z;
+    let phat = s / n;
+    let denom = 1.0 + z2 / n;
+    let centre = (phat + z2 / (2.0 * n)) / denom;
+    let margin = z * ((phat * (1.0 - phat) / n + z2 / (4.0 * n * n)).sqrt()) / denom;
+    ((centre - margin).max(0.0) as f32, (centre + margin).min(1.0) as f32)
+}
+
 fn diagnostic_insufficient(n: u64, version: &'static str) -> AbstainDiagnostic {
     AbstainDiagnostic {
         n_observations: n.min(u32::MAX as u64) as u32,
@@ -316,6 +372,12 @@ mod tests {
             let entry = 2.0 + t * 2.0;
             let exit = -1.0 + t * 1.5;
             cache.observe(route, entry, exit, i);
+        }
+    }
+
+    fn observe_samples(cache: &HotQueryCache, route: RouteId, samples: &[(f32, f32)]) {
+        for (i, (entry, exit)) in samples.iter().copied().enumerate() {
+            cache.observe(route, entry, exit, i as u64);
         }
     }
 
@@ -411,6 +473,71 @@ mod tests {
                 assert_eq!(reason, AbstainReason::NoOpportunity);
             }
             Recommendation::Trade(_) => panic!("floor 10% should force abstain"),
+        }
+    }
+
+    #[test]
+    fn emit_trade_when_joint_gross_survives_floor_even_if_marginals_are_misaligned() {
+        let cache = mk_cache();
+        let cfg = BaselineConfig {
+            floor_pct: 0.5,
+            n_min: 4,
+            ..BaselineConfig::default()
+        };
+        let a3 = BaselineA3::new(cache.clone(), cfg);
+        let route = mk_route();
+        observe_samples(
+            &cache,
+            route,
+            &[(4.0, -3.0), (1.0, 1.0), (1.0, 1.0), (1.0, 1.0)],
+        );
+
+        let rec = a3.recommend(route, 4.0, 1.0, 42);
+        match rec {
+            Recommendation::Trade(setup) => {
+                assert!(setup.gross_profit_p10 >= 0.5);
+                assert!(setup.realization_probability > 0.5);
+            }
+            Recommendation::Abstain { reason, .. } => {
+                panic!("joint distribution should permit trade, got Abstain({reason:?})")
+            }
+        }
+    }
+
+    #[test]
+    fn realization_probability_and_ci_follow_observed_joint_success_rate() {
+        let cache = mk_cache();
+        let cfg = BaselineConfig {
+            floor_pct: 0.5,
+            n_min: 50,
+            ..BaselineConfig::default()
+        };
+        let a3 = BaselineA3::new(cache.clone(), cfg);
+        let route = mk_route();
+        let mut samples = Vec::with_capacity(100);
+        for _ in 0..100 {
+            samples.push((2.0, -0.5));
+        }
+        observe_samples(&cache, route, &samples);
+
+        let rec = a3.recommend(route, 2.1, -0.4, 1_700_000_000_000_000_000);
+        match rec {
+            Recommendation::Trade(setup) => {
+                assert!(
+                    (setup.realization_probability - 1.0).abs() < f32::EPSILON,
+                    "expected empirical success rate of 1.0, got {}",
+                    setup.realization_probability
+                );
+                assert!(
+                    setup.confidence_interval.0 > 0.90,
+                    "expected Wilson-style lower bound near 1.0, got {:?}",
+                    setup.confidence_interval
+                );
+                assert!(setup.confidence_interval.1 <= 1.0);
+            }
+            Recommendation::Abstain { reason, .. } => {
+                panic!("expected Trade on saturated success set, got Abstain({reason:?})")
+            }
         }
     }
 }

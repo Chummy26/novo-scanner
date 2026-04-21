@@ -51,9 +51,10 @@ pub struct AcceptedSample {
     pub buy_vol24: f64,
     pub sell_vol24: f64,
     pub sample_decision: SampleDecision,
-    /// **C4** — marca se TradeSetup foi apresentado ao operador.
-    /// Flipado em runtime quando `RecommendationBroadcaster::publish` retorna
-    /// `true` (≥ 1 consumer ativo). Antes da Wave T era sempre `false`.
+    /// **C4** — marca se TradeSetup foi entregue a algum consumer ativo.
+    /// Flipado em runtime quando `RecommendationBroadcaster::publish`
+    /// retorna `true` (≥ 1 consumer ativo). É proxy de entrega, não de
+    /// leitura humana.
     pub was_recommended: bool,
 }
 

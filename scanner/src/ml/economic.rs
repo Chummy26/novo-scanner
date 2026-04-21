@@ -28,7 +28,7 @@
 //! acontece em Marco 0 semana 4–6.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use crate::ml::contract::{RouteId, TradeSetup};
@@ -233,13 +233,13 @@ pub struct EconomicAccumulator {
 /// Contadores atômicos para Prometheus (exportado via `ml/metrics.rs`).
 #[derive(Debug, Default)]
 pub struct EconomicMetrics {
-    pub n_emissions_total: AtomicU64,
-    pub n_realized_total: AtomicU64,
-    pub n_window_miss_total: AtomicU64,
-    pub n_exit_miss_total: AtomicU64,
+    pub n_emissions_total: std::sync::atomic::AtomicU64,
+    pub n_realized_total: std::sync::atomic::AtomicU64,
+    pub n_window_miss_total: std::sync::atomic::AtomicU64,
+    pub n_exit_miss_total: std::sync::atomic::AtomicU64,
     /// PnL agregado USD × 1e4 (inteiro para evitar float atômico).
     /// Divide por 1e4 ao ler.
-    pub pnl_aggregated_usd_times_10k: AtomicU64,
+    pub pnl_aggregated_usd_times_10k: AtomicI64,
 }
 
 impl EconomicAccumulator {
@@ -274,20 +274,10 @@ impl EconomicAccumulator {
             }
         }
         let pnl_scaled = (evt.gross_pnl_usd * 10_000.0) as i64;
-        // Uses add para somar delta (pode ser negativo); AtomicU64 não aceita
-        // negativo diretamente — usamos wrapping_add que preserva semântica
-        // desde que não underflow (pnl absoluto vai superar perdas agregadas
-        // na maioria dos cenários realistas). Diagnóstico mais preciso vai
-        // direto ao histograma persistido em JSONL.
-        if pnl_scaled >= 0 {
-            self.metrics
-                .pnl_aggregated_usd_times_10k
-                .fetch_add(pnl_scaled as u64, Ordering::Relaxed);
-        } else {
-            self.metrics
-                .pnl_aggregated_usd_times_10k
-                .fetch_sub((-pnl_scaled) as u64, Ordering::Relaxed);
-        }
+        // Delta assinado preserva perdas e ganhos sem underflow/wrap.
+        self.metrics
+            .pnl_aggregated_usd_times_10k
+            .fetch_add(pnl_scaled, Ordering::Relaxed);
 
         self.events.push_back(evt);
         while self.events.len() > self.max_events {
@@ -466,6 +456,31 @@ mod tests {
         assert!((m.realization_rate - 0.5).abs() < 1e-4);
         // PnL agregado = 1.3% de 10k = 130 USD
         assert!((m.simulated_pnl_aggregated_usd - 130.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn accumulator_preserves_negative_pnl_sign() {
+        let mut acc = EconomicAccumulator::new();
+        let now_ns = 1_000_000_000_000;
+        let setup = mk_setup(now_ns);
+        acc.push(EconomicEvent::new(
+            &setup,
+            TradeOutcome::Realized {
+                enter_realized_pct: 0.0,
+                exit_realized_pct: -1.1,
+                horizon_observed_s: 300,
+            },
+            now_ns,
+            true,
+        ));
+        assert_eq!(
+            acc.metrics()
+                .pnl_aggregated_usd_times_10k
+                .load(Ordering::Relaxed),
+            -1_100_000
+        );
+        let m = acc.snapshot_window(3600, now_ns);
+        assert!((m.simulated_pnl_aggregated_usd + 110.0).abs() < 1e-2);
     }
 
     #[test]

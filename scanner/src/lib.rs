@@ -344,9 +344,9 @@ async fn run_spread_engine(
         // --- ML pass (M1.7 shadow mode inline) ---
         // Alimenta HotQueryCache + aciona baseline A3 + broadcast
         // `Recommendation` via `RecommendationBroadcaster` (pós-Wave T:
-        // resolve lacuna de `_rec` descartado). Quando broadcaster tem
-        // consumer, o `AcceptedSample.was_recommended` é flipado para
-        // `true` antes da persistência.
+        // resolve lacuna de `_rec` descartado). Se o broadcast encontra
+        // ao menos 1 consumer, `AcceptedSample.was_recommended` vira um
+        // proxy de entrega antes da persistência.
         //
         // Latência ~1–5 µs por opp; para 50–200 opps por ciclo, overhead
         // total <1 ms em budget de 150 ms.
@@ -376,15 +376,17 @@ async fn run_spread_engine(
                 now,
             );
             // Publica recomendação no canal broadcast para consumers WS /
-            // REST. Retorna `true` se havia ao menos 1 consumer ativo —
-            // isso fecha o loop de `was_recommended`.
-            let was_shown_to_operator = ml_broadcaster.publish(cycle_seq, now, route, &rec);
+            // REST. Retorna `true` se havia ao menos 1 consumer ativo.
+            // Isso é um proxy de entrega, não confirmação de leitura.
+            let was_published_to_consumer =
+                ml_broadcaster.publish(cycle_seq, now, route, &rec);
 
             // **C1 + C4 fix** — enfileira AcceptedSample para JSONL writer
-            // quando trigger aceitou, com flag `was_recommended` refletindo
-            // se algum consumer estava inscrito para receber.
+            // quando trigger aceitou, com flag `was_recommended`
+            // refletindo apenas que a recomendação foi entregue a algum
+            // consumer conectado no momento.
             if let Some(mut sample) = accepted {
-                if was_shown_to_operator {
+                if was_published_to_consumer {
                     sample.mark_recommended();
                 }
                 let _ = ml_writer.try_send(sample);

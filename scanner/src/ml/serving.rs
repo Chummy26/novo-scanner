@@ -33,7 +33,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::ml::baseline::BaselineA3;
-use crate::ml::contract::{Recommendation, RouteId};
+use crate::ml::contract::{
+    AbstainDiagnostic, AbstainReason, Recommendation, RouteId,
+};
+use crate::ml::eval::verify_tradesetup;
 use crate::ml::listing_history::ListingHistory;
 use crate::ml::persistence::{AcceptedSample, RawSample, RawWriterHandle, RouteDecimator};
 use crate::ml::trigger::{SampleDecision, SamplingTrigger};
@@ -65,6 +68,39 @@ pub struct MlServer {
     // /E10/E11 do Marco 0.
     raw_decimator: RouteDecimator,
     raw_writer: Option<RawWriterHandle>,
+}
+
+fn enforce_recommendation_invariants(
+    rec: Recommendation,
+    n_observations: u32,
+) -> Recommendation {
+    match rec {
+        Recommendation::Trade(setup) => {
+            if let Err(err) = verify_tradesetup(&setup) {
+                let model_version = setup.model_version.clone();
+                tracing::warn!(
+                    route = ?setup.route_id,
+                    model_version = %model_version,
+                    error = ?err,
+                    "blocked invalid TradeSetup before broadcast"
+                );
+                Recommendation::Abstain {
+                    reason: AbstainReason::LowConfidence,
+                    diagnostic: AbstainDiagnostic {
+                        n_observations,
+                        ci_width_if_emitted: None,
+                        nearest_feasible_utility: None,
+                        tail_ratio_p99_p95: None,
+                        model_version,
+                        regime_posterior: [0.0; 3],
+                    },
+                }
+            } else {
+                Recommendation::Trade(setup)
+            }
+        }
+        other => other,
+    }
 }
 
 #[derive(Default, Debug)]
@@ -263,11 +299,18 @@ impl MlServer {
         let rec = self
             .baseline
             .recommend(route, entry_spread, exit_spread, now_ns);
+        let n_observations = self
+            .metrics
+            .opportunities_seen
+            .load(Ordering::Relaxed)
+            .min(u32::MAX as u64) as u32;
+        let rec = enforce_recommendation_invariants(rec, n_observations);
         self.bump_rec_metric(&rec);
 
         // 4. **C4** — emite `AcceptedSample` se o trigger aceitou.
         //    `was_recommended` inicializa `false`; broadcast layer flipa
-        //    para `true` quando apresenta ao operador (Marco 3 Fase 2).
+        //    para `true` apenas quando ao menos 1 consumer recebeu o frame
+        //    (proxy de entrega, não de leitura humana).
         let accepted = if sample_dec == SampleDecision::Accept {
             Some(AcceptedSample::new(
                 now_ns,
@@ -388,6 +431,66 @@ mod tests {
         assert_eq!(m.opportunities_seen.load(Ordering::Relaxed), 10);
         assert_eq!(m.sample_rejects_insufficient_history.load(Ordering::Relaxed), 10);
         assert_eq!(m.rec_abstain_insufficient_data.load(Ordering::Relaxed), 10);
+    }
+
+    fn mk_invalid_setup() -> crate::ml::contract::TradeSetup {
+        use crate::ml::contract::{
+            CalibStatus, ReasonKind, TradeReason, ToxicityLevel, TradeSetup,
+        };
+
+        let mut setup = TradeSetup {
+            route_id: mk_route(),
+            enter_at_min: 2.0,
+            enter_typical: 2.4,
+            enter_peak_p95: 2.9,
+            p_enter_hit: 0.85,
+            exit_at_min: -0.8,
+            exit_typical: -0.4,
+            p_exit_hit_given_enter: 0.80,
+            gross_profit_p10: 1.0,
+            gross_profit_p25: 1.4,
+            gross_profit_median: 1.9,
+            gross_profit_p75: 2.3,
+            gross_profit_p90: 2.7,
+            gross_profit_p95: 3.1,
+            realization_probability: 0.77,
+            confidence_interval: (0.70, 0.82),
+            horizon_p05_s: 60,
+            horizon_median_s: 600,
+            horizon_p95_s: 3600,
+            toxicity_level: ToxicityLevel::Healthy,
+            cluster_id: None,
+            cluster_size: 1,
+            cluster_rank: 1,
+            haircut_predicted: 0.15,
+            gross_profit_realizable_median: 1.6,
+            calibration_status: CalibStatus::Ok,
+            reason: TradeReason {
+                kind: ReasonKind::Tail,
+                detail: "test".into(),
+            },
+            model_version: "test-0.1.0".into(),
+            emitted_at: 1_700_000_000_000_000_000,
+            valid_until: 1_700_000_030_000_000_000,
+        };
+        setup.gross_profit_p25 = setup.gross_profit_p10 - 0.5;
+        setup
+    }
+
+    #[test]
+    fn invalid_trade_setup_is_downgraded_before_broadcast() {
+        use crate::ml::contract::Recommendation;
+
+        let rec = Recommendation::Trade(mk_invalid_setup());
+        let sanitized = enforce_recommendation_invariants(rec, 42);
+        match sanitized {
+            Recommendation::Abstain { reason, diagnostic } => {
+                assert_eq!(reason, AbstainReason::LowConfidence);
+                assert_eq!(diagnostic.n_observations, 42);
+                assert_eq!(diagnostic.model_version, "test-0.1.0");
+            }
+            other => panic!("expected Abstain, got {:?}", other),
+        }
     }
 
     #[test]

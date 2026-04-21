@@ -1,8 +1,9 @@
-//! Baseline A3 — ECDF + bootstrap empírico condicional.
+//! Baseline A3 — ECDF + bootstrap empírico pareado.
 //!
 //! Implementa o **baseline shadow** definido em ADR-001: ECDF empírica
 //! sobre histórico da rota, emitindo `TradeSetup` (ADR-016) sem treino
-//! de modelo ML. Serve como:
+//! de modelo ML. Usa a distribuição conjunta do par `entry+exit` para
+//! evitar o trap de marginais independentes. Serve como:
 //!
 //! 1. **Safety-net do kill switch**: quando modelo A2 composta falha
 //!    (ECE alto, panic, latência), fallback para A3 garante que sistema
@@ -14,19 +15,18 @@
 //!
 //! # Limitação documentada (MVP)
 //!
-//! A versão MVP computa `P(realize)` via produto de marginais
-//! (`p_enter_hit × p_exit_hit`), ADMITIDAMENTE sub-ótimo por violar
-//! a correção crítica Q2-M2 de ADR-016 (correlação empírica entry×exit
-//! = −0.93; marginais independentes inflam P otimisticamente).
+//! A3 continua sendo baseline/fallback, então mantém `calibration_status`
+//! como `Degraded` e usa aproximações conservadoras para horizonte e
+//! metadados táticos. O que foi corrigido é a parte mais importante do
+//! contrato: `P(realize)` e os quantis de lucro bruto agora usam a
+//! distribuição conjunta empírica do par `entry+exit`, não soma de
+//! marginais.
 //!
-//! Essa simplificação é explícita e **OK para baseline**:
-//!
-//! - Baseline A3 tem apenas histogramas marginais no `HotQueryCache`
-//!   (joint storage viria em M1.1b com ring buffer; não vale para MVP).
-//! - Modelo A2 (Marco 2) computa `P(realize)` corretamente via CDF de
-//!   `G(t,t')` unificado (ADR-008). A3 é comparativo, não canônico.
-//! - Campo `calibration_status` sinaliza `Degraded` quando A3 está
-//!   ativo — operador sabe que está em fallback.
+//! - `HotQueryCache` mantém entry/exit/gross para o mesmo histórico de
+//!   rota.
+//! - Modelo A2 (Marco 2) continua sendo o caminho para calibração e
+//!   CDF unificada completa de `G(t,t')` (ADR-008).
+//! - `calibration_status = Degraded` continua sinalizando fallback.
 //!
 //! Vide `docs/ml/01_decisions/ADR-016-output-contract-refined.md` para
 //! o contrato correto (modelo A2 completo).

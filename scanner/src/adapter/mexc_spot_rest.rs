@@ -64,6 +64,7 @@ pub async fn run(
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct Entry {
     symbol:    String,
     #[serde(rename = "bidPrice", default)]
