@@ -81,20 +81,21 @@ impl RecommendationFrame {
     /// UI legada do scanner continua no WS `/ws/spread` sem alterações.
     pub fn to_scanner_like_json_string(&self) -> Result<String, serde_json::Error> {
         let timestamp = iso8601_from_ns(self.emitted_at_ns);
+        // Fix pós-auditoria M11: envelope de Abstain também carrega a rota.
+        // `RecommendationFrame` já guarda `route_id` no nível do frame
+        // (independente de Trade/Abstain), então expor no envelope melhora
+        // a explicabilidade — operador vê "rota X abstida por LongTail"
+        // em vez de "um abstain genérico".
         let body = serde_json::json!({
             "type": "ml_recommendation",
             "timestamp": timestamp,
             "cycle_seq": self.cycle_seq,
             "symbol": &self.symbol_name,
             "route": {
-                "buy_venue": match &self.dto {
-                    RecommendationDto::Trade(s) => s.route_id.buy_venue,
-                    RecommendationDto::Abstain { .. } => "",
-                },
-                "sell_venue": match &self.dto {
-                    RecommendationDto::Trade(s) => s.route_id.sell_venue,
-                    RecommendationDto::Abstain { .. } => "",
-                },
+                "buy_venue": self.route_id.buy_venue.as_str(),
+                "sell_venue": self.route_id.sell_venue.as_str(),
+                "buy_market": self.route_id.buy_venue.market().as_str(),
+                "sell_market": self.route_id.sell_venue.market().as_str(),
             },
             "ml": &self.dto,
         });
@@ -242,11 +243,10 @@ mod tests {
             exit_at_min: -1.2, exit_typical: -1.0, p_exit_hit_given_enter: 0.85,
             gross_profit_p10: 0.6, gross_profit_p25: 0.7, gross_profit_median: 1.0,
             gross_profit_p75: 1.5, gross_profit_p90: 2.3, gross_profit_p95: 2.8,
-            realization_probability: 0.77, confidence_interval: (0.70, 0.82),
-            horizon_p05_s: 720, horizon_median_s: 1680, horizon_p95_s: 6000,
+            historical_base_rate_24h: 0.77, historical_base_rate_ci: (0.70, 0.82),
+            time_to_exit_p05_s: None, time_to_exit_median_s: None, time_to_exit_p95_s: None,
             cluster_id: None,
             cluster_size: 1, cluster_rank: 1,
-            haircut_predicted: 0.25, gross_profit_realizable_median: 0.75,
             calibration_status: CalibStatus::Ok,
             reason: TradeReason { kind: ReasonKind::Combined, detail: "t".into() },
             model_version: "a3-0.1.0".into(),

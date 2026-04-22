@@ -58,10 +58,16 @@ pub struct AcceptedSample {
     pub buy_vol24: f64,
     pub sell_vol24: f64,
     pub sample_decision: SampleDecision,
-    /// **C4** — marca se TradeSetup foi entregue a algum consumer ativo.
-    /// Flipado em runtime quando `RecommendationBroadcaster::publish`
-    /// retorna `true` (≥ 1 consumer ativo). É proxy de entrega, não de
-    /// leitura humana.
+    /// Flag de emissão do baseline — `true` se o baseline A3 produziu
+    /// `Recommendation::Trade` para este snapshot (observe: Abstain =
+    /// false). Determinado por `should_mark_sample_recommended` em
+    /// `lib.rs`: `matches!(rec, Recommendation::Trade(_))`.
+    ///
+    /// Fix pós-auditoria L12: a doc anterior dizia "proxy de entrega
+    /// (≥1 consumer WS ativo)", mas a implementação real nunca olha o
+    /// estado do broadcast. Documento reflete o comportamento vigente.
+    /// Trainer usa como sinal de "baseline quis recomendar" para comparar
+    /// contra outcomes supervisionados.
     pub was_recommended: bool,
 }
 

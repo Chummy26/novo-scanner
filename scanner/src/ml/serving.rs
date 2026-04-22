@@ -56,7 +56,7 @@ use crate::ml::trigger::{SampleDecision, SamplingTrigger};
 /// (`S_entrada(t) + S_saída(t) = -(bid_ask_A + bid_ask_B)/ref`) é
 /// sempre negativa no mesmo instante. Permitir resolução intra-tick
 /// (quando `now == emitted_at`) fabrica `Realized` com
-/// `horizon_observed_s = 0` violando física da estratégia.
+/// `horizon_observed_ms = 0` violando física da estratégia.
 ///
 /// Default: 1 ciclo do scanner = 150 ms. Trade só pode realizar em
 /// tick posterior ao da emissão.
@@ -210,16 +210,18 @@ impl PendingEconomicTrade {
 
         let entry_realized_pct = self.entry_hit_pct.unwrap_or(entry_spread);
         if self.entry_hit_ns.is_some() && exit_spread >= self.setup.exit_at_min {
-            let horizon_observed_s = now_ns
+            // Fix pós-auditoria L14: horizonte em milissegundos para
+            // evitar truncamento a 0 em realizações sub-segundo.
+            let horizon_observed_ms = now_ns
                 .saturating_sub(self.setup.emitted_at)
-                .saturating_div(1_000_000_000)
+                .saturating_div(1_000_000)
                 .min(u32::MAX as u64) as u32;
             return Some(EconomicEvent::new(
                 &self.setup,
                 TradeOutcome::Realized {
                     enter_realized_pct: entry_realized_pct,
                     exit_realized_pct: exit_spread,
-                    horizon_observed_s,
+                    horizon_observed_ms,
                 },
                 now_ns,
                 self.from_model,
@@ -312,6 +314,61 @@ impl EconomicTracker {
             self.pending_by_route.insert(route, keep);
         }
     }
+
+    /// Sweeper econômico — fecha pendings cuja janela `valid_until` expirou
+    /// mesmo sem nova observação (Fix pós-auditoria C2).
+    ///
+    /// Análogo ao `LabelResolver::sweep`: rotas que silenciam nunca
+    /// chamariam `resolve_route(clean)`, deixando `PendingEconomicTrade`
+    /// imortais. Isso enviesava `realization_rate` e `pnl_aggregated_usd`.
+    ///
+    /// Usa `last_exit_pct` observado por último (`0.0` default se nunca
+    /// recebeu observação limpa) como `forced_exit_pct` para `ExitMiss`.
+    /// Para `WindowMiss`, não depende de observação.
+    ///
+    /// Retorna número de pendings fechados nesta passagem.
+    fn sweep(&mut self, now_ns: u64) -> u64 {
+        let mut closed = 0u64;
+        let mut empty_routes: Vec<RouteId> = Vec::new();
+        for (route, queue) in self.pending_by_route.iter_mut() {
+            let mut keep = VecDeque::with_capacity(queue.len());
+            while let Some(pending) = queue.pop_front() {
+                if now_ns >= pending.setup.valid_until {
+                    // Timeout — gera outcome com última observação em cache.
+                    let entry_realized_pct = pending
+                        .entry_hit_pct
+                        .unwrap_or(pending.last_exit_pct.max(f32::MIN));
+                    let outcome = if pending.entry_hit_ns.is_none() {
+                        TradeOutcome::WindowMiss
+                    } else {
+                        TradeOutcome::ExitMiss {
+                            enter_realized_pct: entry_realized_pct,
+                            forced_exit_pct: pending.last_exit_pct,
+                        }
+                    };
+                    let evt = EconomicEvent::new(
+                        &pending.setup,
+                        outcome,
+                        now_ns,
+                        pending.from_model,
+                    );
+                    self.accumulator.push(evt);
+                    closed += 1;
+                } else {
+                    keep.push_back(pending);
+                }
+            }
+            if keep.is_empty() {
+                empty_routes.push(*route);
+            } else {
+                *queue = keep;
+            }
+        }
+        for r in empty_routes {
+            self.pending_by_route.remove(&r);
+        }
+        closed
+    }
 }
 
 impl MlServer {
@@ -392,6 +449,15 @@ impl MlServer {
 
     pub fn economic_metrics(&self) -> Arc<EconomicMetrics> {
         self.economic.lock().metrics()
+    }
+
+    /// Fix pós-auditoria C2: fecha trades pendentes cujo `valid_until`
+    /// expirou mesmo sem nova observação da rota. Chamado periodicamente
+    /// por task tokio (análogo ao sweeper do LabelResolver).
+    ///
+    /// Retorna número de pendings fechados.
+    pub fn economic_sweep(&self, now_ns: u64) -> u64 {
+        self.economic.lock().sweep(now_ns)
     }
 
     /// Avança o `cycle_seq` — chamado uma vez pelo spread engine no início
@@ -673,11 +739,16 @@ impl MlServer {
         if let (Some(resolver), Some(accepted_sample), Some((tier, prob))) =
             (self.label_resolver.as_ref(), accepted.as_ref(), tier_snapshot)
         {
-            let (baseline_recommended, baseline_p, baseline_enter_at_min, baseline_exit_at_min) =
+            let (
+                baseline_recommended,
+                baseline_base_rate,
+                baseline_enter_at_min,
+                baseline_exit_at_min,
+            ) =
                 match &rec {
                     Recommendation::Trade(ts) => (
                         true,
-                        Some(ts.realization_probability),
+                        Some(ts.historical_base_rate_24h),
                         Some(ts.enter_at_min),
                         Some(ts.exit_at_min),
                     ),
@@ -690,6 +761,18 @@ impl MlServer {
                 entry_p50_24h: entry_p50_pre_observe,
                 exit_p50_24h: exit_p50_pre_observe,
             };
+            // Fix pós-auditoria H6: `label_sampling_probability` deve
+            // refletir `tier × stride` (doc em labeled_trade.rs:98), não
+            // apenas o tier. Aproximação conservadora:
+            //   effective_prob = tier_prob × (1 / max(stride_s, 1))
+            // — assume ≥ 1 Accept/s por rota em regime de cauda. Quando
+            // stride=0 (tests ou regime sem supressão), mantém tier_prob.
+            let effective_sampling_probability = if self.label_stride_s > 0 {
+                let stride_factor = 1.0_f32 / (self.label_stride_s as f32);
+                prob * stride_factor
+            } else {
+                prob
+            };
             let policy = PolicyMetadata {
                 baseline_model_version: self
                     .baseline
@@ -697,12 +780,12 @@ impl MlServer {
                     .model_version
                     .to_string(),
                 baseline_recommended,
-                baseline_p_forecast: baseline_p,
+                baseline_historical_base_rate_24h: baseline_base_rate,
                 baseline_derived_enter_at_min: baseline_enter_at_min,
                 baseline_derived_exit_at_min: baseline_exit_at_min,
                 baseline_floor_pct: self.baseline.config().floor_pct,
                 label_stride_s: self.label_stride_s,
-                label_sampling_probability: prob,
+                label_sampling_probability: effective_sampling_probability,
             };
             resolver.on_accepted(
                 accepted_sample.sample_id.clone(),
@@ -907,16 +990,14 @@ mod tests {
             gross_profit_p75: 2.3,
             gross_profit_p90: 2.7,
             gross_profit_p95: 3.1,
-            realization_probability: 0.77,
-            confidence_interval: (0.70, 0.82),
-            horizon_p05_s: 60,
-            horizon_median_s: 600,
-            horizon_p95_s: 3600,
+            historical_base_rate_24h: 0.77,
+            historical_base_rate_ci: (0.70, 0.82),
+            time_to_exit_p05_s: None,
+            time_to_exit_median_s: None,
+            time_to_exit_p95_s: None,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
-            haircut_predicted: 0.15,
-            gross_profit_realizable_median: 1.6,
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Tail,
@@ -973,7 +1054,8 @@ mod tests {
         match rec {
             Recommendation::Trade(setup) => {
                 assert_eq!(setup.route_id, route);
-                assert!(setup.realization_probability > 0.0);
+                assert!(setup.historical_base_rate_24h > 0.0);
+                assert!(setup.time_to_exit_median_s.is_none());
             }
             Recommendation::Abstain { reason, .. } => {
                 panic!("expected Trade, got Abstain({:?})", reason);

@@ -580,7 +580,7 @@ mod tests {
         PolicyMetadata {
             baseline_model_version: "baseline-a3-0.2.0".into(),
             baseline_recommended: false,
-            baseline_p_forecast: None,
+            baseline_historical_base_rate_24h: None,
             baseline_derived_enter_at_min: None,
             baseline_derived_exit_at_min: None,
             baseline_floor_pct: 0.8,

@@ -55,6 +55,9 @@ pub struct LovoReport {
 impl LovoReport {
     /// Avalia se LOVO passa os gates hard do ADR-023.
     pub fn passes_hard_gates(&self) -> bool {
+        if self.folds.is_empty() {
+            return false;
+        }
         self.precision_at_10_worst_drop <= 0.15
             && self.ece_worst <= 0.08
             && self.coverage_worst >= 0.85
@@ -134,7 +137,10 @@ mod tests {
     fn empty_folds_returns_neutral_report() {
         let r = LovoReport::from_folds(vec![]);
         assert_eq!(r.precision_at_10_mean, 0.0);
-        assert!(r.passes_hard_gates()); // nada para falhar ainda
+        assert!(
+            !r.passes_hard_gates(),
+            "LOVO sem folds observados não pode passar gates hard"
+        );
     }
 
     #[test]
@@ -181,6 +187,9 @@ mod tests {
     fn baseline_placeholder_returns_neutral_report() {
         let r = run_lovo_on_baseline_a3();
         assert!(r.folds.is_empty());
-        assert!(r.passes_hard_gates());
+        assert!(
+            !r.passes_hard_gates(),
+            "placeholder sem folds não pode sinalizar robustez cross-venue"
+        );
     }
 }

@@ -107,7 +107,8 @@ impl BaselineA3 {
     /// 5. Gate econômico degradado: `current_entry + exit_typical ≥ floor`.
     /// 6. Quantis de gross são proxy marginal:
     ///    `enter_typical + quantile(exit)`, não `entry(t)+exit(t)`.
-    /// 7. `realization_probability` é `P(exit ≥ floor − enter_typical)`.
+    /// 7. `historical_base_rate_24h` é a taxa empírica marginal
+    ///    `P_hist(exit ≥ floor − enter_typical)` na janela do cache.
     /// 8. Emite `TradeSetup` com `calibration_status: Degraded`; o modelo A2
     ///    deve substituir isso por labels forward-looking reais.
     pub fn recommend(
@@ -271,17 +272,6 @@ impl BaselineA3 {
             success_count, total_count, n_eff_divisor,
         );
 
-        // Horizon degradado: sem labels forward-looking, não usamos runs de
-        // `entry(t)+exit(t)` simultâneo. A2 substituirá por T real rotulado.
-        let fallback = self.cfg.valid_for_s.max(1);
-        let horizon_p05_s = fallback / 2;
-        let horizon_median_s = fallback;
-        let horizon_p95_s = fallback.saturating_mul(2);
-
-        // Haircut empírico default — será calibrado em shadow (ADR-013 Fase 2).
-        let haircut = self.cfg.default_haircut;
-        let gross_realizable_median = gross_median * (1.0 - haircut);
-
         let valid_until = now_ns + (self.cfg.valid_for_s as u64) * 1_000_000_000;
 
         let setup = TradeSetup {
@@ -299,16 +289,14 @@ impl BaselineA3 {
             gross_profit_p75: gross_p75,
             gross_profit_p90: gross_p90,
             gross_profit_p95: gross_p95,
-            realization_probability: p_realize,
-            confidence_interval: (ic_low, ic_high),
-            horizon_p05_s,
-            horizon_median_s,
-            horizon_p95_s,
+            historical_base_rate_24h: p_realize,
+            historical_base_rate_ci: (ic_low, ic_high),
+            time_to_exit_p05_s: None,
+            time_to_exit_median_s: None,
+            time_to_exit_p95_s: None,
             cluster_id: None,                       // detector vem em M1.3
             cluster_size: 1,
             cluster_rank: 1,
-            haircut_predicted: haircut,
-            gross_profit_realizable_median: gross_realizable_median,
             // `Degraded` sinaliza que estamos em baseline/safety-net, não no
             // modelo A2 completo. UI deve mostrar `?/100` até que a
             // calibração do modelo principal esteja estabelecida.
@@ -502,8 +490,10 @@ mod tests {
                 assert!(setup.enter_typical <= setup.enter_peak_p95);
                 assert!(setup.gross_profit_p10 <= setup.gross_profit_median);
                 assert!(setup.gross_profit_median <= setup.gross_profit_p95);
-                assert!(setup.realization_probability >= 0.0);
-                assert!(setup.realization_probability <= 1.0);
+                assert!(setup.historical_base_rate_24h >= 0.0);
+                assert!(setup.historical_base_rate_24h <= 1.0);
+                assert!(setup.time_to_exit_p05_s.is_none());
+                assert!(setup.time_to_exit_p95_s.is_none());
                 assert_eq!(setup.calibration_status, CalibStatus::Degraded);
                 assert!(setup.valid_until > setup.emitted_at);
             }
@@ -555,7 +545,8 @@ mod tests {
         match rec {
             Recommendation::Trade(setup) => {
                 assert!(setup.gross_profit_p10 >= 0.5);
-                assert!(setup.realization_probability > 0.5);
+                assert!(setup.historical_base_rate_24h > 0.5);
+                assert!(setup.time_to_exit_median_s.is_none());
             }
             Recommendation::Abstain { reason, .. } => {
                 panic!("marginal exit proxy should permit trade, got Abstain({reason:?})")
@@ -564,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn realization_probability_and_ci_follow_exit_threshold_rate() {
+    fn historical_base_rate_and_ci_follow_exit_threshold_rate() {
         let cache = mk_cache();
         let cfg = BaselineConfig {
             floor_pct: 0.5,
@@ -584,9 +575,9 @@ mod tests {
             Recommendation::Trade(setup) => {
                 // Taxa degradada segue P(exit >= floor - enter_typical).
                 assert!(
-                    (setup.realization_probability - 1.0).abs() < f32::EPSILON,
+                    (setup.historical_base_rate_24h - 1.0).abs() < f32::EPSILON,
                     "expected empirical success rate of 1.0, got {}",
-                    setup.realization_probability
+                    setup.historical_base_rate_24h
                 );
                 // Pós-auditoria: IC usa `wilson_interval_autocorrelated` com
                 // n_eff = n/10 — mais largo e honesto em face de autocorrelação.
@@ -594,11 +585,11 @@ mod tests {
                 // aproximadamente 0.72 (não mais 0.90). Isso REFLETE melhor
                 // a incerteza real em séries autocorrelacionadas (Lahiri 2003).
                 assert!(
-                    setup.confidence_interval.0 > 0.60,
+                    setup.historical_base_rate_ci.0 > 0.60,
                     "lower bound deve ser > 0.60 com n_eff desconto; got {:?}",
-                    setup.confidence_interval
+                    setup.historical_base_rate_ci
                 );
-                assert!(setup.confidence_interval.1 <= 1.0);
+                assert!(setup.historical_base_rate_ci.1 <= 1.0);
             }
             Recommendation::Abstain { reason, .. } => {
                 panic!("expected Trade on saturated success set, got Abstain({reason:?})")
@@ -637,5 +628,25 @@ mod tests {
                 panic!("marginal exit safety-net should emit, got Abstain({reason:?})")
             }
         }
+    }
+
+    #[test]
+    fn source_does_not_fabricate_time_to_exit_from_valid_for_fallback() {
+        let source = include_str!("ecdf.rs");
+        let p05 = ["let ", "horizon_p05_s = fallback / 2;"].concat();
+        let median = ["let ", "horizon_median_s = fallback;"].concat();
+        let p95 = ["let ", "horizon_p95_s = fallback.saturating_mul(2);"].concat();
+        assert!(
+            !source.contains(&p05),
+            "baseline não deve fabricar T sintético a partir de valid_for_s"
+        );
+        assert!(
+            !source.contains(&median),
+            "baseline não deve usar valid_for_s como tempo esperado até saída"
+        );
+        assert!(
+            !source.contains(&p95),
+            "baseline não deve usar múltiplos de valid_for_s como p95 de saída"
+        );
     }
 }

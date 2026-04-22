@@ -1,7 +1,8 @@
 //! Contrato de output do recomendador ML.
 //!
-//! Implementa ADR-005 (abstenção tipada 4 razões) + ADR-016 (output como
-//! thresholds + distribuição empírica de lucro + `P(realize)` via CDF de G).
+//! Implementa ADR-005 (abstenção tipada 4 razões) + o contrato honesto
+//! do baseline atual: thresholds + distribuição empírica de lucro bruto
+//! + estatísticas históricas auxiliares.
 //!
 //! `TradeSetup` representa uma *regra acionável*, não um par de pontos
 //! exatos. Operador captura valores reais durante a vida da oportunidade;
@@ -54,14 +55,16 @@ pub enum Recommendation {
 
 /// Regra acionável emitida para uma rota.
 ///
-/// Contrato thresholds + distribuição empírica (ADR-016):
+/// Contrato thresholds + distribuição empírica:
 /// - `enter_at_min` / `exit_at_min`: regras ("entre quando `entrySpread ≥ X`").
 /// - `gross_profit_{p10, p25, median, p75, p90, p95}`: quantis **empíricos**
 ///   verificáveis com ~10 trades (Kolassa 2016 IJF 32(3)).
-/// - `realization_probability`: `P(G(t, t') ≥ floor | features)` derivado
-///   **direto da CDF** do modelo G unificado (ADR-008). NÃO é decomposição
-///   multiplicativa das marginais — essa fórmula foi o bug crítico corrigido
-///   pela investigação PhD Q2-M2.
+/// - `historical_base_rate_24h`: taxa marginal histórica da janela 24h
+///   para `exit ≥ exit_at_min`. No baseline A3 isso **não é**
+///   `P(realize | state_t0)`, apenas uma estatística de referência do dataset.
+/// - `time_to_exit_*`: quantis de tempo até saída **apenas quando houver
+///   estimativa honesta**. O baseline A3 atual deixa esses campos em `None`
+///   em vez de fabricar `T` sintético.
 #[derive(Debug, Clone)]
 pub struct TradeSetup {
     pub route_id: RouteId,
@@ -74,7 +77,7 @@ pub struct TradeSetup {
     /// Pico esperado (p95) — informa decisão "esperar por mais?".
     pub enter_peak_p95: f32,
     /// P(entrySpread atingir `enter_at_min` em horizonte). **Informativo
-    /// apenas**; NÃO entra no cálculo de `realization_probability`.
+    /// apenas**; NÃO entra no cálculo de `historical_base_rate_24h`.
     pub p_enter_hit: f32,
 
     // --- Regra de saída (threshold) --------------------------------------
@@ -94,19 +97,17 @@ pub struct TradeSetup {
     pub gross_profit_p90: f32,
     pub gross_profit_p95: f32,
 
-    // --- Probabilidade de realização via CDF de G (ADR-016 Q2-M2) --------
-    /// `P(G(t, t') ≥ floor_operador | features, t₀)` derivado direto da
-    /// CDF prevista do modelo G unificado. Calibrado via CQR (ADR-004).
-    pub realization_probability: f32,
-    /// IC 95% sobre `realization_probability`.
-    pub confidence_interval: (f32, f32),
+    // --- Estatística histórica auxiliar (baseline atual) -----------------
+    /// Taxa marginal histórica 24h de `exit >= exit_at_min`.
+    /// É uma referência empírica do dataset, não forecast condicional.
+    pub historical_base_rate_24h: f32,
+    /// IC 95% da taxa histórica acima.
+    pub historical_base_rate_ci: (f32, f32),
 
-    // --- Horizonte com quantis (cauda pesada) ----------------------------
-    /// Pior caso rápido: oportunidade some em X segundos (Q1-E3).
-    pub horizon_p05_s: u32,
-    pub horizon_median_s: u32,
-    /// Pior caso longo (exceeds T_max → timeout).
-    pub horizon_p95_s: u32,
+    // --- Tempo até saída (somente quando houver previsão honesta) --------
+    pub time_to_exit_p05_s: Option<u32>,
+    pub time_to_exit_median_s: Option<u32>,
+    pub time_to_exit_p95_s: Option<u32>,
 
     // --- Contexto de correlação (Q1 emendas) -----------------------------
     /// Se rota pertence a um cluster de correlação, ID do cluster.
@@ -117,12 +118,6 @@ pub struct TradeSetup {
     pub cluster_size: u8,
     /// Ranking desta rota dentro do cluster (1 = melhor).
     pub cluster_rank: u8,
-
-    // --- Haircut empírico (ADR-013 Fase 2 shadow) ------------------------
-    /// Fração esperada de haircut `quoted → realizable` (0.0–1.0).
-    pub haircut_predicted: f32,
-    /// Mediana do lucro bruto após haircut aplicado.
-    pub gross_profit_realizable_median: f32,
 
     // --- Status da calibração --------------------------------------------
     pub calibration_status: CalibStatus,
@@ -167,7 +162,8 @@ pub enum AbstainReason {
 pub struct AbstainDiagnostic {
     /// Histórico disponível da rota no feature store.
     pub n_observations: u32,
-    /// Presente se `LowConfidence`: largura do IC 95% que seria emitido.
+    /// Presente se `LowConfidence`: largura do IC 95% do base rate
+    /// histórico que seria emitido.
     pub ci_width_if_emitted: Option<f32>,
     /// Presente se `NoOpportunity`: melhor utilidade encontrada (< floor).
     pub nearest_feasible_utility: Option<f32>,
@@ -184,8 +180,8 @@ pub struct AbstainDiagnostic {
 
 /// Status da calibração global do modelo no momento da emissão.
 ///
-/// Se `Degraded` ou `Suspended`, UI exibe `P` como "? / 100" em vez
-/// do valor reportado (Q3 recomendação).
+/// Se `Degraded` ou `Suspended`, UI não deve apresentar o baseline como
+/// forecast probabilístico calibrado do modelo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalibStatus {
     Ok,
@@ -304,16 +300,14 @@ mod tests {
             gross_profit_p75: 1.50,
             gross_profit_p90: 2.30,
             gross_profit_p95: 2.80,
-            realization_probability: 0.77,
-            confidence_interval: (0.70, 0.82),
-            horizon_p05_s: 720,
-            horizon_median_s: 1680,
-            horizon_p95_s: 6000,
+            historical_base_rate_24h: 0.77,
+            historical_base_rate_ci: (0.70, 0.82),
+            time_to_exit_p05_s: None,
+            time_to_exit_median_s: None,
+            time_to_exit_p95_s: None,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
-            haircut_predicted: 0.25,
-            gross_profit_realizable_median: 0.75,
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
@@ -383,16 +377,14 @@ mod tests {
             gross_profit_p75: 1.50,
             gross_profit_p90: 2.30,
             gross_profit_p95: 2.80,
-            realization_probability: 0.77,
-            confidence_interval: (0.70, 0.82),
-            horizon_p05_s: 720,
-            horizon_median_s: 1680,
-            horizon_p95_s: 6000,
+            historical_base_rate_24h: 0.77,
+            historical_base_rate_ci: (0.70, 0.82),
+            time_to_exit_p05_s: Some(720),
+            time_to_exit_median_s: Some(1680),
+            time_to_exit_p95_s: Some(6000),
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
-            haircut_predicted: 0.25,
-            gross_profit_realizable_median: 0.75,
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
@@ -422,44 +414,34 @@ mod tests {
     }
 
     #[test]
-    fn invariant_horizon_quantiles_are_monotonic() {
+    fn invariant_time_to_exit_quantiles_are_monotonic_when_present() {
         let s = valid_setup();
-        assert!(s.horizon_p05_s <= s.horizon_median_s, "p05 > median");
-        assert!(s.horizon_median_s <= s.horizon_p95_s, "median > p95");
+        let p05 = s.time_to_exit_p05_s.unwrap();
+        let median = s.time_to_exit_median_s.unwrap();
+        let p95 = s.time_to_exit_p95_s.unwrap();
+        assert!(p05 <= median, "p05 > median");
+        assert!(median <= p95, "median > p95");
     }
 
     #[test]
-    fn invariant_probability_within_unit_interval() {
+    fn invariant_base_rate_and_aux_probs_within_unit_interval() {
         let s = valid_setup();
-        assert!(s.realization_probability >= 0.0 && s.realization_probability <= 1.0);
+        assert!(s.historical_base_rate_24h >= 0.0 && s.historical_base_rate_24h <= 1.0);
         assert!(s.p_enter_hit >= 0.0 && s.p_enter_hit <= 1.0);
         assert!(s.p_exit_hit_given_enter >= 0.0 && s.p_exit_hit_given_enter <= 1.0);
     }
 
     #[test]
-    fn invariant_confidence_interval_contains_probability() {
+    fn invariant_base_rate_ci_contains_base_rate() {
         let s = valid_setup();
-        let (lo, hi) = s.confidence_interval;
+        let (lo, hi) = s.historical_base_rate_ci;
         assert!(lo >= 0.0 && lo <= 1.0, "CI lower out of [0,1]");
         assert!(hi >= 0.0 && hi <= 1.0, "CI upper out of [0,1]");
         assert!(lo <= hi, "CI lower > upper");
         assert!(
-            lo <= s.realization_probability && s.realization_probability <= hi,
-            "P(realize)={} fora de IC=[{}, {}]",
-            s.realization_probability, lo, hi
-        );
-    }
-
-    #[test]
-    fn invariant_haircut_consistency() {
-        let s = valid_setup();
-        assert!(s.haircut_predicted >= 0.0 && s.haircut_predicted <= 1.0);
-        // realizable <= median × (1 − haircut) com tolerância numérica
-        let expected = s.gross_profit_median * (1.0 - s.haircut_predicted);
-        assert!(
-            s.gross_profit_realizable_median <= expected + 1e-4,
-            "realizable {} > median {} × (1 − haircut {}) = {}",
-            s.gross_profit_realizable_median, s.gross_profit_median, s.haircut_predicted, expected
+            lo <= s.historical_base_rate_24h && s.historical_base_rate_24h <= hi,
+            "base_rate={} fora de IC=[{}, {}]",
+            s.historical_base_rate_24h, lo, hi
         );
     }
 
@@ -500,10 +482,25 @@ mod tests {
             s.exit_at_min, s.exit_typical, s.p_exit_hit_given_enter,
             s.gross_profit_p10, s.gross_profit_p25, s.gross_profit_median,
             s.gross_profit_p75, s.gross_profit_p90, s.gross_profit_p95,
-            s.realization_probability,
+            s.historical_base_rate_24h,
         ];
         for (i, v) in finite_fields.iter().enumerate() {
             assert!(v.is_finite(), "field {} is not finite: {}", i, v);
         }
+    }
+
+    #[test]
+    fn source_no_longer_exposes_haircut_fields() {
+        let source = include_str!("contract.rs");
+        let haircut_field = ["pub ", "haircut_predicted:"].concat();
+        let realizable_field = ["pub ", "gross_profit_realizable_median:"].concat();
+        assert!(
+            !source.contains(&haircut_field),
+            "haircut_predicted não deve permanecer no contrato do ML"
+        );
+        assert!(
+            !source.contains(&realizable_field),
+            "gross_profit_realizable_median não deve permanecer no contrato do ML"
+        );
     }
 }

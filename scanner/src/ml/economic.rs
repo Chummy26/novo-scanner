@@ -52,7 +52,7 @@ pub enum TradeOutcome {
     Realized {
         enter_realized_pct: f32,
         exit_realized_pct: f32,
-        horizon_observed_s: u32,
+        horizon_observed_ms: u32,
     },
     /// `enter_at_min` não foi atingido em `T_trigger_max`.
     WindowMiss,
@@ -99,10 +99,19 @@ pub struct EconomicEvent {
     pub gross_pnl_usd: f64,
     /// `true` se foi recomendação do modelo A2; `false` se baseline A3.
     pub from_model: bool,
-    /// Fix pós-auditoria: probabilidade reportada no setup original.
-    /// Usada pelo `CalibrationAccumulator` para calcular ECE.
-    /// Preservada junto ao outcome para auditoria de calibração.
-    pub forecast_probability: f32,
+    /// **Fix pós-auditoria C1 (nomenclatura honesta)**: valor que o baseline
+    /// A3 gravou em `setup.historical_base_rate_24h` — que é, no regime
+    /// atual, uma **taxa marginal histórica de exceedance** (ecdf.rs: taxa
+    /// empírica de `exit ≥ exit_at_min`), **não** um forecast condicional.
+    ///
+    /// Portanto a `ECE` derivada daqui mede "quão bem a taxa marginal
+    /// histórica antecipa o outcome", NÃO calibração de forecast
+    /// probabilístico. Quando o modelo A2 condicional entrar, um campo
+    /// separado `conditional_forecast_probability` será adicionado e uma
+    /// segunda métrica ECE calibrada será exposta. Até lá, o acumulador
+    /// aqui funciona como sanity check de baseline, não como indicador de
+    /// calibração de modelo.
+    pub historical_base_rate_24h: f32,
 }
 
 impl EconomicEvent {
@@ -122,7 +131,7 @@ impl EconomicEvent {
             gross_pnl_pct: gross_pct,
             gross_pnl_usd: (gross_pct as f64 / 100.0) * CAPITAL_HYPOTHETICAL_USD,
             from_model,
-            forecast_probability: setup.realization_probability,
+            historical_base_rate_24h: setup.historical_base_rate_24h,
         }
     }
 
@@ -132,12 +141,12 @@ impl EconomicEvent {
             TradeOutcome::Realized {
                 enter_realized_pct,
                 exit_realized_pct,
-                horizon_observed_s,
+                horizon_observed_ms,
             } => (
                 "realized",
                 enter_realized_pct,
                 exit_realized_pct,
-                horizon_observed_s as i32,
+                horizon_observed_ms as i32,
             ),
             TradeOutcome::WindowMiss => ("window_miss", 0.0, 0.0, -1),
             TradeOutcome::ExitMiss {
@@ -151,7 +160,7 @@ impl EconomicEvent {
                 r#""symbol_id":{},"buy_venue":"{}","sell_venue":"{}","#,
                 r#""model_version":"{}","outcome":"{}","#,
                 r#""enter_realized_pct":{},"exit_realized_pct":{},"#,
-                r#""horizon_observed_s":{},"gross_pnl_pct":{},"#,
+                r#""horizon_observed_ms":{},"gross_pnl_pct":{},"#,
                 r#""gross_pnl_usd":{},"from_model":{}}}"#,
             ),
             self.ts_emitted_ns,
@@ -259,28 +268,28 @@ pub struct EconomicMetrics {
 }
 
 // ---------------------------------------------------------------------------
-// CalibrationAccumulator (ECE bucket-based)
+// BaseRateAccumulator (ECE bucket-based)
 // ---------------------------------------------------------------------------
 
-/// Acumulador de calibração: 10 buckets de `P_forecast` em [0, 1].
+/// Acumulador da taxa histórica: 10 buckets em [0, 1].
 ///
 /// Para cada par `(p_predicted, y_realized)` observado, coloca em
 /// `bucket = floor(p * 10)`. ECE (Expected Calibration Error) =
 /// `Σ |mid_conf − observed_freq| × (n_bucket / N)` — quanto menor,
 /// mais calibrado. DeGroot & Fienberg 1983 (reliability).
 ///
-/// Uso: chamar `record(p, y)` quando um `EconomicEvent` fechar.
+/// Uso: chamar `record(base_rate_hist, y)` quando um `EconomicEvent` fechar.
 /// Chamar `ece()` para snapshot atual.
 #[derive(Debug, Default)]
 pub struct CalibrationAccumulator {
-    /// `(n_emitted, n_realized)` por decil de `realization_probability`.
+    /// `(n_emitted, n_realized)` por decil de `historical_base_rate_24h`.
     /// bucket[0] = [0.0, 0.1), bucket[9] = [0.9, 1.0].
     pub buckets: [(u64, u64); 10],
 }
 
 impl CalibrationAccumulator {
-    pub fn record(&mut self, p_forecast: f32, realized: bool) {
-        let p = p_forecast.clamp(0.0, 0.9999);
+    pub fn record(&mut self, historical_base_rate_24h: f32, realized: bool) {
+        let p = historical_base_rate_24h.clamp(0.0, 0.9999);
         let idx = ((p * 10.0) as usize).min(9);
         self.buckets[idx].0 = self.buckets[idx].0.saturating_add(1);
         if realized {
@@ -381,10 +390,11 @@ impl EconomicAccumulator {
             .pnl_aggregated_usd_times_10k
             .fetch_add(pnl_scaled, Ordering::Relaxed);
 
-        // Fix pós-auditoria: registra par (P_forecast, realized) no tracker
-        // de calibração. Atualiza métricas Prometheus.
+        // Fix C1: registra par (base_rate_histórico, realized) no tracker.
+        // A métrica resultante mede `base_rate_vs_outcome_ece`, não
+        // calibração de forecast — ver doc de `historical_base_rate_24h`.
         self.calibration
-            .record(evt.forecast_probability, realized_bool);
+            .record(evt.historical_base_rate_24h, realized_bool);
         let ece_bps = (self.calibration.ece() * 10_000.0) as u64;
         self.metrics
             .calibration_ece_bps
@@ -501,16 +511,14 @@ mod tests {
             gross_profit_p75: 2.5,
             gross_profit_p90: 2.9,
             gross_profit_p95: 3.0,
-            realization_probability: 0.77,
-            confidence_interval: (0.70, 0.82),
-            horizon_p05_s: 60,
-            horizon_median_s: 600,
-            horizon_p95_s: 3600,
+            historical_base_rate_24h: 0.77,
+            historical_base_rate_ci: (0.70, 0.82),
+            time_to_exit_p05_s: None,
+            time_to_exit_median_s: None,
+            time_to_exit_p95_s: None,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
-            haircut_predicted: 0.2,
-            gross_profit_realizable_median: 1.6,
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Tail,
@@ -527,7 +535,7 @@ mod tests {
         let out = TradeOutcome::Realized {
             enter_realized_pct: 2.3,
             exit_realized_pct: -0.9,
-            horizon_observed_s: 400,
+            horizon_observed_ms: 400,
         };
         assert!((out.gross_pnl_pct() - 1.4).abs() < 1e-5);
         // 1.4% × 10_000 / 100 = 140 USD
@@ -551,7 +559,7 @@ mod tests {
             TradeOutcome::Realized {
                 enter_realized_pct: 2.1,
                 exit_realized_pct: -0.8,
-                horizon_observed_s: 300,
+                horizon_observed_ms: 300,
             },
             now_ns,
             false,
@@ -582,7 +590,7 @@ mod tests {
             TradeOutcome::Realized {
                 enter_realized_pct: 0.0,
                 exit_realized_pct: -1.1,
-                horizon_observed_s: 300,
+                horizon_observed_ms: 300,
             },
             now_ns,
             true,
@@ -608,7 +616,7 @@ mod tests {
             TradeOutcome::Realized {
                 enter_realized_pct: 5.0,
                 exit_realized_pct: 5.0,
-                horizon_observed_s: 100,
+                horizon_observed_ms: 100,
             },
             now_ns - 3_700_000_000_000, // resolved_ns > 1h atrás
             false,
@@ -625,7 +633,7 @@ mod tests {
             TradeOutcome::Realized {
                 enter_realized_pct: 2.1,
                 exit_realized_pct: -0.8,
-                horizon_observed_s: 300,
+                horizon_observed_ms: 300,
             },
             1_700_000_001_000_000_000,
             false,
@@ -633,7 +641,7 @@ mod tests {
         let line = evt.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         assert_eq!(v["outcome"], "realized");
-        assert_eq!(v["horizon_observed_s"], 300);
+        assert_eq!(v["horizon_observed_ms"], 300);
         assert_eq!(v["from_model"], false);
     }
 

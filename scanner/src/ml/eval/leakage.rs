@@ -52,8 +52,8 @@ pub struct LeakageAuditReport {
 }
 
 impl LeakageAuditReport {
-    /// `true` se todos os 5 testes passaram OU foram legitimamente skipped.
-    /// `false` se qualquer teste falhou.
+    /// `true` apenas se todos os testes críticos passaram de fato.
+    /// `Skipped` não conta como prontidão operacional.
     pub fn all_pass_or_skip(&self) -> bool {
         let tests = [
             &self.shuffling_temporal,
@@ -62,7 +62,7 @@ impl LeakageAuditReport {
             &self.purge_verification,
             &self.canary_forward_looking,
         ];
-        tests.iter().all(|t| !matches!(t, LeakageTestResult::Fail(_)))
+        tests.iter().all(|t| matches!(t, LeakageTestResult::Pass))
     }
 
 /// Conta tests em cada status.
@@ -209,7 +209,10 @@ mod tests {
         assert!(pass >= 3);
         assert_eq!(fail, 0);
         assert_eq!(skip, 1);
-        assert!(r.all_pass_or_skip());
+        assert!(
+            !r.all_pass_or_skip(),
+            "audit com canary decisivo skipped não pode sinalizar pronto"
+        );
     }
 
     #[test]

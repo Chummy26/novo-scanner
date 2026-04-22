@@ -89,28 +89,17 @@ pub struct TradeSetupDto {
     pub gross_profit_p90: f32,
     pub gross_profit_p95: f32,
 
-    /// **Rebrand ADR-auditoria 2026-04-21**: o baseline A3 emite a
-    /// frequência empírica BRUTA da janela 24h (`#{gross ≥ floor} / n`),
-    /// que é *prior marginal não-condicional*, não `P(realize | state_t₀)`.
-    /// Renomeamos o campo para refletir semântica real e evitar que a UI
-    /// apresente esse número como "probabilidade agora" (trap T2+T6).
-    /// O valor em `[0,1]` continua válido — só o NOME mudou.
-    /// Um modelo condicional emitirá `realization_probability_conditional`
-    /// separado quando entrar em produção.
     pub historical_base_rate_24h: f32,
-    pub confidence_interval_lo: f32,
-    pub confidence_interval_hi: f32,
+    pub historical_base_rate_ci_lo: f32,
+    pub historical_base_rate_ci_hi: f32,
 
-    pub horizon_p05_s: u32,
-    pub horizon_median_s: u32,
-    pub horizon_p95_s: u32,
+    pub time_to_exit_p05_s: Option<u32>,
+    pub time_to_exit_median_s: Option<u32>,
+    pub time_to_exit_p95_s: Option<u32>,
 
     pub cluster_id: Option<u32>,
     pub cluster_size: u8,
     pub cluster_rank: u8,
-
-    pub haircut_predicted: f32,
-    pub gross_profit_realizable_median: f32,
 
     pub calibration_status: &'static str,
     pub reason_kind: &'static str,
@@ -138,17 +127,15 @@ impl From<&TradeSetup> for TradeSetupDto {
             gross_profit_p75: s.gross_profit_p75,
             gross_profit_p90: s.gross_profit_p90,
             gross_profit_p95: s.gross_profit_p95,
-            historical_base_rate_24h: s.realization_probability,
-            confidence_interval_lo: s.confidence_interval.0,
-            confidence_interval_hi: s.confidence_interval.1,
-            horizon_p05_s: s.horizon_p05_s,
-            horizon_median_s: s.horizon_median_s,
-            horizon_p95_s: s.horizon_p95_s,
+            historical_base_rate_24h: s.historical_base_rate_24h,
+            historical_base_rate_ci_lo: s.historical_base_rate_ci.0,
+            historical_base_rate_ci_hi: s.historical_base_rate_ci.1,
+            time_to_exit_p05_s: s.time_to_exit_p05_s,
+            time_to_exit_median_s: s.time_to_exit_median_s,
+            time_to_exit_p95_s: s.time_to_exit_p95_s,
             cluster_id: s.cluster_id,
             cluster_size: s.cluster_size,
             cluster_rank: s.cluster_rank,
-            haircut_predicted: s.haircut_predicted,
-            gross_profit_realizable_median: s.gross_profit_realizable_median,
             calibration_status: match s.calibration_status {
                 CalibStatus::Ok => "ok",
                 CalibStatus::Degraded => "degraded",
@@ -298,16 +285,14 @@ mod tests {
             gross_profit_p75: 1.5,
             gross_profit_p90: 2.3,
             gross_profit_p95: 2.8,
-            realization_probability: 0.77,
-            confidence_interval: (0.70, 0.82),
-            horizon_p05_s: 720,
-            horizon_median_s: 1680,
-            horizon_p95_s: 6000,
+            historical_base_rate_24h: 0.77,
+            historical_base_rate_ci: (0.70, 0.82),
+            time_to_exit_p05_s: None,
+            time_to_exit_median_s: None,
+            time_to_exit_p95_s: None,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
-            haircut_predicted: 0.25,
-            gross_profit_realizable_median: 0.75,
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
@@ -333,6 +318,14 @@ mod tests {
         assert_eq!(v["reason_kind"], "combined");
         assert_eq!(v["enter_at_min"], 1.8);
         assert_eq!(v["gross_profit_median"], 1.0);
+        assert!(
+            v.get("haircut_predicted").is_none(),
+            "haircut não deve sair no DTO do ML"
+        );
+        assert!(
+            v.get("gross_profit_realizable_median").is_none(),
+            "gross realizable não deve sair no DTO do ML"
+        );
     }
 
     #[test]

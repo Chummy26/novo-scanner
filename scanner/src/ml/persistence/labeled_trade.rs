@@ -91,12 +91,17 @@ pub struct FeaturesT0 {
 pub struct PolicyMetadata {
     pub baseline_model_version: String,
     pub baseline_recommended: bool,
-    pub baseline_p_forecast: Option<f32>,
+    pub baseline_historical_base_rate_24h: Option<f32>,
     pub baseline_derived_enter_at_min: Option<f32>,
     pub baseline_derived_exit_at_min: Option<f32>,
     pub baseline_floor_pct: f32,
     pub label_stride_s: u32,
-    /// Probabilidade efetiva de amostragem — combina tier_prob e stride.
+    /// Probabilidade efetiva de amostragem para IPW no treino.
+    /// Fix pós-auditoria H6: combina tier e stride via
+    /// `tier_prob × (1 / stride_s)` (aproximação conservadora assumindo
+    /// ≥ 1 candidato/s por rota em regime de cauda). Quando `stride_s=0`
+    /// é apenas `tier_prob`. Trainer Python deve usar este valor como
+    /// peso inverso de amostragem.
     pub label_sampling_probability: f32,
 }
 
@@ -173,7 +178,7 @@ impl LabeledTrade {
                 r#""outcome":"{}","censor_reason":{},"#,
                 r#""observed_until_ns":{},"closed_ts_ns":{},"written_ts_ns":{},"#,
                 r#""policy_metadata":{{"baseline_model_version":"{}","#,
-                r#""baseline_recommended":{},"baseline_p_forecast":{},"#,
+                r#""baseline_recommended":{},"baseline_historical_base_rate_24h":{},"#,
                 r#""baseline_derived_enter_at_min":{},"baseline_derived_exit_at_min":{},"#,
                 r#""baseline_floor_pct":{},"label_stride_s":{},"#,
                 r#""label_sampling_probability":{}}},"#,
@@ -214,7 +219,7 @@ impl LabeledTrade {
             self.written_ts_ns,
             escape_json(&self.policy_metadata.baseline_model_version),
             self.policy_metadata.baseline_recommended,
-            opt_f32(self.policy_metadata.baseline_p_forecast),
+            opt_f32(self.policy_metadata.baseline_historical_base_rate_24h),
             opt_f32(self.policy_metadata.baseline_derived_enter_at_min),
             opt_f32(self.policy_metadata.baseline_derived_exit_at_min),
             f32_or_null(self.policy_metadata.baseline_floor_pct),
@@ -335,7 +340,7 @@ mod tests {
             policy_metadata: PolicyMetadata {
                 baseline_model_version: "baseline-a3-0.2.0".into(),
                 baseline_recommended: true,
-                baseline_p_forecast: Some(0.77),
+                baseline_historical_base_rate_24h: Some(0.77),
                 baseline_derived_enter_at_min: Some(1.9),
                 baseline_derived_exit_at_min: Some(-1.1),
                 baseline_floor_pct: 0.8,

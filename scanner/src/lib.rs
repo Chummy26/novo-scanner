@@ -255,6 +255,26 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         });
     }
+
+    // Fix C2 — Sweeper econômico: fecha pendings cujo `valid_until` expirou
+    // mesmo sem nova observação da rota (rotas que silenciam). Mesma cadência
+    // do label sweeper para manter simetria operacional. Sem isso,
+    // `realization_rate` e `pnl_aggregated_usd` ficavam enviesados.
+    {
+        let server_clone = Arc::clone(&ml_server);
+        let interval = Duration::from_secs(cfg.ml.label_sweeper_interval_s.max(1));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let n = server_clone.economic_sweep(now_ns());
+                if n > 0 {
+                    tracing::debug!(n_closed = n, "economic sweeper");
+                }
+            }
+        });
+    }
     let ml_metrics_opt = match MlPrometheusMetrics::register(&obs::Metrics::init().registry) {
         Ok(m) => {
             info!("ML prometheus metrics registered");
@@ -679,16 +699,14 @@ mod tests {
             gross_profit_p75: 1.5,
             gross_profit_p90: 2.3,
             gross_profit_p95: 2.8,
-            realization_probability: 0.77,
-            confidence_interval: (0.70, 0.82),
-            horizon_p05_s: 720,
-            horizon_median_s: 1680,
-            horizon_p95_s: 6000,
+            historical_base_rate_24h: 0.77,
+            historical_base_rate_ci: (0.70, 0.82),
+            time_to_exit_p05_s: None,
+            time_to_exit_median_s: None,
+            time_to_exit_p95_s: None,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
-            haircut_predicted: 0.25,
-            gross_profit_realizable_median: 0.75,
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
