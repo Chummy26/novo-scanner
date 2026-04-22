@@ -229,19 +229,13 @@ impl MlPrometheusMetrics {
             "ml_rec_invariant_blocked_total",
             "TradeSetup bloqueado pelo verificador de invariantes (downgrade para Abstain)",
         ))?;
-        // Fix pós-auditoria C1: renomeado de `ml_calibration_ece` para
-        // deixar claro que o valor mede discrepância entre *taxa marginal
-        // histórica* (reportada no TradeSetup atual pelo baseline A3) e
-        // outcome empírico. NÃO é calibração de forecast condicional;
-        // quando modelo A2 entrar, `ml_calibration_ece_conditional` será
-        // adicionada como métrica separada.
         let calibration_ece = Gauge::with_opts(Opts::new(
-            "ml_base_rate_vs_outcome_ece",
-            "Expected Calibration Error em [0,1] — meta CLAUDE.md: < 0.10",
+            "ml_p_hit_calibration_ece",
+            "Expected Calibration Error de P_hit em [0,1] — baseline A3 degradado não alimenta esta métrica",
         ))?;
         let calibration_observations = IntGauge::with_opts(Opts::new(
             "ml_calibration_observations",
-            "Total de pares (P_forecast, realized) registrados no tracker de calibração",
+            "Total de pares (P_hit, realized) registrados no tracker de calibração",
         ))?;
 
         // Wave V — labels supervisionados + tiers.
@@ -746,7 +740,7 @@ mod tests {
     async fn runtime_update_includes_broadcaster_counters() {
         use crate::ml::broadcast::RecommendationBroadcaster;
         use crate::ml::contract::{
-            CalibStatus, ReasonKind, Recommendation, TradeReason, TradeSetup,
+            BaselineDiagnostics, CalibStatus, ReasonKind, Recommendation, TradeReason, TradeSetup,
         };
 
         let registry = Registry::new();
@@ -761,24 +755,35 @@ mod tests {
         };
         let rec = Recommendation::Trade(TradeSetup {
             route_id: route,
-            enter_at_min: 1.8,
-            enter_typical: 2.0,
-            enter_peak_p95: 2.8,
-            p_enter_hit: 0.9,
-            exit_at_min: -1.2,
-            exit_typical: -1.0,
-            p_exit_hit_given_enter: 0.85,
-            gross_profit_p10: 0.6,
-            gross_profit_p25: 0.7,
-            gross_profit_median: 1.0,
-            gross_profit_p75: 1.5,
-            gross_profit_p90: 2.3,
-            gross_profit_p95: 2.8,
-            historical_base_rate_24h: 0.77,
-            historical_base_rate_ci: (0.70, 0.82),
-            time_to_exit_p05_s: None,
-            time_to_exit_median_s: None,
-            time_to_exit_p95_s: None,
+            entry_now: 2.0,
+            exit_target: -1.0,
+            gross_profit_target: 1.0,
+            p_hit: Some(0.83),
+            p_hit_ci: Some((0.77, 0.88)),
+            exit_q25: Some(-1.4),
+            exit_q50: Some(-1.0),
+            exit_q75: Some(-0.7),
+            t_hit_p25_s: Some(900),
+            t_hit_median_s: Some(1680),
+            t_hit_p75_s: Some(3120),
+            p_censor: Some(0.04),
+            baseline_diagnostics: Some(BaselineDiagnostics {
+                enter_at_min: 1.8,
+                enter_typical: 2.0,
+                enter_peak_p95: 2.8,
+                p_enter_hit: 0.9,
+                exit_at_min: -1.2,
+                exit_typical: -1.0,
+                p_exit_hit_given_enter: 0.85,
+                gross_profit_p10: 0.6,
+                gross_profit_p25: 0.7,
+                gross_profit_median: 1.0,
+                gross_profit_p75: 1.5,
+                gross_profit_p90: 2.3,
+                gross_profit_p95: 2.8,
+                historical_base_rate_24h: 0.77,
+                historical_base_rate_ci: (0.70, 0.82),
+            }),
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,

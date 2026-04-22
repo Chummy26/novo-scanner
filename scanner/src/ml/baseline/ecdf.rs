@@ -6,8 +6,8 @@
 //! simultâneo como label econômico.
 
 use crate::ml::contract::{
-    AbstainDiagnostic, AbstainReason, CalibStatus, ReasonKind, Recommendation, RouteId,
-    TradeReason, TradeSetup,
+    AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, ReasonKind,
+    Recommendation, RouteId, TradeReason, TradeSetup,
 };
 use crate::ml::feature_store::HotQueryCache;
 
@@ -39,10 +39,6 @@ pub struct BaselineConfig {
     /// Validade da recomendação em segundos — após isso, scanner não
     /// considera o setup mais vigente.
     pub valid_for_s: u32,
-    /// Haircut empírico default aplicado ao `gross_profit_median`
-    /// (D2 projeção para longtail cripto: 20–40% em setups 1%).
-    /// Será calibrado empiricamente via shadow mode (ADR-013 Fase 2).
-    pub default_haircut: f32,
     /// Razão máxima P99/P95 de entry_spread antes de abstermos por
     /// `LongTail` (spike anômalo). Default 3.0 (Kolassa 2016 IJF 32(3)
     /// — cauda gaussiana ≈ 1.3; cripto normal ≈ 1.8–2.2; > 3.0 sinaliza
@@ -57,7 +53,6 @@ impl Default for BaselineConfig {
             n_min: 500,
             model_version: "baseline-a3-0.2.0",
             valid_for_s: 30,
-            default_haircut: 0.25,
             tail_ratio_abstain_threshold: 3.0,
         }
     }
@@ -102,14 +97,15 @@ impl BaselineA3 {
     /// 1. Checa `n_observations ≥ n_min` (senão `InsufficientData`).
     /// 2. Checa tail_ratio p99/p95 > threshold → `Abstain(LongTail)`.
     /// 3. Gate tático: `current_entry ≥ p50(entry)` senão `NoOpportunity`.
-    /// 4. `enter_at_min` derivado sobre LUCRO BRUTO COTADO:
+    /// 4. Threshold diagnóstico `enter_at_min` derivado sobre LUCRO BRUTO COTADO:
     ///    `max(floor_pct − exit_typical, p50_entry)`.
     /// 5. Gate econômico degradado: `current_entry + exit_typical ≥ floor`.
     /// 6. Quantis de gross são proxy marginal:
     ///    `enter_typical + quantile(exit)`, não `entry(t)+exit(t)`.
     /// 7. `historical_base_rate_24h` é a taxa empírica marginal
     ///    `P_hist(exit ≥ floor − enter_typical)` na janela do cache.
-    /// 8. Emite `TradeSetup` com `calibration_status: Degraded`; o modelo A2
+    /// 8. Emite `TradeSetup` com `entry_now=current_entry` e
+    ///    `calibration_status: Degraded`; o modelo A2
     ///    deve substituir isso por labels forward-looking reais.
     pub fn recommend(
         &self,
@@ -276,24 +272,38 @@ impl BaselineA3 {
 
         let setup = TradeSetup {
             route_id: route,
-            enter_at_min,
-            enter_typical,
-            enter_peak_p95,
-            p_enter_hit,
-            exit_at_min,
-            exit_typical,
-            p_exit_hit_given_enter: p_exit_hit,
-            gross_profit_p10: gross_p10,
-            gross_profit_p25: gross_p25,
-            gross_profit_median: gross_median,
-            gross_profit_p75: gross_p75,
-            gross_profit_p90: gross_p90,
-            gross_profit_p95: gross_p95,
-            historical_base_rate_24h: p_realize,
-            historical_base_rate_ci: (ic_low, ic_high),
-            time_to_exit_p05_s: None,
-            time_to_exit_median_s: None,
-            time_to_exit_p95_s: None,
+            entry_now: current_entry,
+            exit_target: exit_at_min,
+            gross_profit_target: current_entry + exit_at_min,
+            // A3 não possui forecast condicional calibrado; expor `P_hit`
+            // como Some(p_realize) confundiria taxa marginal com objetivo
+            // central. Mantém None e guarda a ECDF em diagnostics.
+            p_hit: None,
+            p_hit_ci: None,
+            exit_q25: Some(p25_x),
+            exit_q50: Some(p50_x),
+            exit_q75: Some(p75_x),
+            t_hit_p25_s: None,
+            t_hit_median_s: None,
+            t_hit_p75_s: None,
+            p_censor: None,
+            baseline_diagnostics: Some(BaselineDiagnostics {
+                enter_at_min,
+                enter_typical,
+                enter_peak_p95,
+                p_enter_hit,
+                exit_at_min,
+                exit_typical,
+                p_exit_hit_given_enter: p_exit_hit,
+                gross_profit_p10: gross_p10,
+                gross_profit_p25: gross_p25,
+                gross_profit_median: gross_median,
+                gross_profit_p75: gross_p75,
+                gross_profit_p90: gross_p90,
+                gross_profit_p95: gross_p95,
+                historical_base_rate_24h: p_realize,
+                historical_base_rate_ci: (ic_low, ic_high),
+            }),
             cluster_id: None,                       // detector vem em M1.3
             cluster_size: 1,
             cluster_rank: 1,
@@ -483,17 +493,20 @@ mod tests {
             Recommendation::Trade(setup) => {
                 // Sanity checks em campos-chave do ADR-016.
                 assert_eq!(setup.route_id, route);
+                assert_eq!(setup.entry_now, 3.8);
+                assert_eq!(setup.gross_profit_target, setup.entry_now + setup.exit_target);
                 // Pós-auditoria: min/typical/peak podem coincidir quando
                 // piso econômico empurra os 3 níveis para cima. Apenas
                 // invariante monotônico ≤ é exigido.
-                assert!(setup.enter_at_min <= setup.enter_typical);
-                assert!(setup.enter_typical <= setup.enter_peak_p95);
-                assert!(setup.gross_profit_p10 <= setup.gross_profit_median);
-                assert!(setup.gross_profit_median <= setup.gross_profit_p95);
-                assert!(setup.historical_base_rate_24h >= 0.0);
-                assert!(setup.historical_base_rate_24h <= 1.0);
-                assert!(setup.time_to_exit_p05_s.is_none());
-                assert!(setup.time_to_exit_p95_s.is_none());
+                let diag = setup.baseline_diagnostics.as_ref().expect("baseline diagnostics");
+                assert!(diag.enter_at_min <= diag.enter_typical);
+                assert!(diag.enter_typical <= diag.enter_peak_p95);
+                assert!(diag.gross_profit_p10 <= diag.gross_profit_median);
+                assert!(diag.gross_profit_median <= diag.gross_profit_p95);
+                assert!(diag.historical_base_rate_24h >= 0.0);
+                assert!(diag.historical_base_rate_24h <= 1.0);
+                assert!(setup.t_hit_median_s.is_none());
+                assert!(setup.p_hit.is_none());
                 assert_eq!(setup.calibration_status, CalibStatus::Degraded);
                 assert!(setup.valid_until > setup.emitted_at);
             }
@@ -544,9 +557,10 @@ mod tests {
         let rec = a3.recommend(route, 4.0, 1.0, 42);
         match rec {
             Recommendation::Trade(setup) => {
-                assert!(setup.gross_profit_p10 >= 0.5);
-                assert!(setup.historical_base_rate_24h > 0.5);
-                assert!(setup.time_to_exit_median_s.is_none());
+                let diag = setup.baseline_diagnostics.as_ref().expect("baseline diagnostics");
+                assert!(diag.gross_profit_p10 >= 0.5);
+                assert!(diag.historical_base_rate_24h > 0.5);
+                assert!(setup.t_hit_median_s.is_none());
             }
             Recommendation::Abstain { reason, .. } => {
                 panic!("marginal exit proxy should permit trade, got Abstain({reason:?})")
@@ -573,11 +587,12 @@ mod tests {
         let rec = a3.recommend(route, 2.1, -0.4, 1_700_000_000_000_000_000);
         match rec {
             Recommendation::Trade(setup) => {
+                let diag = setup.baseline_diagnostics.as_ref().expect("baseline diagnostics");
                 // Taxa degradada segue P(exit >= floor - enter_typical).
                 assert!(
-                    (setup.historical_base_rate_24h - 1.0).abs() < f32::EPSILON,
+                    (diag.historical_base_rate_24h - 1.0).abs() < f32::EPSILON,
                     "expected empirical success rate of 1.0, got {}",
-                    setup.historical_base_rate_24h
+                    diag.historical_base_rate_24h
                 );
                 // Pós-auditoria: IC usa `wilson_interval_autocorrelated` com
                 // n_eff = n/10 — mais largo e honesto em face de autocorrelação.
@@ -585,11 +600,11 @@ mod tests {
                 // aproximadamente 0.72 (não mais 0.90). Isso REFLETE melhor
                 // a incerteza real em séries autocorrelacionadas (Lahiri 2003).
                 assert!(
-                    setup.historical_base_rate_ci.0 > 0.60,
+                    diag.historical_base_rate_ci.0 > 0.60,
                     "lower bound deve ser > 0.60 com n_eff desconto; got {:?}",
-                    setup.historical_base_rate_ci
+                    diag.historical_base_rate_ci
                 );
-                assert!(setup.historical_base_rate_ci.1 <= 1.0);
+                assert!(diag.historical_base_rate_ci.1 <= 1.0);
             }
             Recommendation::Abstain { reason, .. } => {
                 panic!("expected Trade on saturated success set, got Abstain({reason:?})")
@@ -620,8 +635,9 @@ mod tests {
         let rec = a3.recommend(route, 2.0, -1.5, 1_700_000_000_000_000_000);
         match rec {
             Recommendation::Trade(setup) => {
-                assert!(setup.gross_profit_p10 < cfg.floor_pct);
-                assert!(setup.gross_profit_median >= cfg.floor_pct);
+                let diag = setup.baseline_diagnostics.as_ref().expect("baseline diagnostics");
+                assert!(diag.gross_profit_p10 < cfg.floor_pct);
+                assert!(diag.gross_profit_median >= cfg.floor_pct);
                 assert_eq!(setup.calibration_status, CalibStatus::Degraded);
             }
             Recommendation::Abstain { reason, .. } => {

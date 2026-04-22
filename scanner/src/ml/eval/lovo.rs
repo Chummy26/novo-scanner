@@ -14,9 +14,9 @@
 //! # Estado atual
 //!
 //! Ainda não existe um modelo treinado com folds por venue para avaliar.
-//! O módulo já expõe o contrato final e devolve um relatório neutro quando
-//! não há folds observáveis. Isso evita `None` silencioso e mantém o hook
-//! pronto para quando o treino real chegar.
+//! O módulo expõe o contrato final e devolve um relatório **não-aprovado**
+//! quando não há folds observáveis. Ausência de folds não é evidência de
+//! robustez cross-venue.
 
 use crate::types::Venue;
 
@@ -108,7 +108,7 @@ impl LovoReport {
     }
 }
 
-/// Retorna um relatório neutro enquanto não houver folds válidos.
+/// Retorna um relatório não-aprovado enquanto não houver folds válidos.
 ///
 /// Quando o treino real existir, este ponto pode ser trocado por um
 /// evaluator de venue-exclusion sem alterar o contrato externo.
@@ -134,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_folds_returns_neutral_report() {
+    fn empty_folds_do_not_pass_hard_gates() {
         let r = LovoReport::from_folds(vec![]);
         assert_eq!(r.precision_at_10_mean, 0.0);
         assert!(
@@ -184,7 +184,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_placeholder_returns_neutral_report() {
+    fn baseline_placeholder_does_not_pass_hard_gates() {
         let r = run_lovo_on_baseline_a3();
         assert!(r.folds.is_empty());
         assert!(

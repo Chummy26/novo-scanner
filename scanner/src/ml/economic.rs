@@ -2,7 +2,7 @@
 //!
 //! Implementa o gate econômico obrigatório do Marco 0+: para cada
 //! recomendação emitida (Trade), o `EconomicEvaluator` resolve o
-//! outcome (REALIZED / WINDOW_MISS / EXIT_MISS) varrendo as amostras
+//! outcome (REALIZED / EXIT_MISS) varrendo as amostras
 //! subsequentes e calcula PnL bruto simulado com capital hipotético
 //! fixo `10_000 USDT`.
 //!
@@ -13,10 +13,8 @@
 //! # Resolução de outcome (ADR-019)
 //!
 //! ```text
-//! REALIZED    se ∃ t_enter ∈ [t₀, t₀+T_trigger_max]: entrySpread(t_enter) ≥ enter_at_min
-//!             AND ∃ t_exit ∈ [t_enter, t_enter+T_max]: exitSpread(t_exit) ≥ exit_at_min
-//! WINDOW_MISS se enter_at_min não foi atingido em T_trigger_max
-//! EXIT_MISS   se enter hit mas exit não em T_max (fecha forçado no timeout)
+//! REALIZED    se ∃ t_exit ∈ [t₀, valid_until]: exitSpread(t_exit) ≥ exit_target
+//! EXIT_MISS   se a saída não atinge `exit_target` até o timeout
 //! ```
 //!
 //! # Limitação atual (Marco 0)
@@ -37,8 +35,7 @@ use crate::ml::contract::{RouteId, TradeSetup};
 /// Decisão: 10_000 USDT (ADR-019 §Capital hipotético fixo de referência).
 pub const CAPITAL_HYPOTHETICAL_USD: f64 = 10_000.0;
 
-/// `T_trigger_max`: janela máxima em segundos para aguardar `entrySpread`
-/// atingir `enter_at_min`. Default ADR-019 §Definição operacional: 300 s.
+/// Janela legada mantida para compatibilidade de métricas antigas.
 pub const DEFAULT_T_TRIGGER_MAX_S: u32 = 300;
 
 /// Custo estimado por recomendação (atenção do operador, ADR-019).
@@ -54,7 +51,8 @@ pub enum TradeOutcome {
         exit_realized_pct: f32,
         horizon_observed_ms: u32,
     },
-    /// `enter_at_min` não foi atingido em `T_trigger_max`.
+    /// Variante legada: contrato atual entra em `entry_now`, então novos
+    /// eventos de `TradeSetup` não deveriam produzir WindowMiss.
     WindowMiss,
     /// Entry hit, mas exit não em `T_max` — fechamento forçado no timeout.
     ExitMiss {
@@ -99,19 +97,11 @@ pub struct EconomicEvent {
     pub gross_pnl_usd: f64,
     /// `true` se foi recomendação do modelo A2; `false` se baseline A3.
     pub from_model: bool,
-    /// **Fix pós-auditoria C1 (nomenclatura honesta)**: valor que o baseline
-    /// A3 gravou em `setup.historical_base_rate_24h` — que é, no regime
-    /// atual, uma **taxa marginal histórica de exceedance** (ecdf.rs: taxa
-    /// empírica de `exit ≥ exit_at_min`), **não** um forecast condicional.
+    /// Forecast condicional calibrado do modelo para `P_hit`.
     ///
-    /// Portanto a `ECE` derivada daqui mede "quão bem a taxa marginal
-    /// histórica antecipa o outcome", NÃO calibração de forecast
-    /// probabilístico. Quando o modelo A2 condicional entrar, um campo
-    /// separado `conditional_forecast_probability` será adicionado e uma
-    /// segunda métrica ECE calibrada será exposta. Até lá, o acumulador
-    /// aqui funciona como sanity check de baseline, não como indicador de
-    /// calibração de modelo.
-    pub historical_base_rate_24h: f32,
+    /// Baseline A3 degradado deixa `None`; sua taxa marginal histórica fica
+    /// apenas em `BaselineDiagnostics` e não alimenta ECE do modelo.
+    pub p_hit_forecast: Option<f32>,
 }
 
 impl EconomicEvent {
@@ -131,7 +121,7 @@ impl EconomicEvent {
             gross_pnl_pct: gross_pct,
             gross_pnl_usd: (gross_pct as f64 / 100.0) * CAPITAL_HYPOTHETICAL_USD,
             from_model,
-            historical_base_rate_24h: setup.historical_base_rate_24h,
+            p_hit_forecast: setup.p_hit,
         }
     }
 
@@ -242,8 +232,8 @@ pub struct EconomicAccumulator {
     max_events: usize,
     /// Metrics atómicos para Prometheus.
     metrics: Arc<EconomicMetrics>,
-    /// Fix pós-auditoria: calibration tracker rolling por bucket.
-    /// Registra `(p_forecast, realized)` para cada outcome resolvido.
+    /// Calibration tracker rolling por bucket.
+    /// Registra `(P_hit, realized)` apenas quando há forecast condicional.
     /// Exposto via `calibration_ece()` + `reliability_points()`.
     calibration: CalibrationAccumulator,
 }
@@ -258,8 +248,8 @@ pub struct EconomicMetrics {
     /// PnL agregado USD × 1e4 (inteiro para evitar float atômico).
     /// Divide por 1e4 ao ler.
     pub pnl_aggregated_usd_times_10k: AtomicI64,
-    /// Fix pós-auditoria 2026-04-21: Expected Calibration Error em bps (×1e4).
-    /// Atualizado periodicamente por `EconomicAccumulator::update_calibration`.
+    /// Expected Calibration Error em bps (×1e4).
+    /// Atualizado quando um evento com `p_hit_forecast` resolve.
     /// ECE = Σ |conf_bucket − freq_bucket| × (n_bucket / n_total).
     /// Meta CLAUDE.md: ECE < 0.10 (1000 bps) em janela 24h.
     pub calibration_ece_bps: std::sync::atomic::AtomicU64,
@@ -271,25 +261,25 @@ pub struct EconomicMetrics {
 // BaseRateAccumulator (ECE bucket-based)
 // ---------------------------------------------------------------------------
 
-/// Acumulador da taxa histórica: 10 buckets em [0, 1].
+/// Acumulador de calibração de `P_hit`: 10 buckets em [0, 1].
 ///
-/// Para cada par `(p_predicted, y_realized)` observado, coloca em
+/// Para cada par `(P_hit, y_realized)` observado, coloca em
 /// `bucket = floor(p * 10)`. ECE (Expected Calibration Error) =
 /// `Σ |mid_conf − observed_freq| × (n_bucket / N)` — quanto menor,
 /// mais calibrado. DeGroot & Fienberg 1983 (reliability).
 ///
-/// Uso: chamar `record(base_rate_hist, y)` quando um `EconomicEvent` fechar.
+/// Uso: chamar `record(p_hit, y)` quando um `EconomicEvent` fechar.
 /// Chamar `ece()` para snapshot atual.
 #[derive(Debug, Default)]
 pub struct CalibrationAccumulator {
-    /// `(n_emitted, n_realized)` por decil de `historical_base_rate_24h`.
+    /// `(n_emitted, n_realized)` por decil de `P_hit`.
     /// bucket[0] = [0.0, 0.1), bucket[9] = [0.9, 1.0].
     pub buckets: [(u64, u64); 10],
 }
 
 impl CalibrationAccumulator {
-    pub fn record(&mut self, historical_base_rate_24h: f32, realized: bool) {
-        let p = historical_base_rate_24h.clamp(0.0, 0.9999);
+    pub fn record(&mut self, p_hit: f32, realized: bool) {
+        let p = p_hit.clamp(0.0, 0.9999);
         let idx = ((p * 10.0) as usize).min(9);
         self.buckets[idx].0 = self.buckets[idx].0.saturating_add(1);
         if realized {
@@ -390,11 +380,12 @@ impl EconomicAccumulator {
             .pnl_aggregated_usd_times_10k
             .fetch_add(pnl_scaled, Ordering::Relaxed);
 
-        // Fix C1: registra par (base_rate_histórico, realized) no tracker.
-        // A métrica resultante mede `base_rate_vs_outcome_ece`, não
-        // calibração de forecast — ver doc de `historical_base_rate_24h`.
-        self.calibration
-            .record(evt.historical_base_rate_24h, realized_bool);
+        // Só forecasts condicionais reais entram na calibração do modelo.
+        // Baseline A3 deixa `p_hit_forecast=None` para não confundir taxa
+        // marginal histórica com probabilidade calibrada.
+        if let Some(p_hit) = evt.p_hit_forecast {
+            self.calibration.record(p_hit, realized_bool);
+        }
         let ece_bps = (self.calibration.ece() * 10_000.0) as u64;
         self.metrics
             .calibration_ece_bps
@@ -487,7 +478,7 @@ impl Default for EconomicAccumulator {
 mod tests {
     use super::*;
     use crate::ml::contract::{
-        CalibStatus, ReasonKind, TradeReason,
+        BaselineDiagnostics, CalibStatus, ReasonKind, TradeReason,
     };
     use crate::types::{SymbolId, Venue};
 
@@ -498,24 +489,35 @@ mod tests {
                 buy_venue: Venue::MexcFut,
                 sell_venue: Venue::BingxFut,
             },
-            enter_at_min: 2.0,
-            enter_typical: 2.5,
-            enter_peak_p95: 3.0,
-            p_enter_hit: 0.9,
-            exit_at_min: -1.0,
-            exit_typical: -0.5,
-            p_exit_hit_given_enter: 0.85,
-            gross_profit_p10: 1.0,
-            gross_profit_p25: 1.3,
-            gross_profit_median: 2.0,
-            gross_profit_p75: 2.5,
-            gross_profit_p90: 2.9,
-            gross_profit_p95: 3.0,
-            historical_base_rate_24h: 0.77,
-            historical_base_rate_ci: (0.70, 0.82),
-            time_to_exit_p05_s: None,
-            time_to_exit_median_s: None,
-            time_to_exit_p95_s: None,
+            entry_now: 2.5,
+            exit_target: -0.5,
+            gross_profit_target: 2.0,
+            p_hit: Some(0.83),
+            p_hit_ci: Some((0.77, 0.88)),
+            exit_q25: Some(-0.8),
+            exit_q50: Some(-0.5),
+            exit_q75: Some(-0.2),
+            t_hit_p25_s: Some(900),
+            t_hit_median_s: Some(1680),
+            t_hit_p75_s: Some(3120),
+            p_censor: Some(0.04),
+            baseline_diagnostics: Some(BaselineDiagnostics {
+                enter_at_min: 2.0,
+                enter_typical: 2.5,
+                enter_peak_p95: 3.0,
+                p_enter_hit: 0.9,
+                exit_at_min: -1.0,
+                exit_typical: -0.5,
+                p_exit_hit_given_enter: 0.85,
+                gross_profit_p10: 1.0,
+                gross_profit_p25: 1.3,
+                gross_profit_median: 2.0,
+                gross_profit_p75: 2.5,
+                gross_profit_p90: 2.9,
+                gross_profit_p95: 3.0,
+                historical_base_rate_24h: 0.77,
+                historical_base_rate_ci: (0.70, 0.82),
+            }),
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
@@ -578,6 +580,30 @@ mod tests {
         assert!((m.realization_rate - 0.5).abs() < 1e-4);
         // PnL agregado = 1.3% de 10k = 130 USD
         assert!((m.simulated_pnl_aggregated_usd - 130.0).abs() < 1e-2);
+    }
+
+    #[test]
+    fn baseline_without_p_hit_does_not_feed_calibration() {
+        let mut acc = EconomicAccumulator::new();
+        let now_ns = 1_000_000_000_000;
+        let mut setup = mk_setup(now_ns - 500_000_000);
+        setup.p_hit = None;
+        setup.p_hit_ci = None;
+        setup.calibration_status = CalibStatus::Degraded;
+
+        acc.push(EconomicEvent::new(
+            &setup,
+            TradeOutcome::Realized {
+                enter_realized_pct: 2.1,
+                exit_realized_pct: -0.8,
+                horizon_observed_ms: 300,
+            },
+            now_ns,
+            false,
+        ));
+
+        assert_eq!(acc.metrics().calibration_observations.load(Ordering::Relaxed), 0);
+        assert_eq!(acc.calibration_ece(), 0.0);
     }
 
     #[test]

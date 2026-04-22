@@ -9,7 +9,8 @@
 //!   (skill §3.1 — "preços executados, não cotados"). O operador já entrou
 //!   em t0; não é hipótese futura.
 //! - Label resolve APENAS `exit(t1)` em `[t0, t0+horizon_s]` com t1 > t0.
-//! - `PnL_bruto = entry_locked_pct + best_exit_pct` (skill §3 identidade).
+//! - O alvo supervisionado principal é `first_exit_ge_label_floor_*` com
+//!   censura; `best_exit_pct`/`best_gross_pct` são auditoria hindsight.
 //!
 //! # Opção B: 1 record por (sample_id, horizon_s)
 //!
@@ -19,11 +20,12 @@
 //!
 //! # Alvos contínuos vs first-hit
 //!
-//! - Alvos contínuos (raiz do label): `best_exit_pct`, `best_gross_pct`,
-//!   `T_to_best_s`. **Oracle hindsight** — usar com cuidado no treino.
-//! - First-hit (auditoria anti-hindsight): `first_exit_ge_label_floor_*`
-//!   com `label_floor_pct` explícito — é label DERIVADO para aquele floor,
-//!   não verdade universal.
+//! - First-hit (alvo principal anti-hindsight): `first_exit_ge_label_floor_*`
+//!   com `label_floor_pct` explícito — falsificável sem conhecer a melhor
+//!   saída absoluta da trajetória.
+//! - Alvos contínuos: `best_exit_pct`, `best_gross_pct`, `T_to_best_s`.
+//!   **Oracle hindsight** — usar apenas como auditoria/pesquisa ou alvo
+//!   auxiliar explicitamente separado.
 //!
 //! # Fronteira ML
 //!
@@ -125,7 +127,7 @@ pub struct LabeledTrade {
     // Features t0
     pub features_t0: FeaturesT0,
 
-    // Alvos contínuos (label raiz — skill §3.4)
+    // Auditoria oracle/hindsight — não é o target principal do modelo.
     pub best_exit_pct: Option<f32>,
     pub best_exit_ts_ns: Option<u64>,
     pub best_gross_pct: Option<f32>,

@@ -1,12 +1,11 @@
 //! Contrato de output do recomendador ML.
 //!
-//! Implementa ADR-005 (abstenção tipada 4 razões) + o contrato honesto
-//! do baseline atual: thresholds + distribuição empírica de lucro bruto
-//! + estatísticas históricas auxiliares.
+//! Implementa ADR-005 (abstenção tipada) + o contrato final do operador:
+//! `entry_now`, `exit_target`, `lucro_bruto_alvo`, `P_hit`, `T_hit` e `IC`.
 //!
-//! `TradeSetup` representa uma *regra acionável*, não um par de pontos
-//! exatos. Operador captura valores reais durante a vida da oportunidade;
-//! o lucro bruto realizado é posição na distribuição reportada.
+//! O baseline A3 ainda é um safety-net degradado. As estatísticas ECDF
+//! marginais ficam em `BaselineDiagnostics`; elas não são o output central
+//! do modelo e não devem ser lidas como forecast condicional calibrado.
 //!
 //! Ver `docs/ml/01_decisions/ADR-016-output-contract-refined.md` para
 //! racional completo.
@@ -53,43 +52,21 @@ pub enum Recommendation {
     },
 }
 
-/// Regra acionável emitida para uma rota.
+/// Diagnósticos do baseline A3.
 ///
-/// Contrato thresholds + distribuição empírica:
-/// - `enter_at_min` / `exit_at_min`: regras ("entre quando `entrySpread ≥ X`").
-/// - `gross_profit_{p10, p25, median, p75, p90, p95}`: quantis **empíricos**
-///   verificáveis com ~10 trades (Kolassa 2016 IJF 32(3)).
-/// - `historical_base_rate_24h`: taxa marginal histórica da janela 24h
-///   para `exit ≥ exit_at_min`. No baseline A3 isso **não é**
-///   `P(realize | state_t0)`, apenas uma estatística de referência do dataset.
-/// - `time_to_exit_*`: quantis de tempo até saída **apenas quando houver
-///   estimativa honesta**. O baseline A3 atual deixa esses campos em `None`
-///   em vez de fabricar `T` sintético.
+/// Esses campos são úteis para auditoria e comparação contra A3, mas não
+/// compõem o output normativo do modelo descrito no CLAUDE.md.
 #[derive(Debug, Clone)]
-pub struct TradeSetup {
-    pub route_id: RouteId,
-
-    // --- Regra de entrada (threshold, não ponto) -------------------------
-    /// Regra: entre quando `entrySpread(t) ≥ enter_at_min`.
+pub struct BaselineDiagnostics {
     pub enter_at_min: f32,
-    /// Mediana prevista do entry observável em horizonte.
     pub enter_typical: f32,
-    /// Pico esperado (p95) — informa decisão "esperar por mais?".
     pub enter_peak_p95: f32,
-    /// P(entrySpread atingir `enter_at_min` em horizonte). **Informativo
-    /// apenas**; NÃO entra no cálculo de `historical_base_rate_24h`.
     pub p_enter_hit: f32,
 
-    // --- Regra de saída (threshold) --------------------------------------
-    /// Regra: saia quando `exitSpread(t) ≥ exit_at_min`.
     pub exit_at_min: f32,
     pub exit_typical: f32,
-    /// P(exit atingir threshold | entrou). **Informativo apenas**.
     pub p_exit_hit_given_enter: f32,
 
-    // --- Lucro bruto como distribuição empírica --------------------------
-    /// Quantis empíricos previstos da variável unificada
-    /// `G(t₀, t₁) = S_entrada(t₀) + S_saída(t₁)` (ADR-008).
     pub gross_profit_p10: f32,
     pub gross_profit_p25: f32,
     pub gross_profit_median: f32,
@@ -97,17 +74,45 @@ pub struct TradeSetup {
     pub gross_profit_p90: f32,
     pub gross_profit_p95: f32,
 
-    // --- Estatística histórica auxiliar (baseline atual) -----------------
     /// Taxa marginal histórica 24h de `exit >= exit_at_min`.
-    /// É uma referência empírica do dataset, não forecast condicional.
+    /// Não é `P_hit` condicional.
     pub historical_base_rate_24h: f32,
-    /// IC 95% da taxa histórica acima.
     pub historical_base_rate_ci: (f32, f32),
+}
 
-    // --- Tempo até saída (somente quando houver previsão honesta) --------
-    pub time_to_exit_p05_s: Option<u32>,
-    pub time_to_exit_median_s: Option<u32>,
-    pub time_to_exit_p95_s: Option<u32>,
+/// Recomendação acionável emitida para uma rota no instante `t0`.
+///
+/// Semântica central alinhada ao CLAUDE.md:
+/// - `entry_now`: `S_entrada(t0)` observado/cotado e aceito como entrada agora.
+/// - `exit_target`: threshold futuro de `S_saída(t1)`.
+/// - `gross_profit_target`: `entry_now + exit_target` em spread bruto cotado.
+/// - `p_hit`: probabilidade condicional calibrada de atingir `exit_target`.
+/// - `t_hit_*`: distribuição de tempo até atingir `exit_target`.
+///
+/// Campos opcionais permanecem `None` quando a implementação atual não tem
+/// estimativa honesta. O baseline A3 deve usar `calibration_status=Degraded`.
+#[derive(Debug, Clone)]
+pub struct TradeSetup {
+    pub route_id: RouteId,
+
+    // --- Output central ---------------------------------------------------
+    pub entry_now: f32,
+    pub exit_target: f32,
+    pub gross_profit_target: f32,
+    pub p_hit: Option<f32>,
+    pub p_hit_ci: Option<(f32, f32)>,
+
+    // --- Distribuição opcional exibida no painel expandido ---------------
+    pub exit_q25: Option<f32>,
+    pub exit_q50: Option<f32>,
+    pub exit_q75: Option<f32>,
+    pub t_hit_p25_s: Option<u32>,
+    pub t_hit_median_s: Option<u32>,
+    pub t_hit_p75_s: Option<u32>,
+    pub p_censor: Option<f32>,
+
+    // --- Diagnóstico de fallback -----------------------------------------
+    pub baseline_diagnostics: Option<BaselineDiagnostics>,
 
     // --- Contexto de correlação (Q1 emendas) -----------------------------
     /// Se rota pertence a um cluster de correlação, ID do cluster.
@@ -279,46 +284,48 @@ mod tests {
     use crate::types::Venue;
 
     #[test]
-    fn tradesetup_construction_basic() {
-        // Sanity: construção completa não deve panicar; tipos alinhados.
+    fn tradesetup_exposes_final_operator_semantics() {
         let setup = TradeSetup {
             route_id: RouteId {
-                symbol_id: SymbolId(42),
+                symbol_id: SymbolId(1),
                 buy_venue: Venue::MexcFut,
                 sell_venue: Venue::BingxFut,
             },
-            enter_at_min: 1.80,
-            enter_typical: 2.00,
-            enter_peak_p95: 2.80,
-            p_enter_hit: 0.90,
-            exit_at_min: -1.20,
-            exit_typical: -1.00,
-            p_exit_hit_given_enter: 0.85,
-            gross_profit_p10: 0.60,
-            gross_profit_p25: 0.70,
-            gross_profit_median: 1.00,
-            gross_profit_p75: 1.50,
-            gross_profit_p90: 2.30,
-            gross_profit_p95: 2.80,
-            historical_base_rate_24h: 0.77,
-            historical_base_rate_ci: (0.70, 0.82),
-            time_to_exit_p05_s: None,
-            time_to_exit_median_s: None,
-            time_to_exit_p95_s: None,
+            entry_now: 2.0,
+            exit_target: -1.0,
+            gross_profit_target: 1.0,
+            p_hit: Some(0.83),
+            p_hit_ci: Some((0.77, 0.88)),
+            exit_q25: Some(-1.4),
+            exit_q50: Some(-1.0),
+            exit_q75: Some(-0.7),
+            t_hit_p25_s: Some(900),
+            t_hit_median_s: Some(1680),
+            t_hit_p75_s: Some(3120),
+            p_censor: Some(0.04),
+            baseline_diagnostics: None,
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
-                detail: "regime opportunity + cauda superior".into(),
+                detail: "test".into(),
             },
-            model_version: "0.1.0".into(),
-            emitted_at: 1_730_000_000_000_000_000,
-            valid_until: 1_730_000_150_000_000_000,
+            model_version: "a2-test".into(),
+            emitted_at: 1_700_000_000_000_000_000,
+            valid_until: 1_700_000_150_000_000_000,
         };
-        // Identidade básica: gross_profit_median deveria ser enter_typical + exit_typical.
-        // (modelo pode prever diferente; apenas checa campos existem e são f32.)
+
+        assert_eq!(setup.entry_now + setup.exit_target, setup.gross_profit_target);
+        assert_eq!(setup.p_hit, Some(0.83));
+        assert_eq!(setup.t_hit_median_s, Some(1680));
+    }
+
+    #[test]
+    fn tradesetup_construction_basic() {
+        // Sanity: construção completa não deve panicar; tipos alinhados.
+        let setup = valid_setup();
         let _ = Recommendation::Trade(setup);
     }
 
@@ -364,24 +371,35 @@ mod tests {
                 buy_venue: Venue::MexcFut,
                 sell_venue: Venue::BingxFut,
             },
-            enter_at_min: 1.80,
-            enter_typical: 2.00,
-            enter_peak_p95: 2.80,
-            p_enter_hit: 0.90,
-            exit_at_min: -1.20,
-            exit_typical: -1.00,
-            p_exit_hit_given_enter: 0.85,
-            gross_profit_p10: 0.60,
-            gross_profit_p25: 0.70,
-            gross_profit_median: 1.00,
-            gross_profit_p75: 1.50,
-            gross_profit_p90: 2.30,
-            gross_profit_p95: 2.80,
-            historical_base_rate_24h: 0.77,
-            historical_base_rate_ci: (0.70, 0.82),
-            time_to_exit_p05_s: Some(720),
-            time_to_exit_median_s: Some(1680),
-            time_to_exit_p95_s: Some(6000),
+            entry_now: 2.00,
+            exit_target: -1.00,
+            gross_profit_target: 1.00,
+            p_hit: Some(0.83),
+            p_hit_ci: Some((0.77, 0.88)),
+            exit_q25: Some(-1.40),
+            exit_q50: Some(-1.00),
+            exit_q75: Some(-0.70),
+            t_hit_p25_s: Some(720),
+            t_hit_median_s: Some(1680),
+            t_hit_p75_s: Some(6000),
+            p_censor: Some(0.04),
+            baseline_diagnostics: Some(BaselineDiagnostics {
+                enter_at_min: 1.80,
+                enter_typical: 2.00,
+                enter_peak_p95: 2.80,
+                p_enter_hit: 0.90,
+                exit_at_min: -1.20,
+                exit_typical: -1.00,
+                p_exit_hit_given_enter: 0.85,
+                gross_profit_p10: 0.60,
+                gross_profit_p25: 0.70,
+                gross_profit_median: 1.00,
+                gross_profit_p75: 1.50,
+                gross_profit_p90: 2.30,
+                gross_profit_p95: 2.80,
+                historical_base_rate_24h: 0.77,
+                historical_base_rate_ci: (0.70, 0.82),
+            }),
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
@@ -397,51 +415,45 @@ mod tests {
     }
 
     #[test]
-    fn invariant_gross_quantiles_are_monotonic() {
+    fn invariant_exit_quantiles_are_monotonic_when_present() {
         let s = valid_setup();
-        assert!(s.gross_profit_p10 <= s.gross_profit_p25, "p10 > p25");
-        assert!(s.gross_profit_p25 <= s.gross_profit_median, "p25 > median");
-        assert!(s.gross_profit_median <= s.gross_profit_p75, "median > p75");
-        assert!(s.gross_profit_p75 <= s.gross_profit_p90, "p75 > p90");
-        assert!(s.gross_profit_p90 <= s.gross_profit_p95, "p90 > p95");
+        assert!(s.exit_q25.unwrap() <= s.exit_q50.unwrap(), "q25 > q50");
+        assert!(s.exit_q50.unwrap() <= s.exit_q75.unwrap(), "q50 > q75");
     }
 
     #[test]
-    fn invariant_enter_levels_are_monotonic() {
+    fn invariant_t_hit_quantiles_are_monotonic_when_present() {
         let s = valid_setup();
-        assert!(s.enter_at_min <= s.enter_typical, "enter_at_min > enter_typical");
-        assert!(s.enter_typical <= s.enter_peak_p95, "enter_typical > enter_peak_p95");
+        let p25 = s.t_hit_p25_s.unwrap();
+        let median = s.t_hit_median_s.unwrap();
+        let p75 = s.t_hit_p75_s.unwrap();
+        assert!(p25 <= median, "p25 > median");
+        assert!(median <= p75, "median > p75");
     }
 
     #[test]
-    fn invariant_time_to_exit_quantiles_are_monotonic_when_present() {
+    fn invariant_probabilities_within_unit_interval() {
         let s = valid_setup();
-        let p05 = s.time_to_exit_p05_s.unwrap();
-        let median = s.time_to_exit_median_s.unwrap();
-        let p95 = s.time_to_exit_p95_s.unwrap();
-        assert!(p05 <= median, "p05 > median");
-        assert!(median <= p95, "median > p95");
+        assert!((0.0..=1.0).contains(&s.p_hit.unwrap()));
+        assert!((0.0..=1.0).contains(&s.p_censor.unwrap()));
+        let d = s.baseline_diagnostics.as_ref().unwrap();
+        assert!((0.0..=1.0).contains(&d.historical_base_rate_24h));
+        assert!((0.0..=1.0).contains(&d.p_enter_hit));
+        assert!((0.0..=1.0).contains(&d.p_exit_hit_given_enter));
     }
 
     #[test]
-    fn invariant_base_rate_and_aux_probs_within_unit_interval() {
+    fn invariant_p_hit_ci_contains_p_hit() {
         let s = valid_setup();
-        assert!(s.historical_base_rate_24h >= 0.0 && s.historical_base_rate_24h <= 1.0);
-        assert!(s.p_enter_hit >= 0.0 && s.p_enter_hit <= 1.0);
-        assert!(s.p_exit_hit_given_enter >= 0.0 && s.p_exit_hit_given_enter <= 1.0);
-    }
-
-    #[test]
-    fn invariant_base_rate_ci_contains_base_rate() {
-        let s = valid_setup();
-        let (lo, hi) = s.historical_base_rate_ci;
+        let p = s.p_hit.unwrap();
+        let (lo, hi) = s.p_hit_ci.unwrap();
         assert!(lo >= 0.0 && lo <= 1.0, "CI lower out of [0,1]");
         assert!(hi >= 0.0 && hi <= 1.0, "CI upper out of [0,1]");
         assert!(lo <= hi, "CI lower > upper");
         assert!(
-            lo <= s.historical_base_rate_24h && s.historical_base_rate_24h <= hi,
-            "base_rate={} fora de IC=[{}, {}]",
-            s.historical_base_rate_24h, lo, hi
+            lo <= p && p <= hi,
+            "p_hit={} fora de IC=[{}, {}]",
+            p, lo, hi
         );
     }
 
@@ -455,16 +467,13 @@ mod tests {
     #[test]
     fn invariant_identity_gross_median_approximately_enter_plus_exit() {
         // Identidade contábil (skill §3): PnL = S_entrada(t₀) + S_saída(t₁).
-        // Não exige igualdade exata (modelo pode prever marginais ≠ dos
-        // quantis exatos), mas mediana do gross deve estar razoavelmente
-        // próxima de enter_typical + exit_typical em regime normal.
         let s = valid_setup();
-        let identity = s.enter_typical + s.exit_typical;
-        let delta = (s.gross_profit_median - identity).abs();
+        let identity = s.entry_now + s.exit_target;
+        let delta = (s.gross_profit_target - identity).abs();
         assert!(
-            delta < 0.50,
-            "gross_median {} diverge de identity {} por {} (tolerância 0.50pp)",
-            s.gross_profit_median, identity, delta
+            delta < 1e-6,
+            "gross_target {} diverge de identity {} por {}",
+            s.gross_profit_target, identity, delta
         );
     }
 
@@ -477,12 +486,13 @@ mod tests {
     #[test]
     fn invariant_all_finite() {
         let s = valid_setup();
-        let finite_fields: [f32; 14] = [
-            s.enter_at_min, s.enter_typical, s.enter_peak_p95, s.p_enter_hit,
-            s.exit_at_min, s.exit_typical, s.p_exit_hit_given_enter,
-            s.gross_profit_p10, s.gross_profit_p25, s.gross_profit_median,
-            s.gross_profit_p75, s.gross_profit_p90, s.gross_profit_p95,
-            s.historical_base_rate_24h,
+        let d = s.baseline_diagnostics.as_ref().unwrap();
+        let finite_fields: [f32; 18] = [
+            s.entry_now, s.exit_target, s.gross_profit_target, s.p_hit.unwrap(),
+            s.p_censor.unwrap(), d.enter_at_min, d.enter_typical, d.enter_peak_p95,
+            d.p_enter_hit, d.exit_at_min, d.exit_typical, d.p_exit_hit_given_enter,
+            d.gross_profit_p10, d.gross_profit_p25, d.gross_profit_median,
+            d.gross_profit_p75, d.gross_profit_p90, d.gross_profit_p95,
         ];
         for (i, v) in finite_fields.iter().enumerate() {
             assert!(v.is_finite(), "field {} is not finite: {}", i, v);

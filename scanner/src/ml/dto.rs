@@ -10,7 +10,7 @@
 use serde::Serialize;
 
 use crate::ml::contract::{
-    AbstainDiagnostic, AbstainReason, CalibStatus, EntryQuality, ExitQuality,
+    AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, EntryQuality, ExitQuality,
     ReasonKind, Recommendation, RouteId, TacticalSignal, TradeSetup,
 };
 
@@ -73,29 +73,22 @@ impl From<&Recommendation> for RecommendationDto {
 pub struct TradeSetupDto {
     pub route_id: RouteIdDto,
 
-    pub enter_at_min: f32,
-    pub enter_typical: f32,
-    pub enter_peak_p95: f32,
-    pub p_enter_hit: f32,
+    pub entry_now: f32,
+    pub exit_target: f32,
+    pub gross_profit_target: f32,
+    pub p_hit: Option<f32>,
+    pub p_hit_ci_lo: Option<f32>,
+    pub p_hit_ci_hi: Option<f32>,
 
-    pub exit_at_min: f32,
-    pub exit_typical: f32,
-    pub p_exit_hit_given_enter: f32,
+    pub exit_q25: Option<f32>,
+    pub exit_q50: Option<f32>,
+    pub exit_q75: Option<f32>,
+    pub t_hit_p25_s: Option<u32>,
+    pub t_hit_median_s: Option<u32>,
+    pub t_hit_p75_s: Option<u32>,
+    pub p_censor: Option<f32>,
 
-    pub gross_profit_p10: f32,
-    pub gross_profit_p25: f32,
-    pub gross_profit_median: f32,
-    pub gross_profit_p75: f32,
-    pub gross_profit_p90: f32,
-    pub gross_profit_p95: f32,
-
-    pub historical_base_rate_24h: f32,
-    pub historical_base_rate_ci_lo: f32,
-    pub historical_base_rate_ci_hi: f32,
-
-    pub time_to_exit_p05_s: Option<u32>,
-    pub time_to_exit_median_s: Option<u32>,
-    pub time_to_exit_p95_s: Option<u32>,
+    pub baseline_diagnostics: Option<BaselineDiagnosticsDto>,
 
     pub cluster_id: Option<u32>,
     pub cluster_size: u8,
@@ -112,27 +105,26 @@ pub struct TradeSetupDto {
 
 impl From<&TradeSetup> for TradeSetupDto {
     fn from(s: &TradeSetup) -> Self {
+        let (p_hit_ci_lo, p_hit_ci_hi) = s
+            .p_hit_ci
+            .map(|(lo, hi)| (Some(lo), Some(hi)))
+            .unwrap_or((None, None));
         Self {
             route_id: s.route_id.into(),
-            enter_at_min: s.enter_at_min,
-            enter_typical: s.enter_typical,
-            enter_peak_p95: s.enter_peak_p95,
-            p_enter_hit: s.p_enter_hit,
-            exit_at_min: s.exit_at_min,
-            exit_typical: s.exit_typical,
-            p_exit_hit_given_enter: s.p_exit_hit_given_enter,
-            gross_profit_p10: s.gross_profit_p10,
-            gross_profit_p25: s.gross_profit_p25,
-            gross_profit_median: s.gross_profit_median,
-            gross_profit_p75: s.gross_profit_p75,
-            gross_profit_p90: s.gross_profit_p90,
-            gross_profit_p95: s.gross_profit_p95,
-            historical_base_rate_24h: s.historical_base_rate_24h,
-            historical_base_rate_ci_lo: s.historical_base_rate_ci.0,
-            historical_base_rate_ci_hi: s.historical_base_rate_ci.1,
-            time_to_exit_p05_s: s.time_to_exit_p05_s,
-            time_to_exit_median_s: s.time_to_exit_median_s,
-            time_to_exit_p95_s: s.time_to_exit_p95_s,
+            entry_now: s.entry_now,
+            exit_target: s.exit_target,
+            gross_profit_target: s.gross_profit_target,
+            p_hit: s.p_hit,
+            p_hit_ci_lo,
+            p_hit_ci_hi,
+            exit_q25: s.exit_q25,
+            exit_q50: s.exit_q50,
+            exit_q75: s.exit_q75,
+            t_hit_p25_s: s.t_hit_p25_s,
+            t_hit_median_s: s.t_hit_median_s,
+            t_hit_p75_s: s.t_hit_p75_s,
+            p_censor: s.p_censor,
+            baseline_diagnostics: s.baseline_diagnostics.as_ref().map(BaselineDiagnosticsDto::from),
             cluster_id: s.cluster_id,
             cluster_size: s.cluster_size,
             cluster_rank: s.cluster_rank,
@@ -146,6 +138,49 @@ impl From<&TradeSetup> for TradeSetupDto {
             model_version: s.model_version.clone(),
             emitted_at_ns: s.emitted_at,
             valid_until_ns: s.valid_until,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BaselineDiagnosticsDto {
+    pub enter_at_min: f32,
+    pub enter_typical: f32,
+    pub enter_peak_p95: f32,
+    pub p_enter_hit: f32,
+    pub exit_at_min: f32,
+    pub exit_typical: f32,
+    pub p_exit_hit_given_enter: f32,
+    pub gross_profit_p10: f32,
+    pub gross_profit_p25: f32,
+    pub gross_profit_median: f32,
+    pub gross_profit_p75: f32,
+    pub gross_profit_p90: f32,
+    pub gross_profit_p95: f32,
+    pub historical_base_rate_24h: f32,
+    pub historical_base_rate_ci_lo: f32,
+    pub historical_base_rate_ci_hi: f32,
+}
+
+impl From<&BaselineDiagnostics> for BaselineDiagnosticsDto {
+    fn from(d: &BaselineDiagnostics) -> Self {
+        Self {
+            enter_at_min: d.enter_at_min,
+            enter_typical: d.enter_typical,
+            enter_peak_p95: d.enter_peak_p95,
+            p_enter_hit: d.p_enter_hit,
+            exit_at_min: d.exit_at_min,
+            exit_typical: d.exit_typical,
+            p_exit_hit_given_enter: d.p_exit_hit_given_enter,
+            gross_profit_p10: d.gross_profit_p10,
+            gross_profit_p25: d.gross_profit_p25,
+            gross_profit_median: d.gross_profit_median,
+            gross_profit_p75: d.gross_profit_p75,
+            gross_profit_p90: d.gross_profit_p90,
+            gross_profit_p95: d.gross_profit_p95,
+            historical_base_rate_24h: d.historical_base_rate_24h,
+            historical_base_rate_ci_lo: d.historical_base_rate_ci.0,
+            historical_base_rate_ci_hi: d.historical_base_rate_ci.1,
         }
     }
 }
@@ -272,24 +307,35 @@ mod tests {
                 buy_venue: Venue::MexcFut,
                 sell_venue: Venue::BingxFut,
             },
-            enter_at_min: 1.8,
-            enter_typical: 2.0,
-            enter_peak_p95: 2.8,
-            p_enter_hit: 0.9,
-            exit_at_min: -1.2,
-            exit_typical: -1.0,
-            p_exit_hit_given_enter: 0.85,
-            gross_profit_p10: 0.6,
-            gross_profit_p25: 0.7,
-            gross_profit_median: 1.0,
-            gross_profit_p75: 1.5,
-            gross_profit_p90: 2.3,
-            gross_profit_p95: 2.8,
-            historical_base_rate_24h: 0.77,
-            historical_base_rate_ci: (0.70, 0.82),
-            time_to_exit_p05_s: None,
-            time_to_exit_median_s: None,
-            time_to_exit_p95_s: None,
+            entry_now: 2.0,
+            exit_target: -1.0,
+            gross_profit_target: 1.0,
+            p_hit: Some(0.83),
+            p_hit_ci: Some((0.77, 0.88)),
+            exit_q25: Some(-1.4),
+            exit_q50: Some(-1.0),
+            exit_q75: Some(-0.7),
+            t_hit_p25_s: Some(900),
+            t_hit_median_s: Some(1680),
+            t_hit_p75_s: Some(3120),
+            p_censor: Some(0.04),
+            baseline_diagnostics: Some(BaselineDiagnostics {
+                enter_at_min: 1.8,
+                enter_typical: 2.0,
+                enter_peak_p95: 2.8,
+                p_enter_hit: 0.9,
+                exit_at_min: -1.2,
+                exit_typical: -1.0,
+                p_exit_hit_given_enter: 0.85,
+                gross_profit_p10: 0.6,
+                gross_profit_p25: 0.7,
+                gross_profit_median: 1.0,
+                gross_profit_p75: 1.5,
+                gross_profit_p90: 2.3,
+                gross_profit_p95: 2.8,
+                historical_base_rate_24h: 0.77,
+                historical_base_rate_ci: (0.70, 0.82),
+            }),
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
@@ -316,8 +362,14 @@ mod tests {
         assert!(v.get("toxicity_level").is_none());
         assert_eq!(v["calibration_status"], "ok");
         assert_eq!(v["reason_kind"], "combined");
-        assert_eq!(v["enter_at_min"], 1.8);
-        assert_eq!(v["gross_profit_median"], 1.0);
+        assert_eq!(v["entry_now"], 2.0);
+        assert_eq!(v["exit_target"], -1.0);
+        assert_eq!(v["gross_profit_target"], 1.0);
+        assert_eq!(v["p_hit"], 0.83);
+        assert_eq!(v["t_hit_median_s"], 1680);
+        assert_eq!(v["baseline_diagnostics"]["enter_at_min"], 1.8);
+        assert!(v.get("enter_at_min").is_none());
+        assert!(v.get("gross_profit_median").is_none());
         assert!(
             v.get("haircut_predicted").is_none(),
             "haircut não deve sair no DTO do ML"

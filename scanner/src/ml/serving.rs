@@ -168,8 +168,6 @@ pub struct ServerMetrics {
 #[derive(Debug, Clone)]
 struct PendingEconomicTrade {
     setup: TradeSetup,
-    entry_hit_ns: Option<u64>,
-    entry_hit_pct: Option<f32>,
     last_exit_pct: f32,
     from_model: bool,
 }
@@ -179,8 +177,6 @@ impl PendingEconomicTrade {
         let from_model = !setup.model_version.starts_with("baseline-");
         Self {
             setup,
-            entry_hit_ns: None,
-            entry_hit_pct: None,
             last_exit_pct: 0.0,
             from_model,
         }
@@ -189,7 +185,7 @@ impl PendingEconomicTrade {
     fn observe(
         &mut self,
         now_ns: u64,
-        entry_spread: f32,
+        _entry_spread: f32,
         exit_spread: f32,
     ) -> Option<EconomicEvent> {
         // Fix pós-auditoria: grace period de MIN_HORIZON_NS respeita a
@@ -203,13 +199,8 @@ impl PendingEconomicTrade {
         }
 
         self.last_exit_pct = exit_spread;
-        if self.entry_hit_ns.is_none() && entry_spread >= self.setup.enter_at_min {
-            self.entry_hit_ns = Some(now_ns);
-            self.entry_hit_pct = Some(entry_spread);
-        }
-
-        let entry_realized_pct = self.entry_hit_pct.unwrap_or(entry_spread);
-        if self.entry_hit_ns.is_some() && exit_spread >= self.setup.exit_at_min {
+        let entry_realized_pct = self.setup.entry_now;
+        if exit_spread >= self.setup.exit_target {
             // Fix pós-auditoria L14: horizonte em milissegundos para
             // evitar truncamento a 0 em realizações sub-segundo.
             let horizon_observed_ms = now_ns
@@ -229,13 +220,9 @@ impl PendingEconomicTrade {
         }
 
         if now_ns >= self.setup.valid_until {
-            let outcome = if self.entry_hit_ns.is_none() {
-                TradeOutcome::WindowMiss
-            } else {
-                TradeOutcome::ExitMiss {
-                    enter_realized_pct: entry_realized_pct,
-                    forced_exit_pct: self.last_exit_pct,
-                }
+            let outcome = TradeOutcome::ExitMiss {
+                enter_realized_pct: entry_realized_pct,
+                forced_exit_pct: self.last_exit_pct,
             };
             return Some(EconomicEvent::new(
                 &self.setup,
@@ -324,7 +311,6 @@ impl EconomicTracker {
     ///
     /// Usa `last_exit_pct` observado por último (`0.0` default se nunca
     /// recebeu observação limpa) como `forced_exit_pct` para `ExitMiss`.
-    /// Para `WindowMiss`, não depende de observação.
     ///
     /// Retorna número de pendings fechados nesta passagem.
     fn sweep(&mut self, now_ns: u64) -> u64 {
@@ -335,16 +321,9 @@ impl EconomicTracker {
             while let Some(pending) = queue.pop_front() {
                 if now_ns >= pending.setup.valid_until {
                     // Timeout — gera outcome com última observação em cache.
-                    let entry_realized_pct = pending
-                        .entry_hit_pct
-                        .unwrap_or(pending.last_exit_pct.max(f32::MIN));
-                    let outcome = if pending.entry_hit_ns.is_none() {
-                        TradeOutcome::WindowMiss
-                    } else {
-                        TradeOutcome::ExitMiss {
-                            enter_realized_pct: entry_realized_pct,
-                            forced_exit_pct: pending.last_exit_pct,
-                        }
+                    let outcome = TradeOutcome::ExitMiss {
+                        enter_realized_pct: pending.setup.entry_now,
+                        forced_exit_pct: pending.last_exit_pct,
                     };
                     let evt = EconomicEvent::new(
                         &pending.setup,
@@ -746,12 +725,15 @@ impl MlServer {
                 baseline_exit_at_min,
             ) =
                 match &rec {
-                    Recommendation::Trade(ts) => (
-                        true,
-                        Some(ts.historical_base_rate_24h),
-                        Some(ts.enter_at_min),
-                        Some(ts.exit_at_min),
-                    ),
+                    Recommendation::Trade(ts) => {
+                        let d = ts.baseline_diagnostics.as_ref();
+                        (
+                            true,
+                            d.map(|d| d.historical_base_rate_24h),
+                            d.map(|d| d.enter_at_min),
+                            d.map(|d| d.exit_at_min),
+                        )
+                    }
                     Recommendation::Abstain { .. } => (false, None, None, None),
                 };
             let features_t0 = FeaturesT0 {
@@ -972,29 +954,40 @@ mod tests {
 
     fn mk_invalid_setup() -> crate::ml::contract::TradeSetup {
         use crate::ml::contract::{
-            CalibStatus, ReasonKind, TradeReason, TradeSetup,
+            BaselineDiagnostics, CalibStatus, ReasonKind, TradeReason, TradeSetup,
         };
 
         let mut setup = TradeSetup {
             route_id: mk_route(),
-            enter_at_min: 2.0,
-            enter_typical: 2.4,
-            enter_peak_p95: 2.9,
-            p_enter_hit: 0.85,
-            exit_at_min: -0.8,
-            exit_typical: -0.4,
-            p_exit_hit_given_enter: 0.80,
-            gross_profit_p10: 1.0,
-            gross_profit_p25: 1.4,
-            gross_profit_median: 1.9,
-            gross_profit_p75: 2.3,
-            gross_profit_p90: 2.7,
-            gross_profit_p95: 3.1,
-            historical_base_rate_24h: 0.77,
-            historical_base_rate_ci: (0.70, 0.82),
-            time_to_exit_p05_s: None,
-            time_to_exit_median_s: None,
-            time_to_exit_p95_s: None,
+            entry_now: 2.4,
+            exit_target: -0.4,
+            gross_profit_target: 2.0,
+            p_hit: Some(0.83),
+            p_hit_ci: Some((0.77, 0.88)),
+            exit_q25: Some(-0.7),
+            exit_q50: Some(-0.4),
+            exit_q75: Some(-0.2),
+            t_hit_p25_s: Some(900),
+            t_hit_median_s: Some(1680),
+            t_hit_p75_s: Some(3120),
+            p_censor: Some(0.04),
+            baseline_diagnostics: Some(BaselineDiagnostics {
+                enter_at_min: 2.0,
+                enter_typical: 2.4,
+                enter_peak_p95: 2.9,
+                p_enter_hit: 0.85,
+                exit_at_min: -0.8,
+                exit_typical: -0.4,
+                p_exit_hit_given_enter: 0.80,
+                gross_profit_p10: 1.0,
+                gross_profit_p25: 1.4,
+                gross_profit_median: 1.9,
+                gross_profit_p75: 2.3,
+                gross_profit_p90: 2.7,
+                gross_profit_p95: 3.1,
+                historical_base_rate_24h: 0.77,
+                historical_base_rate_ci: (0.70, 0.82),
+            }),
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
@@ -1007,7 +1000,7 @@ mod tests {
             emitted_at: 1_700_000_000_000_000_000,
             valid_until: 1_700_000_030_000_000_000,
         };
-        setup.gross_profit_p25 = setup.gross_profit_p10 - 0.5;
+        setup.baseline_diagnostics.as_mut().unwrap().gross_profit_p25 = 0.5;
         setup
     }
 
@@ -1054,8 +1047,14 @@ mod tests {
         match rec {
             Recommendation::Trade(setup) => {
                 assert_eq!(setup.route_id, route);
-                assert!(setup.historical_base_rate_24h > 0.0);
-                assert!(setup.time_to_exit_median_s.is_none());
+                assert!(setup
+                    .baseline_diagnostics
+                    .as_ref()
+                    .unwrap()
+                    .historical_base_rate_24h
+                    > 0.0);
+                assert!(setup.p_hit.is_none());
+                assert!(setup.t_hit_median_s.is_none());
             }
             Recommendation::Abstain { reason, .. } => {
                 panic!("expected Trade, got Abstain({:?})", reason);
@@ -1067,9 +1066,8 @@ mod tests {
     fn economic_tracker_resolves_a_trade_in_sequence() {
         // Semântica pós-auditoria: requer 3 ticks.
         // t0: populate cache + abstain InsufficientHistory
-        // t1: emite Trade (cache tem 1 sample, n_min=1)
-        // t2: tick com entry hitting enter_at_min + exit hitting exit_at_min
-        //     → trade realiza (horizon = t2 - t1 ≥ MIN_HORIZON_NS)
+        // t1: emite Trade e trava entry_now em t1 (cache tem 1 sample, n_min=1)
+        // t2: tick futuro com exit >= exit_target realiza o trade.
         let server = mk_server_with_min_history(1);
         let route = mk_route();
 
@@ -1092,11 +1090,9 @@ mod tests {
             Recommendation::Abstain { reason, .. } => panic!("esperava Trade, got {:?}", reason),
         };
 
-        // Tick 2: entry ≥ enter_at_min E exit ≥ exit_at_min deve realizar.
-        // Observar tick com os mesmos valores garante hit (identidade esperada:
-        // setup.enter_at_min ≤ 3.0 e setup.exit_at_min ≤ 0.5).
-        assert!(setup.enter_at_min <= 3.0 + 0.01);
-        assert!(setup.exit_at_min <= 0.5 + 0.01);
+        // Tick 2: entry já está travado em t1; só exit futuro precisa cruzar o alvo.
+        assert_eq!(setup.entry_now, 3.0);
+        assert!(setup.exit_target <= 0.5 + 0.01);
 
         let (_rec, _dec, _accepted) = server.on_opportunity(
             2, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t2,
@@ -1139,6 +1135,28 @@ mod tests {
             realized_after_emit, 0,
             "trade NÃO deve realizar intra-tick (horizon > 0 é obrigatório)"
         );
+    }
+
+    #[test]
+    fn economic_sweeper_closes_silent_route_after_valid_until() {
+        let server = mk_server_with_min_history(1);
+        let route = mk_route();
+        let t0: u64 = 1_000_000_000;
+        let t_emit: u64 = t0 + 1_000_000_000;
+
+        let _ = server.on_opportunity(
+            0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0,
+        );
+        let (rec, _, _) = server.on_opportunity(
+            1, route, "BTC-USDT", 3.0, 0.4, 1e6, 1e6, t_emit,
+        );
+        assert!(matches!(rec, Recommendation::Trade(_)));
+
+        let closed = server.economic_sweep(t_emit + 31_000_000_000);
+        let econ = server.economic_metrics();
+        assert_eq!(closed, 1);
+        assert_eq!(econ.n_emissions_total.load(Ordering::Relaxed), 1);
+        assert_eq!(econ.n_exit_miss_total.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

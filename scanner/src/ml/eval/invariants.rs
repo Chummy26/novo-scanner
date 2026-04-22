@@ -15,18 +15,20 @@ use crate::ml::contract::TradeSetup;
 /// que foi violada. Mensagens são concatenáveis em logs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InvariantError {
-    /// `gross_profit_{p10, p25, median, p75, p90, p95}` não é monotônico.
-    GrossQuantilesNotMonotonic {
+    /// `exit_q25 <= exit_q50 <= exit_q75` violado.
+    ExitQuantilesNotMonotonic { q25: f32, q50: f32, q75: f32 },
+    /// Diagnósticos do baseline violam monotonicidade de gross.
+    BaselineGrossQuantilesNotMonotonic {
         p10: f32, p25: f32, median: f32, p75: f32, p90: f32, p95: f32,
     },
-    /// `enter_at_min <= enter_typical <= enter_peak_p95` violado.
-    EnterLevelsNotMonotonic { min: f32, typical: f32, peak: f32 },
-    /// `time_to_exit_p05_s <= time_to_exit_median_s <= time_to_exit_p95_s`
+    /// Diagnósticos do baseline violam `enter_at_min <= enter_typical <= enter_peak_p95`.
+    BaselineEnterLevelsNotMonotonic { min: f32, typical: f32, peak: f32 },
+    /// `t_hit_p25_s <= t_hit_median_s <= t_hit_p75_s`
     /// violado quando os três quantis existem.
-    TimeToExitQuantilesNotMonotonic { p05: u32, median: u32, p95: u32 },
+    TimeToHitQuantilesNotMonotonic { p25: u32, median: u32, p75: u32 },
     /// Probabilidade/base-rate fora do intervalo [0, 1].
     ProbabilityOutOfUnitInterval { field: &'static str, value: f32 },
-    /// IC 95% não envolve `historical_base_rate_24h` ou lower > upper.
+    /// IC 95% não envolve a probabilidade correspondente ou lower > upper.
     ConfidenceIntervalInconsistent { p: f32, lo: f32, hi: f32 },
     /// `cluster_rank` não está em [1, cluster_size].
     ClusterRankOutOfRange { size: u8, rank: u8 },
@@ -52,102 +54,171 @@ pub fn verify_tradesetup(s: &TradeSetup) -> Result<(), InvariantError> {
             }
         };
     }
-    check_finite!(enter_at_min);
-    check_finite!(enter_typical);
-    check_finite!(enter_peak_p95);
-    check_finite!(p_enter_hit);
-    check_finite!(exit_at_min);
-    check_finite!(exit_typical);
-    check_finite!(p_exit_hit_given_enter);
-    check_finite!(gross_profit_p10);
-    check_finite!(gross_profit_p25);
-    check_finite!(gross_profit_median);
-    check_finite!(gross_profit_p75);
-    check_finite!(gross_profit_p90);
-    check_finite!(gross_profit_p95);
-    check_finite!(historical_base_rate_24h);
+    check_finite!(entry_now);
+    check_finite!(exit_target);
+    check_finite!(gross_profit_target);
 
-    // 2. Quantis gross monotônicos.
-    if !(s.gross_profit_p10 <= s.gross_profit_p25
-        && s.gross_profit_p25 <= s.gross_profit_median
-        && s.gross_profit_median <= s.gross_profit_p75
-        && s.gross_profit_p75 <= s.gross_profit_p90
-        && s.gross_profit_p90 <= s.gross_profit_p95)
-    {
-        return Err(InvariantError::GrossQuantilesNotMonotonic {
-            p10: s.gross_profit_p10,
-            p25: s.gross_profit_p25,
-            median: s.gross_profit_median,
-            p75: s.gross_profit_p75,
-            p90: s.gross_profit_p90,
-            p95: s.gross_profit_p95,
+    if let Some(p) = s.p_hit {
+        if !p.is_finite() {
+            return Err(InvariantError::NonFiniteField { field: "p_hit", value: p });
+        }
+    }
+    if let Some(p) = s.p_censor {
+        if !p.is_finite() {
+            return Err(InvariantError::NonFiniteField { field: "p_censor", value: p });
+        }
+    }
+
+    // 2. Identidade do output central.
+    let identity = s.entry_now + s.exit_target;
+    if (s.gross_profit_target - identity).abs() > 1e-4 {
+        return Err(InvariantError::NonFiniteField {
+            field: "gross_profit_target_identity",
+            value: s.gross_profit_target,
         });
     }
 
-    // 3. Níveis de entry monotônicos.
-    if !(s.enter_at_min <= s.enter_typical && s.enter_typical <= s.enter_peak_p95) {
-        return Err(InvariantError::EnterLevelsNotMonotonic {
-            min: s.enter_at_min,
-            typical: s.enter_typical,
-            peak: s.enter_peak_p95,
-        });
-    }
-
-    // 4. Quantis de tempo até saída monotônicos, se existirem.
-    match (
-        s.time_to_exit_p05_s,
-        s.time_to_exit_median_s,
-        s.time_to_exit_p95_s,
-    ) {
-        (Some(p05), Some(median), Some(p95)) => {
-            if !(p05 <= median && median <= p95) {
-                return Err(InvariantError::TimeToExitQuantilesNotMonotonic {
-                    p05,
-                    median,
-                    p95,
+    // 3. Quantis de exit monotônicos, se existirem.
+    match (s.exit_q25, s.exit_q50, s.exit_q75) {
+        (Some(q25), Some(q50), Some(q75)) => {
+            if !(q25 <= q50 && q50 <= q75) {
+                return Err(InvariantError::ExitQuantilesNotMonotonic {
+                    q25,
+                    q50,
+                    q75,
                 });
             }
         }
         (None, None, None) => {}
         _ => {
             return Err(InvariantError::NonFiniteField {
-                field: "time_to_exit_*",
+                field: "exit_q*",
                 value: f32::NAN,
             });
         }
     }
 
-    // 5. Probabilidades/base-rate em [0, 1].
-    for (name, v) in [
-        ("historical_base_rate_24h", s.historical_base_rate_24h),
-        ("p_enter_hit", s.p_enter_hit),
-        ("p_exit_hit_given_enter", s.p_exit_hit_given_enter),
-    ] {
-        if !(0.0..=1.0).contains(&v) {
-            return Err(InvariantError::ProbabilityOutOfUnitInterval {
-                field: name,
-                value: v,
+    // 4. Quantis de tempo até saída monotônicos, se existirem.
+    match (s.t_hit_p25_s, s.t_hit_median_s, s.t_hit_p75_s) {
+        (Some(p25), Some(median), Some(p75)) => {
+            if !(p25 <= median && median <= p75) {
+                return Err(InvariantError::TimeToHitQuantilesNotMonotonic {
+                    p25,
+                    median,
+                    p75,
+                });
+            }
+        }
+        (None, None, None) => {}
+        _ => {
+            return Err(InvariantError::NonFiniteField {
+                field: "t_hit_*",
+                value: f32::NAN,
             });
         }
     }
 
-    // 6. IC envolve a base rate histórica.
-    let (lo, hi) = s.historical_base_rate_ci;
-    if !(lo.is_finite() && hi.is_finite()) {
-        return Err(InvariantError::NonFiniteField {
-            field: "historical_base_rate_ci",
-            value: if lo.is_finite() { hi } else { lo },
-        });
-    }
-    if !(0.0 <= lo && lo <= s.historical_base_rate_24h && s.historical_base_rate_24h <= hi && hi <= 1.0) {
-        return Err(InvariantError::ConfidenceIntervalInconsistent {
-            p: s.historical_base_rate_24h,
-            lo,
-            hi,
-        });
+    // 5. Probabilidades em [0, 1].
+    for (name, v) in [("p_hit", s.p_hit), ("p_censor", s.p_censor)] {
+        if let Some(v) = v {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(InvariantError::ProbabilityOutOfUnitInterval {
+                    field: name,
+                    value: v,
+                });
+            }
+        }
     }
 
-    // 7. Cluster rank em [1, size].
+    // 6. IC envolve p_hit quando ambos existem.
+    match (s.p_hit, s.p_hit_ci) {
+        (Some(p), Some((lo, hi))) => {
+            if !(lo.is_finite() && hi.is_finite()) {
+                return Err(InvariantError::NonFiniteField {
+                    field: "p_hit_ci",
+                    value: if lo.is_finite() { hi } else { lo },
+                });
+            }
+            if !(0.0 <= lo && lo <= p && p <= hi && hi <= 1.0) {
+                return Err(InvariantError::ConfidenceIntervalInconsistent { p, lo, hi });
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(InvariantError::ProbabilityOutOfUnitInterval {
+                field: "p_hit/p_hit_ci",
+                value: s.p_hit.unwrap_or(f32::NAN),
+            });
+        }
+    }
+
+    // 7. Diagnósticos do baseline, quando presentes, seguem invariantes antigas.
+    if let Some(d) = &s.baseline_diagnostics {
+        for (name, v) in [
+            ("baseline.enter_at_min", d.enter_at_min),
+            ("baseline.enter_typical", d.enter_typical),
+            ("baseline.enter_peak_p95", d.enter_peak_p95),
+            ("baseline.p_enter_hit", d.p_enter_hit),
+            ("baseline.exit_at_min", d.exit_at_min),
+            ("baseline.exit_typical", d.exit_typical),
+            ("baseline.p_exit_hit_given_enter", d.p_exit_hit_given_enter),
+            ("baseline.gross_profit_p10", d.gross_profit_p10),
+            ("baseline.gross_profit_p25", d.gross_profit_p25),
+            ("baseline.gross_profit_median", d.gross_profit_median),
+            ("baseline.gross_profit_p75", d.gross_profit_p75),
+            ("baseline.gross_profit_p90", d.gross_profit_p90),
+            ("baseline.gross_profit_p95", d.gross_profit_p95),
+            ("baseline.historical_base_rate_24h", d.historical_base_rate_24h),
+        ] {
+            if !v.is_finite() {
+                return Err(InvariantError::NonFiniteField { field: name, value: v });
+            }
+        }
+        if !(d.gross_profit_p10 <= d.gross_profit_p25
+            && d.gross_profit_p25 <= d.gross_profit_median
+            && d.gross_profit_median <= d.gross_profit_p75
+            && d.gross_profit_p75 <= d.gross_profit_p90
+            && d.gross_profit_p90 <= d.gross_profit_p95)
+        {
+            return Err(InvariantError::BaselineGrossQuantilesNotMonotonic {
+                p10: d.gross_profit_p10,
+                p25: d.gross_profit_p25,
+                median: d.gross_profit_median,
+                p75: d.gross_profit_p75,
+                p90: d.gross_profit_p90,
+                p95: d.gross_profit_p95,
+            });
+        }
+        if !(d.enter_at_min <= d.enter_typical && d.enter_typical <= d.enter_peak_p95) {
+            return Err(InvariantError::BaselineEnterLevelsNotMonotonic {
+                min: d.enter_at_min,
+                typical: d.enter_typical,
+                peak: d.enter_peak_p95,
+            });
+        }
+        for (name, v) in [
+            ("baseline.historical_base_rate_24h", d.historical_base_rate_24h),
+            ("baseline.p_enter_hit", d.p_enter_hit),
+            ("baseline.p_exit_hit_given_enter", d.p_exit_hit_given_enter),
+        ] {
+            if !(0.0..=1.0).contains(&v) {
+                return Err(InvariantError::ProbabilityOutOfUnitInterval {
+                    field: name,
+                    value: v,
+                });
+            }
+        }
+        let (lo, hi) = d.historical_base_rate_ci;
+        if !(0.0 <= lo && lo <= d.historical_base_rate_24h && d.historical_base_rate_24h <= hi && hi <= 1.0) {
+            return Err(InvariantError::ConfidenceIntervalInconsistent {
+                p: d.historical_base_rate_24h,
+                lo,
+                hi,
+            });
+        }
+    }
+
+    // 8. Cluster rank em [1, size].
     if s.cluster_size == 0 || s.cluster_rank == 0 || s.cluster_rank > s.cluster_size {
         return Err(InvariantError::ClusterRankOutOfRange {
             size: s.cluster_size,
@@ -155,7 +226,7 @@ pub fn verify_tradesetup(s: &TradeSetup) -> Result<(), InvariantError> {
         });
     }
 
-    // 8. Janela de validade não-vazia.
+    // 9. Janela de validade não-vazia.
     if s.valid_until <= s.emitted_at {
         return Err(InvariantError::ValidUntilBeforeEmittedAt {
             emitted_at: s.emitted_at,
@@ -170,7 +241,7 @@ pub fn verify_tradesetup(s: &TradeSetup) -> Result<(), InvariantError> {
 mod tests {
     use super::*;
     use crate::ml::contract::{
-        CalibStatus, ReasonKind, RouteId, TradeReason,
+        BaselineDiagnostics, CalibStatus, ReasonKind, RouteId, TradeReason,
     };
     use crate::types::{SymbolId, Venue};
 
@@ -181,24 +252,35 @@ mod tests {
                 buy_venue: Venue::MexcFut,
                 sell_venue: Venue::BingxFut,
             },
-            enter_at_min: 1.80,
-            enter_typical: 2.00,
-            enter_peak_p95: 2.80,
-            p_enter_hit: 0.90,
-            exit_at_min: -1.20,
-            exit_typical: -1.00,
-            p_exit_hit_given_enter: 0.85,
-            gross_profit_p10: 0.60,
-            gross_profit_p25: 0.70,
-            gross_profit_median: 1.00,
-            gross_profit_p75: 1.50,
-            gross_profit_p90: 2.30,
-            gross_profit_p95: 2.80,
-            historical_base_rate_24h: 0.77,
-            historical_base_rate_ci: (0.70, 0.82),
-            time_to_exit_p05_s: None,
-            time_to_exit_median_s: None,
-            time_to_exit_p95_s: None,
+            entry_now: 2.0,
+            exit_target: -1.0,
+            gross_profit_target: 1.0,
+            p_hit: Some(0.83),
+            p_hit_ci: Some((0.77, 0.88)),
+            exit_q25: Some(-1.4),
+            exit_q50: Some(-1.0),
+            exit_q75: Some(-0.7),
+            t_hit_p25_s: Some(720),
+            t_hit_median_s: Some(1680),
+            t_hit_p75_s: Some(6000),
+            p_censor: Some(0.04),
+            baseline_diagnostics: Some(BaselineDiagnostics {
+                enter_at_min: 1.80,
+                enter_typical: 2.00,
+                enter_peak_p95: 2.80,
+                p_enter_hit: 0.90,
+                exit_at_min: -1.20,
+                exit_typical: -1.00,
+                p_exit_hit_given_enter: 0.85,
+                gross_profit_p10: 0.60,
+                gross_profit_p25: 0.70,
+                gross_profit_median: 1.00,
+                gross_profit_p75: 1.50,
+                gross_profit_p90: 2.30,
+                gross_profit_p95: 2.80,
+                historical_base_rate_24h: 0.77,
+                historical_base_rate_ci: (0.70, 0.82),
+            }),
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
@@ -219,17 +301,17 @@ mod tests {
     }
 
     #[test]
-    fn detects_non_monotonic_gross_quantiles() {
+    fn detects_non_monotonic_baseline_gross_quantiles() {
         let mut s = valid();
-        s.gross_profit_p10 = 5.0; // maior que median
+        s.baseline_diagnostics.as_mut().unwrap().gross_profit_p10 = 5.0; // maior que median
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::GrossQuantilesNotMonotonic { .. }));
+        assert!(matches!(err, InvariantError::BaselineGrossQuantilesNotMonotonic { .. }));
     }
 
     #[test]
     fn detects_probability_out_of_range() {
         let mut s = valid();
-        s.historical_base_rate_24h = 1.5;
+        s.p_hit = Some(1.5);
         let err = verify_tradesetup(&s).unwrap_err();
         assert!(matches!(err, InvariantError::ProbabilityOutOfUnitInterval { .. }));
     }
@@ -237,7 +319,7 @@ mod tests {
     #[test]
     fn detects_ci_not_containing_p() {
         let mut s = valid();
-        s.historical_base_rate_ci = (0.10, 0.20); // base_rate=0.77 está fora
+        s.p_hit_ci = Some((0.10, 0.20)); // p_hit=0.83 está fora
         let err = verify_tradesetup(&s).unwrap_err();
         assert!(matches!(err, InvariantError::ConfidenceIntervalInconsistent { .. }));
     }
@@ -245,7 +327,7 @@ mod tests {
     #[test]
     fn detects_nan() {
         let mut s = valid();
-        s.historical_base_rate_24h = f32::NAN;
+        s.entry_now = f32::NAN;
         let err = verify_tradesetup(&s).unwrap_err();
         assert!(matches!(err, InvariantError::NonFiniteField { .. }));
     }
@@ -268,20 +350,20 @@ mod tests {
     }
 
     #[test]
-    fn detects_non_monotonic_time_to_exit() {
+    fn detects_non_monotonic_time_to_hit() {
         let mut s = valid();
-        s.time_to_exit_p05_s = Some(9999);
-        s.time_to_exit_median_s = Some(100);
-        s.time_to_exit_p95_s = Some(200);
+        s.t_hit_p25_s = Some(9999);
+        s.t_hit_median_s = Some(100);
+        s.t_hit_p75_s = Some(200);
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::TimeToExitQuantilesNotMonotonic { .. }));
+        assert!(matches!(err, InvariantError::TimeToHitQuantilesNotMonotonic { .. }));
     }
 
     #[test]
-    fn detects_non_monotonic_enter_levels() {
+    fn detects_non_monotonic_baseline_enter_levels() {
         let mut s = valid();
-        s.enter_at_min = 3.0; // > typical
+        s.baseline_diagnostics.as_mut().unwrap().enter_at_min = 3.0; // > typical
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::EnterLevelsNotMonotonic { .. }));
+        assert!(matches!(err, InvariantError::BaselineEnterLevelsNotMonotonic { .. }));
     }
 }

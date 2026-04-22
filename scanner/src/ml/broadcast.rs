@@ -71,7 +71,7 @@ impl RecommendationFrame {
     ///
     /// **Fix pós-auditoria 2026-04-21**: o envelope anterior reusava
     /// `"type": "opportunity"` e preenchia `buyPrice`/`sellPrice` com
-    /// `enter_typical`/`exit_typical` (valores de SPREAD predito em %),
+    /// campos do contrato ML (valores de SPREAD em %),
     /// que no schema original do scanner representavam **preços reais**
     /// do orderbook. Isso confundia a UI legada (risco de execução com
     /// preço 2.4 USDT em ativo que vale 0.00123). Agora usa envelope
@@ -224,7 +224,8 @@ impl Default for RecommendationBroadcaster {
 mod tests {
     use super::*;
     use crate::ml::contract::{
-        AbstainDiagnostic, AbstainReason, CalibStatus, ReasonKind, TradeReason, TradeSetup,
+        AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, ReasonKind,
+        TradeReason, TradeSetup,
     };
     use crate::types::{SymbolId, Venue};
 
@@ -239,18 +240,46 @@ mod tests {
     fn mk_trade() -> Recommendation {
         Recommendation::Trade(TradeSetup {
             route_id: mk_route(),
-            enter_at_min: 1.8, enter_typical: 2.0, enter_peak_p95: 2.8, p_enter_hit: 0.9,
-            exit_at_min: -1.2, exit_typical: -1.0, p_exit_hit_given_enter: 0.85,
-            gross_profit_p10: 0.6, gross_profit_p25: 0.7, gross_profit_median: 1.0,
-            gross_profit_p75: 1.5, gross_profit_p90: 2.3, gross_profit_p95: 2.8,
-            historical_base_rate_24h: 0.77, historical_base_rate_ci: (0.70, 0.82),
-            time_to_exit_p05_s: None, time_to_exit_median_s: None, time_to_exit_p95_s: None,
+            entry_now: 2.0,
+            exit_target: -1.0,
+            gross_profit_target: 1.0,
+            p_hit: Some(0.83),
+            p_hit_ci: Some((0.77, 0.88)),
+            exit_q25: Some(-1.4),
+            exit_q50: Some(-1.0),
+            exit_q75: Some(-0.7),
+            t_hit_p25_s: Some(900),
+            t_hit_median_s: Some(1680),
+            t_hit_p75_s: Some(3120),
+            p_censor: Some(0.04),
+            baseline_diagnostics: Some(BaselineDiagnostics {
+                enter_at_min: 1.8,
+                enter_typical: 2.0,
+                enter_peak_p95: 2.8,
+                p_enter_hit: 0.9,
+                exit_at_min: -1.2,
+                exit_typical: -1.0,
+                p_exit_hit_given_enter: 0.85,
+                gross_profit_p10: 0.6,
+                gross_profit_p25: 0.7,
+                gross_profit_median: 1.0,
+                gross_profit_p75: 1.5,
+                gross_profit_p90: 2.3,
+                gross_profit_p95: 2.8,
+                historical_base_rate_24h: 0.77,
+                historical_base_rate_ci: (0.70, 0.82),
+            }),
             cluster_id: None,
-            cluster_size: 1, cluster_rank: 1,
+            cluster_size: 1,
+            cluster_rank: 1,
             calibration_status: CalibStatus::Ok,
-            reason: TradeReason { kind: ReasonKind::Combined, detail: "t".into() },
+            reason: TradeReason {
+                kind: ReasonKind::Combined,
+                detail: "t".into(),
+            },
             model_version: "a3-0.1.0".into(),
-            emitted_at: 1_000, valid_until: 2_000,
+            emitted_at: 1_000,
+            valid_until: 2_000,
         })
     }
 
