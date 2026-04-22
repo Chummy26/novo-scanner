@@ -200,7 +200,7 @@ mod tests {
     use super::*;
     use crate::ml::contract::RouteId;
     use crate::ml::persistence::labeled_trade::{
-        CensorReason, FeaturesT0, LabelOutcome, LabeledTrade, PolicyMetadata,
+        CensorReason, FeaturesT0, FloorHitLabel, LabelOutcome, LabeledTrade, PolicyMetadata,
         LABELED_TRADE_SCHEMA_VERSION, SCANNER_VERSION,
     };
     use crate::types::{SymbolId, Venue};
@@ -208,6 +208,7 @@ mod tests {
     fn mk_label(horizon_s: u32, ts_written_ns: u64) -> LabeledTrade {
         LabeledTrade {
             sample_id: "deadbeef12345678deadbeef12345678".into(),
+            sample_decision: "accept",
             horizon_s,
             ts_emit_ns: 1_745_159_400u64 * 1_000_000_000,
             cycle_seq: 1,
@@ -247,6 +248,13 @@ mod tests {
             first_exit_ge_label_floor_ts_ns: None,
             first_exit_ge_label_floor_pct: None,
             t_to_first_hit_s: None,
+            label_floor_hits: vec![FloorHitLabel {
+                floor_pct: 0.8,
+                first_exit_ge_floor_ts_ns: None,
+                first_exit_ge_floor_pct: None,
+                t_to_first_hit_s: None,
+                realized: false,
+            }],
             outcome: LabelOutcome::Miss,
             censor_reason: None,
             observed_until_ns: 1_745_159_400u64 * 1_000_000_000 + 900_000_000_000,

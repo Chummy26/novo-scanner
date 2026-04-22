@@ -1,7 +1,7 @@
-//! Resolver de `LabeledTrade` com 3 horizontes independentes (Opção B).
+//! Resolver de `LabeledTrade` com horizontes independentes (Opção B).
 //!
-//! Cada `AcceptedSample(t0)` elegível pelo stride gera um `PendingLabel`
-//! contendo 3 `PendingHorizon` (15 min, 30 min, 2 h). Cada slot é
+//! Cada candidate limpo elegível pelo stride gera um `PendingLabel`
+//! contendo um `PendingHorizon` por horizonte configurado. Cada slot é
 //! resolvido independentemente: quando `now_ns >= t_emit + horizon_s`,
 //! escreve seu record no `LabeledWriterHandle` e fecha.
 //!
@@ -16,7 +16,8 @@
 //! - Se `observed_until_ns < now - 5 min` → censura `route_vanished`.
 //! - Se `now >= t_emit + h + slack` → fecha normal.
 //!
-//! Em SIGTERM limpo, sweeper força `censored { shutdown }` de todos abertos.
+//! Em SIGTERM limpo, pendings abertos são fechados preservando outcomes já
+//! determinados; apenas janelas incompletas viram `censored { shutdown }`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,14 +29,18 @@ use parking_lot::Mutex;
 
 use crate::ml::contract::RouteId;
 use crate::ml::persistence::labeled_trade::{
-    CensorReason, FeaturesT0, LabelOutcome, LabeledTrade, PolicyMetadata,
+    CensorReason, FeaturesT0, FloorHitLabel, LabelOutcome, LabeledTrade, PolicyMetadata,
     LABELED_TRADE_SCHEMA_VERSION, SCANNER_VERSION,
 };
 use crate::ml::persistence::labeled_writer::{LabeledWriterHandle, LabeledWriterSendError};
 
 /// Padrões de horizonte (s). CLAUDE.md menciona "~2h15" como exemplo;
-/// aqui usamos (15 min, 30 min, 2 h) cobrindo curto/médio/longo.
-pub const DEFAULT_HORIZONS_S: [u32; 3] = [900, 1800, 7200];
+/// adicionamos 8 h para evitar miss artificial em fechamento mais lento.
+pub const DEFAULT_HORIZONS_S: [u32; 4] = [900, 1800, 7200, 28800];
+
+/// Floors brutos padrao para estimar P(exit atinge floor | estado, floor).
+/// `0.8` permanece como floor primario de compatibilidade.
+pub const DEFAULT_LABEL_FLOORS_PCT: [f32; 6] = [0.3, 0.5, 0.8, 1.2, 2.0, 3.0];
 
 /// Slack após `t_emit + h` antes de fechar o horizonte (permite capturar
 /// best_exit do último bucket sem perder dados por timing).
@@ -48,25 +53,48 @@ pub const ROUTE_VANISH_IDLE_NS: u64 = 5 * 60 * 1_000_000_000; // 5 min
 pub const MAX_PENDING_PER_ROUTE: usize = 10_000;
 
 #[derive(Debug, Clone)]
+pub struct PendingFloorHit {
+    pub floor_pct: f32,
+    pub first_exit_ge_floor_ts_ns: Option<u64>,
+    pub first_exit_ge_floor_pct: Option<f32>,
+}
+
+impl PendingFloorHit {
+    fn new(floor_pct: f32) -> Self {
+        Self {
+            floor_pct,
+            first_exit_ge_floor_ts_ns: None,
+            first_exit_ge_floor_pct: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct PendingHorizon {
     pub horizon_s: u32,
     pub best_exit_pct_so_far: Option<f32>,
     pub best_exit_ts_ns_so_far: Option<u64>,
     pub first_exit_ge_floor_ts_ns: Option<u64>,
     pub first_exit_ge_floor_pct: Option<f32>,
+    pub floor_hits: Vec<PendingFloorHit>,
     pub observed_until_ns: u64,
     pub n_clean_future_samples: u32,
     pub closed: bool,
 }
 
 impl PendingHorizon {
-    fn new(horizon_s: u32, t_emit_ns: u64) -> Self {
+    fn new(horizon_s: u32, t_emit_ns: u64, floors_pct: &[f32]) -> Self {
         Self {
             horizon_s,
             best_exit_pct_so_far: None,
             best_exit_ts_ns_so_far: None,
             first_exit_ge_floor_ts_ns: None,
             first_exit_ge_floor_pct: None,
+            floor_hits: floors_pct
+                .iter()
+                .copied()
+                .map(PendingFloorHit::new)
+                .collect(),
             observed_until_ns: t_emit_ns,
             n_clean_future_samples: 0,
             closed: false,
@@ -82,6 +110,7 @@ impl PendingHorizon {
 #[derive(Debug, Clone)]
 pub struct PendingLabel {
     pub sample_id: String,
+    pub sample_decision: &'static str,
     pub ts_emit_ns: u64,
     pub cycle_seq: u32,
     pub route_id: RouteId,
@@ -90,6 +119,7 @@ pub struct PendingLabel {
     pub exit_start_pct: f32,
     pub features_t0: FeaturesT0,
     pub label_floor_pct: f32,
+    pub label_floors_pct: Vec<f32>,
     pub policy_metadata: PolicyMetadata,
     pub sampling_tier: &'static str,
     pub sampling_probability: f32,
@@ -105,7 +135,7 @@ impl PendingLabel {
 /// Config do resolvedor.
 #[derive(Debug, Clone)]
 pub struct ResolverConfig {
-    pub horizons_s: [u32; 3],
+    pub horizons_s: Vec<u32>,
     pub close_slack_ns: u64,
     pub route_vanish_idle_ns: u64,
     pub max_pending_per_route: usize,
@@ -115,7 +145,7 @@ pub struct ResolverConfig {
 impl Default for ResolverConfig {
     fn default() -> Self {
         Self {
-            horizons_s: DEFAULT_HORIZONS_S,
+            horizons_s: DEFAULT_HORIZONS_S.to_vec(),
             close_slack_ns: DEFAULT_CLOSE_SLACK_NS,
             route_vanish_idle_ns: ROUTE_VANISH_IDLE_NS,
             max_pending_per_route: MAX_PENDING_PER_ROUTE,
@@ -153,8 +183,8 @@ pub struct LabelResolver {
 }
 
 struct ResolverInner {
-    /// Pending labels por rota. VecDeque preserva ordem FIFO para
-    /// "descartar o mais antigo" em overflow.
+    /// Pending labels por rota. VecDeque preserva ordem FIFO para manter
+    /// labels antigos quando houver overflow; novos pendings são recusados.
     pending_by_route: AHashMap<RouteId, VecDeque<PendingLabel>>,
     /// Último `ts_ns` em que um label foi criado por rota (para stride).
     last_label_ts: AHashMap<RouteId, u64>,
@@ -177,12 +207,11 @@ impl LabelResolver {
         Arc::clone(&self.metrics)
     }
 
-    pub fn horizons(&self) -> [u32; 3] {
-        self.cfg.horizons_s
+    pub fn horizons(&self) -> &[u32] {
+        &self.cfg.horizons_s
     }
 
-    /// Cria `PendingLabel` para um AcceptedSample em t₀, respeitando stride.
-    /// Retorna `true` se criou, `false` se pulou por stride.
+    /// Compatibilidade para callers que ainda rotulam apenas Accept/floor primario.
     #[allow(clippy::too_many_arguments)]
     pub fn on_accepted(
         &self,
@@ -200,6 +229,47 @@ impl LabelResolver {
         sampling_probability: f32,
         label_stride_s: u32,
     ) -> bool {
+        self.on_candidate(
+            sample_id,
+            "accept",
+            ts_emit_ns,
+            cycle_seq,
+            route_id,
+            symbol_name,
+            entry_locked_pct,
+            exit_start_pct,
+            features_t0,
+            label_floor_pct,
+            vec![label_floor_pct],
+            policy_metadata,
+            sampling_tier,
+            sampling_probability,
+            label_stride_s,
+        )
+    }
+
+    /// Cria `PendingLabel` para um candidate limpo em t0, respeitando stride.
+    /// Retorna `true` se criou, `false` se pulou por stride.
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_candidate(
+        &self,
+        sample_id: String,
+        sample_decision: &'static str,
+        ts_emit_ns: u64,
+        cycle_seq: u32,
+        route_id: RouteId,
+        symbol_name: String,
+        entry_locked_pct: f32,
+        exit_start_pct: f32,
+        features_t0: FeaturesT0,
+        label_floor_pct: f32,
+        label_floors_pct: Vec<f32>,
+        policy_metadata: PolicyMetadata,
+        sampling_tier: &'static str,
+        sampling_probability: f32,
+        label_stride_s: u32,
+    ) -> bool {
+        let floors = normalized_floors(label_floor_pct, label_floors_pct);
         let mut inner = self.inner.lock();
         // Stride por rota.
         if label_stride_s > 0 {
@@ -219,11 +289,12 @@ impl LabelResolver {
             .cfg
             .horizons_s
             .iter()
-            .map(|&h| PendingHorizon::new(h, ts_emit_ns))
+            .map(|&h| PendingHorizon::new(h, ts_emit_ns, &floors))
             .collect();
 
         let pending = PendingLabel {
             sample_id,
+            sample_decision,
             ts_emit_ns,
             cycle_seq,
             route_id,
@@ -232,6 +303,7 @@ impl LabelResolver {
             exit_start_pct,
             features_t0,
             label_floor_pct,
+            label_floors_pct: floors,
             policy_metadata,
             sampling_tier,
             sampling_probability,
@@ -308,6 +380,12 @@ impl LabelResolver {
                     if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
                         slot.first_exit_ge_floor_ts_ns = Some(now_ns);
                         slot.first_exit_ge_floor_pct = Some(exit_spread);
+                    }
+                    for hit in slot.floor_hits.iter_mut() {
+                        if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none() {
+                            hit.first_exit_ge_floor_ts_ns = Some(now_ns);
+                            hit.first_exit_ge_floor_pct = Some(exit_spread);
+                        }
                     }
                     if now_ns == deadline {
                         slot.closed = true;
@@ -483,9 +561,27 @@ impl LabelResolver {
             ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000)
                 .min(u32::MAX as u64) as u32
         });
+        let label_floor_hits = slot
+            .floor_hits
+            .iter()
+            .map(|hit| {
+                let t_to_first_hit_s = hit.first_exit_ge_floor_ts_ns.map(|ts| {
+                    ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000)
+                        .min(u32::MAX as u64) as u32
+                });
+                FloorHitLabel {
+                    floor_pct: hit.floor_pct,
+                    first_exit_ge_floor_ts_ns: hit.first_exit_ge_floor_ts_ns,
+                    first_exit_ge_floor_pct: hit.first_exit_ge_floor_pct,
+                    t_to_first_hit_s,
+                    realized: hit.first_exit_ge_floor_ts_ns.is_some(),
+                }
+            })
+            .collect();
 
         let label = LabeledTrade {
             sample_id: pending.sample_id.clone(),
+            sample_decision: pending.sample_decision,
             horizon_s: slot.horizon_s,
             ts_emit_ns: pending.ts_emit_ns,
             cycle_seq: pending.cycle_seq,
@@ -505,6 +601,7 @@ impl LabelResolver {
             first_exit_ge_label_floor_ts_ns: slot.first_exit_ge_floor_ts_ns,
             first_exit_ge_label_floor_pct: slot.first_exit_ge_floor_pct,
             t_to_first_hit_s: t_to_first_hit,
+            label_floor_hits,
             outcome,
             censor_reason,
             observed_until_ns: slot.observed_until_ns,
@@ -559,6 +656,19 @@ impl LabelOutcome {
             LabelOutcome::Censored
         }
     }
+}
+
+fn normalized_floors(primary_floor: f32, mut floors: Vec<f32>) -> Vec<f32> {
+    if primary_floor.is_finite() {
+        floors.push(primary_floor);
+    }
+    floors.retain(|v| v.is_finite());
+    floors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    floors.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    if floors.is_empty() {
+        floors.push(primary_floor);
+    }
+    floors
 }
 
 // ---------------------------------------------------------------------------
@@ -634,7 +744,7 @@ mod tests {
     #[tokio::test]
     async fn realized_when_first_hit_occurs_within_horizon() {
         let cfg = ResolverConfig {
-            horizons_s: [2, 4, 6],
+            horizons_s: vec![2, 4, 6],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
@@ -664,7 +774,7 @@ mod tests {
     #[tokio::test]
     async fn miss_when_first_hit_never_occurs() {
         let cfg = ResolverConfig {
-            horizons_s: [2, 4, 6],
+            horizons_s: vec![2, 4, 6],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
@@ -698,7 +808,7 @@ mod tests {
     #[tokio::test]
     async fn expired_incomplete_horizon_is_censored_not_miss() {
         let cfg = ResolverConfig {
-            horizons_s: [10, 20, 30],
+            horizons_s: vec![10, 20, 30],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
@@ -724,7 +834,7 @@ mod tests {
     #[tokio::test]
     async fn censored_when_route_silent_beyond_idle_threshold() {
         let cfg = ResolverConfig {
-            horizons_s: [60, 120, 180],
+            horizons_s: vec![60, 120, 180],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 5 * 1_000_000_000, // 5s no teste
             max_pending_per_route: 100,
@@ -780,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn best_exit_tracks_max_even_after_first_hit() {
         let cfg = ResolverConfig {
-            horizons_s: [10, 20, 30],
+            horizons_s: vec![10, 20, 30],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
@@ -817,15 +927,15 @@ mod tests {
         );
         // Sem observações → observed_until == t_emit < qualquer deadline → Censored.
         let closed = resolver.shutdown_flush(t0 + 1_000_000_000);
-        assert_eq!(closed, 3, "3 horizontes devem ter sido fechados");
+        assert_eq!(closed, 4, "4 horizontes default devem ter sido fechados");
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert_eq!(
             m.shutdown_lost_pending_total.load(Ordering::Relaxed),
-            3,
-            "sem observações, todos 3 são Censored (lost)"
+            4,
+            "sem observações, todos 4 são Censored (lost)"
         );
-        assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 3);
+        assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 4);
         assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 0);
         drop(resolver);
         drop(tmp);
@@ -837,7 +947,7 @@ mod tests {
         // sobrescrever labels que já tinham `first_exit_ge_floor_ts_ns` —
         // eles devem ser emitidos como Realized, não como Censored{Shutdown}.
         let cfg = ResolverConfig {
-            horizons_s: [10, 20, 30],
+            horizons_s: vec![10, 20, 30],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
@@ -891,7 +1001,7 @@ mod tests {
         // fechado pelo sweep ainda). Shutdown deve emitir Miss, não
         // Censored, porque observed_until >= deadline.
         let cfg = ResolverConfig {
-            horizons_s: [2, 4, 6],
+            horizons_s: vec![2, 4, 6],
             close_slack_ns: 5_000_000_000, // slack grande — sweep não fecharia ainda
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
@@ -942,7 +1052,7 @@ mod tests {
     #[tokio::test]
     async fn backpressure_drops_incoming_when_cap_exceeded() {
         let cfg = ResolverConfig {
-            horizons_s: [60, 120, 180],
+            horizons_s: vec![60, 120, 180],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
             max_pending_per_route: 3,

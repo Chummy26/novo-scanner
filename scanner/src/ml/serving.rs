@@ -46,8 +46,10 @@ use crate::ml::economic::{
 use crate::ml::listing_history::ListingHistory;
 use crate::ml::persistence::{
     AcceptedSample, FeaturesT0, LabelResolver, PolicyMetadata, RawSample, RawWriterHandle,
-    RouteDecimator, RouteRanking,
+    RouteDecimator, RouteRanking, SamplingTier,
 };
+use crate::ml::persistence::label_resolver::DEFAULT_LABEL_FLOORS_PCT;
+use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::trigger::{SampleDecision, SamplingTrigger};
 
 /// Horizonte mínimo (ns) antes de um trade pending poder ser resolvido.
@@ -61,6 +63,7 @@ use crate::ml::trigger::{SampleDecision, SamplingTrigger};
 /// Default: 1 ciclo do scanner = 150 ms. Trade só pode realizar em
 /// tick posterior ao da emissão.
 pub const MIN_HORIZON_NS: u64 = 150_000_000;
+pub const IC_WIDTH_LIMIT: f32 = 0.20;
 
 // ---------------------------------------------------------------------------
 // MlServer
@@ -98,6 +101,9 @@ pub struct MlServer {
     // Wave V — parâmetros de labeling (stride, floor).
     label_stride_s: u32,
     label_floor_pct: f32,
+    label_floors_pct: Vec<f32>,
+    last_trade_emit_by_route: Mutex<AHashMap<RouteId, u64>>,
+    recommendation_cooldown_ns: u64,
 }
 
 fn enforce_recommendation_invariants(
@@ -129,6 +135,23 @@ fn enforce_recommendation_invariants(
                         regime_posterior: [0.0; 3],
                     },
                 }
+            } else if let Some((lo, hi)) = setup.p_hit_ci {
+                let width = (hi - lo).max(0.0);
+                if width >= IC_WIDTH_LIMIT {
+                    let model_version = setup.model_version.clone();
+                    return Recommendation::Abstain {
+                        reason: AbstainReason::LowConfidence,
+                        diagnostic: AbstainDiagnostic {
+                            n_observations,
+                            ci_width_if_emitted: Some(width),
+                            nearest_feasible_utility: None,
+                            tail_ratio_p99_p95: None,
+                            model_version,
+                            regime_posterior: [0.0; 3],
+                        },
+                    };
+                }
+                Recommendation::Trade(setup)
             } else {
                 Recommendation::Trade(setup)
             }
@@ -155,6 +178,9 @@ pub struct ServerMetrics {
     pub rec_invariant_blocked: AtomicU64,
     /// ADR-025: RawSample enviado ao writer (fast path).
     pub raw_samples_emitted: AtomicU64,
+    pub raw_samples_emitted_allowlist: AtomicU64,
+    pub raw_samples_emitted_priority: AtomicU64,
+    pub raw_samples_emitted_decimated_uniform: AtomicU64,
     /// ADR-025: canal cheio — sample descartada.
     pub raw_samples_dropped_channel_full: AtomicU64,
     /// ADR-025: writer encerrado — sample descartada.
@@ -173,11 +199,11 @@ struct PendingEconomicTrade {
 }
 
 impl PendingEconomicTrade {
-    fn new(setup: TradeSetup) -> Self {
+    fn new(setup: TradeSetup, initial_exit_pct: f32) -> Self {
         let from_model = !setup.model_version.starts_with("baseline-");
         Self {
             setup,
-            last_exit_pct: 0.0,
+            last_exit_pct: initial_exit_pct,
             from_model,
         }
     }
@@ -274,7 +300,7 @@ impl EconomicTracker {
             self.pending_by_route
                 .entry(route)
                 .or_default()
-                .push_back(PendingEconomicTrade::new(setup.clone()));
+                .push_back(PendingEconomicTrade::new(setup.clone(), exit_spread));
         }
     }
 
@@ -365,6 +391,9 @@ impl MlServer {
             label_resolver: None,
             label_stride_s: 60,
             label_floor_pct: 0.8,
+            label_floors_pct: DEFAULT_LABEL_FLOORS_PCT.to_vec(),
+            last_trade_emit_by_route: Mutex::new(AHashMap::with_capacity(4096)),
+            recommendation_cooldown_ns: 60 * 1_000_000_000,
         }
     }
 
@@ -399,6 +428,24 @@ impl MlServer {
     pub fn with_label_params(mut self, stride_s: u32, floor_pct: f32) -> Self {
         self.label_stride_s = stride_s;
         self.label_floor_pct = floor_pct;
+        self.label_floors_pct = DEFAULT_LABEL_FLOORS_PCT.to_vec();
+        self
+    }
+
+    pub fn with_label_config(
+        mut self,
+        stride_s: u32,
+        floor_pct: f32,
+        floors_pct: Vec<f32>,
+    ) -> Self {
+        self.label_stride_s = stride_s;
+        self.label_floor_pct = floor_pct;
+        self.label_floors_pct = floors_pct;
+        self
+    }
+
+    pub fn with_recommendation_cooldown_s(mut self, cooldown_s: u32) -> Self {
+        self.recommendation_cooldown_ns = (cooldown_s as u64) * 1_000_000_000;
         self
     }
 
@@ -437,6 +484,40 @@ impl MlServer {
     /// Retorna número de pendings fechados.
     pub fn economic_sweep(&self, now_ns: u64) -> u64 {
         self.economic.lock().sweep(now_ns)
+    }
+
+    fn apply_trade_cooldown(
+        &self,
+        route: RouteId,
+        now_ns: u64,
+        n_observations: u32,
+        rec: Recommendation,
+    ) -> Recommendation {
+        let Recommendation::Trade(setup) = rec else {
+            return rec;
+        };
+        if self.recommendation_cooldown_ns == 0 {
+            self.last_trade_emit_by_route.lock().insert(route, now_ns);
+            return Recommendation::Trade(setup);
+        }
+        let mut last_by_route = self.last_trade_emit_by_route.lock();
+        if let Some(prev) = last_by_route.get(&route) {
+            if now_ns < prev.saturating_add(self.recommendation_cooldown_ns) {
+                return Recommendation::Abstain {
+                    reason: AbstainReason::LowConfidence,
+                    diagnostic: AbstainDiagnostic {
+                        n_observations,
+                        ci_width_if_emitted: setup.p_hit_ci.map(|(lo, hi)| (hi - lo).max(0.0)),
+                        nearest_feasible_utility: Some(setup.gross_profit_target),
+                        tail_ratio_p99_p95: None,
+                        model_version: setup.model_version,
+                        regime_posterior: [0.0; 3],
+                    },
+                };
+            }
+        }
+        last_by_route.insert(route, now_ns);
+        Recommendation::Trade(setup)
     }
 
     /// Avança o `cycle_seq` — chamado uma vez pelo spread engine no início
@@ -504,6 +585,7 @@ impl MlServer {
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
                         self.metrics.raw_samples_emitted.fetch_add(1, Ordering::Relaxed);
+                        self.bump_raw_sample_tier_metric(dr.tier);
                     }
                     Err(crate::ml::persistence::RawWriterSendError::ChannelFull) => {
                         self.metrics
@@ -627,6 +709,7 @@ impl MlServer {
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
                         self.metrics.raw_samples_emitted.fetch_add(1, Ordering::Relaxed);
+                        self.bump_raw_sample_tier_metric(dr.tier);
                     }
                     Err(crate::ml::persistence::RawWriterSendError::ChannelFull) => {
                         self.metrics
@@ -662,6 +745,7 @@ impl MlServer {
             n_observations,
             Some(&self.metrics.rec_invariant_blocked),
         );
+        let rec = self.apply_trade_cooldown(route, now_ns, n_observations, rec);
         self.bump_rec_metric(&rec);
         let entry_p25_pre_observe = self.baseline.cache().quantile_entry(route, 0.25);
         let entry_p50_pre_observe = self.baseline.cache().quantile_entry(route, 0.50);
@@ -725,12 +809,16 @@ impl MlServer {
             None
         };
 
-        // Wave V — enfileira `PendingLabel` quando sample é Accept.
-        // Stride configurável (`label_stride_s`); supression rates saem em
-        // métricas do resolver (`stride_skipped_total`).
-        if let (Some(resolver), Some(accepted_sample), Some((tier, prob))) =
-            (self.label_resolver.as_ref(), accepted.as_ref(), tier_snapshot)
+        // Wave V — enfileira `PendingLabel` para candidates limpos, não
+        // apenas Accept. Isso dá negativos supervisionáveis
+        // (insufficient_history/below_tail) para abstenção sem contaminar
+        // com low-volume operacional.
+        if let (Some(resolver), Some((tier, prob))) =
+            (self.label_resolver.as_ref(), tier_snapshot)
         {
+            if !clean {
+                return (rec, sample_dec, accepted);
+            }
             let (
                 baseline_recommended,
                 baseline_base_rate,
@@ -783,16 +871,30 @@ impl MlServer {
                 label_stride_s: self.label_stride_s,
                 label_sampling_probability: prob,
             };
-            resolver.on_accepted(
-                accepted_sample.sample_id.clone(),
+            let label_sample_id = accepted
+                .as_ref()
+                .map(|s| s.sample_id.clone())
+                .unwrap_or_else(|| {
+                    sample_id_of(
+                        now_ns,
+                        cycle_seq,
+                        symbol_name,
+                        route.buy_venue,
+                        route.sell_venue,
+                    )
+                });
+            resolver.on_candidate(
+                label_sample_id,
+                sample_dec.reason_label(),
                 now_ns,
                 cycle_seq,
                 route,
-                accepted_sample.symbol_name.clone(),
+                symbol_name.to_string(),
                 entry_spread,
                 exit_spread,
                 features_t0,
                 self.label_floor_pct,
+                self.label_floors_pct.clone(),
                 policy,
                 tier.as_str(),
                 prob,
@@ -813,6 +915,17 @@ impl MlServer {
             SampleDecision::RejectBelowTail => &self.metrics.sample_rejects_below_tail,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn bump_raw_sample_tier_metric(&self, tier: SamplingTier) {
+        match tier {
+            SamplingTier::Allowlist => &self.metrics.raw_samples_emitted_allowlist,
+            SamplingTier::Priority => &self.metrics.raw_samples_emitted_priority,
+            SamplingTier::DecimatedUniform => {
+                &self.metrics.raw_samples_emitted_decimated_uniform
+            }
+        }
+        .fetch_add(1, Ordering::Relaxed);
     }
 
     fn bump_rec_metric(&self, rec: &Recommendation) {
@@ -1037,8 +1150,37 @@ mod tests {
     }
 
     #[test]
+    fn wide_confidence_interval_is_downgraded_before_broadcast() {
+        use crate::ml::contract::Recommendation;
+
+        let counter = AtomicU64::new(0);
+        let mut setup = mk_invalid_setup();
+        setup
+            .baseline_diagnostics
+            .as_mut()
+            .unwrap()
+            .gross_profit_p25 = 1.4;
+        setup.p_hit_ci = Some((0.55, 0.90));
+        let sanitized =
+            enforce_recommendation_invariants(Recommendation::Trade(setup), 42, Some(&counter));
+        match sanitized {
+            Recommendation::Abstain { reason, diagnostic } => {
+                assert_eq!(reason, AbstainReason::LowConfidence);
+                let width = diagnostic.ci_width_if_emitted.unwrap();
+                assert!((width - 0.35).abs() < 1e-6);
+            }
+            other => panic!("expected Abstain, got {:?}", other),
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "IC largo é gate de confiança, não invariant quebrada"
+        );
+    }
+
+    #[test]
     fn accumulated_observations_eventually_emit_trade() {
-        let server = mk_server();
+        let server = mk_server().with_recommendation_cooldown_s(0);
         let route = mk_route();
         // Popula 200 observações "regime opportunity".
         for i in 0..200 {
@@ -1073,6 +1215,29 @@ mod tests {
             Recommendation::Abstain { reason, .. } => {
                 panic!("expected Trade, got Abstain({:?})", reason);
             }
+        }
+    }
+
+    #[test]
+    fn cooldown_suppresses_duplicate_trade_on_same_route() {
+        let server = mk_server_with_min_history(1).with_recommendation_cooldown_s(60);
+        let route = mk_route();
+        let t0 = 1_000_000_000u64;
+        let t1 = t0 + 1_000_000_000;
+        let t2 = t1 + 1_000_000_000;
+
+        let _ = server.on_opportunity(0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0);
+        let (first, _, _) =
+            server.on_opportunity(1, route, "BTC-USDT", 3.1, 0.6, 1e6, 1e6, t1);
+        assert!(matches!(first, Recommendation::Trade(_)));
+
+        let (second, _, _) =
+            server.on_opportunity(2, route, "BTC-USDT", 3.2, 0.7, 1e6, 1e6, t2);
+        match second {
+            Recommendation::Abstain { reason, .. } => {
+                assert_eq!(reason, AbstainReason::LowConfidence);
+            }
+            other => panic!("expected cooldown Abstain, got {:?}", other),
         }
     }
 
@@ -1171,6 +1336,61 @@ mod tests {
         assert_eq!(closed, 1);
         assert_eq!(econ.n_emissions_total.load(Ordering::Relaxed), 1);
         assert_eq!(econ.n_exit_miss_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn economic_sweeper_uses_emit_tick_exit_when_route_silences() {
+        use crate::ml::contract::{CalibStatus, ReasonKind, TradeReason, TradeSetup};
+
+        let route = mk_route();
+        let t_emit = 1_000_000_000u64;
+        let setup = TradeSetup {
+            route_id: route,
+            entry_now: 2.0,
+            exit_target: 0.5,
+            gross_profit_target: 2.5,
+            p_hit: None,
+            p_hit_ci: None,
+            exit_q25: None,
+            exit_q50: None,
+            exit_q75: None,
+            t_hit_p25_s: None,
+            t_hit_median_s: None,
+            t_hit_p75_s: None,
+            p_censor: None,
+            baseline_diagnostics: None,
+            cluster_id: None,
+            cluster_size: 1,
+            cluster_rank: 1,
+            calibration_status: CalibStatus::Degraded,
+            reason: TradeReason {
+                kind: ReasonKind::Tail,
+                detail: "test".into(),
+            },
+            model_version: "baseline-a3-test".into(),
+            emitted_at: t_emit,
+            valid_until: t_emit + 30_000_000_000,
+        };
+        let mut tracker = EconomicTracker::new();
+        tracker.process(
+            route,
+            setup.entry_now,
+            -1.3,
+            t_emit,
+            &Recommendation::Trade(setup),
+        );
+
+        let closed = tracker.sweep(t_emit + 31_000_000_000);
+        assert_eq!(closed, 1);
+        let window = tracker
+            .accumulator
+            .snapshot_window(60, t_emit + 31_000_000_000);
+        assert_eq!(window.n_exit_miss, 1);
+        assert!(
+            (window.simulated_pnl_aggregated_usd - 70.0).abs() < 1e-3,
+            "timeout deve usar o exit observado na emissão, não default 0.0; pnl={}",
+            window.simulated_pnl_aggregated_usd,
+        );
     }
 
     #[tokio::test]
@@ -1287,6 +1507,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clean_rejected_snapshots_create_supervised_negative_labels() {
+        use crate::ml::persistence::{
+            LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, ResolverConfig,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let (writer, handle) = LabeledJsonlWriter::create(LabeledWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 1024,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(50),
+            file_prefix: "neg-label".into(),
+        });
+        let task = tokio::spawn(writer.run());
+        let resolver = Arc::new(LabelResolver::new(
+            ResolverConfig {
+                horizons_s: vec![1],
+                close_slack_ns: 1_000_000_000,
+                route_vanish_idle_ns: 60 * 1_000_000_000,
+                max_pending_per_route: 100,
+                sweeper_interval: Duration::from_secs(10),
+            },
+            handle,
+        ));
+
+        let server = mk_server()
+            .with_label_resolver(Arc::clone(&resolver))
+            .with_raw_decimator(RouteDecimator::with_modulus(1));
+        let route = mk_route();
+        let (_rec, dec, accepted) = server.on_opportunity(
+            0,
+            route,
+            "BTC-USDT",
+            2.5,
+            -0.8,
+            1e6,
+            1e6,
+            1_745_159_400u64 * 1_000_000_000,
+        );
+        assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
+        assert!(accepted.is_none());
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_created_total
+                .load(Ordering::Relaxed),
+            1,
+            "snapshot limpo rejeitado deve gerar label negativo supervisionavel"
+        );
+        drop(server);
+        drop(resolver);
+        drop(tmp);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn labeled_trade_features_t0_use_pre_observation_quantiles() {
         use crate::ml::persistence::{
             LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, ResolverConfig,
@@ -1305,7 +1583,7 @@ mod tests {
         let task = tokio::spawn(writer.run());
         let resolver = Arc::new(LabelResolver::new(
             ResolverConfig {
-                horizons_s: [1, 2, 3],
+                horizons_s: vec![1, 2, 3],
                 close_slack_ns: 1_000_000_000,
                 route_vanish_idle_ns: 60 * 1_000_000_000,
                 max_pending_per_route: 100,
@@ -1359,6 +1637,11 @@ mod tests {
         let content = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
         let line = content.lines().next().expect("at least 1 label");
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["sample_decision"], "accept");
+        assert!(
+            v["label_floor_hits"].as_array().unwrap().len() > 1,
+            "label deve carregar multiplos floors para curva P(exit>=floor)"
+        );
         let label_entry_p50 = v["features_t0"]["entry_p50_24h"].as_f64().unwrap() as f32;
         assert!(
             (label_entry_p50 - pre_entry_p50).abs() < 0.05,

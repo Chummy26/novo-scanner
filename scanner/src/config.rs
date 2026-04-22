@@ -80,9 +80,9 @@ pub struct MlConfig {
     #[serde(default = "default_label_stride_s")]
     pub label_stride_s: u32,
 
-    /// Horizontes em segundos. Default `[900, 1800, 7200]`.
+    /// Horizontes em segundos. Default `[900, 1800, 7200, 28800]`.
     #[serde(default = "default_label_horizons_s")]
-    pub label_horizons_s: [u32; 3],
+    pub label_horizons_s: Vec<u32>,
 
     /// Intervalo do sweeper global de labels (s). Default 10.
     #[serde(default = "default_label_sweeper_interval_s")]
@@ -93,6 +93,16 @@ pub struct MlConfig {
     /// fora, fronteira ML explícita).
     #[serde(default = "default_label_floor_pct")]
     pub label_floor_pct: f32,
+
+    /// Floors brutos adicionais para labels multi-threshold.
+    /// O primeiro target operacional continua `label_floor_pct`; esta lista
+    /// permite treinar curva P(exit >= floor | estado, floor).
+    #[serde(default = "default_label_floors_pct")]
+    pub label_floors_pct: Vec<f32>,
+
+    /// Cooldown de emissao por rota para evitar spam/dedup no layer serving.
+    #[serde(default = "default_recommendation_cooldown_s")]
+    pub recommendation_cooldown_s: u32,
 }
 
 impl Default for MlConfig {
@@ -106,6 +116,8 @@ impl Default for MlConfig {
             label_horizons_s: default_label_horizons_s(),
             label_sweeper_interval_s: default_label_sweeper_interval_s(),
             label_floor_pct: default_label_floor_pct(),
+            label_floors_pct: default_label_floors_pct(),
+            recommendation_cooldown_s: default_recommendation_cooldown_s(),
         }
     }
 }
@@ -114,9 +126,11 @@ fn default_raw_target_coverage()     -> f64      { 0.95 }
 fn default_raw_decimation_mod()      -> u64      { 10 }
 fn default_raw_rerank_interval_s()   -> u64      { 3600 }
 fn default_label_stride_s()          -> u32      { 60 }
-fn default_label_horizons_s()        -> [u32; 3] { [900, 1800, 7200] }
+fn default_label_horizons_s()        -> Vec<u32>  { vec![900, 1800, 7200, 28800] }
 fn default_label_sweeper_interval_s()-> u64      { 10 }
 fn default_label_floor_pct()         -> f32      { 0.8 }
+fn default_label_floors_pct()        -> Vec<f32>  { vec![0.3, 0.5, 0.8, 1.2, 2.0, 3.0] }
+fn default_recommendation_cooldown_s()-> u32      { 60 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VenueToggles {

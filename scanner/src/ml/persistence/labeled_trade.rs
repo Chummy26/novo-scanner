@@ -36,10 +36,11 @@ use crate::ml::contract::RouteId;
 
 /// Versão atual do schema do LabeledTrade.
 ///
-/// v3 (2026-04-22): `sample_id` passa a FNV-1a 128-bit hex32 para
-/// acompanhar RawSample/AcceptedSample v5; `features_t0` passa a expor
-/// quantis PIT de entry/exit, duracao historica de runs e idade da rota.
-pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 3;
+/// v4 (2026-04-22): adiciona `sample_decision` e `label_floor_hits`
+/// multi-threshold. Mantem os campos first-hit primarios por compatibilidade,
+/// mas permite treinar P(exit >= floor | state, floor) sem congelar o modelo
+/// em um unico floor global.
+pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 4;
 
 /// Scanner version — mesma convenção dos outros schemas.
 pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -120,11 +121,27 @@ pub struct PolicyMetadata {
     pub label_sampling_probability: f32,
 }
 
+/// Resultado first-hit para um floor bruto especifico.
+///
+/// O primeiro elemento normalmente replica `label_floor_pct` e os campos
+/// `first_exit_ge_label_floor_*` para compatibilidade. Demais elementos
+/// permitem estimar a curva condicional P(exit atinge floor) sem oracle de
+/// melhor saida absoluta.
+#[derive(Debug, Clone)]
+pub struct FloorHitLabel {
+    pub floor_pct: f32,
+    pub first_exit_ge_floor_ts_ns: Option<u64>,
+    pub first_exit_ge_floor_pct: Option<f32>,
+    pub t_to_first_hit_s: Option<u32>,
+    pub realized: bool,
+}
+
 /// `LabeledTrade` — 1 record por `(sample_id, horizon_s)` conforme Opção B.
 #[derive(Debug, Clone)]
 pub struct LabeledTrade {
     // Identificação & join
     pub sample_id: String,
+    pub sample_decision: &'static str,
     pub horizon_s: u32,
     pub ts_emit_ns: u64,
     pub cycle_seq: u32,
@@ -152,6 +169,7 @@ pub struct LabeledTrade {
     pub first_exit_ge_label_floor_ts_ns: Option<u64>,
     pub first_exit_ge_label_floor_pct: Option<f32>,
     pub t_to_first_hit_s: Option<u32>,
+    pub label_floor_hits: Vec<FloorHitLabel>,
 
     // Outcome + 3 timestamps distintos por semântica (correção P5)
     pub outcome: LabelOutcome,
@@ -175,10 +193,11 @@ impl LabeledTrade {
             .censor_reason
             .map(|r| format!("\"{}\"", r.as_str()))
             .unwrap_or_else(|| "null".to_string());
+        let label_floor_hits = floor_hits_json(&self.label_floor_hits);
 
         format!(
             concat!(
-                r#"{{"sample_id":"{}","horizon_s":{},"ts_emit_ns":{},"cycle_seq":{},"#,
+                r#"{{"sample_id":"{}","sample_decision":"{}","horizon_s":{},"ts_emit_ns":{},"cycle_seq":{},"#,
                 r#""schema_version":{},"scanner_version":"{}","#,
                 r#""symbol_id":{},"symbol_name":"{}","#,
                 r#""buy_venue":"{}","sell_venue":"{}","#,
@@ -194,6 +213,7 @@ impl LabeledTrade {
                 r#""t_to_best_s":{},"n_clean_future_samples":{},"#,
                 r#""label_floor_pct":{},"first_exit_ge_label_floor_ts_ns":{},"#,
                 r#""first_exit_ge_label_floor_pct":{},"t_to_first_hit_s":{},"#,
+                r#""label_floor_hits":{},"#,
                 r#""outcome":"{}","censor_reason":{},"#,
                 r#""observed_until_ns":{},"closed_ts_ns":{},"written_ts_ns":{},"#,
                 r#""policy_metadata":{{"baseline_model_version":"{}","#,
@@ -204,6 +224,7 @@ impl LabeledTrade {
                 r#""sampling_tier":"{}","sampling_probability":{}}}"#,
             ),
             self.sample_id,
+            self.sample_decision,
             self.horizon_s,
             self.ts_emit_ns,
             self.cycle_seq,
@@ -241,6 +262,7 @@ impl LabeledTrade {
             opt_u64(self.first_exit_ge_label_floor_ts_ns),
             opt_f32(self.first_exit_ge_label_floor_pct),
             opt_u32(self.t_to_first_hit_s),
+            label_floor_hits,
             self.outcome.as_str(),
             censor_str,
             self.observed_until_ns,
@@ -314,6 +336,29 @@ fn escape_json(s: &str) -> String {
     out
 }
 
+fn floor_hits_json(hits: &[FloorHitLabel]) -> String {
+    let mut out = String::from("[");
+    for (idx, hit) in hits.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            concat!(
+                r#"{{"floor_pct":{},"first_exit_ge_floor_ts_ns":{},"#,
+                r#""first_exit_ge_floor_pct":{},"t_to_first_hit_s":{},"#,
+                r#""realized":{}}}"#
+            ),
+            f32_or_null(hit.floor_pct),
+            opt_u64(hit.first_exit_ge_floor_ts_ns),
+            opt_f32(hit.first_exit_ge_floor_pct),
+            opt_u32(hit.t_to_first_hit_s),
+            hit.realized,
+        ));
+    }
+    out.push(']');
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -334,6 +379,7 @@ mod tests {
     fn mk_label() -> LabeledTrade {
         LabeledTrade {
             sample_id: "abcdef0123456789abcdef0123456789".into(),
+            sample_decision: "accept",
             horizon_s: 900,
             ts_emit_ns: 1_700_000_000_000_000_000,
             cycle_seq: 42,
@@ -371,6 +417,33 @@ mod tests {
             ),
             first_exit_ge_label_floor_pct: Some(-1.7),
             t_to_first_hit_s: Some(120),
+            label_floor_hits: vec![
+                FloorHitLabel {
+                    floor_pct: 0.5,
+                    first_exit_ge_floor_ts_ns: Some(
+                        1_700_000_000_000_000_000 + 60 * 1_000_000_000,
+                    ),
+                    first_exit_ge_floor_pct: Some(-1.9),
+                    t_to_first_hit_s: Some(60),
+                    realized: true,
+                },
+                FloorHitLabel {
+                    floor_pct: 0.8,
+                    first_exit_ge_floor_ts_ns: Some(
+                        1_700_000_000_000_000_000 + 120 * 1_000_000_000,
+                    ),
+                    first_exit_ge_floor_pct: Some(-1.7),
+                    t_to_first_hit_s: Some(120),
+                    realized: true,
+                },
+                FloorHitLabel {
+                    floor_pct: 3.0,
+                    first_exit_ge_floor_ts_ns: None,
+                    first_exit_ge_floor_pct: None,
+                    t_to_first_hit_s: None,
+                    realized: false,
+                },
+            ],
             outcome: LabelOutcome::Realized,
             censor_reason: None,
             observed_until_ns: 1_700_000_000_000_000_000 + 900 * 1_000_000_000,
@@ -398,13 +471,17 @@ mod tests {
         assert!(!line.contains('\n'));
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["sample_id"], "abcdef0123456789abcdef0123456789");
+        assert_eq!(v["sample_decision"], "accept");
         assert_eq!(v["horizon_s"], 900);
-        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["schema_version"], 4);
         assert_eq!(v["symbol_name"], "BTC-USDT");
         assert_eq!(v["entry_locked_pct"], 2.5);
         assert_eq!(v["outcome"], "realized");
         assert!(v["censor_reason"].is_null());
         assert_eq!(v["label_floor_pct"], 0.8);
+        assert_eq!(v["label_floor_hits"].as_array().unwrap().len(), 3);
+        assert_eq!(v["label_floor_hits"][0]["floor_pct"], 0.5);
+        assert_eq!(v["label_floor_hits"][2]["realized"], false);
         assert_eq!(v["policy_metadata"]["baseline_model_version"], "baseline-a3-0.2.0");
         assert_eq!(v["sampling_tier"], "allowlist");
         assert_eq!(v["features_t0"]["entry_p95_24h"], 3.0);

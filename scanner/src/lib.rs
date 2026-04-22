@@ -158,7 +158,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     tokio::spawn(async move { labeled_writer.run().await; });
 
     let resolver_cfg = ResolverConfig {
-        horizons_s: cfg.ml.label_horizons_s,
+        horizons_s: cfg.ml.label_horizons_s.clone(),
         sweeper_interval: Duration::from_secs(cfg.ml.label_sweeper_interval_s),
         ..ResolverConfig::default()
     };
@@ -173,7 +173,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .with_raw_writer(ml_raw_writer_handle)
             .with_route_ranking(Arc::clone(&ranker))
             .with_label_resolver(Arc::clone(&label_resolver))
-            .with_label_params(cfg.ml.label_stride_s, cfg.ml.label_floor_pct),
+            .with_label_config(
+                cfg.ml.label_stride_s,
+                cfg.ml.label_floor_pct,
+                cfg.ml.label_floors_pct.clone(),
+            )
+            .with_recommendation_cooldown_s(cfg.ml.recommendation_cooldown_s),
     );
 
     // --- Allowlist Wave V: resolver símbolos em rotas engine-elegíveis ---

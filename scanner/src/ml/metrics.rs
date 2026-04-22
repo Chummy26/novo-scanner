@@ -15,6 +15,7 @@
 //! | `ml_recommendations_total` | CounterVec | `kind` | Trade / abstain por razão |
 //! | `ml_cache_routes_tracked` | IntGauge | — | Rotas distintas no HotQueryCache |
 //! | `ml_raw_samples_emitted_total` | Counter | — | RawSamples pré-trigger emitidos (ADR-025) |
+//! | `ml_raw_samples_emitted_by_tier_total` | CounterVec | `tier` | RawSamples emitidos por tier |
 //! | `ml_raw_samples_dropped_total` | CounterVec | `reason` | RawSamples descartados (channel_full/closed) |
 //! | `ml_broadcaster_published_total` | CounterVec | `kind` | Recommendations publicadas ao broadcaster (ADR-026) |
 //! | `ml_broadcaster_no_subscribers_total` | Counter | — | Publicações sem consumers ativos |
@@ -54,6 +55,7 @@ pub struct MlPrometheusMetrics {
 
     // Wave T extensions — raw samples, broadcaster, economic.
     raw_samples_emitted_total: IntCounter,
+    raw_samples_emitted_by_tier_total: IntCounterVec,
     raw_samples_dropped_total: IntCounterVec,
     broadcaster_published_total: IntCounterVec,
     broadcaster_no_subscribers_total: IntCounter,
@@ -117,6 +119,9 @@ struct ServerMetricsSnapshot {
     rec_abstain_low_confidence: u64,
     rec_abstain_long_tail: u64,
     raw_samples_emitted: u64,
+    raw_samples_emitted_allowlist: u64,
+    raw_samples_emitted_priority: u64,
+    raw_samples_emitted_decimated_uniform: u64,
     raw_samples_dropped_channel_full: u64,
     raw_samples_dropped_channel_closed: u64,
     // Wave U pós-auditoria.
@@ -178,6 +183,13 @@ impl MlPrometheusMetrics {
             "ml_raw_samples_emitted_total",
             "RawSamples pré-trigger emitidos ao writer JSONL (ADR-025)",
         ))?;
+        let raw_samples_emitted_by_tier_total = IntCounterVec::new(
+            Opts::new(
+                "ml_raw_samples_emitted_by_tier_total",
+                "RawSamples pré-trigger emitidos por tier de decimação",
+            ),
+            &["tier"],
+        )?;
         let raw_samples_dropped_total = IntCounterVec::new(
             Opts::new(
                 "ml_raw_samples_dropped_total",
@@ -287,6 +299,7 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(recommendations_total.clone()))?;
         registry.register(Box::new(cache_routes_tracked.clone()))?;
         registry.register(Box::new(raw_samples_emitted_total.clone()))?;
+        registry.register(Box::new(raw_samples_emitted_by_tier_total.clone()))?;
         registry.register(Box::new(raw_samples_dropped_total.clone()))?;
         registry.register(Box::new(broadcaster_published_total.clone()))?;
         registry.register(Box::new(broadcaster_no_subscribers_total.clone()))?;
@@ -331,6 +344,11 @@ impl MlPrometheusMetrics {
         for reason in &["channel_full", "channel_closed"] {
             raw_samples_dropped_total.with_label_values(&[reason]).inc_by(0);
         }
+        for tier in &["allowlist", "priority", "decimated_uniform"] {
+            raw_samples_emitted_by_tier_total
+                .with_label_values(&[tier])
+                .inc_by(0);
+        }
         for kind in &["trade", "abstain"] {
             broadcaster_published_total.with_label_values(&[kind]).inc_by(0);
         }
@@ -361,6 +379,7 @@ impl MlPrometheusMetrics {
             recommendations_total,
             cache_routes_tracked,
             raw_samples_emitted_total,
+            raw_samples_emitted_by_tier_total,
             raw_samples_dropped_total,
             broadcaster_published_total,
             broadcaster_no_subscribers_total,
@@ -448,6 +467,15 @@ impl MlPrometheusMetrics {
 
         // Raw samples do ServerMetrics.
         self.raw_samples_emitted_total.inc_by(diff!(raw_samples_emitted));
+        self.raw_samples_emitted_by_tier_total
+            .with_label_values(&["allowlist"])
+            .inc_by(diff!(raw_samples_emitted_allowlist));
+        self.raw_samples_emitted_by_tier_total
+            .with_label_values(&["priority"])
+            .inc_by(diff!(raw_samples_emitted_priority));
+        self.raw_samples_emitted_by_tier_total
+            .with_label_values(&["decimated_uniform"])
+            .inc_by(diff!(raw_samples_emitted_decimated_uniform));
         self.raw_samples_dropped_total
             .with_label_values(&["channel_full"])
             .inc_by(diff!(raw_samples_dropped_channel_full));
@@ -650,6 +678,15 @@ fn snapshot(m: &Arc<ServerMetrics>) -> ServerMetricsSnapshot {
         rec_abstain_low_confidence: m.rec_abstain_low_confidence.load(Ordering::Relaxed),
         rec_abstain_long_tail: m.rec_abstain_long_tail.load(Ordering::Relaxed),
         raw_samples_emitted: m.raw_samples_emitted.load(Ordering::Relaxed),
+        raw_samples_emitted_allowlist: m
+            .raw_samples_emitted_allowlist
+            .load(Ordering::Relaxed),
+        raw_samples_emitted_priority: m
+            .raw_samples_emitted_priority
+            .load(Ordering::Relaxed),
+        raw_samples_emitted_decimated_uniform: m
+            .raw_samples_emitted_decimated_uniform
+            .load(Ordering::Relaxed),
         raw_samples_dropped_channel_full: m
             .raw_samples_dropped_channel_full
             .load(Ordering::Relaxed),
@@ -709,6 +746,7 @@ mod tests {
         assert!(names.contains(&"ml_sample_decisions_total".to_string()));
         assert!(names.contains(&"ml_recommendations_total".to_string()));
         assert!(names.contains(&"ml_cache_routes_tracked".to_string()));
+        assert!(names.contains(&"ml_raw_samples_emitted_by_tier_total".to_string()));
         // F2-R4
         assert!(names.contains(&"ml_premature_recommendation_rate".to_string()));
     }
@@ -844,6 +882,38 @@ mod tests {
                 .with_label_values(&["insufficient_history"])
                 .get(),
             5
+        );
+
+        server
+            .metrics()
+            .raw_samples_emitted_allowlist
+            .fetch_add(2, Ordering::Relaxed);
+        server
+            .metrics()
+            .raw_samples_emitted_priority
+            .fetch_add(3, Ordering::Relaxed);
+        server
+            .metrics()
+            .raw_samples_emitted_decimated_uniform
+            .fetch_add(4, Ordering::Relaxed);
+        m.update_from_server(&server);
+        assert_eq!(
+            m.raw_samples_emitted_by_tier_total
+                .with_label_values(&["allowlist"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            m.raw_samples_emitted_by_tier_total
+                .with_label_values(&["priority"])
+                .get(),
+            3
+        );
+        assert_eq!(
+            m.raw_samples_emitted_by_tier_total
+                .with_label_values(&["decimated_uniform"])
+                .get(),
+            4
         );
     }
 
