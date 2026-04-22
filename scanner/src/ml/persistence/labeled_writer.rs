@@ -207,7 +207,7 @@ mod tests {
 
     fn mk_label(horizon_s: u32, ts_written_ns: u64) -> LabeledTrade {
         LabeledTrade {
-            sample_id: "deadbeef12345678".into(),
+            sample_id: "deadbeef12345678deadbeef12345678".into(),
             horizon_s,
             ts_emit_ns: 1_745_159_400u64 * 1_000_000_000,
             cycle_seq: 1,
@@ -225,8 +225,18 @@ mod tests {
                 buy_vol24: 1e6,
                 sell_vol24: 2e6,
                 tail_ratio_p99_p95: None,
+                entry_p25_24h: None,
                 entry_p50_24h: None,
+                entry_p75_24h: None,
+                entry_p95_24h: None,
+                exit_p25_24h: None,
                 exit_p50_24h: None,
+                exit_p75_24h: None,
+                exit_p95_24h: None,
+                gross_run_p05_s: None,
+                gross_run_p50_s: None,
+                gross_run_p95_s: None,
+                listing_age_days: None,
             },
             best_exit_pct: Some(-0.3),
             best_exit_ts_ns: Some(1_745_159_400u64 * 1_000_000_000 + 300_000_000_000),

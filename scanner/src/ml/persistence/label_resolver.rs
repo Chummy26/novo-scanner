@@ -243,12 +243,15 @@ impl LabelResolver {
             .entry(route_id)
             .or_insert_with(|| VecDeque::with_capacity(128));
         if queue.len() >= self.cfg.max_pending_per_route {
-            // Descarta o mais antigo (correção P6 — backpressure explícito).
-            queue.pop_front();
+            // Preserva os labels antigos: eles já acumularam observações
+            // futuras e estão mais próximos de resolver. Descartar o oldest
+            // enviesaria o dataset contra labels ricos, favorecendo pendings
+            // novos com zero futuro observado.
             self.metrics
                 .labels_dropped_capacity_overflow_total
                 .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(route = ?route_id, "pending_labels overflow: dropped oldest");
+            tracing::warn!(route = ?route_id, "pending_labels overflow: dropped incoming");
+            return false;
         }
         queue.push_back(pending);
         self.metrics
@@ -397,9 +400,18 @@ impl LabelResolver {
         n
     }
 
-    /// Em shutdown limpo, força `censored{shutdown}` em tudo aberto.
+    /// Em shutdown limpo, fecha pendings abertos preservando o outcome real.
+    ///
+    /// Fix pós-auditoria 2026-04-22: versão anterior forçava `Censored{Shutdown}`
+    /// em todos os horizontes abertos, sobrescrevendo labels que já tinham
+    /// `first_exit_ge_floor_ts_ns.is_some()` (Realized) ou que já haviam
+    /// passado do deadline sem hit (Miss). Isso subestimava `P_hit` empírico
+    /// no dataset supervisionado. A lógica correta é a mesma do `sweep`:
+    /// chamar `LabelOutcome::from_pending()` e só atribuir `Shutdown` quando
+    /// o outcome for de fato `Censored` (incomplete window).
     pub fn shutdown_flush(&self, now_ns: u64) -> u64 {
-        let mut to_write: Vec<(PendingLabel, usize)> = Vec::new();
+        let mut to_write: Vec<(PendingLabel, usize, LabelOutcome, Option<CensorReason>)> =
+            Vec::new();
         {
             let mut inner = self.inner.lock();
             for (_route, queue) in inner.pending_by_route.iter_mut() {
@@ -414,7 +426,12 @@ impl LabelResolver {
                     if !closed_idx.is_empty() {
                         let snap = pending.clone();
                         for idx in closed_idx {
-                            to_write.push((snap.clone(), idx));
+                            let outcome = LabelOutcome::from_pending(&snap, idx);
+                            let reason = match outcome {
+                                LabelOutcome::Censored => Some(CensorReason::Shutdown),
+                                _ => None,
+                            };
+                            to_write.push((snap.clone(), idx, outcome, reason));
                         }
                     }
                 }
@@ -423,17 +440,15 @@ impl LabelResolver {
             inner.last_label_ts.clear();
         }
         let n = to_write.len() as u64;
-        for (pending, idx) in to_write {
-            self.metrics
-                .shutdown_lost_pending_total
-                .fetch_add(1, Ordering::Relaxed);
-            self.write_closed_horizon_with_reason(
-                pending,
-                idx,
-                now_ns,
-                LabelOutcome::Censored,
-                Some(CensorReason::Shutdown),
-            );
+        for (pending, idx, outcome, reason) in to_write {
+            // Métrica conta apenas labels realmente "perdidos" — Realized e
+            // Miss são outcomes válidos, não perdas.
+            if matches!(outcome, LabelOutcome::Censored) {
+                self.metrics
+                    .shutdown_lost_pending_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.write_closed_horizon_with_reason(pending, idx, now_ns, outcome, reason);
         }
         n
     }
@@ -571,8 +586,18 @@ mod tests {
             buy_vol24: 1e6,
             sell_vol24: 2e6,
             tail_ratio_p99_p95: None,
+            entry_p25_24h: None,
             entry_p50_24h: None,
+            entry_p75_24h: None,
+            entry_p95_24h: None,
+            exit_p25_24h: None,
             exit_p50_24h: None,
+            exit_p75_24h: None,
+            exit_p95_24h: None,
+            gross_run_p05_s: None,
+            gross_run_p50_s: None,
+            gross_run_p95_s: None,
+            listing_age_days: None,
         }
     }
 
@@ -790,17 +815,132 @@ mod tests {
             2.0, -1.0, mk_features(), 0.8, mk_policy(),
             "allowlist", 1.0, 0,
         );
-        let lost = resolver.shutdown_flush(t0 + 1_000_000_000);
-        assert_eq!(lost, 3, "3 horizontes devem ter sido forçados censored");
+        // Sem observações → observed_until == t_emit < qualquer deadline → Censored.
+        let closed = resolver.shutdown_flush(t0 + 1_000_000_000);
+        assert_eq!(closed, 3, "3 horizontes devem ter sido fechados");
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
-        assert_eq!(m.shutdown_lost_pending_total.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            m.shutdown_lost_pending_total.load(Ordering::Relaxed),
+            3,
+            "sem observações, todos 3 são Censored (lost)"
+        );
+        assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 3);
+        assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 0);
         drop(resolver);
         drop(tmp);
     }
 
     #[tokio::test]
-    async fn backpressure_drops_oldest_when_cap_exceeded() {
+    async fn shutdown_preserves_realized_when_first_hit_before_shutdown() {
+        // Fix P0-U1 pós-auditoria 2026-04-22: shutdown_flush não deve
+        // sobrescrever labels que já tinham `first_exit_ge_floor_ts_ns` —
+        // eles devem ser emitidos como Realized, não como Censored{Shutdown}.
+        let cfg = ResolverConfig {
+            horizons_s: [10, 20, 30],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t0 = 1_000_000_000u64;
+        resolver.on_accepted(
+            "sid_realized".into(),
+            t0,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0, -1.0,
+            mk_features(),
+            0.5,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
+        );
+        // Observação dentro de 2s: gross = 2.0 + (-0.5) = 1.5 > floor 0.5 → hit.
+        resolver.on_clean_observation(mk_route(), t0 + 2_000_000_000, 1.8, -0.5);
+        // Shutdown em t0+5s (antes de qualquer horizonte expirar).
+        let closed = resolver.shutdown_flush(t0 + 5_000_000_000);
+        assert_eq!(closed, 3, "3 horizontes fechados no shutdown");
+        sleep(Duration::from_millis(150)).await;
+        let m = resolver.metrics();
+        assert_eq!(
+            m.labels_written_realized_total.load(Ordering::Relaxed),
+            3,
+            "todos 3 horizontes tinham first_exit.is_some() → Realized"
+        );
+        assert_eq!(
+            m.labels_written_censored_total.load(Ordering::Relaxed),
+            0,
+            "nenhum deve virar Censored se já havia hit"
+        );
+        assert_eq!(
+            m.shutdown_lost_pending_total.load(Ordering::Relaxed),
+            0,
+            "métrica shutdown_lost_pending só conta Censored de verdade"
+        );
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn shutdown_emits_miss_when_deadline_passed_without_hit() {
+        // Caso de borda: horizonte vencido mas ainda aberto (não foi
+        // fechado pelo sweep ainda). Shutdown deve emitir Miss, não
+        // Censored, porque observed_until >= deadline.
+        let cfg = ResolverConfig {
+            horizons_s: [2, 4, 6],
+            close_slack_ns: 5_000_000_000, // slack grande — sweep não fecharia ainda
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t0 = 1_000_000_000u64;
+        resolver.on_accepted(
+            "sid_miss".into(),
+            t0,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0, -1.0,
+            mk_features(),
+            10.0, // floor inalcançável → nunca hita
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
+        );
+        // Observações continuam chegando (rota não sumiu) até além do último
+        // deadline (6s), mas nunca hitam o floor de 10%.
+        for i in 1..=7u64 {
+            resolver.on_clean_observation(
+                mk_route(),
+                t0 + i * 1_000_000_000,
+                1.9,
+                -2.0,
+            );
+        }
+        // Shutdown em t0+7s — slot 900s/1800s/2h (no config test: 2/4/6s)
+        // todos têm observed_until >= deadline → Miss, não Censored.
+        resolver.shutdown_flush(t0 + 7_000_000_000);
+        sleep(Duration::from_millis(150)).await;
+        let m = resolver.metrics();
+        assert_eq!(
+            m.labels_written_miss_total.load(Ordering::Relaxed),
+            3,
+            "3 horizontes expiraram observados sem hit → Miss"
+        );
+        assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.shutdown_lost_pending_total.load(Ordering::Relaxed), 0);
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn backpressure_drops_incoming_when_cap_exceeded() {
         let cfg = ResolverConfig {
             horizons_s: [60, 120, 180],
             close_slack_ns: 1_000_000_000,
@@ -826,7 +966,11 @@ mod tests {
             2,
             "2 dos 5 labels devem ter sido descartados (cap=3)"
         );
-        assert_eq!(m.pending_created_total.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            m.pending_created_total.load(Ordering::Relaxed),
+            3,
+            "apenas os 3 primeiros labels devem ser criados; os novos são descartados"
+        );
         drop(resolver);
         drop(tmp);
     }

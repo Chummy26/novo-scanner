@@ -663,8 +663,21 @@ impl MlServer {
             Some(&self.metrics.rec_invariant_blocked),
         );
         self.bump_rec_metric(&rec);
+        let entry_p25_pre_observe = self.baseline.cache().quantile_entry(route, 0.25);
         let entry_p50_pre_observe = self.baseline.cache().quantile_entry(route, 0.50);
+        let entry_p75_pre_observe = self.baseline.cache().quantile_entry(route, 0.75);
+        let entry_p95_pre_observe = self.baseline.cache().quantile_entry(route, 0.95);
+        let exit_p25_pre_observe = self.baseline.cache().quantile_exit(route, 0.25);
         let exit_p50_pre_observe = self.baseline.cache().quantile_exit(route, 0.50);
+        let exit_p75_pre_observe = self.baseline.cache().quantile_exit(route, 0.75);
+        let exit_p95_pre_observe = self.baseline.cache().quantile_exit(route, 0.95);
+        let (gross_run_p05_pre_observe, gross_run_p50_pre_observe, gross_run_p95_pre_observe) =
+            self.baseline
+                .cache()
+                .gross_run_duration_quantiles(route, self.label_floor_pct)
+                .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
+                .unwrap_or((None, None, None));
+        let listing_age_days_pre_observe = self.listing.listing_age_days(route, now_ns);
         // Fix pós-auditoria: popular `tail_ratio_p99_p95` usando o mesmo
         // cache pré-observe (PIT). Feature contínua que o baseline já
         // computa para o gate LongTail; expor como input do modelo
@@ -740,21 +753,22 @@ impl MlServer {
                 buy_vol24: buy_vol24_usd,
                 sell_vol24: sell_vol24_usd,
                 tail_ratio_p99_p95: tail_ratio_pre_observe,
+                entry_p25_24h: entry_p25_pre_observe,
                 entry_p50_24h: entry_p50_pre_observe,
+                entry_p75_24h: entry_p75_pre_observe,
+                entry_p95_24h: entry_p95_pre_observe,
+                exit_p25_24h: exit_p25_pre_observe,
                 exit_p50_24h: exit_p50_pre_observe,
+                exit_p75_24h: exit_p75_pre_observe,
+                exit_p95_24h: exit_p95_pre_observe,
+                gross_run_p05_s: gross_run_p05_pre_observe,
+                gross_run_p50_s: gross_run_p50_pre_observe,
+                gross_run_p95_s: gross_run_p95_pre_observe,
+                listing_age_days: listing_age_days_pre_observe,
             };
-            // Fix pós-auditoria H6: `label_sampling_probability` deve
-            // refletir `tier × stride` (doc em labeled_trade.rs:98), não
-            // apenas o tier. Aproximação conservadora:
-            //   effective_prob = tier_prob × (1 / max(stride_s, 1))
-            // — assume ≥ 1 Accept/s por rota em regime de cauda. Quando
-            // stride=0 (tests ou regime sem supressão), mantém tier_prob.
-            let effective_sampling_probability = if self.label_stride_s > 0 {
-                let stride_factor = 1.0_f32 / (self.label_stride_s as f32);
-                prob * stride_factor
-            } else {
-                prob
-            };
+            // `label_sampling_probability` é apenas a probabilidade do tier.
+            // Não tenta corrigir stride: a probabilidade efetiva depende da
+            // taxa observada de accepts por rota e deve ser estimada offline.
             let policy = PolicyMetadata {
                 baseline_model_version: self
                     .baseline
@@ -767,7 +781,7 @@ impl MlServer {
                 baseline_derived_exit_at_min: baseline_exit_at_min,
                 baseline_floor_pct: self.baseline.config().floor_pct,
                 label_stride_s: self.label_stride_s,
-                label_sampling_probability: effective_sampling_probability,
+                label_sampling_probability: prob,
             };
             resolver.on_accepted(
                 accepted_sample.sample_id.clone(),

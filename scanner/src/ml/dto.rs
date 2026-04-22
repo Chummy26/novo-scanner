@@ -46,8 +46,18 @@ impl From<RouteId> for RouteIdDto {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecommendationDto {
-    Trade(TradeSetupDto),
+    Trade {
+        /// Status badge CLAUDE.md (`ENTER` / `CAUTION` / `FLOOR` /
+        /// `LOW_CONFIDENCE`). Derivado determinístico dos campos numéricos
+        /// do `TradeSetupDto` — UI filtra sem interpretação.
+        status: &'static str,
+        #[serde(flatten)]
+        setup: TradeSetupDto,
+    },
     Abstain {
+        /// Status badge CLAUDE.md (`NO_OPPORTUNITY` / `INSUFFICIENT_DATA` /
+        /// `LOW_CONFIDENCE` / `LONG_TAIL`). Derivado do `AbstainReason`.
+        status: &'static str,
         reason: AbstainReasonDto,
         diagnostic: AbstainDiagnosticDto,
     },
@@ -56,12 +66,95 @@ pub enum RecommendationDto {
 impl From<&Recommendation> for RecommendationDto {
     fn from(r: &Recommendation) -> Self {
         match r {
-            Recommendation::Trade(s) => RecommendationDto::Trade(TradeSetupDto::from(s)),
+            Recommendation::Trade(s) => RecommendationDto::Trade {
+                status: classify_trade_status(s),
+                setup: TradeSetupDto::from(s),
+            },
             Recommendation::Abstain { reason, diagnostic } => RecommendationDto::Abstain {
+                status: abstain_status_label(*reason),
                 reason: AbstainReasonDto::from(*reason),
                 diagnostic: AbstainDiagnosticDto::from(diagnostic),
             },
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Classificador de status badges (CLAUDE.md §Output esperado)
+// ---------------------------------------------------------------------------
+
+/// Piso mínimo de `p_hit` para emitir `[ENTER]`. Abaixo → `[CAUTION]`.
+/// Default: 0.60. Operador pode revisar se baseline histórico for outro.
+pub const STATUS_P_FLOOR: f32 = 0.60;
+
+/// Threshold de `p_hit` acima do qual convicção é alta (permite
+/// classificar `[ENTER]` mesmo com T longo). Default: 0.75.
+pub const STATUS_P_STRONG: f32 = 0.75;
+
+/// Tempo mediano (s) acima do qual `[CAUTION]` é emitido por "T longo".
+/// Default: 3600 s = 1 h. CLAUDE.md exemplo `T~2h15` mostra que T longo é
+/// emissível (não invalida trade), mas merece cautela visual.
+pub const STATUS_T_LONG_S: u32 = 3600;
+
+/// Floor econômico típico sobre `gross_profit_target` (spread bruto cotado).
+/// Abaixo → `[FLOOR]`. Default: 0.8% (mesmo do baseline A3).
+pub const STATUS_GROSS_FLOOR_PCT: f32 = 0.8;
+
+/// Largura máxima de IC 95% de `p_hit` para emitir números de execução.
+/// Acima → `[LOW_CONFIDENCE]` e setup é suprimido visualmente mesmo que
+/// presente no JSON (ver CLAUDE.md §Output).
+pub const STATUS_IC_WIDTH_LIMIT: f32 = 0.20;
+
+/// Classifica `TradeSetup` em status badge CLAUDE.md.
+///
+/// Ordem de precedência (mais restritivo primeiro):
+/// 1. `LOW_CONFIDENCE` — `ic_width >= STATUS_IC_WIDTH_LIMIT`.
+/// 2. `FLOOR` — `gross_profit_target < STATUS_GROSS_FLOOR_PCT`.
+/// 3. `CAUTION` — `p_hit < STATUS_P_FLOOR` OR (`p_hit < STATUS_P_STRONG` AND
+///    `t_hit_median_s >= STATUS_T_LONG_S`).
+/// 4. `ENTER` — resto.
+///
+/// Quando `p_hit.is_none()` (baseline A3 degradado), retorna `CAUTION`:
+/// sem forecast condicional, evitamos `ENTER` direto para forçar revisão
+/// manual pelo operador.
+pub fn classify_trade_status(s: &TradeSetup) -> &'static str {
+    // 1. IC width gate (precede tudo — se IC é ruim, o P não é confiável).
+    if let Some((lo, hi)) = s.p_hit_ci {
+        let width = hi - lo;
+        if width >= STATUS_IC_WIDTH_LIMIT {
+            return "LOW_CONFIDENCE";
+        }
+    }
+    // 2. Floor econômico (sobre lucro bruto cotado).
+    if s.gross_profit_target < STATUS_GROSS_FLOOR_PCT {
+        return "FLOOR";
+    }
+    // 3. Convicção reduzida.
+    let p = match s.p_hit {
+        Some(p) => p,
+        None => return "CAUTION", // sem forecast condicional.
+    };
+    if p < STATUS_P_FLOOR {
+        return "CAUTION";
+    }
+    let t_long = s
+        .t_hit_median_s
+        .map(|t| t >= STATUS_T_LONG_S)
+        .unwrap_or(false);
+    if p < STATUS_P_STRONG && t_long {
+        return "CAUTION";
+    }
+    // 4. ENTER.
+    "ENTER"
+}
+
+/// Label string do `AbstainReason` alinhado ao CLAUDE.md.
+pub fn abstain_status_label(reason: AbstainReason) -> &'static str {
+    match reason {
+        AbstainReason::NoOpportunity => "NO_OPPORTUNITY",
+        AbstainReason::InsufficientData => "INSUFFICIENT_DATA",
+        AbstainReason::LowConfidence => "LOW_CONFIDENCE",
+        AbstainReason::LongTail => "LONG_TAIL",
     }
 }
 
@@ -423,5 +516,127 @@ mod tests {
             let dto: TradeSetupDto = (&s).into();
             assert_eq!(dto.calibration_status, label);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Status badges CLAUDE.md (F2-R3 pós-auditoria 2026-04-22)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn status_enter_when_all_gates_pass() {
+        // Setup base: p_hit=0.83, ci_width=0.11, gross=1.0, t_median=1680s.
+        let s = mk_setup();
+        assert_eq!(classify_trade_status(&s), "ENTER");
+    }
+
+    #[test]
+    fn status_low_confidence_when_ic_width_exceeds_limit() {
+        let mut s = mk_setup();
+        s.p_hit_ci = Some((0.60, 0.85)); // width = 0.25 >= 0.20
+        assert_eq!(classify_trade_status(&s), "LOW_CONFIDENCE");
+    }
+
+    #[test]
+    fn status_floor_when_gross_below_economic_floor() {
+        let mut s = mk_setup();
+        s.gross_profit_target = 0.20; // < 0.8
+        assert_eq!(classify_trade_status(&s), "FLOOR");
+    }
+
+    #[test]
+    fn status_caution_when_p_hit_below_floor() {
+        let mut s = mk_setup();
+        s.p_hit = Some(0.41);
+        // Ajusta IC para não disparar LOW_CONFIDENCE primeiro.
+        s.p_hit_ci = Some((0.35, 0.47));
+        assert_eq!(classify_trade_status(&s), "CAUTION");
+    }
+
+    #[test]
+    fn status_caution_when_p_hit_borderline_and_t_long() {
+        let mut s = mk_setup();
+        s.p_hit = Some(0.68); // entre FLOOR e STRONG
+        s.p_hit_ci = Some((0.63, 0.73));
+        s.t_hit_median_s = Some(STATUS_T_LONG_S + 1);
+        assert_eq!(classify_trade_status(&s), "CAUTION");
+    }
+
+    #[test]
+    fn status_enter_when_p_hit_borderline_but_t_short() {
+        let mut s = mk_setup();
+        s.p_hit = Some(0.68);
+        s.p_hit_ci = Some((0.63, 0.73));
+        s.t_hit_median_s = Some(600); // 10 min < STATUS_T_LONG_S
+        assert_eq!(classify_trade_status(&s), "ENTER");
+    }
+
+    #[test]
+    fn status_caution_when_p_hit_missing() {
+        let mut s = mk_setup();
+        s.p_hit = None; // baseline A3 degradado
+        s.p_hit_ci = None;
+        assert_eq!(classify_trade_status(&s), "CAUTION");
+    }
+
+    #[test]
+    fn ic_width_gate_precedes_floor_check() {
+        // Gross abaixo do floor E IC width grande — IC width deve vencer.
+        let mut s = mk_setup();
+        s.gross_profit_target = 0.20;
+        s.p_hit_ci = Some((0.40, 0.80)); // width 0.40
+        assert_eq!(classify_trade_status(&s), "LOW_CONFIDENCE");
+    }
+
+    #[test]
+    fn abstain_status_labels_match_claude_md() {
+        assert_eq!(
+            abstain_status_label(AbstainReason::NoOpportunity),
+            "NO_OPPORTUNITY"
+        );
+        assert_eq!(
+            abstain_status_label(AbstainReason::InsufficientData),
+            "INSUFFICIENT_DATA"
+        );
+        assert_eq!(
+            abstain_status_label(AbstainReason::LowConfidence),
+            "LOW_CONFIDENCE"
+        );
+        assert_eq!(
+            abstain_status_label(AbstainReason::LongTail),
+            "LONG_TAIL"
+        );
+    }
+
+    #[test]
+    fn recommendation_dto_includes_status_field_for_trade() {
+        let rec = Recommendation::Trade(mk_setup());
+        let dto = RecommendationDto::from(&rec);
+        let json = serde_json::to_string(&dto).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["kind"], "trade");
+        assert_eq!(v["status"], "ENTER");
+        // Campos flat do setup continuam no mesmo nível (flatten).
+        assert!(v["entry_now"].is_number());
+    }
+
+    #[test]
+    fn recommendation_dto_includes_status_field_for_abstain() {
+        let rec = Recommendation::Abstain {
+            reason: AbstainReason::NoOpportunity,
+            diagnostic: AbstainDiagnostic {
+                n_observations: 800,
+                ci_width_if_emitted: None,
+                nearest_feasible_utility: Some(0.1),
+                tail_ratio_p99_p95: None,
+                model_version: "a3-0.1.0".into(),
+                regime_posterior: [0.7, 0.2, 0.1],
+            },
+        };
+        let dto = RecommendationDto::from(&rec);
+        let json = serde_json::to_string(&dto).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["kind"], "abstain");
+        assert_eq!(v["status"], "NO_OPPORTUNITY");
+        assert_eq!(v["reason"], "no_opportunity");
     }
 }

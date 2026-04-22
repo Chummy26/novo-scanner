@@ -35,7 +35,11 @@
 use crate::ml::contract::RouteId;
 
 /// Versão atual do schema do LabeledTrade.
-pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 2;
+///
+/// v3 (2026-04-22): `sample_id` passa a FNV-1a 128-bit hex32 para
+/// acompanhar RawSample/AcceptedSample v5; `features_t0` passa a expor
+/// quantis PIT de entry/exit, duracao historica de runs e idade da rota.
+pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 3;
 
 /// Scanner version — mesma convenção dos outros schemas.
 pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -78,14 +82,24 @@ impl CensorReason {
     }
 }
 
-/// Features observadas em t0 (estado estrutural; features_t0 mínimas).
+/// Features observadas em t0 (estado estrutural de spread bruto).
 #[derive(Debug, Clone)]
 pub struct FeaturesT0 {
     pub buy_vol24: f64,
     pub sell_vol24: f64,
     pub tail_ratio_p99_p95: Option<f32>,
+    pub entry_p25_24h: Option<f32>,
     pub entry_p50_24h: Option<f32>,
+    pub entry_p75_24h: Option<f32>,
+    pub entry_p95_24h: Option<f32>,
+    pub exit_p25_24h: Option<f32>,
     pub exit_p50_24h: Option<f32>,
+    pub exit_p75_24h: Option<f32>,
+    pub exit_p95_24h: Option<f32>,
+    pub gross_run_p05_s: Option<u32>,
+    pub gross_run_p50_s: Option<u32>,
+    pub gross_run_p95_s: Option<u32>,
+    pub listing_age_days: Option<f32>,
 }
 
 /// Metadados de policy (auditoria, não target do modelo — correção A1/P3).
@@ -98,12 +112,11 @@ pub struct PolicyMetadata {
     pub baseline_derived_exit_at_min: Option<f32>,
     pub baseline_floor_pct: f32,
     pub label_stride_s: u32,
-    /// Probabilidade efetiva de amostragem para IPW no treino.
-    /// Fix pós-auditoria H6: combina tier e stride via
-    /// `tier_prob × (1 / stride_s)` (aproximação conservadora assumindo
-    /// ≥ 1 candidato/s por rota em regime de cauda). Quando `stride_s=0`
-    /// é apenas `tier_prob`. Trainer Python deve usar este valor como
-    /// peso inverso de amostragem.
+    /// Probabilidade do tier de persistência, não IPW total do label.
+    /// O stride é informado separadamente em `label_stride_s`; trainer
+    /// offline deve estimar probabilidade efetiva por rota/horizonte a
+    /// partir da taxa observada de candidates/accepts, não assumir
+    /// `tier_prob / stride_s`.
     pub label_sampling_probability: f32,
 }
 
@@ -172,7 +185,11 @@ impl LabeledTrade {
                 r#""buy_market":"{}","sell_market":"{}","#,
                 r#""entry_locked_pct":{},"exit_start_pct":{},"#,
                 r#""features_t0":{{"buy_vol24":{},"sell_vol24":{},"#,
-                r#""tail_ratio_p99_p95":{},"entry_p50_24h":{},"exit_p50_24h":{}}},"#,
+                r#""tail_ratio_p99_p95":{},"entry_p25_24h":{},"entry_p50_24h":{},"#,
+                r#""entry_p75_24h":{},"entry_p95_24h":{},"exit_p25_24h":{},"#,
+                r#""exit_p50_24h":{},"exit_p75_24h":{},"exit_p95_24h":{},"#,
+                r#""gross_run_p05_s":{},"gross_run_p50_s":{},"gross_run_p95_s":{},"#,
+                r#""listing_age_days":{}}},"#,
                 r#""best_exit_pct":{},"best_exit_ts_ns":{},"best_gross_pct":{},"#,
                 r#""t_to_best_s":{},"n_clean_future_samples":{},"#,
                 r#""label_floor_pct":{},"first_exit_ge_label_floor_ts_ns":{},"#,
@@ -203,8 +220,18 @@ impl LabeledTrade {
             f64_or_null(self.features_t0.buy_vol24),
             f64_or_null(self.features_t0.sell_vol24),
             opt_f32(self.features_t0.tail_ratio_p99_p95),
+            opt_f32(self.features_t0.entry_p25_24h),
             opt_f32(self.features_t0.entry_p50_24h),
+            opt_f32(self.features_t0.entry_p75_24h),
+            opt_f32(self.features_t0.entry_p95_24h),
+            opt_f32(self.features_t0.exit_p25_24h),
             opt_f32(self.features_t0.exit_p50_24h),
+            opt_f32(self.features_t0.exit_p75_24h),
+            opt_f32(self.features_t0.exit_p95_24h),
+            opt_u32(self.features_t0.gross_run_p05_s),
+            opt_u32(self.features_t0.gross_run_p50_s),
+            opt_u32(self.features_t0.gross_run_p95_s),
+            opt_f32(self.features_t0.listing_age_days),
             opt_f32(self.best_exit_pct),
             opt_u64(self.best_exit_ts_ns),
             opt_f32(self.best_gross_pct),
@@ -306,7 +333,7 @@ mod tests {
 
     fn mk_label() -> LabeledTrade {
         LabeledTrade {
-            sample_id: "abcdef0123456789".into(),
+            sample_id: "abcdef0123456789abcdef0123456789".into(),
             horizon_s: 900,
             ts_emit_ns: 1_700_000_000_000_000_000,
             cycle_seq: 42,
@@ -320,8 +347,18 @@ mod tests {
                 buy_vol24: 1e6,
                 sell_vol24: 2e6,
                 tail_ratio_p99_p95: Some(1.8),
+                entry_p25_24h: Some(1.4),
                 entry_p50_24h: Some(2.0),
+                entry_p75_24h: Some(2.4),
+                entry_p95_24h: Some(3.0),
+                exit_p25_24h: Some(-1.4),
                 exit_p50_24h: Some(-1.1),
+                exit_p75_24h: Some(-0.8),
+                exit_p95_24h: Some(-0.5),
+                gross_run_p05_s: Some(30),
+                gross_run_p50_s: Some(120),
+                gross_run_p95_s: Some(600),
+                listing_age_days: Some(14.0),
             },
             best_exit_pct: Some(-0.3),
             best_exit_ts_ns: Some(1_700_000_000_000_000_000 + 300 * 1_000_000_000),
@@ -360,9 +397,9 @@ mod tests {
         let line = l.to_json_line();
         assert!(!line.contains('\n'));
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["sample_id"], "abcdef0123456789");
+        assert_eq!(v["sample_id"], "abcdef0123456789abcdef0123456789");
         assert_eq!(v["horizon_s"], 900);
-        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["schema_version"], 3);
         assert_eq!(v["symbol_name"], "BTC-USDT");
         assert_eq!(v["entry_locked_pct"], 2.5);
         assert_eq!(v["outcome"], "realized");
@@ -370,6 +407,10 @@ mod tests {
         assert_eq!(v["label_floor_pct"], 0.8);
         assert_eq!(v["policy_metadata"]["baseline_model_version"], "baseline-a3-0.2.0");
         assert_eq!(v["sampling_tier"], "allowlist");
+        assert_eq!(v["features_t0"]["entry_p95_24h"], 3.0);
+        assert_eq!(v["features_t0"]["exit_p25_24h"], -1.4);
+        assert_eq!(v["features_t0"]["gross_run_p50_s"], 120);
+        assert_eq!(v["features_t0"]["listing_age_days"], 14.0);
         assert!(v["features_t0"].get("buy_book_age_ms").is_none());
         assert!(v["features_t0"].get("sell_book_age_ms").is_none());
         assert!(v["features_t0"].get("halt_active").is_none());

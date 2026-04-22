@@ -32,10 +32,9 @@
 //! # Janela rolante 24h real
 //!
 //! Ring buffer pop-front samples com `ts_ns < now_ns - WINDOW_NS`.
-//! Histograma é **reconstruído periodicamente** (a cada 1h) a partir
-//! do ring atual — mais simples que decremento incremental
-//! (hdrhistogram não suporta nativamente) e custo amortizado é aceitável
-//! (~3 ms por rota por hora = desprezível).
+//! Histograma é **reconstruído imediatamente quando há expiração** a partir
+//! do ring atual. `hdrhistogram` não suporta decremento incremental; rebuild
+//! imediato preserva quantis point-in-time sem carregar amostras vencidas.
 //!
 //! # Encoding de spread em u64
 //!
@@ -103,7 +102,7 @@ fn quantile_sorted_u64(values: &[u64], q: f64) -> u32 {
 /// Defaults escolhidos em `DATASET_ACTION_PLAN.md` Fase 0:
 /// - decimação 1-em-10 → 2.4 GB total para 2600 rotas × 24h.
 /// - janela 24h (convenção do skill §4).
-/// - rebuild 1h → custo amortizado ~3 ms/rota/hora.
+/// - rebuild imediato quando há expiração → quantis PIT exatos.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheConfig {
     /// Guarda 1 a cada `decimation` samples no ring (e histograma).
@@ -111,7 +110,8 @@ pub struct CacheConfig {
     pub decimation: u32,
     /// Tamanho da janela rolante em nanosegundos. Default 24h.
     pub window_ns: u64,
-    /// Intervalo entre rebuilds completos do histograma (ns). Default 1h.
+    /// Campo legado de compatibilidade. A implementação atual reconstrói
+    /// imediatamente quando expira amostra para evitar histograma stale.
     pub rebuild_interval_ns: u64,
     /// Capacidade inicial do `VecDeque` ring buffer (não hard limit; VecDeque
     /// cresce sob demanda). Default 1024; max esperado ~144k por rota.
@@ -227,10 +227,9 @@ impl PerRouteCache {
             }
         }
 
-        // Rebuild periódico — mais simples que decremento incremental.
-        let should_rebuild = expired > 0
-            && (ts_ns.saturating_sub(self.last_rebuild_ns) >= self.cfg.rebuild_interval_ns);
-        if should_rebuild {
+        // `hdrhistogram` não decrementa. Se houve expiração, rebuild
+        // imediato evita quantis PIT contaminados por amostras fora da janela.
+        if expired > 0 {
             self.entry_hist.reset();
             self.exit_hist.reset();
             self.gross_hist.reset();
@@ -368,7 +367,7 @@ pub struct HotQueryCache {
 }
 
 impl HotQueryCache {
-    /// Constrói com config default (decimação 10, janela 24h, rebuild 1h).
+    /// Constrói com config default (decimação 10, janela 24h).
     pub fn new() -> Self {
         Self::with_config(CacheConfig::default())
     }
@@ -634,6 +633,29 @@ mod tests {
         // Agora p50 deveria refletir apenas samples 5.0 (os 0.5 expiraram).
         let p50 = cache.quantile_entry(route, 0.5).unwrap();
         assert!(p50 >= 4.8 && p50 <= 5.2, "p50 = {p50}, expected ~5.0 após expiração");
+    }
+
+    #[test]
+    fn expired_samples_never_remain_in_histogram_until_rebuild_interval() {
+        let cfg = CacheConfig {
+            decimation: 1,
+            window_ns: 500,
+            rebuild_interval_ns: u64::MAX,
+            ring_initial_capacity: 64,
+        };
+        let cache = HotQueryCache::with_config(cfg);
+        let route = mk_route(1);
+        for i in 0..100 {
+            cache.observe(route, 0.5, -1.0, i);
+        }
+        cache.observe(route, 5.0, -1.0, 1_000);
+
+        assert_eq!(cache.n_observations(route), 1);
+        let p50 = cache.quantile_entry(route, 0.5).unwrap();
+        assert!(
+            p50 >= 4.8 && p50 <= 5.2,
+            "histograma não pode manter samples expirados; p50={p50}"
+        );
     }
 
     #[test]

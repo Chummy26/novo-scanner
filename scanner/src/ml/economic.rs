@@ -315,8 +315,11 @@ impl CalibrationAccumulator {
     }
 
     /// Reliability diagram data — para dashboard.
-    /// Retorna `(mid_conf_i, freq_i, n_i)` para cada bucket não vazio.
-    pub fn reliability_points(&self) -> Vec<(f32, f32, u64)> {
+    /// Retorna pontos com IC de Wilson por bucket (correção pós-auditoria
+    /// 2026-04-22: reliability diagram sem IC é estatisticamente inválido;
+    /// Wald é anti-conservativo em amostra pequena conforme Agresti-Coull 1998).
+    /// Buckets com `n < 30` são marcados `unstable = true`.
+    pub fn reliability_points(&self) -> Vec<ReliabilityPoint> {
         let mut pts = Vec::new();
         for (i, (n, k)) in self.buckets.iter().enumerate() {
             if *n == 0 {
@@ -324,10 +327,69 @@ impl CalibrationAccumulator {
             }
             let conf_mid = (i as f32 + 0.5) / 10.0;
             let freq = (*k as f32) / (*n as f32);
-            pts.push((conf_mid, freq, *n));
+            let (ic_lower, ic_upper) = wilson_ci_95(*n, *k);
+            pts.push(ReliabilityPoint {
+                conf_mid,
+                freq,
+                n: *n,
+                ic_lower,
+                ic_upper,
+                unstable: *n < RELIABILITY_BUCKET_MIN_N,
+            });
         }
         pts
     }
+}
+
+/// Threshold mínimo de amostras por bucket para considerar estatisticamente
+/// estável. Abaixo disso, a aproximação normal do Wilson IC perde acurácia e
+/// o gate de kill switch não deve disparar por ruído amostral.
+pub const RELIABILITY_BUCKET_MIN_N: u64 = 30;
+
+/// Ponto do reliability diagram com IC de Wilson.
+///
+/// Campos:
+/// - `conf_mid`: centro do decil de confiança (0.05, 0.15, ..., 0.95).
+/// - `freq`: frequência empírica realizada dentro do bucket.
+/// - `n`: tamanho da amostra no bucket.
+/// - `ic_lower`, `ic_upper`: Wilson 95% IC da frequência.
+/// - `unstable`: `true` se `n < RELIABILITY_BUCKET_MIN_N`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReliabilityPoint {
+    pub conf_mid: f32,
+    pub freq: f32,
+    pub n: u64,
+    pub ic_lower: f32,
+    pub ic_upper: f32,
+    pub unstable: bool,
+}
+
+/// Wilson score interval 95% (Wilson 1927, Agresti-Coull 1998).
+///
+/// `IC = [ĉp − margin, ĉp + margin]`
+/// onde `ĉp = (p̂ + z²/(2n)) / (1 + z²/n)`
+/// e `margin = z × sqrt(p̂(1−p̂)/n + z²/(4n²)) / (1 + z²/n)`.
+///
+/// Para `n=0` retorna `(0.0, 1.0)` (intervalo total — desconhecido).
+///
+/// Superior a Wald para proporções em amostra pequena: não viola `[0, 1]`,
+/// não colapsa em `p=0` ou `p=1`, cobertura empírica mais próxima do nominal.
+pub fn wilson_ci_95(n: u64, k: u64) -> (f32, f32) {
+    if n == 0 {
+        return (0.0, 1.0);
+    }
+    // z = 1.96 para 95% de confiança (two-sided normal).
+    const Z: f64 = 1.96;
+    const Z2: f64 = Z * Z;
+    let n_f = n as f64;
+    let p = (k as f64) / n_f;
+    let denom = 1.0 + Z2 / n_f;
+    let center = (p + Z2 / (2.0 * n_f)) / denom;
+    let margin_term = (p * (1.0 - p) / n_f + Z2 / (4.0 * n_f * n_f)).sqrt();
+    let margin = Z * margin_term / denom;
+    let lo = (center - margin).clamp(0.0, 1.0) as f32;
+    let hi = (center + margin).clamp(0.0, 1.0) as f32;
+    (lo, hi)
 }
 
 impl EconomicAccumulator {
@@ -353,8 +415,8 @@ impl EconomicAccumulator {
         self.calibration.ece()
     }
 
-    /// Reliability diagram data para dashboard.
-    pub fn reliability_points(&self) -> Vec<(f32, f32, u64)> {
+    /// Reliability diagram data para dashboard (com Wilson IC 95% por bucket).
+    pub fn reliability_points(&self) -> Vec<ReliabilityPoint> {
         self.calibration.reliability_points()
     }
 
@@ -695,5 +757,99 @@ mod tests {
         assert_eq!(ws.len(), 4);
         assert_eq!(ws[0].window_s, 3_600);
         assert_eq!(ws[3].window_s, 2_592_000);
+    }
+
+    // -------------------------------------------------------------------
+    // Wilson IC 95% + ReliabilityPoint (correção F2-R1 pós-auditoria 2026-04-22)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn wilson_ci_handles_zero_samples() {
+        // n=0: intervalo total [0, 1] — desconhecido.
+        let (lo, hi) = wilson_ci_95(0, 0);
+        assert_eq!(lo, 0.0);
+        assert_eq!(hi, 1.0);
+    }
+
+    #[test]
+    fn wilson_ci_does_not_exceed_unit_interval() {
+        // Wilson nunca viola [0, 1] mesmo em corner cases (ao contrário de Wald).
+        for (n, k) in [(1, 0), (1, 1), (10, 0), (10, 10), (100, 0), (100, 100)] {
+            let (lo, hi) = wilson_ci_95(n, k);
+            assert!(lo >= 0.0 && lo <= 1.0, "lo={} n={} k={}", lo, n, k);
+            assert!(hi >= 0.0 && hi <= 1.0, "hi={} n={} k={}", hi, n, k);
+            assert!(lo <= hi, "lo > hi: lo={} hi={}", lo, hi);
+        }
+    }
+
+    #[test]
+    fn wilson_ci_contains_observed_proportion_for_large_n() {
+        // Amostra grande (n=1000, p̂=0.7): IC deve conter 0.7 e ser apertado.
+        let (lo, hi) = wilson_ci_95(1000, 700);
+        assert!(lo < 0.70 && hi > 0.70);
+        assert!(hi - lo < 0.06, "IC muito largo para n=1000: width={}", hi - lo);
+    }
+
+    #[test]
+    fn wilson_ci_widens_for_small_n() {
+        // Amostra pequena (n=10, p̂=0.7): IC deve ser bem mais largo.
+        let (lo_small, hi_small) = wilson_ci_95(10, 7);
+        let (lo_large, hi_large) = wilson_ci_95(1000, 700);
+        let width_small = hi_small - lo_small;
+        let width_large = hi_large - lo_large;
+        assert!(
+            width_small > width_large * 3.0,
+            "IC pequeno não é significativamente mais largo: small={} large={}",
+            width_small, width_large
+        );
+    }
+
+    #[test]
+    fn wilson_ci_does_not_collapse_at_boundary() {
+        // Wald colapsaria em (0, 0) para k=0; Wilson preserva IC não-trivial.
+        let (lo, hi) = wilson_ci_95(50, 0);
+        assert_eq!(lo, 0.0, "lower bound sensato em p̂=0");
+        assert!(hi > 0.0, "upper bound NÃO deve colapsar em 0 para n>0");
+        assert!(hi < 0.15, "upper bound razoavelmente apertado: hi={}", hi);
+    }
+
+    #[test]
+    fn reliability_points_include_wilson_ic_and_stability_flag() {
+        let mut c = CalibrationAccumulator::default();
+        // Bucket [0.8, 0.9): 50 emissões, 40 realized → freq = 0.80
+        for _ in 0..40 {
+            c.record(0.85, true);
+        }
+        for _ in 0..10 {
+            c.record(0.85, false);
+        }
+        // Bucket [0.5, 0.6): 15 emissões, 8 realized → instável (n<30)
+        for _ in 0..8 {
+            c.record(0.55, true);
+        }
+        for _ in 0..7 {
+            c.record(0.55, false);
+        }
+
+        let pts = c.reliability_points();
+        assert_eq!(pts.len(), 2);
+
+        let big = pts.iter().find(|p| p.n == 50).unwrap();
+        assert!((big.freq - 0.80).abs() < 1e-4);
+        assert!(big.ic_lower < 0.80 && big.ic_upper > 0.80);
+        assert!(!big.unstable, "n=50 deve ser estável");
+        assert!(big.ic_upper - big.ic_lower < 0.25);
+
+        let small = pts.iter().find(|p| p.n == 15).unwrap();
+        assert!(small.unstable, "n=15 < 30 deve ser unstable=true");
+        let width = small.ic_upper - small.ic_lower;
+        assert!(width > 0.30, "IC de bucket pequeno deve ser largo: {}", width);
+    }
+
+    #[test]
+    fn reliability_bucket_min_n_matches_constant() {
+        // Documenta que o threshold de stability é 30 (derivado de
+        // aproximação normal → rule of thumb Student-t clássico).
+        assert_eq!(RELIABILITY_BUCKET_MIN_N, 30);
     }
 }

@@ -68,6 +68,13 @@ pub struct MlPrometheusMetrics {
     rec_invariant_blocked_total: IntCounter,
     calibration_ece: Gauge,
     calibration_observations: IntGauge,
+    // F2-R4 (pós-auditoria 2026-04-22) — taxa de "recomendação prematura".
+    // Definição: `n_window_miss_total / n_emissions_total` acumulado. Alta
+    // taxa indica que o modelo está recomendando antes do entry realmente
+    // atingir `enter_at_min` dentro da janela, validado empiricamente.
+    // Complementa ECE: calibra a dimensão TEMPORAL do sinal ("recomendar
+    // cedo demais sistematicamente é erro do modelo" — CLAUDE.md).
+    premature_recommendation_rate: Gauge,
 
     // Wave V — labels supervisionados + decimator tiers.
     labels_created_total: IntCounter,
@@ -237,6 +244,11 @@ impl MlPrometheusMetrics {
             "ml_calibration_observations",
             "Total de pares (P_hit, realized) registrados no tracker de calibração",
         ))?;
+        // F2-R4: taxa acumulada de recomendação prematura.
+        let premature_recommendation_rate = Gauge::with_opts(Opts::new(
+            "ml_premature_recommendation_rate",
+            "n_window_miss_total / n_emissions_total acumulado — taxa de recomendações que não realizaram o entry dentro da janela (CLAUDE.md: 'recomendar cedo demais sistematicamente é erro do modelo')",
+        ))?;
 
         // Wave V — labels supervisionados + tiers.
         let labels_created_total = IntCounter::with_opts(Opts::new(
@@ -288,6 +300,7 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(rec_invariant_blocked_total.clone()))?;
         registry.register(Box::new(calibration_ece.clone()))?;
         registry.register(Box::new(calibration_observations.clone()))?;
+        registry.register(Box::new(premature_recommendation_rate.clone()))?;
         // Wave V
         registry.register(Box::new(labels_created_total.clone()))?;
         registry.register(Box::new(labels_stride_skipped_total.clone()))?;
@@ -360,6 +373,7 @@ impl MlPrometheusMetrics {
             rec_invariant_blocked_total,
             calibration_ece,
             calibration_observations,
+            premature_recommendation_rate,
             labels_created_total,
             labels_stride_skipped_total,
             labels_written_total,
@@ -602,6 +616,17 @@ impl MlPrometheusMetrics {
         let obs = em.calibration_observations.load(Ordering::Relaxed);
         self.calibration_observations.set(obs as i64);
 
+        // F2-R4 — Taxa de recomendação prematura acumulada.
+        // `n_window_miss_total / n_emissions_total`. Se emissions=0, set 0
+        // (sem dados é melhor que NaN em dashboard). Valores acumulados
+        // desde startup; idealmente janela rolling, mas isso é Marco 2.
+        let premature_rate = if emissions > 0 {
+            (window_miss as f64) / (emissions as f64)
+        } else {
+            0.0
+        };
+        self.premature_recommendation_rate.set(premature_rate);
+
         self.last_economic.n_emissions_total = emissions;
         self.last_economic.n_realized_total = realized;
         self.last_economic.n_window_miss_total = window_miss;
@@ -684,6 +709,111 @@ mod tests {
         assert!(names.contains(&"ml_sample_decisions_total".to_string()));
         assert!(names.contains(&"ml_recommendations_total".to_string()));
         assert!(names.contains(&"ml_cache_routes_tracked".to_string()));
+        // F2-R4
+        assert!(names.contains(&"ml_premature_recommendation_rate".to_string()));
+    }
+
+    #[test]
+    fn premature_recommendation_rate_is_window_miss_over_emissions() {
+        use crate::ml::economic::{EconomicAccumulator, EconomicEvent, TradeOutcome};
+        use crate::ml::contract::{
+            BaselineDiagnostics, CalibStatus, ReasonKind, TradeReason, TradeSetup,
+        };
+
+        let registry = Registry::new();
+        let mut m = MlPrometheusMetrics::register(&registry).expect("register");
+        let mut acc = EconomicAccumulator::new();
+
+        fn mk_setup(emitted_at: u64) -> TradeSetup {
+            TradeSetup {
+                route_id: RouteId {
+                    symbol_id: SymbolId(1),
+                    buy_venue: Venue::MexcFut,
+                    sell_venue: Venue::BingxFut,
+                },
+                entry_now: 2.0,
+                exit_target: -1.0,
+                gross_profit_target: 1.0,
+                p_hit: None,
+                p_hit_ci: None,
+                exit_q25: None,
+                exit_q50: None,
+                exit_q75: None,
+                t_hit_p25_s: None,
+                t_hit_median_s: None,
+                t_hit_p75_s: None,
+                p_censor: None,
+                baseline_diagnostics: Some(BaselineDiagnostics {
+                    enter_at_min: 1.8,
+                    enter_typical: 2.0,
+                    enter_peak_p95: 2.8,
+                    p_enter_hit: 0.9,
+                    exit_at_min: -1.2,
+                    exit_typical: -1.0,
+                    p_exit_hit_given_enter: 0.85,
+                    gross_profit_p10: 0.6,
+                    gross_profit_p25: 0.7,
+                    gross_profit_median: 1.0,
+                    gross_profit_p75: 1.5,
+                    gross_profit_p90: 2.3,
+                    gross_profit_p95: 2.8,
+                    historical_base_rate_24h: 0.7,
+                    historical_base_rate_ci: (0.65, 0.75),
+                }),
+                cluster_id: None,
+                cluster_size: 1,
+                cluster_rank: 1,
+                calibration_status: CalibStatus::Degraded,
+                reason: TradeReason {
+                    kind: ReasonKind::Combined,
+                    detail: "t".into(),
+                },
+                model_version: "test".into(),
+                emitted_at,
+                valid_until: emitted_at + 30_000_000_000,
+            }
+        }
+
+        // 10 emissões: 3 realized, 7 window_miss.
+        for i in 0..3u64 {
+            acc.push(EconomicEvent::new(
+                &mk_setup(1_000_000_000 + i * 1_000_000_000),
+                TradeOutcome::Realized {
+                    enter_realized_pct: 2.0,
+                    exit_realized_pct: -1.0,
+                    horizon_observed_ms: 100,
+                },
+                2_000_000_000 + i * 1_000_000_000,
+                false,
+            ));
+        }
+        for i in 0..7u64 {
+            acc.push(EconomicEvent::new(
+                &mk_setup(10_000_000_000 + i * 1_000_000_000),
+                TradeOutcome::WindowMiss,
+                11_000_000_000 + i * 1_000_000_000,
+                false,
+            ));
+        }
+
+        m.update_from_economic(&acc.metrics());
+        // 7 window_miss / 10 emissions = 0.7
+        let rate = m.premature_recommendation_rate.get();
+        assert!(
+            (rate - 0.7).abs() < 1e-6,
+            "premature rate esperado 0.7; observado {}",
+            rate
+        );
+    }
+
+    #[test]
+    fn premature_recommendation_rate_is_zero_without_emissions() {
+        use crate::ml::economic::EconomicAccumulator;
+        let registry = Registry::new();
+        let mut m = MlPrometheusMetrics::register(&registry).expect("register");
+        let acc = EconomicAccumulator::new();
+        m.update_from_economic(&acc.metrics());
+        assert_eq!(m.premature_recommendation_rate.get(), 0.0);
     }
 
     #[test]

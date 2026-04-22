@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(frame.cycle_seq, 42);
         assert_eq!(frame.emitted_at_ns, 1_234);
         assert_eq!(frame.symbol_name, "BTC-USDT");
-        assert!(matches!(frame.dto, RecommendationDto::Trade(_)));
+        assert!(matches!(frame.dto, RecommendationDto::Trade { .. }));
     }
 
     #[tokio::test]

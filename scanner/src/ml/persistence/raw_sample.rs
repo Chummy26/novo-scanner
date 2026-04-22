@@ -48,7 +48,8 @@ use crate::ml::trigger::SampleDecision;
 ///   (allowlist + priority + uniforme); auditoria de amostragem.
 /// - **v4** (2026-04-21): remove `buy/sell_book_age_ms` e `halt_active`.
 ///   Esses campos são diagnósticos operacionais, não dataset ML.
-pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 4;
+/// - **v5** (2026-04-22): `sample_id` passa a FNV-1a 128-bit hex32.
+pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 5;
 
 /// Versão do scanner — mesmo que em `sample.rs`.
 pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -423,10 +424,10 @@ mod tests {
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, RAW_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 4);
+        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 5);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
-        assert_eq!(s.sample_id.len(), 16);
+        assert_eq!(s.sample_id.len(), 32);
     }
 
     #[test]
@@ -450,9 +451,9 @@ mod tests {
         assert_eq!(v["buy_venue"], "mexc");
         assert_eq!(v["sell_venue"], "bingx");
         assert_eq!(v["sample_decision"], "accept");
-        assert_eq!(v["schema_version"], 4);
+        assert_eq!(v["schema_version"], 5);
         assert!(v["scanner_version"].is_string());
-        assert_eq!(v["sample_id"].as_str().unwrap().len(), 16);
+        assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert_eq!(v["sampling_tier"], "decimated_uniform");
         assert!(v["sampling_probability"].as_f64().is_some());
         assert!(v.get("buy_book_age_ms").is_none());
@@ -635,11 +636,11 @@ mod tests {
         );
         assert_eq!(s.sampling_tier, "allowlist");
         assert!((s.sampling_probability - 1.0).abs() < f32::EPSILON);
-        // Serialização respeita o tier e o sample_id é hex16.
+        // Serialização respeita o tier e o sample_id é hex32.
         let line = s.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["sampling_tier"], "allowlist");
-        assert_eq!(v["sample_id"].as_str().unwrap().len(), 16);
+        assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
     }
 
     #[test]

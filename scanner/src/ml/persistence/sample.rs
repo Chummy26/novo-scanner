@@ -24,7 +24,8 @@ use crate::ml::trigger::SampleDecision;
 ///   e `LabeledTrade`. Correção PhD Q5.
 /// - **v4** (2026-04-21): remove `buy/sell_book_age_ms`; book age é
 ///   diagnóstico operacional de corretora, não dado do dataset ML.
-pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 4;
+/// - **v5** (2026-04-22): `sample_id` passa a FNV-1a 128-bit hex32.
+pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 5;
 
 /// Versão do scanner no momento da serialização. Injetado pelo crate
 /// via `env!("CARGO_PKG_VERSION")`. Permite debugging retrospectivo de
@@ -223,10 +224,10 @@ mod tests {
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, ACCEPTED_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(s.schema_version, 4);
+        assert_eq!(s.schema_version, 5);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
-        assert_eq!(s.sample_id.len(), 16);
+        assert_eq!(s.sample_id.len(), 32);
         assert!(!s.was_recommended);
     }
 
@@ -255,8 +256,8 @@ mod tests {
         assert_eq!(v["sample_decision"], "accept");
         assert_eq!(v["was_recommended"], false);
         assert!(v["scanner_version"].is_string());
-        assert_eq!(v["schema_version"], 4);
-        assert_eq!(v["sample_id"].as_str().unwrap().len(), 16);
+        assert_eq!(v["schema_version"], 5);
+        assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert!(
             v.get("buy_book_age_ms").is_none(),
             "book age não deve sair no dataset ML"

@@ -1,7 +1,7 @@
 //! Função única de `sample_id` compartilhada por RawSample, AcceptedSample
 //! e LabeledTrade (correção PhD Q5).
 //!
-//! Hash **determinístico entre runs**: FNV-1a 64-bit. Zero dependências
+//! Hash **determinístico entre runs**: FNV-1a 128-bit. Zero dependências
 //! novas e saída estável (o mesmo tuple produz o mesmo hex em qualquer
 //! processo). Essencial para joins cross-schema no trainer Python.
 //!
@@ -15,29 +15,30 @@
 //!
 //! # Formato de saída
 //!
-//! Hex lowercase de 16 chars (u64). Rápido de tokenizar em Python/Pandas.
+//! Hex lowercase de 32 chars (u128). Colisão fica desprezível mesmo em
+//! janelas multi-dia com centenas de milhões de linhas.
 //!
 //! # Por que FNV-1a e não ahash/xxhash
 //!
 //! - `ahash`: intencionalmente aleatório por-processo (proteção HashDoS).
 //!   Quebraria joins cross-run.
 //! - `xxhash-rust`: determinístico e mais rápido, mas adicionaria nova dep.
-//!   FNV-1a puro-Rust ≈ 20 linhas, suficiente para 1 hash por AcceptedSample.
+//!   FNV-1a 128 puro-Rust ≈ 20 linhas, suficiente para 1 hash por sample.
 
 use crate::types::{Market, Venue};
 
-const FNV_OFFSET_64: u64 = 0xcbf29ce484222325;
-const FNV_PRIME_64:  u64 = 0x00000100000001B3;
+const FNV_OFFSET_128: u128 = 0x6c62272e07bb014262b821756295c58d;
+const FNV_PRIME_128: u128 = 0x0000000001000000000000000000013b;
 
 #[inline]
-fn fnv1a_update(state: &mut u64, bytes: &[u8]) {
+fn fnv1a_update(state: &mut u128, bytes: &[u8]) {
     for &b in bytes {
-        *state ^= b as u64;
-        *state = state.wrapping_mul(FNV_PRIME_64);
+        *state ^= b as u128;
+        *state = state.wrapping_mul(FNV_PRIME_128);
     }
 }
 
-/// Computa `sample_id` hex de 16 chars para a tupla canonical.
+/// Computa `sample_id` hex de 32 chars para a tupla canonical.
 ///
 /// Inclui todos os campos que identificam unicamente um snapshot de
 /// oportunidade no scanner. `ts_ns + cycle_seq` diferencia ciclos; a
@@ -50,7 +51,7 @@ pub fn sample_id_of(
     buy_venue: Venue,
     sell_venue: Venue,
 ) -> String {
-    let mut h = FNV_OFFSET_64;
+    let mut h = FNV_OFFSET_128;
     fnv1a_update(&mut h, &ts_ns.to_le_bytes());
     fnv1a_update(&mut h, &cycle_seq.to_le_bytes());
     fnv1a_update(&mut h, symbol_name.as_bytes());
@@ -62,7 +63,7 @@ pub fn sample_id_of(
     fnv1a_update(&mut h, sell_venue.as_str().as_bytes());
     fnv1a_update(&mut h, b":");
     fnv1a_update(&mut h, market_str(sell_venue.market()).as_bytes());
-    format!("{:016x}", h)
+    format!("{:032x}", h)
 }
 
 #[inline]
@@ -76,10 +77,10 @@ mod tests {
     use crate::types::Venue;
 
     #[test]
-    fn sample_id_is_hex16_lowercase() {
+    fn sample_id_is_hex32_lowercase() {
         let id = sample_id_of(1_700_000_000_000_000_000, 42, "BTC-USDT",
                               Venue::MexcFut, Venue::BingxFut);
-        assert_eq!(id.len(), 16);
+        assert_eq!(id.len(), 32);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
