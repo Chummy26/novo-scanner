@@ -248,8 +248,9 @@ impl SamplingTier {
 pub struct DecisionResult {
     pub should_persist: bool,
     pub tier: SamplingTier,
-    /// Probabilidade efetiva: 1.0 para allowlist/priority; `1/modulus` se
-    /// decimated uniform entrou; 0.0 se decimated uniform descartou.
+    /// Probabilidade de inclusão do tier: 1.0 para allowlist/priority;
+    /// `1/modulus` para residual uniforme, independentemente deste tick
+    /// específico ter sido incluído.
     pub probability: f32,
 }
 
@@ -315,9 +316,30 @@ impl RouteDecimator {
         self.priority_set.store(Arc::new(routes));
     }
 
-    /// Decisão completa — retorna tier + probabilidade.
+    /// Decisão completa legada por rota — retorna tier + probabilidade.
+    ///
+    /// Use [`RouteDecimator::decide_for_sample`] no hot path de persistência:
+    /// residual por rota transforma ~10% das rotas em captura integral e
+    /// explode volume. Esta API fica para testes/backcompat.
     #[inline]
     pub fn decide(&self, route: RouteId) -> DecisionResult {
+        self.decide_inner(route, 0, 0)
+    }
+
+    /// Decisão por observação. Allowlist e priority continuam full-capture;
+    /// o residual é uniforme por `(route, ts_ns, cycle_seq)`.
+    #[inline]
+    pub fn decide_for_sample(
+        &self,
+        route: RouteId,
+        ts_ns: u64,
+        cycle_seq: u32,
+    ) -> DecisionResult {
+        self.decide_inner(route, ts_ns, cycle_seq)
+    }
+
+    #[inline]
+    fn decide_inner(&self, route: RouteId, ts_ns: u64, cycle_seq: u32) -> DecisionResult {
         if self.allowlist.load().contains(&route) {
             return DecisionResult {
                 should_persist: true,
@@ -336,6 +358,8 @@ impl RouteDecimator {
         use std::hash::{BuildHasher, Hash, Hasher};
         let mut h = self.hasher.build_hasher();
         route.hash(&mut h);
+        ts_ns.hash(&mut h);
+        cycle_seq.hash(&mut h);
         let v = h.finish();
         let should = (v % self.modulus) == 0;
         DecisionResult {
@@ -623,6 +647,29 @@ mod tests {
         assert_eq!(dr.probability, 0.1);
         // Determinístico — chamar duas vezes retorna igual.
         assert_eq!(dr.should_persist, d.decide(r).should_persist);
+    }
+
+    #[test]
+    fn decider_residual_samples_ticks_not_entire_routes() {
+        let d = RouteDecimator::with_modulus(10);
+        let r = mk_route(42, Venue::MexcFut, Venue::BingxFut);
+        let mut accepted = 0u32;
+
+        for cycle in 0..10_000u32 {
+            let ts_ns = 1_700_000_000_000_000_000u64 + cycle as u64;
+            let dr = d.decide_for_sample(r, ts_ns, cycle);
+            assert_eq!(dr.tier, SamplingTier::DecimatedUniform);
+            assert!((dr.probability - 0.1).abs() < f32::EPSILON);
+            if dr.should_persist {
+                accepted += 1;
+            }
+        }
+
+        let ratio = accepted as f64 / 10_000.0;
+        assert!(
+            (0.08..0.12).contains(&ratio),
+            "residual deve amostrar ticks ~10%, não rota inteira; ratio={ratio}"
+        );
     }
 
     #[test]

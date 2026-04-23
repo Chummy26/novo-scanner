@@ -3,8 +3,9 @@
 //! Três responsabilidades:
 //!
 //! - [`invariants`] — verificadores reutilizáveis de propriedades estruturais
-//!   do `TradeSetup` (monotonicidade de quantis, coerência haircut, P ∈ [0,1],
-//!   IC contém P, etc.). Usados em CI e em runtime antes de broadcast.
+//!   do `TradeSetup` (monotonicidade de quantis, identidade de lucro bruto,
+//!   P ∈ [0,1], IC contém P, etc.). Usados em CI e em runtime antes de
+//!   broadcast.
 //! - [`leakage`] — 5 testes CI bloqueantes contra label leakage (ADR-006).
 //!   Infraestrutura mínima em Marco 0; implementação completa em Marco 1
 //!   quando dataset e pipeline de treino existirem.

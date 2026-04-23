@@ -51,3 +51,54 @@ history_len  = 512
 enabled             = false
 # Dedicated core index for the spread engine loop. Omit = automatic.
 # spread_engine_core = 11
+
+[ml]
+# Raw tier-0 symbols always persisted in full.
+raw_allowlist_symbols = ["BTC-USDT", "ETH-USDT"]
+
+# Priority-set target coverage for raw sampling.
+raw_sampling_target_coverage = 0.95
+
+# Residual uniform raw decimation = 1-in-N.
+raw_decimation_mod = 10
+
+# Rerank cadence of the priority routes.
+raw_rerank_interval_s = 3600
+
+# Label cadence / floors.
+label_stride_s = 60
+label_horizons_s = [900, 1800, 7200, 28800]
+label_sweeper_interval_s = 10
+label_floor_pct = 0.8
+label_floors_pct = [0.3, 0.5, 0.8, 1.2, 2.0, 3.0]
+recommendation_cooldown_s = 60
+
+[ml.retention]
+# Operational retention in disk. This is physical TTL, not the trainer
+# lookback. Current safe defaults reflect "research mode":
+# raw = 30d, accepted = 30d, labeled = 365d.
+enabled = true
+sweep_interval_s = 3600
+keep_recent_hours = 12
+raw_retention_days = 30
+accepted_retention_days = 30
+labeled_retention_days = 365
+dry_run = false
+
+[ml.parquet]
+# Closed hourly JSONL partitions are compacted to Parquet/ZSTD.
+# Hot path stays append-only JSONL; compression happens only after close.
+enabled = true
+delete_jsonl_after_success = true
+batch_size = 4096
+zstd_level = 3
+
+[ml.windows]
+# Statistical memory of the model/trainer. These windows do not delete
+# files. They declare the intended lookback:
+# - train_window_days: rolling training window
+# - calibration_window_days: recent window for calibrating P / IC
+# - archive_reference_days: cold slices / rare regimes kept for research
+train_window_days = 90
+calibration_window_days = 21
+archive_reference_days = 365

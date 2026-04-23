@@ -15,6 +15,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::ml::persistence::labeled_trade::LabeledTrade;
+use crate::ml::persistence::parquet_compactor::{
+    compact_jsonl_file, DatasetKind, ParquetCompactionConfig,
+};
 use crate::ml::persistence::writer::hour_key_for_ns;
 
 #[derive(Debug, Clone)]
@@ -24,6 +27,7 @@ pub struct LabeledWriterConfig {
     pub flush_after_n: usize,
     pub flush_interval: Duration,
     pub file_prefix: String,
+    pub parquet: ParquetCompactionConfig,
 }
 
 impl Default for LabeledWriterConfig {
@@ -36,6 +40,7 @@ impl Default for LabeledWriterConfig {
             flush_after_n: 512,
             flush_interval: Duration::from_secs(5),
             file_prefix: format!("labeled-{}-{}", hostname, pid),
+            parquet: ParquetCompactionConfig::default(),
         }
     }
 }
@@ -71,9 +76,11 @@ pub struct LabeledJsonlWriter {
     rx: mpsc::Receiver<LabeledTrade>,
     current_hour_key: Option<String>,
     writer: Option<BufWriter<std::fs::File>>,
+    current_path: Option<PathBuf>,
     lines_since_flush: usize,
     total_written: u64,
     total_dropped: u64,
+    compaction_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl LabeledJsonlWriter {
@@ -85,9 +92,11 @@ impl LabeledJsonlWriter {
                 rx,
                 current_hour_key: None,
                 writer: None,
+                current_path: None,
                 lines_since_flush: 0,
                 total_written: 0,
                 total_dropped: 0,
+                compaction_tasks: Vec::new(),
             },
             LabeledWriterHandle { tx },
         )
@@ -111,13 +120,15 @@ impl LabeledJsonlWriter {
                 }
                 maybe = self.rx.recv() => {
                     match maybe {
-                        Some(l) => self.write_one(l),
+                        Some(l) => self.write_one(l).await,
                         None => {
                             info!(
                                 total_written = self.total_written,
                                 "ML labeled-trade writer encerrando (canal fechado)"
                             );
                             self.periodic_flush();
+                            self.close_current_file();
+                            self.await_pending_compactions().await;
                             break;
                         }
                     }
@@ -126,15 +137,14 @@ impl LabeledJsonlWriter {
         }
     }
 
-    fn write_one(&mut self, label: LabeledTrade) {
+    async fn write_one(&mut self, label: LabeledTrade) {
         let hour_key = hour_key_for_ns(label.written_ts_ns);
         if self.current_hour_key.as_deref() != Some(hour_key.as_str()) {
-            if let Some(mut w) = self.writer.take() {
-                let _ = w.flush();
-            }
+            self.close_current_file();
             match self.open_writer_for_hour(&hour_key) {
-                Ok(w) => {
+                Ok((w, path)) => {
                     self.writer = Some(w);
+                    self.current_path = Some(path);
                     self.current_hour_key = Some(hour_key);
                 }
                 Err(e) => {
@@ -169,7 +179,54 @@ impl LabeledJsonlWriter {
         }
     }
 
-    fn open_writer_for_hour(&self, hour_key: &str) -> std::io::Result<BufWriter<std::fs::File>> {
+    fn close_current_file(&mut self) {
+        if let Some(mut w) = self.writer.take() {
+            let _ = w.flush();
+        }
+        let Some(path) = self.current_path.take() else {
+            return;
+        };
+        self.lines_since_flush = 0;
+
+        if !self.cfg.parquet.enabled {
+            return;
+        }
+
+        let parquet_cfg = self.cfg.parquet.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            match compact_jsonl_file(&path, DatasetKind::LabeledTrades, &parquet_cfg) {
+                Ok(Some(parquet_path)) => {
+                    info!(
+                        source = %path.display(),
+                        parquet = %parquet_path.display(),
+                        "ML labeled writer compactou partição horária para parquet"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "ML labeled writer falhou ao compactar JSONL para parquet"
+                    );
+                }
+            }
+        });
+        self.compaction_tasks.push(handle);
+    }
+
+    async fn await_pending_compactions(&mut self) {
+        while let Some(handle) = self.compaction_tasks.pop() {
+            if let Err(e) = handle.await {
+                warn!(error = %e, "ML labeled writer compaction task join falhou");
+            }
+        }
+    }
+
+    fn open_writer_for_hour(
+        &self,
+        hour_key: &str,
+    ) -> std::io::Result<(BufWriter<std::fs::File>, PathBuf)> {
         let dir_path = self.cfg.data_dir.join(hour_key);
         create_dir_all(&dir_path)?;
         let start_ts = SystemTime::now()
@@ -180,7 +237,7 @@ impl LabeledJsonlWriter {
         let path = dir_path.join(filename);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         info!(path = %path.display(), "labeled writer: abrindo novo arquivo");
-        Ok(BufWriter::with_capacity(64 * 1024, file))
+        Ok((BufWriter::with_capacity(64 * 1024, file), path))
     }
 
     pub fn total_written(&self) -> u64 {
@@ -284,6 +341,10 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "labtest".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         };
         let (writer, handle) = LabeledJsonlWriter::create(cfg);
         let task = tokio::spawn(writer.run());
@@ -313,6 +374,10 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_secs(60),
             file_prefix: "labtest".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         };
         let (_writer, handle) = LabeledJsonlWriter::create(cfg);
         let l = mk_label(900, 1_745_159_400u64 * 1_000_000_000);
@@ -332,6 +397,10 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "labtest".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         };
         let (writer, handle) = LabeledJsonlWriter::create(cfg);
         let task = tokio::spawn(writer.run());
@@ -354,5 +423,53 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(v["outcome"], "censored");
         assert_eq!(v["censor_reason"], "route_vanished");
+    }
+
+    #[tokio::test]
+    async fn writer_compacts_closed_hour_to_parquet() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let cfg = LabeledWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 16,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(100),
+            file_prefix: "labtest".into(),
+            parquet: ParquetCompactionConfig::default(),
+        };
+        let (writer, handle) = LabeledJsonlWriter::create(cfg);
+        let task = tokio::spawn(writer.run());
+
+        let ts14 = 1_745_159_400u64 * 1_000_000_000;
+        handle.try_send(mk_label(900, ts14)).expect("send labeled");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(handle);
+        task.await.expect("task join");
+
+        let hour14 = tmp.path().join("year=2025/month=04/day=20/hour=14");
+        let parquet_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("parquet")).then_some(p)
+            })
+            .collect();
+        let jsonl_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("jsonl")).then_some(p)
+            })
+            .collect();
+
+        assert_eq!(
+            parquet_files.len(),
+            1,
+            "labeled writer deve finalizar em parquet"
+        );
+        assert!(
+            jsonl_files.is_empty(),
+            "jsonl intermediário do labeled writer deve ser removido após compactação"
+        );
     }
 }

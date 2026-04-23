@@ -354,6 +354,44 @@ impl PerRouteCache {
             quantile_sorted_u64(&runs, 0.95),
         ))
     }
+
+    #[inline]
+    fn exit_run_duration_quantiles(&self, exit_threshold: f32) -> Option<(u32, u32, u32)> {
+        if self.n_observations == 0 {
+            return None;
+        }
+
+        let threshold_bucket = to_bucket(exit_threshold) as u32;
+        let mut runs: Vec<u64> = Vec::new();
+        let mut active_start: Option<u64> = None;
+        let mut last_ts: Option<u64> = None;
+
+        for s in &self.ring {
+            last_ts = Some(s.ts_ns);
+            if s.exit_bucket >= threshold_bucket {
+                if active_start.is_none() {
+                    active_start = Some(s.ts_ns);
+                }
+            } else if let Some(start) = active_start.take() {
+                runs.push((s.ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000);
+            }
+        }
+
+        if let (Some(start), Some(end)) = (active_start, last_ts) {
+            runs.push((end.saturating_sub(start) + 999_999_999) / 1_000_000_000);
+        }
+
+        if runs.is_empty() {
+            return None;
+        }
+
+        runs.sort_unstable();
+        Some((
+            quantile_sorted_u64(&runs, 0.05),
+            quantile_sorted_u64(&runs, 0.50),
+            quantile_sorted_u64(&runs, 0.95),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -429,9 +467,29 @@ impl HotQueryCache {
         guard.get(&route)?.probability_exit_ge(threshold)
     }
 
+    /// Quantis de runs de `entry(t)+exit(t)` simultâneo.
+    ///
+    /// Mantido apenas para compatibilidade/testes. Não use como feature do
+    /// modelo de arbitragem: pela identidade estrutural da skill §2, esse
+    /// gross intra-tick tende a ser negativo e não representa
+    /// `entry(t0)+exit(t1)`.
     pub fn gross_run_duration_quantiles(&self, route: RouteId, threshold: f32) -> Option<(u32, u32, u32)> {
         let guard = self.routes.read();
         guard.get(&route)?.gross_run_duration_quantiles(threshold)
+    }
+
+    /// Quantis de duração dos runs históricos em que `exit_spread >= threshold`.
+    ///
+    /// Para labels ML, o caller deve passar `threshold = label_floor - entry_now`.
+    /// Isso evita o bug conceitual de usar `entry(t)+exit(t)` no mesmo tick,
+    /// que pela identidade da skill tende a ser sempre negativo.
+    pub fn exit_run_duration_quantiles(
+        &self,
+        route: RouteId,
+        exit_threshold: f32,
+    ) -> Option<(u32, u32, u32)> {
+        let guard = self.routes.read();
+        guard.get(&route)?.exit_run_duration_quantiles(exit_threshold)
     }
 
     pub fn last_update_ns(&self, route: RouteId) -> u64 {
@@ -656,6 +714,29 @@ mod tests {
             p50 >= 4.8 && p50 <= 5.2,
             "histograma não pode manter samples expirados; p50={p50}"
         );
+    }
+
+    #[test]
+    fn exit_run_duration_quantiles_use_exit_threshold_not_same_tick_gross() {
+        let cache = mk_cache();
+        let route = mk_route(1);
+
+        // Mesmo com `entry + exit` simultâneo sempre abaixo do floor 0.8,
+        // uma entrada atual de 2.0% precisaria apenas de exit >= -1.2%.
+        // O run histórico de saída deve existir e alimentar T/IC sem oracle.
+        for i in 0..5u64 {
+            cache.observe(route, 0.2, -1.0, i * 1_000_000_000);
+        }
+
+        assert_eq!(
+            cache.gross_run_duration_quantiles(route, 0.8),
+            None,
+            "gross simultâneo não deve passar floor positivo neste cenário"
+        );
+        let (p05, p50, p95) = cache
+            .exit_run_duration_quantiles(route, -1.2)
+            .expect("exit >= -1.2 deveria formar um run histórico");
+        assert_eq!((p05, p50, p95), (4, 4, 4));
     }
 
     #[test]

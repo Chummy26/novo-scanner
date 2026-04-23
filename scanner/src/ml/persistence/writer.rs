@@ -36,6 +36,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::ml::persistence::parquet_compactor::{
+    compact_jsonl_file, DatasetKind, ParquetCompactionConfig,
+};
 use crate::ml::persistence::sample::AcceptedSample;
 
 // ---------------------------------------------------------------------------
@@ -57,6 +60,8 @@ pub struct WriterConfig {
     /// Default: hostname + pid. Permite múltiplos scanners no mesmo
     /// disco sem conflito.
     pub file_prefix: String,
+    /// Compactação assíncrona do JSONL fechado para Parquet/ZSTD.
+    pub parquet: ParquetCompactionConfig,
 }
 
 impl Default for WriterConfig {
@@ -69,6 +74,7 @@ impl Default for WriterConfig {
             flush_after_n: 1024,
             flush_interval: Duration::from_secs(5),
             file_prefix: format!("{}-{}", hostname, pid),
+            parquet: ParquetCompactionConfig::default(),
         }
     }
 }
@@ -121,9 +127,11 @@ pub struct JsonlWriter {
     rx: mpsc::Receiver<AcceptedSample>,
     current_hour_key: Option<String>,
     writer: Option<BufWriter<std::fs::File>>,
+    current_path: Option<PathBuf>,
     lines_since_flush: usize,
     total_written: u64,
     total_dropped: u64,
+    compaction_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl JsonlWriter {
@@ -136,9 +144,11 @@ impl JsonlWriter {
             rx,
             current_hour_key: None,
             writer: None,
+            current_path: None,
             lines_since_flush: 0,
             total_written: 0,
             total_dropped: 0,
+            compaction_tasks: Vec::new(),
         };
         (writer, WriterHandle { tx })
     }
@@ -163,13 +173,15 @@ impl JsonlWriter {
                 }
                 maybe_sample = self.rx.recv() => {
                     match maybe_sample {
-                        Some(sample) => self.write_one(sample),
+                        Some(sample) => self.write_one(sample).await,
                         None => {
                             info!(
                                 total_written = self.total_written,
                                 "ML dataset writer encerrando (canal fechado)"
                             );
                             self.periodic_flush();
+                            self.close_current_file();
+                            self.await_pending_compactions().await;
                             break;
                         }
                     }
@@ -178,16 +190,14 @@ impl JsonlWriter {
         }
     }
 
-    fn write_one(&mut self, sample: AcceptedSample) {
+    async fn write_one(&mut self, sample: AcceptedSample) {
         let hour_key = hour_key_for_ns(sample.ts_ns);
         if self.current_hour_key.as_deref() != Some(hour_key.as_str()) {
-            // Troca de hora — fechar writer anterior, abrir novo.
-            if let Some(mut w) = self.writer.take() {
-                let _ = w.flush();
-            }
+            self.close_current_file();
             match self.open_writer_for_hour(&hour_key) {
-                Ok(w) => {
+                Ok((w, path)) => {
                     self.writer = Some(w);
+                    self.current_path = Some(path);
                     self.current_hour_key = Some(hour_key);
                 }
                 Err(e) => {
@@ -226,7 +236,54 @@ impl JsonlWriter {
         }
     }
 
-    fn open_writer_for_hour(&self, hour_key: &str) -> std::io::Result<BufWriter<std::fs::File>> {
+    fn close_current_file(&mut self) {
+        if let Some(mut w) = self.writer.take() {
+            let _ = w.flush();
+        }
+        let Some(path) = self.current_path.take() else {
+            return;
+        };
+        self.lines_since_flush = 0;
+
+        if !self.cfg.parquet.enabled {
+            return;
+        }
+
+        let parquet_cfg = self.cfg.parquet.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            match compact_jsonl_file(&path, DatasetKind::AcceptedSamples, &parquet_cfg) {
+                Ok(Some(parquet_path)) => {
+                    info!(
+                        source = %path.display(),
+                        parquet = %parquet_path.display(),
+                        "ML accepted writer compactou partição horária para parquet"
+                    );
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        path = %path.display(),
+                        "ML accepted writer falhou ao compactar JSONL para parquet"
+                    );
+                }
+            }
+        });
+        self.compaction_tasks.push(handle);
+    }
+
+    async fn await_pending_compactions(&mut self) {
+        while let Some(handle) = self.compaction_tasks.pop() {
+            if let Err(e) = handle.await {
+                warn!(error = %e, "ML accepted writer compaction task join falhou");
+            }
+        }
+    }
+
+    fn open_writer_for_hour(
+        &self,
+        hour_key: &str,
+    ) -> std::io::Result<(BufWriter<std::fs::File>, PathBuf)> {
         let dir_path = self.cfg.data_dir.join(hour_key);
         create_dir_all(&dir_path)?;
         let start_ts = SystemTime::now()
@@ -240,7 +297,7 @@ impl JsonlWriter {
             .append(true)
             .open(&path)?;
         info!(path = %path.display(), "ML writer: abrindo novo arquivo");
-        Ok(BufWriter::with_capacity(64 * 1024, file))
+        Ok((BufWriter::with_capacity(64 * 1024, file), path))
     }
 
     pub fn total_written(&self) -> u64 {
@@ -364,6 +421,10 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "test".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         };
         let (writer, handle) = JsonlWriter::create(cfg);
         let task = tokio::spawn(writer.run());
@@ -415,6 +476,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_compacts_closed_hour_to_parquet() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let cfg = WriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 16,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(100),
+            file_prefix: "test".into(),
+            parquet: ParquetCompactionConfig::default(),
+        };
+        let (writer, handle) = JsonlWriter::create(cfg);
+        let task = tokio::spawn(writer.run());
+
+        let route = mk_route();
+        let s = AcceptedSample::new(
+            1_745_159_400u64 * 1_000_000_000,
+            0,
+            route,
+            "BTC-USDT",
+            2.0,
+            -1.0,
+            1e6,
+            1e6,
+            SampleDecision::Accept,
+        );
+        handle.try_send(s).expect("send sample");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(handle);
+        task.await.expect("task join");
+
+        let hour14 = tmp.path().join("year=2025/month=04/day=20/hour=14");
+        let parquet_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("parquet")).then_some(p)
+            })
+            .collect();
+        let jsonl_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("jsonl")).then_some(p)
+            })
+            .collect();
+
+        assert_eq!(parquet_files.len(), 1, "writer deve finalizar em parquet");
+        assert!(
+            jsonl_files.is_empty(),
+            "jsonl intermediário deve ser removido após compactação"
+        );
+    }
+
+    #[tokio::test]
     async fn backpressure_drops_without_blocking() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         // Canal 1 de capacidade.
@@ -424,6 +540,10 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_secs(60),
             file_prefix: "test".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         };
         // Cria mas NÃO spawna — canal não consumido.
         let (_writer, handle) = JsonlWriter::create(cfg);

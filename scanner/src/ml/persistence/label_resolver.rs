@@ -679,6 +679,7 @@ fn normalized_floors(primary_floor: f32, mut floors: Vec<f32>) -> Vec<f32> {
 mod tests {
     use super::*;
     use crate::ml::persistence::labeled_writer::{LabeledJsonlWriter, LabeledWriterConfig};
+    use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
     use crate::types::{SymbolId, Venue};
     use std::time::Duration;
     use tokio::time::sleep;
@@ -734,6 +735,10 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "lrtest".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         };
         let (writer, handle) = LabeledJsonlWriter::create(wcfg);
         let task = tokio::spawn(writer.run());

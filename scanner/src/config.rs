@@ -103,6 +103,24 @@ pub struct MlConfig {
     /// Cooldown de emissao por rota para evitar spam/dedup no layer serving.
     #[serde(default = "default_recommendation_cooldown_s")]
     pub recommendation_cooldown_s: u32,
+
+    /// Política operacional de retenção física do dataset em disco.
+    /// Separada das janelas de treino/calibração porque retenção e
+    /// lookback estatístico não são a mesma coisa.
+    #[serde(default)]
+    pub retention: MlRetentionConfig,
+
+    /// Compactação de partições fechadas para Parquet/ZSTD.
+    /// Mantém o hot path em JSONL append-only e converte apenas quando
+    /// a partição horária fecha.
+    #[serde(default)]
+    pub parquet: MlParquetConfig,
+
+    /// Janelas efetivas de treino/calibração/archive do modelo.
+    /// Não deletam arquivos; definem a memória estatística que o
+    /// trainer deve privilegiar.
+    #[serde(default)]
+    pub windows: MlWindowConfig,
 }
 
 impl Default for MlConfig {
@@ -118,6 +136,124 @@ impl Default for MlConfig {
             label_floor_pct: default_label_floor_pct(),
             label_floors_pct: default_label_floors_pct(),
             recommendation_cooldown_s: default_recommendation_cooldown_s(),
+            retention: MlRetentionConfig::default(),
+            parquet: MlParquetConfig::default(),
+            windows: MlWindowConfig::default(),
+        }
+    }
+}
+
+/// Política de retenção física em disco para os datasets ML.
+///
+/// Defaults alinhados ao estado atual do projeto:
+/// - `raw`: 30d enquanto o schema/label ainda amadurece;
+/// - `accepted`: 30d para auditoria de trigger/recomendação;
+/// - `labeled`: 365d, pois é o ativo supervisionado central do ML.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MlRetentionConfig {
+    /// Ativa sweeper periódico de retenção.
+    #[serde(default = "default_retention_enabled")]
+    pub enabled: bool,
+
+    /// Cadência do sweeper em segundos. Default 1h.
+    #[serde(default = "default_retention_sweep_interval_s")]
+    pub sweep_interval_s: u64,
+
+    /// Guard-rail operacional: nunca tocar em partições das últimas N horas,
+    /// mesmo que o TTL configurado seja agressivo. Protege contra clock skew,
+    /// escrita ainda em andamento e investigações recentes.
+    #[serde(default = "default_retention_keep_recent_hours")]
+    pub keep_recent_hours: u16,
+
+    /// TTL físico do dataset bruto pré-trigger.
+    #[serde(default = "default_raw_retention_days")]
+    pub raw_retention_days: u16,
+
+    /// TTL físico do dataset pós-trigger (`AcceptedSample`).
+    #[serde(default = "default_accepted_retention_days")]
+    pub accepted_retention_days: u16,
+
+    /// TTL físico do dataset supervisionado (`LabeledTrade`).
+    #[serde(default = "default_labeled_retention_days")]
+    pub labeled_retention_days: u16,
+
+    /// Modo observação: calcula e loga, mas não remove nada.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl Default for MlRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_retention_enabled(),
+            sweep_interval_s: default_retention_sweep_interval_s(),
+            keep_recent_hours: default_retention_keep_recent_hours(),
+            raw_retention_days: default_raw_retention_days(),
+            accepted_retention_days: default_accepted_retention_days(),
+            labeled_retention_days: default_labeled_retention_days(),
+            dry_run: false,
+        }
+    }
+}
+
+/// Política de compactação das partições horárias para Parquet/ZSTD.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MlParquetConfig {
+    /// Ativa compactação assíncrona de arquivos `.jsonl` fechados.
+    #[serde(default = "default_parquet_enabled")]
+    pub enabled: bool,
+
+    /// Remove o `.jsonl` após gerar o `.parquet` com sucesso.
+    #[serde(default = "default_parquet_delete_jsonl_after_success")]
+    pub delete_jsonl_after_success: bool,
+
+    /// Tamanho do batch Arrow usado na leitura do JSONL.
+    #[serde(default = "default_parquet_batch_size")]
+    pub batch_size: usize,
+
+    /// Nível do codec ZSTD do Parquet.
+    #[serde(default = "default_parquet_zstd_level")]
+    pub zstd_level: i32,
+}
+
+impl Default for MlParquetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_parquet_enabled(),
+            delete_jsonl_after_success: default_parquet_delete_jsonl_after_success(),
+            batch_size: default_parquet_batch_size(),
+            zstd_level: default_parquet_zstd_level(),
+        }
+    }
+}
+
+/// Janelas estatísticas do modelo.
+///
+/// Estas janelas não deletam dados. Elas codificam o consenso operacional:
+/// - treino principal privilegia uma janela rolling recente;
+/// - calibração de `P`/`IC` deve ser ainda mais recente;
+/// - archive de referência preserva caudas/regimes raros para auditoria.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MlWindowConfig {
+    /// Janela rolling primária do trainer.
+    #[serde(default = "default_train_window_days")]
+    pub train_window_days: u16,
+
+    /// Janela recente para calibração de P/T/IC.
+    #[serde(default = "default_calibration_window_days")]
+    pub calibration_window_days: u16,
+
+    /// Horizonte de referência para slices frios / regimes raros.
+    #[serde(default = "default_archive_reference_days")]
+    pub archive_reference_days: u16,
+}
+
+impl Default for MlWindowConfig {
+    fn default() -> Self {
+        Self {
+            train_window_days: default_train_window_days(),
+            calibration_window_days: default_calibration_window_days(),
+            archive_reference_days: default_archive_reference_days(),
         }
     }
 }
@@ -131,6 +267,19 @@ fn default_label_sweeper_interval_s()-> u64      { 10 }
 fn default_label_floor_pct()         -> f32      { 0.8 }
 fn default_label_floors_pct()        -> Vec<f32>  { vec![0.3, 0.5, 0.8, 1.2, 2.0, 3.0] }
 fn default_recommendation_cooldown_s()-> u32      { 60 }
+fn default_retention_enabled()       -> bool     { true }
+fn default_retention_sweep_interval_s() -> u64   { 3600 }
+fn default_retention_keep_recent_hours() -> u16  { 12 }
+fn default_raw_retention_days()      -> u16      { 30 }
+fn default_accepted_retention_days() -> u16      { 30 }
+fn default_labeled_retention_days()  -> u16      { 365 }
+fn default_parquet_enabled()         -> bool     { true }
+fn default_parquet_delete_jsonl_after_success() -> bool { true }
+fn default_parquet_batch_size()      -> usize    { 4096 }
+fn default_parquet_zstd_level()      -> i32      { 3 }
+fn default_train_window_days()       -> u16      { 90 }
+fn default_calibration_window_days() -> u16      { 21 }
+fn default_archive_reference_days()  -> u16      { 365 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VenueToggles {
@@ -300,6 +449,11 @@ mod tests {
         assert_eq!(cfg.broadcast_ms, 150);
         assert!(cfg.venues.is_enabled(Venue::BinanceSpot));
         assert!(cfg.venues.is_enabled(Venue::KucoinSpot));
+        assert!(cfg.ml.retention.enabled);
+        assert_eq!(cfg.ml.retention.raw_retention_days, 30);
+        assert!(cfg.ml.parquet.enabled);
+        assert_eq!(cfg.ml.parquet.zstd_level, 3);
+        assert_eq!(cfg.ml.windows.train_window_days, 90);
     }
 
     #[test]
@@ -331,5 +485,42 @@ kucoin       = true
         assert!(cfg.venues.is_enabled(Venue::KucoinSpot));
         // ignore t to silence unused-var lint
         let _ = t;
+    }
+
+    #[test]
+    fn nested_ml_policy_toml_parses() {
+        let t = r#"
+[ml]
+raw_decimation_mod = 7
+
+[ml.retention]
+enabled = true
+raw_retention_days = 14
+accepted_retention_days = 21
+labeled_retention_days = 400
+
+[ml.parquet]
+enabled = true
+delete_jsonl_after_success = true
+batch_size = 8192
+zstd_level = 6
+
+[ml.windows]
+train_window_days = 120
+calibration_window_days = 30
+archive_reference_days = 500
+"#;
+        let cfg: Config = toml::from_str(t).expect("parse");
+        assert_eq!(cfg.ml.raw_decimation_mod, 7);
+        assert_eq!(cfg.ml.retention.raw_retention_days, 14);
+        assert_eq!(cfg.ml.retention.accepted_retention_days, 21);
+        assert_eq!(cfg.ml.retention.labeled_retention_days, 400);
+        assert!(cfg.ml.parquet.enabled);
+        assert!(cfg.ml.parquet.delete_jsonl_after_success);
+        assert_eq!(cfg.ml.parquet.batch_size, 8192);
+        assert_eq!(cfg.ml.parquet.zstd_level, 6);
+        assert_eq!(cfg.ml.windows.train_window_days, 120);
+        assert_eq!(cfg.ml.windows.calibration_window_days, 30);
+        assert_eq!(cfg.ml.windows.archive_reference_days, 500);
     }
 }

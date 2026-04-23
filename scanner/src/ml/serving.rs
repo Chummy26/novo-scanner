@@ -567,7 +567,9 @@ impl MlServer {
 
         // Wave V — decimator em tiers.
         if let Some(raw_writer) = self.raw_writer.as_ref() {
-            let dr = self.raw_decimator.decide(route);
+            let dr = self
+                .raw_decimator
+                .decide_for_sample(route, now_ns, cycle_seq);
             if dr.should_persist {
                 let raw = RawSample::with_tier(
                     now_ns,
@@ -691,7 +693,9 @@ impl MlServer {
         //     se o decimator (com 3 tiers) aprovar. `sample_id` e
         //     `sampling_tier` inclusos no schema v3.
         let tier_snapshot = if let Some(raw_writer) = self.raw_writer.as_ref() {
-            let dr = self.raw_decimator.decide(route);
+            let dr = self
+                .raw_decimator
+                .decide_for_sample(route, now_ns, cycle_seq);
             if dr.should_persist {
                 let raw = RawSample::with_tier(
                     now_ns,
@@ -727,7 +731,9 @@ impl MlServer {
         } else {
             // Sem raw_writer, ainda calcula o tier para alimentar o label
             // resolver (correção B1 — label persiste mesmo sem raw).
-            let dr = self.raw_decimator.decide(route);
+            let dr = self
+                .raw_decimator
+                .decide_for_sample(route, now_ns, cycle_seq);
             Some((dr.tier, dr.probability))
         };
 
@@ -755,10 +761,18 @@ impl MlServer {
         let exit_p50_pre_observe = self.baseline.cache().quantile_exit(route, 0.50);
         let exit_p75_pre_observe = self.baseline.cache().quantile_exit(route, 0.75);
         let exit_p95_pre_observe = self.baseline.cache().quantile_exit(route, 0.95);
+        // PIT: duração histórica dos runs em que a saída teria satisfeito
+        // o floor primário dado o entry travado AGORA.
+        //
+        // Não use `entry(t)+exit(t)` simultâneo aqui: pela identidade da
+        // skill §2 isso é estruturalmente negativo e tornava `gross_run_*`
+        // nulo em massa. O threshold correto para o histórico de saída é:
+        //     exit >= label_floor - entry_locked(t0)
+        let exit_threshold_for_primary_floor = self.label_floor_pct - entry_spread;
         let (gross_run_p05_pre_observe, gross_run_p50_pre_observe, gross_run_p95_pre_observe) =
             self.baseline
                 .cache()
-                .gross_run_duration_quantiles(route, self.label_floor_pct)
+                .exit_run_duration_quantiles(route, exit_threshold_for_primary_floor)
                 .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
                 .unwrap_or((None, None, None));
         let listing_age_days_pre_observe = self.listing.listing_age_days(route, now_ns);
@@ -813,7 +827,7 @@ impl MlServer {
         // apenas Accept. Isso dá negativos supervisionáveis
         // (insufficient_history/below_tail) para abstenção sem contaminar
         // com low-volume operacional.
-        if let (Some(resolver), Some((tier, prob))) =
+        if let (Some(resolver), Some((tier, _raw_sampling_probability))) =
             (self.label_resolver.as_ref(), tier_snapshot)
         {
             if !clean {
@@ -854,9 +868,10 @@ impl MlServer {
                 gross_run_p95_s: gross_run_p95_pre_observe,
                 listing_age_days: listing_age_days_pre_observe,
             };
-            // `label_sampling_probability` é apenas a probabilidade do tier.
-            // Não tenta corrigir stride: a probabilidade efetiva depende da
-            // taxa observada de accepts por rota e deve ser estimada offline.
+            // Probabilidade efetiva do label é desconhecida online: o labeler
+            // usa stride por rota, então IPW correto depende da taxa observada
+            // de candidates/accepts por rota e deve ser estimado offline.
+            let label_sampling_probability = f32::NAN;
             let policy = PolicyMetadata {
                 baseline_model_version: self
                     .baseline
@@ -869,7 +884,7 @@ impl MlServer {
                 baseline_derived_exit_at_min: baseline_exit_at_min,
                 baseline_floor_pct: self.baseline.config().floor_pct,
                 label_stride_s: self.label_stride_s,
-                label_sampling_probability: prob,
+                label_sampling_probability,
             };
             let label_sample_id = accepted
                 .as_ref()
@@ -897,7 +912,7 @@ impl MlServer {
                 self.label_floors_pct.clone(),
                 policy,
                 tier.as_str(),
-                prob,
+                label_sampling_probability,
                 self.label_stride_s,
             );
         }
@@ -1398,6 +1413,7 @@ mod tests {
         // ADR-025 gate de aceitação #2 — com `modulus=1`, toda observação
         // passa pelo writer, independentemente do trigger aceitar.
         use crate::ml::persistence::{RawSampleWriter, RawWriterConfig};
+        use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -1407,6 +1423,10 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "test".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         });
         let task = tokio::spawn(writer.run());
 
@@ -1466,6 +1486,7 @@ mod tests {
         // ADR-025 gate de aceitação #3 — o veredito do trigger persistido
         // no RawSample deve ser idêntico ao retornado por on_opportunity.
         use crate::ml::persistence::{RawSampleWriter, RawWriterConfig};
+        use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -1475,6 +1496,10 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "pit".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         });
         let task = tokio::spawn(writer.run());
 
@@ -1515,12 +1540,17 @@ mod tests {
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().expect("tmpdir");
+        use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
         let (writer, handle) = LabeledJsonlWriter::create(LabeledWriterConfig {
             data_dir: tmp.path().to_path_buf(),
             channel_capacity: 1024,
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "neg-label".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         });
         let task = tokio::spawn(writer.run());
         let resolver = Arc::new(LabelResolver::new(
@@ -1573,12 +1603,17 @@ mod tests {
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().expect("tmpdir");
+        use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
         let (writer, handle) = LabeledJsonlWriter::create(LabeledWriterConfig {
             data_dir: tmp.path().to_path_buf(),
             channel_capacity: 1024,
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "pit-label".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
         });
         let task = tokio::spawn(writer.run());
         let resolver = Arc::new(LabelResolver::new(
@@ -1646,6 +1681,15 @@ mod tests {
         assert!(
             (label_entry_p50 - pre_entry_p50).abs() < 0.05,
             "features_t0 must use pre-observe p50; got {label_entry_p50}, pre was {pre_entry_p50}"
+        );
+        assert!(
+            v["features_t0"]["gross_run_p50_s"].as_u64().is_some(),
+            "gross_run_* deve ser derivado do run histórico de exit >= floor-entry(t0), não ficar nulo por usar gross simultâneo"
+        );
+        assert!(
+            v["sampling_probability"].is_null()
+                && v["policy_metadata"]["label_sampling_probability"].is_null(),
+            "probabilidade efetiva do label depende do stride por rota e deve ser estimada offline, não herdada do raw decimator"
         );
     }
 }

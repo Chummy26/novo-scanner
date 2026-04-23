@@ -12,30 +12,26 @@
 //! - [`raw_writer`] — `RawSampleWriter` paralelo ao `JsonlWriter`, mesma
 //!   semântica de rotação/flush, grava em `data/ml/raw_samples/`.
 //!
-//! # Escolha de formato: JSONL em vez de Parquet no MVP
+//! # Escolha de formato: JSONL no hot path, Parquet/ZSTD após fechamento
 //!
-//! O `DATASET_ACTION_PLAN.md` Fase 1 recomendou Parquet. No MVP,
-//! escolhemos **JSONL (one JSON object per line)** com rotação horária.
-//! Racional:
+//! O scanner continua escrevendo **JSONL append-only** no hot path e
+//! compacta a partição horária fechada para **Parquet/ZSTD**. Racional:
 //!
-//! 1. **Zero dependências novas** — scanner já tem `serde_json`. Parquet
-//!    adiciona `arrow` + `parquet` crates (~20 MB binary, 100+ deps
-//!    transitivos).
-//! 2. **Trainer Python consome trivialmente** — `pandas.read_json(path,
-//!    lines=True)` em 1 linha; ou `pyarrow.json.read_json` quando scale
-//!    justificar.
-//! 3. **Migração para Parquet é 1-líner depois** — mesmo schema, mesmo
-//!    writer task; só troca formato de output em Marco 2 quando pipeline
-//!    Python exigir.
-//! 4. **Storage aceitável**: ~200 B/sample uncompressed, 6.7×10⁶
-//!    samples/90d = ~1.3 GB. Gzip comprime ~5–10×. Tolerável.
+//! 1. **Persistência simples e robusta** durante o ciclo atual — só
+//!    append/flush no arquivo aberto.
+//! 2. **Compressão colunar real** após fechamento — melhor custo de disco
+//!    e melhor leitura offline para treino/auditoria.
+//! 3. **Mesmo schema lógico** entre produtor e consumidor — o compactor lê
+//!    o JSONL já emitido e grava Parquet sem reabrir a semântica do dataset.
 //!
-//! Em Marco 2, ao trocar para Parquet, o *mesmo* schema de `AcceptedSample`
-//! é mapeado para Arrow RecordBatch. Zero mudança no produtor (MlServer).
+//! O produtor (`MlServer`) continua agnóstico ao formato final. A camada de
+//! persistência é que decide se a partição fechada fica em `.jsonl`,
+//! `.parquet`, ou ambos.
 
 pub mod label_resolver;
 pub mod labeled_trade;
 pub mod labeled_writer;
+pub mod parquet_compactor;
 pub mod raw_sample;
 pub mod raw_writer;
 pub mod route_ranking;
@@ -46,6 +42,9 @@ pub mod writer;
 pub use label_resolver::{
     LabelResolver, PendingHorizon, PendingLabel, ResolverConfig, ResolverMetrics,
     DEFAULT_HORIZONS_S,
+};
+pub use parquet_compactor::{
+    compact_existing_jsonl_in_tree, compact_jsonl_file, DatasetKind, ParquetCompactionConfig,
 };
 pub use labeled_trade::{
     CensorReason, FeaturesT0, LabelOutcome, LabeledTrade, PolicyMetadata,

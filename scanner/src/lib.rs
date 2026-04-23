@@ -16,6 +16,7 @@ pub use error::{Error, Result};
 
 use std::sync::Arc;
 use std::time::Duration;
+use std::path::PathBuf;
 
 use tracing::{info, warn};
 
@@ -30,9 +31,12 @@ use crate::ml::contract::RouteId;
 use crate::ml::feature_store::HotQueryCache;
 use crate::ml::metrics::MlPrometheusMetrics;
 use crate::ml::persistence::{
-    JsonlWriter, LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, RawSampleWriter,
-    RawWriterConfig, ResolverConfig, RouteDecimator, RouteRanking, WriterConfig, WriterHandle,
-    WriterSendError,
+    compact_existing_jsonl_in_tree, DatasetKind, JsonlWriter, LabelResolver, LabeledJsonlWriter,
+    LabeledWriterConfig, ParquetCompactionConfig, RawSampleWriter, RawWriterConfig, ResolverConfig,
+    RouteDecimator, RouteRanking, WriterConfig, WriterHandle, WriterSendError,
+};
+use crate::ml::retention::{
+    sweep_datasets, DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy,
 };
 use crate::ml::serving::MlServer;
 use crate::ml::trigger::SamplingTrigger;
@@ -50,10 +54,68 @@ fn route_decimator_from_ml_config(ml: &config::MlConfig) -> RouteDecimator {
     RouteDecimator::with_modulus(ml.raw_decimation_mod.max(1))
 }
 
+fn parquet_compaction_from_ml_config(
+    ml: &config::MlConfig,
+) -> anyhow::Result<ParquetCompactionConfig> {
+    if ml.parquet.batch_size == 0 {
+        anyhow::bail!("ml.parquet.batch_size must be >= 1");
+    }
+    if !(1..=22).contains(&ml.parquet.zstd_level) {
+        anyhow::bail!("ml.parquet.zstd_level must be in [1, 22]");
+    }
+    Ok(ParquetCompactionConfig {
+        enabled: ml.parquet.enabled,
+        delete_jsonl_after_success: ml.parquet.delete_jsonl_after_success,
+        batch_size: ml.parquet.batch_size,
+        zstd_level: ml.parquet.zstd_level,
+    })
+}
+
+async fn compact_existing_partitions(
+    root: PathBuf,
+    dataset_kind: DatasetKind,
+    parquet: ParquetCompactionConfig,
+    dataset_name: &'static str,
+) {
+    let root_for_task = root.clone();
+    match tokio::task::spawn_blocking(move || {
+        compact_existing_jsonl_in_tree(&root_for_task, dataset_kind, &parquet)
+    })
+    .await
+    {
+        Ok(Ok(n)) if n > 0 => {
+            info!(dataset = dataset_name, compacted = n, root = %root.display(), "startup parquet sweep compactou partições órfãs");
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            warn!(dataset = dataset_name, error = %e, root = %root.display(), "startup parquet sweep falhou");
+        }
+        Err(e) => {
+            warn!(dataset = dataset_name, error = %e, root = %root.display(), "startup parquet sweep join falhou");
+        }
+    }
+}
+
 /// Top-level entry point. Wires: discovery → book store → adapters →
 /// spread engine → broadcast server.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     obs::Metrics::init();
+
+    let model_window_policy = ModelWindowPolicy::from(&cfg.ml.windows);
+    model_window_policy
+        .validate()
+        .map_err(|e| Error::Config(format!("ml.windows: {}", e)))?;
+    let parquet_compaction = parquet_compaction_from_ml_config(&cfg.ml)
+        .map_err(|e| Error::Config(format!("ml.parquet: {}", e)))?;
+    info!(
+        train_window_days = model_window_policy.train_window_days,
+        calibration_window_days = model_window_policy.calibration_window_days,
+        archive_reference_days = model_window_policy.archive_reference_days,
+        parquet_enabled = parquet_compaction.enabled,
+        parquet_batch_size = parquet_compaction.batch_size,
+        parquet_zstd_level = parquet_compaction.zstd_level,
+        "ML window policy carregada"
+    );
 
     // --- Symbol discovery (REST, parallel per-venue) ---
     let http = reqwest::Client::builder()
@@ -130,7 +192,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // Fix pós-auditoria: log ABSOLUTO do path data_dir no startup.
     // Default é relativo ("data/ml/..."), dependendo do CWD — primeira
     // coleta podia "sumir" silenciosamente no disco errado.
-    let raw_writer_cfg = RawWriterConfig::default();
+    let mut raw_writer_cfg = RawWriterConfig::default();
+    raw_writer_cfg.parquet = parquet_compaction.clone();
     let raw_writer_abs = std::env::current_dir()
         .map(|cwd| cwd.join(&raw_writer_cfg.data_dir))
         .unwrap_or_else(|_| raw_writer_cfg.data_dir.clone());
@@ -139,12 +202,20 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         cap = raw_writer_cfg.channel_capacity,
         "ML raw writer — path absoluto"
     );
+    compact_existing_partitions(
+        raw_writer_abs.clone(),
+        DatasetKind::RawSamples,
+        raw_writer_cfg.parquet.clone(),
+        "raw_samples",
+    )
+    .await;
     let (ml_raw_writer, ml_raw_writer_handle) =
         RawSampleWriter::create(raw_writer_cfg);
     tokio::spawn(async move { ml_raw_writer.run().await; });
 
     // --- Wave V: Labeled trade writer + resolver + ranker ---
-    let labeled_writer_cfg = LabeledWriterConfig::default();
+    let mut labeled_writer_cfg = LabeledWriterConfig::default();
+    labeled_writer_cfg.parquet = parquet_compaction.clone();
     let labeled_writer_abs = std::env::current_dir()
         .map(|cwd| cwd.join(&labeled_writer_cfg.data_dir))
         .unwrap_or_else(|_| labeled_writer_cfg.data_dir.clone());
@@ -153,6 +224,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         cap = labeled_writer_cfg.channel_capacity,
         "ML labeled-trade writer — path absoluto"
     );
+    compact_existing_partitions(
+        labeled_writer_abs.clone(),
+        DatasetKind::LabeledTrades,
+        labeled_writer_cfg.parquet.clone(),
+        "labeled_trades",
+    )
+    .await;
     let label_flush_interval = labeled_writer_cfg.flush_interval;
     let (labeled_writer, labeled_handle) = LabeledJsonlWriter::create(labeled_writer_cfg);
     tokio::spawn(async move { labeled_writer.run().await; });
@@ -317,7 +395,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // amortece picos de ~100 min a 17 req/s.
     //
     // Fix pós-auditoria: log ABSOLUTO do path.
-    let writer_cfg = WriterConfig::default();
+    let mut writer_cfg = WriterConfig::default();
+    writer_cfg.parquet = parquet_compaction;
     let writer_abs = std::env::current_dir()
         .map(|cwd| cwd.join(&writer_cfg.data_dir))
         .unwrap_or_else(|_| writer_cfg.data_dir.clone());
@@ -326,8 +405,88 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         cap = writer_cfg.channel_capacity,
         "ML accepted writer — path absoluto"
     );
+    compact_existing_partitions(
+        writer_abs.clone(),
+        DatasetKind::AcceptedSamples,
+        writer_cfg.parquet.clone(),
+        "accepted_samples",
+    )
+    .await;
     let (ml_writer, ml_writer_handle) = JsonlWriter::create(writer_cfg);
     tokio::spawn(async move { ml_writer.run().await; });
+
+    // --- Dataset retention policy ---
+    // Persistência física != janela estatística do modelo. O runtime
+    // mantém TTL operacional por camada; o trainer usa a política de
+    // `ml.windows` para escolher lookback/calibração.
+    {
+        let retention_policy = DatasetRetentionPolicy::from(&cfg.ml.retention);
+        let managed = vec![
+            ManagedDataset {
+                name: "raw_samples",
+                root: raw_writer_abs.clone(),
+                retention_days: cfg.ml.retention.raw_retention_days,
+            },
+            ManagedDataset {
+                name: "accepted_samples",
+                root: writer_abs.clone(),
+                retention_days: cfg.ml.retention.accepted_retention_days,
+            },
+            ManagedDataset {
+                name: "labeled_trades",
+                root: labeled_writer_abs.clone(),
+                retention_days: cfg.ml.retention.labeled_retention_days,
+            },
+        ];
+        retention_policy
+            .validate(&managed)
+            .map_err(|e| Error::Config(format!("ml.retention: {}", e)))?;
+        info!(
+            enabled = retention_policy.enabled,
+            dry_run = retention_policy.dry_run,
+            sweep_interval_s = retention_policy.sweep_interval.as_secs(),
+            keep_recent_hours = retention_policy.keep_recent_hours,
+            raw_retention_days = cfg.ml.retention.raw_retention_days,
+            accepted_retention_days = cfg.ml.retention.accepted_retention_days,
+            labeled_retention_days = cfg.ml.retention.labeled_retention_days,
+            "ML retention policy carregada"
+        );
+        if retention_policy.enabled {
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(retention_policy.sweep_interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tick.tick().await;
+                    let managed = managed.clone();
+                    let policy = retention_policy.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        sweep_datasets(&managed, &policy, std::time::SystemTime::now())
+                    })
+                    .await
+                    {
+                        Ok(Ok(report)) => {
+                            info!(
+                                removed = %report.summary_line(),
+                                total_removed = %crate::ml::retention::human_bytes(
+                                    report.total_removed_bytes()
+                                ),
+                                total_kept = %crate::ml::retention::human_bytes(
+                                    report.total_kept_bytes()
+                                ),
+                                "ML retention sweep concluído"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "ML retention sweep falhou");
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "ML retention task join falhou");
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     // --- Spread engine loop (150ms) ---
     let u_engine  = Arc::clone(&universe);
@@ -762,5 +921,21 @@ mod tests {
         let decimator = super::route_decimator_from_ml_config(&ml);
 
         assert_eq!(decimator.modulus(), 7);
+    }
+
+    #[test]
+    fn parquet_compaction_uses_configured_policy() {
+        let mut ml = crate::config::MlConfig::default();
+        ml.parquet.enabled = true;
+        ml.parquet.delete_jsonl_after_success = true;
+        ml.parquet.batch_size = 8192;
+        ml.parquet.zstd_level = 6;
+
+        let parquet = super::parquet_compaction_from_ml_config(&ml).expect("parquet cfg");
+
+        assert!(parquet.enabled);
+        assert!(parquet.delete_jsonl_after_success);
+        assert_eq!(parquet.batch_size, 8192);
+        assert_eq!(parquet.zstd_level, 6);
     }
 }

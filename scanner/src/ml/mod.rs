@@ -39,6 +39,7 @@ pub mod feature_store;
 pub mod listing_history;
 pub mod metrics;
 pub mod persistence;
+pub mod retention;
 pub mod serving;
 pub mod trigger;
 
@@ -60,3 +61,6 @@ pub use broadcast::{BroadcasterMetrics, RecommendationBroadcaster, Recommendatio
 pub use dto::{RecommendationDto, TradeSetupDto, TacticalSignalDto};
 pub use economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome, WindowMetrics};
 pub use eval::{verify_tradesetup, InvariantError};
+pub use retention::{
+    DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy, RetentionSweepReport,
+};

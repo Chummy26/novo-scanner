@@ -40,7 +40,10 @@ use crate::ml::contract::RouteId;
 /// multi-threshold. Mantem os campos first-hit primarios por compatibilidade,
 /// mas permite treinar P(exit >= floor | state, floor) sem congelar o modelo
 /// em um unico floor global.
-pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 4;
+/// v5 (2026-04-23): `gross_run_*` passa a significar run histórico de
+/// `exit >= label_floor - entry_locked(t0)`; `sampling_probability` do label
+/// serializa null quando a probabilidade efetiva depende do stride por rota.
+pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 5;
 
 /// Scanner version — mesma convenção dos outros schemas.
 pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -97,6 +100,10 @@ pub struct FeaturesT0 {
     pub exit_p50_24h: Option<f32>,
     pub exit_p75_24h: Option<f32>,
     pub exit_p95_24h: Option<f32>,
+    /// Duração histórica de janelas em que `entry_locked(t0) + exit_hist`
+    /// teria atingido o `label_floor_pct` primário. Computado como run de
+    /// `exit_hist >= label_floor_pct - entry_locked(t0)`, não como
+    /// `entry(t)+exit(t)` simultâneo.
     pub gross_run_p05_s: Option<u32>,
     pub gross_run_p50_s: Option<u32>,
     pub gross_run_p95_s: Option<u32>,
@@ -113,11 +120,12 @@ pub struct PolicyMetadata {
     pub baseline_derived_exit_at_min: Option<f32>,
     pub baseline_floor_pct: f32,
     pub label_stride_s: u32,
-    /// Probabilidade do tier de persistência, não IPW total do label.
-    /// O stride é informado separadamente em `label_stride_s`; trainer
-    /// offline deve estimar probabilidade efetiva por rota/horizonte a
-    /// partir da taxa observada de candidates/accepts, não assumir
-    /// `tier_prob / stride_s`.
+    /// Probabilidade efetiva do label quando conhecida.
+    ///
+    /// No runtime atual, o labeler usa stride por rota, não amostragem
+    /// Bernoulli independente. A probabilidade efetiva depende da taxa
+    /// observada de candidates por rota/horizonte; quando não for conhecida
+    /// online, serializa como `null` e o trainer deve estimar offline.
     pub label_sampling_probability: f32,
 }
 
@@ -181,7 +189,8 @@ pub struct LabeledTrade {
     // Policy metadata (não é target)
     pub policy_metadata: PolicyMetadata,
 
-    // Decimação (mesmo schema de RawSample)
+    // Contexto de tier bruto. `sampling_probability` pode ser null quando
+    // a probabilidade efetiva do label depende do stride por rota.
     pub sampling_tier: &'static str,
     pub sampling_probability: f32,
 }
@@ -473,7 +482,7 @@ mod tests {
         assert_eq!(v["sample_id"], "abcdef0123456789abcdef0123456789");
         assert_eq!(v["sample_decision"], "accept");
         assert_eq!(v["horizon_s"], 900);
-        assert_eq!(v["schema_version"], 4);
+        assert_eq!(v["schema_version"], 5);
         assert_eq!(v["symbol_name"], "BTC-USDT");
         assert_eq!(v["entry_locked_pct"], 2.5);
         assert_eq!(v["outcome"], "realized");
