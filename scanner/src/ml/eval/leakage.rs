@@ -95,15 +95,49 @@ pub fn run_full_audit() -> LeakageAuditReport {
         )
     };
 
-    let ast_feature_audit = if source_lacks_any(
-        include_str!("../baseline/ecdf.rs"),
-        &["sample_decision", "was_recommended", "outcome", "pnl"],
-    ) {
-        LeakageTestResult::Pass
-    } else {
-        LeakageTestResult::Fail(
-            "baseline feature path references output-side fields".into(),
-        )
+    // Fix B5 + B10: AST audit estendido para serving.rs (onde FeaturesT0 é
+    // montado) + lista proibida expandida cobrindo campos hindsight.
+    const FORBIDDEN: &[&str] = &[
+        "sample_decision",
+        "was_recommended",
+        "baseline_recommended",
+        "outcome",
+        "realized",
+        "audit_hindsight_best_exit",
+        "audit_hindsight_best_gross",
+        "audit_hindsight_t_to_best",
+        "n_clean_future_samples",
+        "first_exit_ge_label_floor",
+        "t_to_first_hit_s",
+        "censor_reason",
+        "pnl",
+    ];
+    // O scan em serving.rs procura apenas ocorrências DENTRO do literal
+    // `FeaturesT0 { ... }`; o match atual é conservador (substring simples
+    // sobre o arquivo inteiro) e tolera referências a esses nomes em
+    // outros contextos. Parser AST via `syn` seria ideal mas adiciona dep;
+    // a lista atual cobre o vetor-ataque principal (cópia errante
+    // atribuindo um desses campos ao FeaturesT0).
+    let ast_feature_audit = {
+        let ecdf_ok = source_lacks_any(include_str!("../baseline/ecdf.rs"), FORBIDDEN);
+        // serving.rs contém referências LEGAIS (policy_metadata, outcome em
+        // resolve_route) — não podemos usar `source_lacks_any` ingenuamente.
+        // Em vez disso, verificamos que o literal `FeaturesT0 {` não é seguido
+        // por nenhum dos identificadores proibidos dentro de janela de 2000
+        // bytes (tamanho típico do bloco de construção).
+        let serving_src = include_str!("../serving.rs");
+        let serving_ok = features_t0_literal_free_of(serving_src, FORBIDDEN);
+        if ecdf_ok && serving_ok {
+            LeakageTestResult::Pass
+        } else if !ecdf_ok {
+            LeakageTestResult::Fail(
+                "baseline feature path references output-side fields".into(),
+            )
+        } else {
+            LeakageTestResult::Fail(
+                "serving.rs FeaturesT0 literal contains forbidden output-side field".into(),
+            )
+        }
     };
 
     let dataset_wide_statistics = if source_lacks_any(
@@ -136,6 +170,31 @@ pub fn run_full_audit() -> LeakageAuditReport {
 
 fn source_lacks_any(source: &str, needles: &[&str]) -> bool {
     needles.iter().all(|needle| !source.contains(needle))
+}
+
+/// Fix B5: verifica que o literal `FeaturesT0 { ... }` não contém nenhum dos
+/// identificadores proibidos dentro da janela de 2000 bytes pós-abertura.
+/// Conservador — não é AST parsing completo, mas cobre o vetor principal
+/// de leakage (cópia errante de campo).
+fn features_t0_literal_free_of(source: &str, needles: &[&str]) -> bool {
+    const WINDOW: usize = 2000;
+    let pattern = "FeaturesT0 {";
+    let mut idx = 0;
+    while let Some(found) = source[idx..].find(pattern) {
+        let start = idx + found + pattern.len();
+        let end = (start + WINDOW).min(source.len());
+        let block = &source[start..end];
+        // Procura o `}` de fechamento do literal dentro do WINDOW.
+        let close = block.find('}').map(|p| start + p + 1).unwrap_or(end);
+        let literal = &source[start..close];
+        for needle in needles {
+            if literal.contains(needle) {
+                return false;
+            }
+        }
+        idx = close;
+    }
+    true
 }
 
 fn temporal_ordering_guard() -> bool {

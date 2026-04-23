@@ -80,12 +80,42 @@ pub struct BaselineDiagnostics {
     pub historical_base_rate_ci: (f32, f32),
 }
 
+/// Fonte canônica da recomendação (fix D15).
+///
+/// Antes inferido por `!model_version.starts_with("baseline-")` em `serving.rs`,
+/// o que quebrava silenciosamente em nomenclatura experimental (ex:
+/// `"a3-stablenet-0.3.0"`). Enum explícito evita ambiguidade no gate 7
+/// (modelo vs baseline).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    /// Modelo ML real (QRF+CatBoost+RSF ou sucessor).
+    Model,
+    /// Baseline A3 ECDF emitindo em shadow mode.
+    Baseline,
+    /// Modelo falhou (circuit breaker) e baseline A3 está ativo como fallback.
+    Fallback,
+}
+
+impl SourceKind {
+    pub fn is_model(self) -> bool {
+        matches!(self, SourceKind::Model)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SourceKind::Model => "model",
+            SourceKind::Baseline => "baseline",
+            SourceKind::Fallback => "fallback",
+        }
+    }
+}
+
 /// Recomendação acionável emitida para uma rota no instante `t0`.
 ///
 /// Semântica central alinhada ao CLAUDE.md:
 /// - `entry_now`: `S_entrada(t0)` observado/cotado e aceito como entrada agora.
 /// - `exit_target`: threshold futuro de `S_saída(t1)`.
-/// - `gross_profit_target`: `entry_now + exit_target` em spread bruto cotado.
+/// - `gross_profit_central`: `entry_now + exit_q50` (quantil mediano, fix D1).
 /// - `p_hit`: probabilidade condicional calibrada de atingir `exit_target`.
 /// - `t_hit_*`: distribuição de tempo até atingir `exit_target`.
 ///
@@ -98,9 +128,27 @@ pub struct TradeSetup {
     // --- Output central ---------------------------------------------------
     pub entry_now: f32,
     pub exit_target: f32,
+    /// Lucro bruto central derivado do quantil mediano: `entry_now + exit_q50`.
+    /// Fix D1: antes `gross_profit_target = entry_now + exit_target`, o que
+    /// viola CLAUDE.md §Output "L = enter + exit_q50; não duplica incerteza".
+    /// Quando `exit_q50` é `None`, fallback para `entry_now + exit_target` por
+    /// compat; invariante `eval::verify_tradesetup` exige igualdade com
+    /// `exit_q50` quando este existe.
     pub gross_profit_target: f32,
     pub p_hit: Option<f32>,
     pub p_hit_ci: Option<(f32, f32)>,
+    /// Método usado para construir `p_hit_ci` (fix D2).
+    ///
+    /// Convenções:
+    /// - `"wilson_marginal"` — baseline A3 ECDF; IC via Wilson 1927 sobre base
+    ///   rate histórica 24h. Assintótico, não distribution-free.
+    /// - `"conformal_split"` — split conformal (Angelopoulos & Bates 2022
+    ///   arXiv:2107.07511) sobre resíduos do calibration tracker. Honesto sob
+    ///   exchangeability.
+    /// - `"conformal_weighted"` — weighted CPS (Jonkers et al. 2024
+    ///   arXiv:2404.15018) sob covariate shift.
+    /// - `"none"` — sem IC (p_hit_ci = None).
+    pub ci_method: &'static str,
 
     // --- Distribuição opcional exibida no painel expandido ---------------
     pub exit_q25: Option<f32>,
@@ -123,6 +171,12 @@ pub struct TradeSetup {
     pub cluster_size: u8,
     /// Ranking desta rota dentro do cluster (1 = melhor).
     pub cluster_rank: u8,
+    /// Status explícito da detecção de cluster (fix D3).
+    ///
+    /// `"not_implemented"` quando o detector correlacional ainda não está
+    /// ativo — `cluster_id=None, cluster_size=1, cluster_rank=1` são literais
+    /// placeholder. Força `calibration_status=Degraded` nesse caso.
+    pub cluster_detection_status: &'static str,
 
     // --- Status da calibração --------------------------------------------
     pub calibration_status: CalibStatus,
@@ -130,6 +184,8 @@ pub struct TradeSetup {
     // --- Metadata --------------------------------------------------------
     pub reason: TradeReason,
     pub model_version: String,
+    /// Fonte canônica (fix D15) — substitui prefix match frágil em serving.rs.
+    pub source_kind: SourceKind,
     /// Instante da emissão (nanosegundos desde UNIX_EPOCH).
     pub emitted_at: u64,
     /// Instante até quando a recomendação é válida.
@@ -140,10 +196,12 @@ pub struct TradeSetup {
 // Razões de abstenção (ADR-005, T5)
 // ---------------------------------------------------------------------------
 
-/// Quatro categorias mutuamente exclusivas para não emissão.
+/// Categorias mutuamente exclusivas para não emissão (fix D12 documenta
+/// `LongTail` como subtipo de abstenção com diagnóstico específico; fix E4
+/// adiciona `Cooldown` para bloqueio temporário pós-emissão legítima).
 ///
 /// Precedência (quando múltiplas aplicam simultaneamente):
-/// `InsufficientData > LongTail > LowConfidence > NoOpportunity`.
+/// `InsufficientData > LongTail > LowConfidence > Cooldown > NoOpportunity`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbstainReason {
     /// Nenhuma tupla `(enter_at, exit_at)` viável atinge o floor de
@@ -160,6 +218,12 @@ pub enum AbstainReason {
     /// — spike event, hack, exchange manipulation. Modelo não treinou
     /// para este regime.
     LongTail,
+    /// Cooldown pós-emissão — rota teve `Trade` emitido recentemente e a
+    /// política operacional bloqueia re-emissão dentro da janela
+    /// `recommendation_cooldown_ns` (fix E4). Distinto de `NoOpportunity`:
+    /// não significa que o sinal sumiu, significa que o operador já foi
+    /// avisado e UI não deve repetir a notificação.
+    Cooldown,
 }
 
 /// Diagnóstico estruturado acompanhando abstenção.
@@ -202,13 +266,58 @@ pub enum CalibStatus {
 
 /// Razão categorizada para operador entender *por que* esta recomendação.
 ///
-/// Quatro categorias simples (Q3 F-UX5 F-UX1 — SHAP fica offline). UI pode
-/// mapear em ícones e `reason_detail` adiciona uma linha de explicação.
+/// Quatro categorias simples (Q3 F-UX5 F-UX1 — SHAP fica offline). UI mapeia
+/// em ícones; `ReasonDetail` expõe apenas números determinísticos (fix D17)
+/// para respeitar CLAUDE.md §Output "nenhuma prosa qualitativa se não for
+/// derivada deterministicamente dos números".
 #[derive(Debug, Clone, PartialEq)]
 pub struct TradeReason {
     pub kind: ReasonKind,
-    /// Uma linha curta de contexto (ex: "regime dispersão + cauda").
-    pub detail: String,
+    pub detail: ReasonDetail,
+}
+
+/// Detalhe estruturado da razão — zero prosa, apenas números auditáveis.
+///
+/// UI renderiza texto a partir destes campos; não há free-form string que
+/// possa divergir do que os números dizem.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReasonDetail {
+    /// Percentil empírico de `entry_now` na ECDF 24h da rota (0..1).
+    /// `None` quando histórico insuficiente.
+    pub entry_percentile_24h: Option<f32>,
+    /// Máximo do `regime_posterior` [calm, opportunity, event].
+    pub regime_posterior_top: f32,
+    /// Índice do regime dominante (0=calm, 1=opportunity, 2=event).
+    pub regime_dominant_idx: u8,
+    /// Z-score robusto de `entry_now` vs mediana/MAD da janela 24h.
+    /// `None` quando histórico insuficiente.
+    pub tail_z_score: Option<f32>,
+}
+
+impl ReasonDetail {
+    pub fn placeholder() -> Self {
+        Self {
+            entry_percentile_24h: None,
+            regime_posterior_top: 1.0,
+            regime_dominant_idx: 0,
+            tail_z_score: None,
+        }
+    }
+}
+
+/// Compat para testes legados que construíam `detail: "...".into()`.
+/// Sempre retorna `placeholder()` — a string é ignorada (fix D17 proíbe
+/// prosa free-form). Caller novo deve construir `ReasonDetail` explicitamente.
+impl From<&str> for ReasonDetail {
+    fn from(_: &str) -> Self {
+        Self::placeholder()
+    }
+}
+
+impl From<String> for ReasonDetail {
+    fn from(_: String) -> Self {
+        Self::placeholder()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,9 +402,10 @@ mod tests {
             },
             entry_now: 2.0,
             exit_target: -1.0,
-            gross_profit_target: 1.0,
+            gross_profit_target: 1.0, // entry_now + exit_q50 = 2.0 + (-1.0)
             p_hit: Some(0.83),
             p_hit_ci: Some((0.77, 0.88)),
+            ci_method: "wilson_marginal",
             exit_q25: Some(-1.4),
             exit_q50: Some(-1.0),
             exit_q75: Some(-0.7),
@@ -307,17 +417,21 @@ mod tests {
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
-                detail: "test".into(),
+                detail: ReasonDetail::placeholder(),
             },
             model_version: "a2-test".into(),
+            source_kind: SourceKind::Model,
             emitted_at: 1_700_000_000_000_000_000,
             valid_until: 1_700_000_150_000_000_000,
         };
 
-        assert_eq!(setup.entry_now + setup.exit_target, setup.gross_profit_target);
+        // Fix D1: gross_profit_target deve equivaler a entry_now + exit_q50
+        // (não entry_now + exit_target); ambos coincidem aqui por construção.
+        assert_eq!(setup.entry_now + setup.exit_q50.unwrap(), setup.gross_profit_target);
         assert_eq!(setup.p_hit, Some(0.83));
         assert_eq!(setup.t_hit_median_s, Some(1680));
     }
@@ -373,9 +487,10 @@ mod tests {
             },
             entry_now: 2.00,
             exit_target: -1.00,
-            gross_profit_target: 1.00,
+            gross_profit_target: 1.00, // entry_now + exit_q50
             p_hit: Some(0.83),
             p_hit_ci: Some((0.77, 0.88)),
+            ci_method: "wilson_marginal",
             exit_q25: Some(-1.40),
             exit_q50: Some(-1.00),
             exit_q75: Some(-0.70),
@@ -403,12 +518,14 @@ mod tests {
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
-                detail: "test".into(),
+                detail: ReasonDetail::placeholder(),
             },
-            model_version: "0.1.0".into(),
+            model_version: "baseline-a3-0.2.0".into(),
+            source_kind: SourceKind::Baseline,
             emitted_at: 1_000_000_000_000_000_000,
             valid_until: 1_000_000_150_000_000_000,
         }
@@ -465,14 +582,18 @@ mod tests {
     }
 
     #[test]
-    fn invariant_identity_gross_median_approximately_enter_plus_exit() {
-        // Identidade contábil (skill §3): PnL = S_entrada(t₀) + S_saída(t₁).
+    fn invariant_identity_gross_central_equals_entry_plus_q50() {
+        // Fix D1: gross_profit_target deriva de `entry_now + exit_q50` (CLAUDE.md
+        // §Output "L = enter + exit_q50; não duplica incerteza"). Quando
+        // exit_q50 existe, é a identidade autoritativa; exit_target pode
+        // divergir (é alvo probabilístico distinto do quantil mediano).
         let s = valid_setup();
-        let identity = s.entry_now + s.exit_target;
+        let q50 = s.exit_q50.expect("q50 presente no valid_setup");
+        let identity = s.entry_now + q50;
         let delta = (s.gross_profit_target - identity).abs();
         assert!(
             delta < 1e-6,
-            "gross_target {} diverge de identity {} por {}",
+            "gross_target {} diverge de identity entry+q50 {} por {}",
             s.gross_profit_target, identity, delta
         );
     }

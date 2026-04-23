@@ -42,6 +42,15 @@ pub mod persistence;
 pub mod retention;
 pub mod serving;
 pub mod trigger;
+pub mod util;
+
+/// Versão única do scanner para todos os schemas de dataset (fix E5).
+///
+/// Antes existia uma `const SCANNER_VERSION` replicada em `raw_sample.rs`,
+/// `sample.rs` e `labeled_trade.rs`. Se um fosse alterado por engano (override
+/// local de teste, macro mal usada), records divergiam sem catch-all. A
+/// consolidação elimina essa classe inteira de bug.
+pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use contract::{
     AbstainDiagnostic,
@@ -49,9 +58,11 @@ pub use contract::{
     CalibStatus,
     EntryQuality,
     ExitQuality,
+    ReasonDetail,
     ReasonKind,
     Recommendation,
     RouteId,
+    SourceKind,
     TacticalSignal,
     TradeReason,
     TradeSetup,
@@ -60,7 +71,7 @@ pub use contract::{
 pub use broadcast::{BroadcasterMetrics, RecommendationBroadcaster, RecommendationFrame};
 pub use dto::{RecommendationDto, TradeSetupDto, TacticalSignalDto};
 pub use economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome, WindowMetrics};
-pub use eval::{verify_tradesetup, InvariantError};
+pub use eval::{verify_tradesetup, verify_tradesetup_with_floor, InvariantError, DEFAULT_P_HIT_EMISSION_FLOOR};
 pub use retention::{
     DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy, RetentionSweepReport,
 };

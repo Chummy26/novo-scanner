@@ -43,59 +43,84 @@ pub const DEFAULT_T_TRIGGER_MAX_S: u32 = 300;
 pub const DEFAULT_OPERATOR_ATTENTION_COST_USD: f64 = 0.10;
 
 /// Outcome resolvido de uma recomendação.
+///
+/// Fix D9: `enter_realized_pct` removido das variantes — skill §3.1 afirma
+/// que `S_entrada(t0)` é preço executado imutável após entrada. Campo
+/// vestigial confundia consumidores Python. PnL agora deriva de
+/// `setup.entry_now + exit_realized_pct`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TradeOutcome {
-    /// Entry E saída realizadas conforme regra.
+    /// Entry travado em t0 e saída realizada conforme regra.
     Realized {
-        enter_realized_pct: f32,
         exit_realized_pct: f32,
         horizon_observed_ms: u32,
     },
-    /// Variante legada: contrato atual entra em `entry_now`, então novos
-    /// eventos de `TradeSetup` não deveriam produzir WindowMiss.
+    /// Variante legada deprecated: contrato atual sempre entra em `entry_now`
+    /// imediatamente, então `WindowMiss` é estruturalmente inalcançável.
+    /// Mantida temporariamente apenas para JSONL serialização de runs antigos.
+    #[deprecated(note = "contrato atual entra em t0 — WindowMiss é inalcançável")]
     WindowMiss,
-    /// Entry hit, mas exit não em `T_max` — fechamento forçado no timeout.
-    ExitMiss {
-        enter_realized_pct: f32,
-        forced_exit_pct: f32,
-    },
+    /// Exit não atingiu threshold dentro de `T_max` — fechamento forçado.
+    ExitMiss { forced_exit_pct: f32 },
 }
 
 impl TradeOutcome {
-    /// PnL bruto % (enter_realized + exit_realized) dado o outcome.
-    /// `WindowMiss` = 0 (nunca executou).
-    pub fn gross_pnl_pct(&self) -> f32 {
+    /// PnL bruto percentual dado `entry_now` travado em t0.
+    ///
+    /// Fix D9: entry travado é parâmetro externo (do `TradeSetup`), não
+    /// campo interno do outcome.
+    pub fn gross_pnl_pct(&self, entry_locked_pct: f32) -> f32 {
+        #[allow(deprecated)]
         match *self {
-            TradeOutcome::Realized {
-                enter_realized_pct, exit_realized_pct, ..
-            } => enter_realized_pct + exit_realized_pct,
+            TradeOutcome::Realized { exit_realized_pct, .. } => entry_locked_pct + exit_realized_pct,
             TradeOutcome::WindowMiss => 0.0,
-            TradeOutcome::ExitMiss {
-                enter_realized_pct,
-                forced_exit_pct,
-            } => enter_realized_pct + forced_exit_pct,
+            TradeOutcome::ExitMiss { forced_exit_pct } => entry_locked_pct + forced_exit_pct,
         }
     }
 
-    /// PnL em USDT sobre `CAPITAL_HYPOTHETICAL_USD`.
-    pub fn gross_pnl_usd(&self) -> f64 {
-        (self.gross_pnl_pct() as f64 / 100.0) * CAPITAL_HYPOTHETICAL_USD
+    /// Valor indicativo bruto sobre `CAPITAL_HYPOTHETICAL_USD`.
+    ///
+    /// Fix D11: nome semântico — **não é PnL operacional real**. Capital
+    /// hipotético 10k USDT serve apenas como denominador de comparabilidade
+    /// (ADR-019). Fees, funding e slippage **não** estão incluídos — CLAUDE.md
+    /// §Fronteira ML proíbe modelar esses termos no ML.
+    pub fn indicative_gross_at_10k_ref_usd(&self, entry_locked_pct: f32) -> f64 {
+        (self.gross_pnl_pct(entry_locked_pct) as f64 / 100.0) * CAPITAL_HYPOTHETICAL_USD
     }
 }
 
 /// Evento registrado por emissão (recomendação + outcome resolvido).
+///
+/// Fix D7: inclui `sampling_probability` para Horvitz-Thompson 1952 correto
+/// na agregação `WindowMetrics`. Eventos allowlist (π=1.0) ponderam
+/// diferente de eventos Uniform (π=0.1); agregação ingênua enviesa para
+/// rotas priority sobre-representadas.
+///
+/// Fix D11: campo renomeado `gross_pnl_usd` → `indicative_gross_at_10k_ref_usd`
+/// para eliminar semântica falsa de "ganho operacional real" no dashboard.
 #[derive(Debug, Clone)]
 pub struct EconomicEvent {
     pub ts_emitted_ns: u64,
     pub ts_resolved_ns: u64,
     pub route_id: RouteId,
     pub model_version: String,
+    /// Fix D15: fonte canônica via enum, substituindo prefix match `!starts_with("baseline-")`.
+    pub source_kind: crate::ml::contract::SourceKind,
+    /// `entry_now` travado pelo `TradeSetup` em t0 (imutável, skill §3.1).
+    pub entry_locked_pct: f32,
     pub outcome: TradeOutcome,
-    /// PnL bruto % — cacheado para agregações rápidas.
+    /// Lucro bruto percentual (entry_locked + exit_realized). Cacheado.
     pub gross_pnl_pct: f32,
-    /// PnL em USDT sobre capital hipotético — cacheado.
-    pub gross_pnl_usd: f64,
-    /// `true` se foi recomendação do modelo A2; `false` se baseline A3.
+    /// Valor indicativo sobre 10k USDT de referência.
+    /// **NÃO é PnL operacional real** — fees/funding/slippage excluídos
+    /// (CLAUDE.md §Fronteira ML). Renomeado em fix D11.
+    pub indicative_gross_at_10k_ref_usd: f64,
+    /// Fix D7: probabilidade de amostragem Horvitz-Thompson (IPW).
+    /// NaN ⇒ trainer/agregador deve estimar offline.
+    pub sampling_probability: f32,
+    /// `true` se foi recomendação do modelo real; `false` se baseline/fallback.
+    /// Derivado de `source_kind.is_model()` — mantido para compat binário dos
+    /// consumidores JSONL mais antigos.
     pub from_model: bool,
     /// Forecast condicional calibrado do modelo para `P_hit`.
     ///
@@ -109,49 +134,59 @@ impl EconomicEvent {
         setup: &TradeSetup,
         outcome: TradeOutcome,
         resolved_ns: u64,
-        from_model: bool,
     ) -> Self {
-        let gross_pct = outcome.gross_pnl_pct();
+        Self::with_sampling_probability(setup, outcome, resolved_ns, f32::NAN)
+    }
+
+    /// Fix D7: construtor que registra `sampling_probability` para IPW.
+    pub fn with_sampling_probability(
+        setup: &TradeSetup,
+        outcome: TradeOutcome,
+        resolved_ns: u64,
+        sampling_probability: f32,
+    ) -> Self {
+        let gross_pct = outcome.gross_pnl_pct(setup.entry_now);
         Self {
             ts_emitted_ns: setup.emitted_at,
             ts_resolved_ns: resolved_ns,
             route_id: setup.route_id,
             model_version: setup.model_version.clone(),
+            source_kind: setup.source_kind,
+            entry_locked_pct: setup.entry_now,
             outcome,
             gross_pnl_pct: gross_pct,
-            gross_pnl_usd: (gross_pct as f64 / 100.0) * CAPITAL_HYPOTHETICAL_USD,
-            from_model,
+            indicative_gross_at_10k_ref_usd: (gross_pct as f64 / 100.0) * CAPITAL_HYPOTHETICAL_USD,
+            sampling_probability,
+            from_model: setup.source_kind.is_model(),
             p_hit_forecast: setup.p_hit,
         }
     }
 
     /// Serialização JSONL (persistência append-only `data/ml/economic/`).
     pub fn to_json_line(&self) -> String {
-        let (outcome_label, enter_r, exit_r, horizon) = match self.outcome {
+        #[allow(deprecated)]
+        let (outcome_label, exit_r, horizon) = match self.outcome {
             TradeOutcome::Realized {
-                enter_realized_pct,
                 exit_realized_pct,
                 horizon_observed_ms,
             } => (
                 "realized",
-                enter_realized_pct,
                 exit_realized_pct,
                 horizon_observed_ms as i32,
             ),
-            TradeOutcome::WindowMiss => ("window_miss", 0.0, 0.0, -1),
-            TradeOutcome::ExitMiss {
-                enter_realized_pct,
-                forced_exit_pct,
-            } => ("exit_miss", enter_realized_pct, forced_exit_pct, -1),
+            TradeOutcome::WindowMiss => ("window_miss", 0.0, -1),
+            TradeOutcome::ExitMiss { forced_exit_pct } => ("exit_miss", forced_exit_pct, -1),
         };
         format!(
             concat!(
                 r#"{{"ts_emitted_ns":{},"ts_resolved_ns":{},"#,
                 r#""symbol_id":{},"buy_venue":"{}","sell_venue":"{}","#,
-                r#""model_version":"{}","outcome":"{}","#,
-                r#""enter_realized_pct":{},"exit_realized_pct":{},"#,
+                r#""model_version":"{}","source_kind":"{}","outcome":"{}","#,
+                r#""entry_locked_pct":{},"exit_realized_pct":{},"#,
                 r#""horizon_observed_ms":{},"gross_pnl_pct":{},"#,
-                r#""gross_pnl_usd":{},"from_model":{}}}"#,
+                r#""indicative_gross_at_10k_ref_usd":{},"#,
+                r#""sampling_probability":{},"from_model":{},"#,
+                r#""disclaimer":"bruto sobre capital hipotético 10k; não inclui fees/funding/slippage"}}"#,
             ),
             self.ts_emitted_ns,
             self.ts_resolved_ns,
@@ -159,12 +194,14 @@ impl EconomicEvent {
             self.route_id.buy_venue.as_str(),
             self.route_id.sell_venue.as_str(),
             self.model_version,
+            self.source_kind.as_str(),
             outcome_label,
-            finite_or_null_f32(enter_r),
+            finite_or_null_f32(self.entry_locked_pct),
             finite_or_null_f32(exit_r),
             horizon,
             finite_or_null_f32(self.gross_pnl_pct),
-            finite_or_null_f64(self.gross_pnl_usd),
+            finite_or_null_f64(self.indicative_gross_at_10k_ref_usd),
+            finite_or_null_f32(self.sampling_probability),
             self.from_model,
         )
     }
@@ -261,57 +298,168 @@ pub struct EconomicMetrics {
 // BaseRateAccumulator (ECE bucket-based)
 // ---------------------------------------------------------------------------
 
-/// Acumulador de calibração de `P_hit`: 10 buckets em [0, 1].
+/// Buckets de horizonte para ECE condicional (fix D6).
 ///
-/// Para cada par `(P_hit, y_realized)` observado, coloca em
-/// `bucket = floor(p * 10)`. ECE (Expected Calibration Error) =
-/// `Σ |mid_conf − observed_freq| × (n_bucket / N)` — quanto menor,
-/// mais calibrado. DeGroot & Fienberg 1983 (reliability).
+/// Skill §3.2: multiplicidade de pares (t0, t1) significa que calibração deve
+/// ser avaliada por horizonte. Misturar setups de 30s vs 8h num único ECE
+/// viola DeGroot-Fienberg 1983 (reliability diagram assume condição idêntica).
 ///
-/// Uso: chamar `record(p_hit, y)` quando um `EconomicEvent` fechar.
-/// Chamar `ece()` para snapshot atual.
-#[derive(Debug, Default)]
+/// Grid log-uniforme: `< 60s | < 5min | < 30min | < 2h | >= 2h`.
+pub const HORIZON_BUCKETS_S: [u32; 5] = [60, 300, 1800, 7200, u32::MAX];
+
+/// Classifica `horizon_observed_ms` em bucket de horizonte (fix D6).
+#[inline]
+pub fn horizon_bucket_idx(horizon_observed_ms: u32) -> usize {
+    let horizon_s = horizon_observed_ms / 1000;
+    HORIZON_BUCKETS_S
+        .iter()
+        .position(|&threshold| horizon_s < threshold)
+        .unwrap_or(HORIZON_BUCKETS_S.len() - 1)
+}
+
+/// Janela de decay para ECE rolling (fix D8).
+///
+/// Sem decay, acumulador vitalício atenua drift: em 30 dias, um regime novo
+/// de 6h representa ~0.8% do total e não move ECE. Meta CLAUDE.md "ECE<0.10
+/// em janela 24h" requer decay. Half-life 24h via exponential weighting.
+pub const ECE_DECAY_HALF_LIFE_NS: u64 = 24 * 3600 * 1_000_000_000;
+
+/// Acumulador de calibração de `P_hit` com decay exponencial e segregação
+/// por horizonte (fixes D6 + D8).
+///
+/// Buckets: `[horizon_bucket; 5] × [p_decile; 10]`. Contadores em `f64`
+/// decaídos exponencialmente com half-life 24h para responder a drift.
+///
+/// DeGroot & Fienberg 1983 (reliability). Ao contrário do acumulador
+/// vitalício anterior, este limita janela efetiva e segrega condição de
+/// horizonte.
+#[derive(Debug)]
 pub struct CalibrationAccumulator {
-    /// `(n_emitted, n_realized)` por decil de `P_hit`.
-    /// bucket[0] = [0.0, 0.1), bucket[9] = [0.9, 1.0].
-    pub buckets: [(u64, u64); 10],
+    /// `(n_soft, k_soft)` por (horizon_bucket, p_decile). f64 para decay.
+    pub buckets: [[(f64, f64); 10]; 5],
+    /// Último timestamp de record para decay entre chamadas.
+    last_record_ns: u64,
+    /// Agregado sem segregação de horizonte — compat com API `ece()` global.
+    flat_buckets: [(u64, u64); 10],
+}
+
+impl Default for CalibrationAccumulator {
+    fn default() -> Self {
+        Self {
+            buckets: [[(0.0, 0.0); 10]; 5],
+            last_record_ns: 0,
+            flat_buckets: [(0, 0); 10],
+        }
+    }
 }
 
 impl CalibrationAccumulator {
+    /// Compat API — registra sem ts (sem decay). Use `record_at` em produção.
     pub fn record(&mut self, p_hit: f32, realized: bool) {
+        self.record_at(p_hit, realized, 0, self.last_record_ns + 1);
+    }
+
+    /// Registra observação com horizonte e timestamp (fix D6 + D8).
+    pub fn record_at(
+        &mut self,
+        p_hit: f32,
+        realized: bool,
+        horizon_observed_ms: u32,
+        now_ns: u64,
+    ) {
+        // Decay exponencial sobre buckets por horizonte.
+        if self.last_record_ns > 0 && now_ns > self.last_record_ns {
+            let dt_ns = now_ns - self.last_record_ns;
+            let decay = (-0.693147_f64 * (dt_ns as f64) / (ECE_DECAY_HALF_LIFE_NS as f64)).exp();
+            for h_row in self.buckets.iter_mut() {
+                for slot in h_row.iter_mut() {
+                    slot.0 *= decay;
+                    slot.1 *= decay;
+                }
+            }
+        }
+        self.last_record_ns = now_ns;
+
         let p = p_hit.clamp(0.0, 0.9999);
-        let idx = ((p * 10.0) as usize).min(9);
-        self.buckets[idx].0 = self.buckets[idx].0.saturating_add(1);
+        let p_idx = ((p * 10.0) as usize).min(9);
+        let h_idx = horizon_bucket_idx(horizon_observed_ms);
+
+        self.buckets[h_idx][p_idx].0 += 1.0;
         if realized {
-            self.buckets[idx].1 = self.buckets[idx].1.saturating_add(1);
+            self.buckets[h_idx][p_idx].1 += 1.0;
+        }
+        // Flat agregado — não-decaído para API antiga.
+        self.flat_buckets[p_idx].0 = self.flat_buckets[p_idx].0.saturating_add(1);
+        if realized {
+            self.flat_buckets[p_idx].1 = self.flat_buckets[p_idx].1.saturating_add(1);
         }
     }
 
-    /// Total de observações registradas.
+    /// Total de observações registradas (API legada via flat_buckets).
     pub fn total(&self) -> u64 {
-        self.buckets.iter().map(|(n, _)| *n).sum()
+        self.flat_buckets.iter().map(|(n, _)| *n).sum()
     }
 
-    /// Expected Calibration Error ∈ [0, 1].
+    /// Total decaído (soma sobre todos horizon buckets).
+    pub fn total_soft(&self) -> f64 {
+        self.buckets
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|(n, _)| *n)
+            .sum()
+    }
+
+    /// ECE global (agregado sobre horizontes) com decay ativo.
     ///
-    /// Retorna 0 se não há observações suficientes (< 10 amostras totais).
+    /// Fix D8: usa soft counts decaídos; meta "ECE<0.10 em 24h" computável.
     pub fn ece(&self) -> f32 {
-        let total = self.total();
-        if total < 10 {
+        let total = self.total_soft();
+        if total < 10.0 {
             return 0.0;
         }
-        let total_f = total as f32;
-        let mut ece = 0.0_f32;
-        for (i, (n, k)) in self.buckets.iter().enumerate() {
-            if *n == 0 {
+        let mut ece = 0.0_f64;
+        for (p_idx, p_bucket) in self.flat_buckets.iter().enumerate() {
+            // Agrega soft counts dos 5 horizon buckets no mesmo decil.
+            let (mut n_soft, mut k_soft) = (0.0_f64, 0.0_f64);
+            for h_row in self.buckets.iter() {
+                n_soft += h_row[p_idx].0;
+                k_soft += h_row[p_idx].1;
+            }
+            let _ = p_bucket;
+            if n_soft == 0.0 {
                 continue;
             }
-            let conf_mid = (i as f32 + 0.5) / 10.0;
-            let freq = (*k as f32) / (*n as f32);
-            let weight = (*n as f32) / total_f;
+            let conf_mid = (p_idx as f64 + 0.5) / 10.0;
+            let freq = k_soft / n_soft;
+            let weight = n_soft / total;
             ece += (conf_mid - freq).abs() * weight;
         }
-        ece
+        ece as f32
+    }
+
+    /// Fix D6: ECE por bucket de horizonte. Útil para detectar miscalibração
+    /// localizada (curto superconfiante + longo subconfiante se compensam no
+    /// ECE global).
+    pub fn ece_by_horizon_bucket(&self) -> [Option<f32>; 5] {
+        let mut out = [None; 5];
+        for (h_idx, h_row) in self.buckets.iter().enumerate() {
+            let total: f64 = h_row.iter().map(|(n, _)| *n).sum();
+            if total < 10.0 {
+                continue;
+            }
+            let mut ece = 0.0_f64;
+            for (p_idx, (n_soft, k_soft)) in h_row.iter().enumerate() {
+                if *n_soft == 0.0 {
+                    continue;
+                }
+                let conf_mid = (p_idx as f64 + 0.5) / 10.0;
+                let freq = k_soft / n_soft;
+                let weight = n_soft / total;
+                ece += (conf_mid - freq).abs() * weight;
+            }
+            out[h_idx] = Some(ece as f32);
+        }
+        out
     }
 
     /// Reliability diagram data — para dashboard.
@@ -320,8 +468,16 @@ impl CalibrationAccumulator {
     /// Wald é anti-conservativo em amostra pequena conforme Agresti-Coull 1998).
     /// Buckets com `n < 30` são marcados `unstable = true`.
     pub fn reliability_points(&self) -> Vec<ReliabilityPoint> {
+        self.reliability_points_with_min_n(RELIABILITY_BUCKET_MIN_N)
+    }
+
+    /// Fix E9: variante com threshold de estabilidade configurável.
+    pub fn reliability_points_with_min_n(&self, min_n: u64) -> Vec<ReliabilityPoint> {
+        // Fix D6: buckets agora são `[[(f64, f64); 10]; 5]` (segregado por
+        // horizon); `flat_buckets` mantém agregação por p_decile para a API
+        // global do reliability diagram.
         let mut pts = Vec::new();
-        for (i, (n, k)) in self.buckets.iter().enumerate() {
+        for (i, (n, k)) in self.flat_buckets.iter().enumerate() {
             if *n == 0 {
                 continue;
             }
@@ -334,7 +490,7 @@ impl CalibrationAccumulator {
                 n: *n,
                 ic_lower,
                 ic_upper,
-                unstable: *n < RELIABILITY_BUCKET_MIN_N,
+                unstable: *n < min_n,
             });
         }
         pts
@@ -344,6 +500,11 @@ impl CalibrationAccumulator {
 /// Threshold mínimo de amostras por bucket para considerar estatisticamente
 /// estável. Abaixo disso, a aproximação normal do Wilson IC perde acurácia e
 /// o gate de kill switch não deve disparar por ruído amostral.
+///
+/// Fix E9: Valor default (30) derivado de Student-t rule-of-thumb (CLT
+/// converge razoavelmente a partir desse tamanho). Operador pode sobrescrever
+/// via `reliability_points_with_min_n` para regimes heavy-tail (60+
+/// recomendado quando `tail_ratio_p99_p95 > 2`).
 pub const RELIABILITY_BUCKET_MIN_N: u64 = 30;
 
 /// Ponto do reliability diagram com IC de Wilson.
@@ -394,7 +555,10 @@ pub fn wilson_ci_95(n: u64, k: u64) -> (f32, f32) {
 
 impl EconomicAccumulator {
     pub fn new() -> Self {
-        Self::with_capacity(100_000)
+        // Fix E20: meta CLAUDE.md "ECE<0.10 em 24h" implica janela 24h ~3.7M
+        // eventos a 1 rec/min × 2600 rotas. 100k anterior truncava em ~40min.
+        // Elevamos para 4M para cobrir 24h com folga em regime estacionário.
+        Self::with_capacity(4_000_000)
     }
 
     pub fn with_capacity(max_events: usize) -> Self {
@@ -425,6 +589,7 @@ impl EconomicAccumulator {
     pub fn push(&mut self, evt: EconomicEvent) {
         self.metrics.n_emissions_total.fetch_add(1, Ordering::Relaxed);
         let realized_bool = matches!(evt.outcome, TradeOutcome::Realized { .. });
+        #[allow(deprecated)]
         match evt.outcome {
             TradeOutcome::Realized { .. } => {
                 self.metrics.n_realized_total.fetch_add(1, Ordering::Relaxed);
@@ -436,17 +601,27 @@ impl EconomicAccumulator {
                 self.metrics.n_exit_miss_total.fetch_add(1, Ordering::Relaxed);
             }
         }
-        let pnl_scaled = (evt.gross_pnl_usd * 10_000.0) as i64;
+        let pnl_scaled = (evt.indicative_gross_at_10k_ref_usd * 10_000.0) as i64;
         // Delta assinado preserva perdas e ganhos sem underflow/wrap.
         self.metrics
             .pnl_aggregated_usd_times_10k
             .fetch_add(pnl_scaled, Ordering::Relaxed);
 
-        // Só forecasts condicionais reais entram na calibração do modelo.
-        // Baseline A3 deixa `p_hit_forecast=None` para não confundir taxa
-        // marginal histórica com probabilidade calibrada.
+        // Fix D6: record_at com horizonte observado para ECE segregada.
+        // Fix D8: ts_resolved_ns aciona decay exponencial 24h.
         if let Some(p_hit) = evt.p_hit_forecast {
-            self.calibration.record(p_hit, realized_bool);
+            #[allow(deprecated)]
+            let horizon_ms = match evt.outcome {
+                TradeOutcome::Realized { horizon_observed_ms, .. } => horizon_observed_ms,
+                TradeOutcome::ExitMiss { .. } => u32::MAX, // longest bucket
+                TradeOutcome::WindowMiss => 0,
+            };
+            self.calibration.record_at(
+                p_hit,
+                realized_bool,
+                horizon_ms,
+                evt.ts_resolved_ns,
+            );
         }
         let ece_bps = (self.calibration.ece() * 10_000.0) as u64;
         self.metrics
@@ -464,10 +639,15 @@ impl EconomicAccumulator {
     }
 
     /// Snapshot agregado de eventos resolvidos em [now − window, now].
+    ///
+    /// Fix D7: aplica Horvitz-Thompson 1952 quando `sampling_probability` é
+    /// finito. Eventos allowlist (π=1.0) ponderam 1×, Uniform (π=0.1)
+    /// ponderam 10×; reconstrói distribuição populacional sem viés para
+    /// rotas priority sobre-representadas.
     pub fn snapshot_window(&self, window_s: u32, now_ns: u64) -> WindowMetrics {
         let window_ns = (window_s as u64) * 1_000_000_000;
         let cutoff = now_ns.saturating_sub(window_ns);
-        let mut relevant: Vec<&EconomicEvent> = self
+        let relevant: Vec<&EconomicEvent> = self
             .events
             .iter()
             .filter(|e| e.ts_resolved_ns >= cutoff && e.ts_resolved_ns <= now_ns)
@@ -477,23 +657,42 @@ impl EconomicAccumulator {
             return WindowMetrics::empty(window_s);
         }
         let mut realized = 0u64;
+        #[allow(deprecated)]
         let mut window_miss = 0u64;
         let mut exit_miss = 0u64;
         let mut total_usd = 0.0;
         let mut pnl_vec: Vec<f64> = Vec::with_capacity(relevant.len());
+        // IPW: se `sampling_probability` ausente/NaN, peso = 1.0 (neutro).
+        let mut weighted_realized = 0.0_f64;
+        let mut weighted_n = 0.0_f64;
         for e in &relevant {
+            #[allow(deprecated)]
             match e.outcome {
                 TradeOutcome::Realized { .. } => realized += 1,
                 TradeOutcome::WindowMiss => window_miss += 1,
                 TradeOutcome::ExitMiss { .. } => exit_miss += 1,
             }
-            total_usd += e.gross_pnl_usd;
-            pnl_vec.push(e.gross_pnl_usd);
+            let w: f64 = if e.sampling_probability.is_finite() && e.sampling_probability > 1e-6 {
+                1.0 / (e.sampling_probability as f64)
+            } else {
+                1.0
+            };
+            let is_realized = matches!(e.outcome, TradeOutcome::Realized { .. });
+            weighted_n += w;
+            if is_realized {
+                weighted_realized += w;
+            }
+            total_usd += e.indicative_gross_at_10k_ref_usd * w;
+            pnl_vec.push(e.indicative_gross_at_10k_ref_usd);
         }
         pnl_vec.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        relevant.sort_by_key(|e| e.ts_resolved_ns);
         let median = pnl_vec[pnl_vec.len() / 2];
         let p10 = pnl_vec[pnl_vec.len() / 10];
+        let realization_rate = if weighted_n > 0.0 {
+            (weighted_realized / weighted_n) as f32
+        } else {
+            realized as f32 / n as f32
+        };
         WindowMetrics {
             window_s,
             n_emissions: n,
@@ -503,7 +702,7 @@ impl EconomicAccumulator {
             simulated_pnl_aggregated_usd: total_usd,
             pnl_per_emission_median_usd: median,
             pnl_per_emission_p10_usd: p10,
-            realization_rate: realized as f32 / n as f32,
+            realization_rate,
         }
     }
 
@@ -540,7 +739,7 @@ impl Default for EconomicAccumulator {
 mod tests {
     use super::*;
     use crate::ml::contract::{
-        BaselineDiagnostics, CalibStatus, ReasonKind, TradeReason,
+        BaselineDiagnostics, CalibStatus, ReasonDetail, ReasonKind, SourceKind, TradeReason,
     };
     use crate::types::{SymbolId, Venue};
 
@@ -553,9 +752,10 @@ mod tests {
             },
             entry_now: 2.5,
             exit_target: -0.5,
-            gross_profit_target: 2.0,
+            gross_profit_target: 2.0, // entry_now + exit_q50 = 2.5 + (-0.5)
             p_hit: Some(0.83),
             p_hit_ci: Some((0.77, 0.88)),
+            ci_method: "wilson_marginal",
             exit_q25: Some(-0.8),
             exit_q50: Some(-0.5),
             exit_q75: Some(-0.2),
@@ -583,12 +783,14 @@ mod tests {
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Tail,
-                detail: "test".into(),
+                detail: ReasonDetail::placeholder(),
             },
-            model_version: "a3-0.1.0".into(),
+            model_version: "baseline-a3-0.2.0".into(),
+            source_kind: SourceKind::Baseline,
             emitted_at,
             valid_until: emitted_at + 30_000_000_000,
         }
@@ -597,20 +799,22 @@ mod tests {
     #[test]
     fn realized_outcome_computes_pnl_correctly() {
         let out = TradeOutcome::Realized {
-            enter_realized_pct: 2.3,
             exit_realized_pct: -0.9,
             horizon_observed_ms: 400,
         };
-        assert!((out.gross_pnl_pct() - 1.4).abs() < 1e-5);
+        // Fix D9: entry_locked é parâmetro externo, não campo interno.
+        assert!((out.gross_pnl_pct(2.3) - 1.4).abs() < 1e-5);
         // 1.4% × 10_000 / 100 = 140 USD
-        assert!((out.gross_pnl_usd() - 140.0).abs() < 1e-3);
+        assert!((out.indicative_gross_at_10k_ref_usd(2.3) - 140.0).abs() < 1e-3);
     }
 
     #[test]
+    #[allow(deprecated)]
     fn window_miss_has_zero_pnl() {
         let out = TradeOutcome::WindowMiss;
-        assert_eq!(out.gross_pnl_pct(), 0.0);
-        assert_eq!(out.gross_pnl_usd(), 0.0);
+        // WindowMiss ignora entry_locked — variante deprecated.
+        assert_eq!(out.gross_pnl_pct(2.5), 0.0);
+        assert_eq!(out.indicative_gross_at_10k_ref_usd(2.5), 0.0);
     }
 
     #[test]
@@ -621,27 +825,26 @@ mod tests {
         acc.push(EconomicEvent::new(
             &setup1,
             TradeOutcome::Realized {
-                enter_realized_pct: 2.1,
                 exit_realized_pct: -0.8,
                 horizon_observed_ms: 300,
             },
             now_ns,
-            false,
         ));
         let setup2 = mk_setup(now_ns - 400_000_000);
+        #[allow(deprecated)]
         acc.push(EconomicEvent::new(
             &setup2,
             TradeOutcome::WindowMiss,
             now_ns,
-            false,
         ));
         let m = acc.snapshot_window(3600, now_ns);
         assert_eq!(m.n_emissions, 2);
         assert_eq!(m.n_realized, 1);
         assert_eq!(m.n_window_miss, 1);
         assert!((m.realization_rate - 0.5).abs() < 1e-4);
-        // PnL agregado = 1.3% de 10k = 130 USD
-        assert!((m.simulated_pnl_aggregated_usd - 130.0).abs() < 1e-2);
+        // Fix D9: gross agora é entry_locked(2.5) + exit_realized(-0.8) = 1.7%
+        // × 10k / 100 = 170 USD. Antes era com enter_realized=2.1 = 130 USD.
+        assert!((m.simulated_pnl_aggregated_usd - 170.0).abs() < 1e-2);
     }
 
     #[test]
@@ -656,12 +859,10 @@ mod tests {
         acc.push(EconomicEvent::new(
             &setup,
             TradeOutcome::Realized {
-                enter_realized_pct: 2.1,
                 exit_realized_pct: -0.8,
                 horizon_observed_ms: 300,
             },
             now_ns,
-            false,
         ));
 
         assert_eq!(acc.metrics().calibration_observations.load(Ordering::Relaxed), 0);
@@ -672,16 +873,17 @@ mod tests {
     fn accumulator_preserves_negative_pnl_sign() {
         let mut acc = EconomicAccumulator::new();
         let now_ns = 1_000_000_000_000;
-        let setup = mk_setup(now_ns);
+        let mut setup = mk_setup(now_ns);
+        // Força entry_now = 0 para teste de perda pura vir do exit.
+        setup.entry_now = 0.0;
+        setup.gross_profit_target = 0.0 + (-0.5); // entry + exit_q50
         acc.push(EconomicEvent::new(
             &setup,
             TradeOutcome::Realized {
-                enter_realized_pct: 0.0,
                 exit_realized_pct: -1.1,
                 horizon_observed_ms: 300,
             },
             now_ns,
-            true,
         ));
         assert_eq!(
             acc.metrics()
@@ -702,12 +904,10 @@ mod tests {
         acc.push(EconomicEvent::new(
             &setup_old,
             TradeOutcome::Realized {
-                enter_realized_pct: 5.0,
                 exit_realized_pct: 5.0,
                 horizon_observed_ms: 100,
             },
             now_ns - 3_700_000_000_000, // resolved_ns > 1h atrás
-            false,
         ));
         let m = acc.snapshot_window(3600, now_ns);
         assert_eq!(m.n_emissions, 0);
@@ -719,18 +919,20 @@ mod tests {
         let evt = EconomicEvent::new(
             &setup,
             TradeOutcome::Realized {
-                enter_realized_pct: 2.1,
                 exit_realized_pct: -0.8,
                 horizon_observed_ms: 300,
             },
             1_700_000_001_000_000_000,
-            false,
         );
         let line = evt.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         assert_eq!(v["outcome"], "realized");
         assert_eq!(v["horizon_observed_ms"], 300);
+        // setup_kind Baseline → from_model false.
         assert_eq!(v["from_model"], false);
+        assert_eq!(v["source_kind"], "baseline");
+        assert!(v["indicative_gross_at_10k_ref_usd"].is_number());
+        assert!(v["disclaimer"].as_str().unwrap().contains("fees"));
     }
 
     #[test]
@@ -738,11 +940,11 @@ mod tests {
         let mut acc = EconomicAccumulator::with_capacity(3);
         let setup = mk_setup(1);
         for _ in 0..5 {
+            #[allow(deprecated)]
             acc.push(EconomicEvent::new(
                 &setup,
                 TradeOutcome::WindowMiss,
                 2,
-                false,
             ));
         }
         assert_eq!(acc.len(), 3);
@@ -757,6 +959,64 @@ mod tests {
         assert_eq!(ws.len(), 4);
         assert_eq!(ws[0].window_s, 3_600);
         assert_eq!(ws[3].window_s, 2_592_000);
+    }
+
+    // ---- Fix D6: ECE por horizon bucket --------------------------------
+
+    #[test]
+    fn horizon_bucket_idx_segregates_correctly() {
+        assert_eq!(horizon_bucket_idx(30_000), 0);       // 30s < 60s
+        assert_eq!(horizon_bucket_idx(120_000), 1);      // 2min < 5min
+        assert_eq!(horizon_bucket_idx(1_200_000), 2);    // 20min < 30min
+        assert_eq!(horizon_bucket_idx(3_600_000), 3);    // 1h < 2h
+        assert_eq!(horizon_bucket_idx(20_000_000), 4);   // 5h bucket longest
+    }
+
+    #[test]
+    fn ece_segregated_by_horizon_bucket() {
+        let mut c = CalibrationAccumulator::default();
+        // Bucket 0 (30s): calibrado 0.85 → 0.85 (3 obs)
+        for _ in 0..3 {
+            c.record_at(0.85, true, 30_000, 1_000_000_000_000);
+        }
+        // Bucket 3 (2h): miscalibrado 0.85 → 0.2 (100 obs para quorum)
+        for _ in 0..20 {
+            c.record_at(0.85, true, 4_000_000, 1_000_000_000_001);
+        }
+        for _ in 0..80 {
+            c.record_at(0.85, false, 4_000_000, 1_000_000_000_001);
+        }
+        let per_bucket = c.ece_by_horizon_bucket();
+        // Bucket 0: < 10 obs → None.
+        assert!(per_bucket[0].is_none());
+        // Bucket 3: 100 obs; freq_realized ≈ 0.2; conf_mid 0.85 → ECE ≈ 0.65.
+        assert!(per_bucket[3].unwrap() > 0.3);
+    }
+
+    // ---- Fix D8: ECE com decay 24h --------------------------------------
+
+    #[test]
+    fn ece_decay_shrinks_old_observations() {
+        let mut c = CalibrationAccumulator::default();
+        let t0 = 1_000_000_000_000_000_000u64;
+        // Observações antigas (muito miscalibradas).
+        for _ in 0..100 {
+            c.record_at(0.85, false, 1_800_000, t0);
+        }
+        let ece_fresh = c.ece();
+        // 72h depois com observações bem calibradas.
+        let t1 = t0 + 3 * ECE_DECAY_HALF_LIFE_NS;
+        for _ in 0..100 {
+            c.record_at(0.85, true, 1_800_000, t1);
+        }
+        let ece_decayed = c.ece();
+        // Observações antigas decaíram por fator ~0.125 (3 half-lives),
+        // então novas dominam; ECE cai substancialmente.
+        assert!(
+            ece_decayed < ece_fresh,
+            "ECE decaída ({}) deveria ser menor que fresca ({})",
+            ece_decayed, ece_fresh
+        );
     }
 
     // -------------------------------------------------------------------

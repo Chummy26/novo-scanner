@@ -848,6 +848,7 @@ mod tests {
     }
 
     fn mk_trade() -> Recommendation {
+        use crate::ml::contract::SourceKind;
         Recommendation::Trade(TradeSetup {
             route_id: mk_route(),
             entry_now: 2.0,
@@ -855,6 +856,7 @@ mod tests {
             gross_profit_target: 1.0,
             p_hit: Some(0.83),
             p_hit_ci: Some((0.77, 0.88)),
+            ci_method: "wilson_marginal",
             exit_q25: Some(-1.4),
             exit_q50: Some(-1.0),
             exit_q75: Some(-0.7),
@@ -882,12 +884,14 @@ mod tests {
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
                 detail: "test".into(),
             },
-            model_version: "a3-0.1.0".into(),
+            model_version: "baseline-a3-0.2.0".into(),
+            source_kind: SourceKind::Baseline,
             emitted_at: 1_700_000_000_000_000_000,
             valid_until: 1_700_000_150_000_000_000,
         })

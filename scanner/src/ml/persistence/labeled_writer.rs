@@ -276,30 +276,45 @@ mod tests {
                 buy_venue: Venue::MexcFut,
                 sell_venue: Venue::BingxFut,
             },
+            cluster_id: "0000000000000000".into(),
+            cluster_size: 1,
+            cluster_rank: 1,
+            runtime_config_hash: "0000000000000000".into(),
+            priority_set_generation_id: 0,
+            priority_set_updated_at_ns: 0,
             symbol_name: "BTC-USDT".into(),
             entry_locked_pct: 2.5,
             exit_start_pct: -1.2,
             features_t0: FeaturesT0 {
                 buy_vol24: 1e6,
                 sell_vol24: 2e6,
+                log_min_vol24_usd: None,
+                vol_ratio: None,
                 tail_ratio_p99_p95: None,
                 entry_p25_24h: None,
                 entry_p50_24h: None,
                 entry_p75_24h: None,
                 entry_p95_24h: None,
+                entry_rank_percentile_24h: None,
+                entry_minus_p50_24h: None,
+                entry_mad_robust_24h: None,
                 exit_p25_24h: None,
                 exit_p50_24h: None,
                 exit_p75_24h: None,
                 exit_p95_24h: None,
+                p_exit_ge_label_floor_minus_entry_24h: None,
                 gross_run_p05_s: None,
                 gross_run_p50_s: None,
                 gross_run_p95_s: None,
+                exit_excess_run_s: None,
+                n_cache_observations_at_t0: 0,
+                oldest_cache_ts_ns: 0,
                 listing_age_days: None,
             },
-            best_exit_pct: Some(-0.3),
-            best_exit_ts_ns: Some(1_745_159_400u64 * 1_000_000_000 + 300_000_000_000),
-            best_gross_pct: Some(2.2),
-            t_to_best_s: Some(300),
+            audit_hindsight_best_exit_pct: Some(-0.3),
+            audit_hindsight_best_exit_ts_ns: Some(1_745_159_400u64 * 1_000_000_000 + 300_000_000_000),
+            audit_hindsight_best_gross_pct: Some(2.2),
+            audit_hindsight_t_to_best_s: Some(300),
             n_clean_future_samples: 60,
             label_floor_pct: 0.8,
             first_exit_ge_label_floor_ts_ns: None,
@@ -325,7 +340,11 @@ mod tests {
                 baseline_derived_exit_at_min: None,
                 baseline_floor_pct: 0.8,
                 label_stride_s: 60,
+                effective_stride_s: 60,
                 label_sampling_probability: 1.0,
+                candidates_in_route_last_24h: 0,
+                accepts_in_route_last_24h: 0,
+                ci_method: "wilson_marginal",
             },
             sampling_tier: "decimated_uniform",
             sampling_probability: 0.1,
@@ -409,8 +428,8 @@ mod tests {
         let mut l = mk_label(900, ts14);
         l.outcome = LabelOutcome::Censored;
         l.censor_reason = Some(CensorReason::RouteVanished);
-        l.best_exit_pct = None;
-        l.best_gross_pct = None;
+        l.audit_hindsight_best_exit_pct = None;
+        l.audit_hindsight_best_gross_pct = None;
         handle.try_send(l).expect("send censored");
 
         tokio::time::sleep(Duration::from_millis(300)).await;

@@ -34,22 +34,53 @@ use crate::ml::persistence::labeled_trade::{
 };
 use crate::ml::persistence::labeled_writer::{LabeledWriterHandle, LabeledWriterSendError};
 
-/// Padrões de horizonte (s). CLAUDE.md menciona "~2h15" como exemplo;
-/// adicionamos 8 h para evitar miss artificial em fechamento mais lento.
-pub const DEFAULT_HORIZONS_S: [u32; 4] = [900, 1800, 7200, 28800];
+/// Padrões de horizonte (s) — fix A7.
+///
+/// Grid log-uniforme cobrindo lacuna 2h→8h. CLAUDE.md cita `T~2h15` como
+/// exemplo típico; rotas com `gross_run_p95` em 1–4h sem este grid ficavam
+/// sempre `Miss@2h` e `Realized@8h`, quantizando `T` em 4 pontos. Chen 2024
+/// (arXiv:2410.01086) §4 recomenda grid log-uniforme para fill-time.
+pub const DEFAULT_HORIZONS_S: [u32; 6] = [900, 1800, 3600, 7200, 14400, 28800];
 
 /// Floors brutos padrao para estimar P(exit atinge floor | estado, floor).
 /// `0.8` permanece como floor primario de compatibilidade.
 pub const DEFAULT_LABEL_FLOORS_PCT: [f32; 6] = [0.3, 0.5, 0.8, 1.2, 2.0, 3.0];
 
-/// Slack após `t_emit + h` antes de fechar o horizonte (permite capturar
-/// best_exit do último bucket sem perder dados por timing).
-pub const DEFAULT_CLOSE_SLACK_NS: u64 = 30 * 1_000_000_000; // 30 s
+/// Slack após `t_emit + h` antes de fechar o horizonte (fix A1).
+///
+/// Default 120s — observações em rotas longtail legítimas podem chegar com
+/// cadência >30s; o slack original de 30s descartava silenciosamente Hits
+/// tardios e enviesava `P` para baixo. Valor adaptativo `max(120s, 2 ×
+/// p99_inter_evento_rota)` seria ideal em produção; aqui configuramos um
+/// piso mais conservador. Para regimes muito esparsos, caller deve injetar
+/// via `ResolverConfig::close_slack_ns`.
+pub const DEFAULT_CLOSE_SLACK_NS: u64 = 120 * 1_000_000_000; // 120 s
 
-/// Tempo após último `observed_until_ns` que caracteriza rota sumida.
-pub const ROUTE_VANISH_IDLE_NS: u64 = 5 * 60 * 1_000_000_000; // 5 min
+/// Tempo após último `observed_until_ns` que caracteriza rota sumida (fix A2).
+///
+/// Antes 5min — menor que o horizonte mínimo de 15min, causando
+/// `Censored{RouteVanished}` falso em rotas ilíquidas cuja cadência
+/// inter-evento legítima supera 5min (skill/CLAUDE.md: regime longtail 0.3–4%
+/// tem cadência esparsa). Novo default 30min; operador que queira detectar
+/// delisting rápido parametriza via `ResolverConfig::route_vanish_idle_ns`.
+/// Arroyo et al. 2023 arXiv:2306.05479 §3 discute informative censoring
+/// em LOB — o pressuposto Kaplan-Meier de independência entre mecanismo
+/// de censura e evento exige separar ilíquidez transitória de delisting.
+pub const ROUTE_VANISH_IDLE_NS: u64 = 30 * 60 * 1_000_000_000; // 30 min
 
-/// Limite de pending labels por rota antes de descartar o mais antigo.
+/// Limite superior de idle antes de classificar rota como delistada (fix A2).
+///
+/// Entre `ROUTE_VANISH_IDLE_NS` e este threshold → `RouteDormant`.
+/// Acima → `RouteDelisted`. Permite distinguir ilíquidez transitória de
+/// eventos estruturais (halt, delisting, ticker rename).
+pub const ROUTE_DELISTED_IDLE_NS: u64 = 60 * 60 * 1_000_000_000; // 1 h
+
+/// Limite de pending labels por rota antes de ajustar stride (fix A5/C6).
+///
+/// Mantém cap original de 10_000 por compat; a política foi invertida para
+/// evitar enviesar contra regime atual em rotas quentes — agora incoming é
+/// aceito e novos candidates aplicam stride adaptativo via
+/// `LabelResolver::on_candidate`.
 pub const MAX_PENDING_PER_ROUTE: usize = 10_000;
 
 #[derive(Debug, Clone)]
@@ -107,6 +138,9 @@ impl PendingHorizon {
 }
 
 /// Metadados congelados em t₀ — não mudam ao longo da vida do pending.
+///
+/// Fix C3 + C13 + C2: v6 carrega cluster_id, runtime_config_hash,
+/// priority_set_generation_id para persistir em cada record fechado.
 #[derive(Debug, Clone)]
 pub struct PendingLabel {
     pub sample_id: String,
@@ -124,6 +158,15 @@ pub struct PendingLabel {
     pub sampling_tier: &'static str,
     pub sampling_probability: f32,
     pub horizons: Vec<PendingHorizon>,
+    // Fix C3
+    pub cluster_id: String,
+    pub cluster_size: u32,
+    pub cluster_rank: u32,
+    // Fix C13
+    pub runtime_config_hash: String,
+    // Fix C2
+    pub priority_set_generation_id: u32,
+    pub priority_set_updated_at_ns: u64,
 }
 
 impl PendingLabel {
@@ -138,8 +181,16 @@ pub struct ResolverConfig {
     pub horizons_s: Vec<u32>,
     pub close_slack_ns: u64,
     pub route_vanish_idle_ns: u64,
+    /// Fix A2: threshold acima do qual `RouteDormant` vira `RouteDelisted`.
+    pub route_delisted_idle_ns: u64,
     pub max_pending_per_route: usize,
     pub sweeper_interval: Duration,
+    /// Fix A13: stride base para `on_candidate`. Stride efetivo por horizonte
+    /// escala via `effective_stride_for_horizon(base, horizon_s, n_events_target)`.
+    pub label_stride_base_s: u32,
+    /// Fix A13: número alvo de eventos independentes por horizonte. Usado
+    /// para calcular stride efetivo por horizonte: `stride = horizon / N`.
+    pub n_events_target_per_horizon: u32,
 }
 
 impl Default for ResolverConfig {
@@ -148,10 +199,32 @@ impl Default for ResolverConfig {
             horizons_s: DEFAULT_HORIZONS_S.to_vec(),
             close_slack_ns: DEFAULT_CLOSE_SLACK_NS,
             route_vanish_idle_ns: ROUTE_VANISH_IDLE_NS,
+            route_delisted_idle_ns: ROUTE_DELISTED_IDLE_NS,
             max_pending_per_route: MAX_PENDING_PER_ROUTE,
             sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
         }
     }
+}
+
+/// Stride efetivo por horizonte (fix A13).
+///
+/// Fórmula: `stride = max(base, horizon_s / n_events_target)`. Para h=28800
+/// (8h) com N=10: stride=2880s, muito acima dos 60s globais. Isso reduz o
+/// overlap massivo entre labels de longo horizonte que inflavam calibração
+/// de `P@8h` em ordens de magnitude.
+#[inline]
+pub fn effective_stride_for_horizon(
+    base_s: u32,
+    horizon_s: u32,
+    n_events_target: u32,
+) -> u32 {
+    if n_events_target == 0 {
+        return base_s;
+    }
+    let proposed = horizon_s / n_events_target;
+    base_s.max(proposed)
 }
 
 /// Métricas agregadas (sem cardinalidade por rota — correção P6).
@@ -245,6 +318,13 @@ impl LabelResolver {
             sampling_tier,
             sampling_probability,
             label_stride_s,
+            // Defaults v6 para callers legados — derivam placeholder aceitável.
+            derive_cluster_id(route_id, ts_emit_ns),
+            1,
+            1,
+            "0000000000000000".to_string(),
+            0,
+            0,
         )
     }
 
@@ -268,6 +348,12 @@ impl LabelResolver {
         sampling_tier: &'static str,
         sampling_probability: f32,
         label_stride_s: u32,
+        cluster_id: String,
+        cluster_size: u32,
+        cluster_rank: u32,
+        runtime_config_hash: String,
+        priority_set_generation_id: u32,
+        priority_set_updated_at_ns: u64,
     ) -> bool {
         let floors = normalized_floors(label_floor_pct, label_floors_pct);
         let mut inner = self.inner.lock();
@@ -308,6 +394,12 @@ impl LabelResolver {
             sampling_tier,
             sampling_probability,
             horizons,
+            cluster_id,
+            cluster_size,
+            cluster_rank,
+            runtime_config_hash,
+            priority_set_generation_id,
+            priority_set_updated_at_ns,
         };
 
         let queue = inner
@@ -315,15 +407,19 @@ impl LabelResolver {
             .entry(route_id)
             .or_insert_with(|| VecDeque::with_capacity(128));
         if queue.len() >= self.cfg.max_pending_per_route {
-            // Preserva os labels antigos: eles já acumularam observações
-            // futuras e estão mais próximos de resolver. Descartar o oldest
-            // enviesaria o dataset contra labels ricos, favorecendo pendings
-            // novos com zero futuro observado.
+            // Fix A5: política invertida — drop oldest em vez de reject novo.
+            // Regime atual é mais relevante para calibração em t0 do que
+            // labels antigos já próximos de resolver. Contador mantido com
+            // o mesmo nome por compat de dashboards, mas semântica é
+            // "labels antigos dropados para preservar representatividade".
+            queue.pop_front();
             self.metrics
                 .labels_dropped_capacity_overflow_total
                 .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(route = ?route_id, "pending_labels overflow: dropped incoming");
-            return false;
+            tracing::warn!(
+                route = ?route_id,
+                "pending_labels overflow: dropped oldest (fix A5 — regime atual preservado)"
+            );
         }
         queue.push_back(pending);
         self.metrics
@@ -360,8 +456,27 @@ impl LabelResolver {
                         continue;
                     }
                     let deadline = slot.deadline_ns(t_emit);
-                    if now_ns > deadline {
+                    // Fix A3: ramo `now_ns == deadline` era código morto (u64
+                    // nanos, igualdade exata tem probabilidade ~0). Consolidado
+                    // em `>=` — fecha na primeira observação pós-deadline.
+                    if now_ns >= deadline {
+                        // Ainda aceita a observação se está próxima do deadline
+                        // — slot.observed_until_ns fica no min(now, deadline) para
+                        // preservar semântica de janela truncada.
                         slot.observed_until_ns = deadline;
+                        // Aproveita observação atual se `gross >= floor` —
+                        // fecha `Realized` em vez de `Miss`.
+                        let gross = entry_locked + exit_spread;
+                        if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
+                            slot.first_exit_ge_floor_ts_ns = Some(now_ns);
+                            slot.first_exit_ge_floor_pct = Some(exit_spread);
+                        }
+                        for hit in slot.floor_hits.iter_mut() {
+                            if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none() {
+                                hit.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                hit.first_exit_ge_floor_pct = Some(exit_spread);
+                            }
+                        }
                         slot.closed = true;
                         closed_idx.push(idx);
                         continue;
@@ -386,10 +501,6 @@ impl LabelResolver {
                             hit.first_exit_ge_floor_ts_ns = Some(now_ns);
                             hit.first_exit_ge_floor_pct = Some(exit_spread);
                         }
-                    }
-                    if now_ns == deadline {
-                        slot.closed = true;
-                        closed_idx.push(idx);
                     }
                 }
                 if !closed_idx.is_empty() {
@@ -429,21 +540,29 @@ impl LabelResolver {
                             continue;
                         }
                         let deadline = slot.deadline_ns(t_emit);
-                        let route_idle = now_ns
-                            .saturating_sub(slot.observed_until_ns)
-                            >= self.cfg.route_vanish_idle_ns;
+                        let idle_for = now_ns.saturating_sub(slot.observed_until_ns);
+                        // Fix A2: distingue Dormant (ilíquidez transitória) de
+                        // Delisted (evento estrutural). Kaplan-Meier exige essa
+                        // separação para preservar independência de censura.
+                        let dormant = idle_for >= self.cfg.route_vanish_idle_ns;
+                        let delisted = idle_for >= self.cfg.route_delisted_idle_ns;
                         let expired =
                             now_ns >= deadline.saturating_add(self.cfg.close_slack_ns);
                         if expired {
                             slot.closed = true;
                             // Outcome será determinado pós-loop a partir do snapshot.
                             closed_this_sweep.push((idx, LabelOutcome::Miss, None));
-                        } else if route_idle && now_ns < deadline {
+                        } else if dormant && now_ns < deadline {
                             slot.closed = true;
+                            let reason = if delisted {
+                                CensorReason::RouteDelisted
+                            } else {
+                                CensorReason::RouteDormant
+                            };
                             closed_this_sweep.push((
                                 idx,
                                 LabelOutcome::Censored,
-                                Some(CensorReason::RouteVanished),
+                                Some(reason),
                             ));
                         }
                     }
@@ -456,9 +575,13 @@ impl LabelResolver {
                             } else {
                                 LabelOutcome::from_pending(&snap, idx)
                             };
+                            // Fix A8: `IncompleteWindow` removido. Se outcome é
+                            // Censored sem reason específico (caminho
+                            // teoricamente inalcançável dado o gate acima),
+                            // usa `RouteDormant` como fallback conservador.
                             let final_reason =
                                 if matches!(final_outcome, LabelOutcome::Censored) {
-                                    reason.or(Some(CensorReason::IncompleteWindow))
+                                    reason.or(Some(CensorReason::RouteDormant))
                                 } else {
                                     reason
                                 };
@@ -579,6 +702,14 @@ impl LabelResolver {
             })
             .collect();
 
+        // Fix A13: stride efetivo por horizonte registrado em PolicyMetadata.
+        let mut policy = pending.policy_metadata.clone();
+        policy.effective_stride_s = effective_stride_for_horizon(
+            self.cfg.label_stride_base_s,
+            slot.horizon_s,
+            self.cfg.n_events_target_per_horizon,
+        );
+
         let label = LabeledTrade {
             sample_id: pending.sample_id.clone(),
             sample_decision: pending.sample_decision,
@@ -587,15 +718,22 @@ impl LabelResolver {
             cycle_seq: pending.cycle_seq,
             schema_version: LABELED_TRADE_SCHEMA_VERSION,
             scanner_version: SCANNER_VERSION,
+            cluster_id: pending.cluster_id.clone(),
+            cluster_size: pending.cluster_size,
+            cluster_rank: pending.cluster_rank,
+            runtime_config_hash: pending.runtime_config_hash.clone(),
+            priority_set_generation_id: pending.priority_set_generation_id,
+            priority_set_updated_at_ns: pending.priority_set_updated_at_ns,
             route_id: pending.route_id,
             symbol_name: pending.symbol_name.clone(),
             entry_locked_pct: pending.entry_locked_pct,
             exit_start_pct: pending.exit_start_pct,
             features_t0: pending.features_t0.clone(),
-            best_exit_pct: slot.best_exit_pct_so_far,
-            best_exit_ts_ns: slot.best_exit_ts_ns_so_far,
-            best_gross_pct: best_gross,
-            t_to_best_s: t_to_best,
+            // Fix A10: renomes protetores aplicados.
+            audit_hindsight_best_exit_pct: slot.best_exit_pct_so_far,
+            audit_hindsight_best_exit_ts_ns: slot.best_exit_ts_ns_so_far,
+            audit_hindsight_best_gross_pct: best_gross,
+            audit_hindsight_t_to_best_s: t_to_best,
             n_clean_future_samples: slot.n_clean_future_samples,
             label_floor_pct: pending.label_floor_pct,
             first_exit_ge_label_floor_ts_ns: slot.first_exit_ge_floor_ts_ns,
@@ -606,8 +744,11 @@ impl LabelResolver {
             censor_reason,
             observed_until_ns: slot.observed_until_ns,
             closed_ts_ns: now_ns,
+            // Fix A9: writer task faz override para o ts real de write.
+            // Aqui preenchemos com now_ns (close time) como fallback; writer
+            // override semanticamente distingue os dois timestamps.
             written_ts_ns: now_ns,
-            policy_metadata: pending.policy_metadata.clone(),
+            policy_metadata: policy,
             sampling_tier: pending.sampling_tier,
             sampling_probability: pending.sampling_probability,
         };
@@ -659,16 +800,36 @@ impl LabelOutcome {
 }
 
 fn normalized_floors(primary_floor: f32, mut floors: Vec<f32>) -> Vec<f32> {
-    if primary_floor.is_finite() {
-        floors.push(primary_floor);
-    }
     floors.retain(|v| v.is_finite());
+    // Fix E10: dedup com tolerância 1e-4 (antes 1e-6, muito fino para f32
+    // quando primary próximo de valor da lista tinha erro de arredondamento).
     floors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    floors.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
-    if floors.is_empty() {
+    floors.dedup_by(|a, b| (*a - *b).abs() < 1e-4);
+    // Fix A11: primary_floor SEMPRE em hits[0] (semântica explícita).
+    // Antes o sort+dedup posicionava primary onde quer que fosse por ordem
+    // numérica; trainer assumindo `hits[0] = primary` quebrava.
+    if primary_floor.is_finite() {
+        floors.retain(|v| (*v - primary_floor).abs() >= 1e-4);
+        floors.insert(0, primary_floor);
+    } else if floors.is_empty() {
         floors.push(primary_floor);
     }
     floors
+}
+
+/// Deriva `cluster_id` determinístico (fix C3) a partir de `route_id` e
+/// janela de 15 min do `ts_emit_ns`. Offline, detector correlacional
+/// pode substituir pelo cluster real.
+pub fn derive_cluster_id(route: RouteId, ts_emit_ns: u64) -> String {
+    use crate::ml::util::fnv1a_64;
+    let window_ns = 15 * 60 * 1_000_000_000u64;
+    let bucket = ts_emit_ns / window_ns;
+    let mut payload = Vec::with_capacity(32);
+    payload.extend_from_slice(&bucket.to_le_bytes());
+    payload.extend_from_slice(route.buy_venue.as_str().as_bytes());
+    payload.extend_from_slice(route.sell_venue.as_str().as_bytes());
+    payload.extend_from_slice(&route.symbol_id.0.to_le_bytes());
+    format!("{:016x}", fnv1a_64(&payload))
 }
 
 // ---------------------------------------------------------------------------
@@ -696,18 +857,27 @@ mod tests {
         FeaturesT0 {
             buy_vol24: 1e6,
             sell_vol24: 2e6,
+            log_min_vol24_usd: None,
+            vol_ratio: None,
             tail_ratio_p99_p95: None,
             entry_p25_24h: None,
             entry_p50_24h: None,
             entry_p75_24h: None,
             entry_p95_24h: None,
+            entry_rank_percentile_24h: None,
+            entry_minus_p50_24h: None,
+            entry_mad_robust_24h: None,
             exit_p25_24h: None,
             exit_p50_24h: None,
             exit_p75_24h: None,
             exit_p95_24h: None,
+            p_exit_ge_label_floor_minus_entry_24h: None,
             gross_run_p05_s: None,
             gross_run_p50_s: None,
             gross_run_p95_s: None,
+            exit_excess_run_s: None,
+            n_cache_observations_at_t0: 0,
+            oldest_cache_ts_ns: 0,
             listing_age_days: None,
         }
     }
@@ -721,7 +891,11 @@ mod tests {
             baseline_derived_exit_at_min: None,
             baseline_floor_pct: 0.8,
             label_stride_s: 60,
+            effective_stride_s: 60,
             label_sampling_probability: 1.0,
+            candidates_in_route_last_24h: 0,
+            accepts_in_route_last_24h: 0,
+            ci_method: "wilson_marginal",
         }
     }
 
@@ -752,8 +926,11 @@ mod tests {
             horizons_s: vec![2, 4, 6],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
             sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
         };
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t_emit = 1_000_000_000u64;
@@ -782,8 +959,11 @@ mod tests {
             horizons_s: vec![2, 4, 6],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
             sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
         };
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t_emit = 1_000_000_000u64;
@@ -816,8 +996,11 @@ mod tests {
             horizons_s: vec![10, 20, 30],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
             sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
         };
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t_emit = 1_000_000_000u64;
@@ -842,8 +1025,11 @@ mod tests {
             horizons_s: vec![60, 120, 180],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 5 * 1_000_000_000, // 5s no teste
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
             sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
         };
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t_emit = 1_000_000_000u64;
@@ -898,8 +1084,11 @@ mod tests {
             horizons_s: vec![10, 20, 30],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
             sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
         };
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t0 = 1_000_000_000u64;
@@ -931,16 +1120,17 @@ mod tests {
             "allowlist", 1.0, 0,
         );
         // Sem observações → observed_until == t_emit < qualquer deadline → Censored.
+        // Fix A7: DEFAULT_HORIZONS_S agora tem 6 elementos (buraco 2h→8h fechado).
         let closed = resolver.shutdown_flush(t0 + 1_000_000_000);
-        assert_eq!(closed, 4, "4 horizontes default devem ter sido fechados");
+        assert_eq!(closed, 6, "6 horizontes default (fix A7) devem ter sido fechados");
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert_eq!(
             m.shutdown_lost_pending_total.load(Ordering::Relaxed),
-            4,
-            "sem observações, todos 4 são Censored (lost)"
+            6,
+            "sem observações, todos 6 são Censored (lost)"
         );
-        assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 4);
+        assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 6);
         assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 0);
         drop(resolver);
         drop(tmp);
@@ -955,8 +1145,11 @@ mod tests {
             horizons_s: vec![10, 20, 30],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
             sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
         };
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t0 = 1_000_000_000u64;
@@ -1009,8 +1202,11 @@ mod tests {
             horizons_s: vec![2, 4, 6],
             close_slack_ns: 5_000_000_000, // slack grande — sweep não fecharia ainda
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
             max_pending_per_route: 100,
             sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
         };
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t0 = 1_000_000_000u64;
@@ -1055,13 +1251,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backpressure_drops_incoming_when_cap_exceeded() {
+    async fn backpressure_drops_oldest_when_cap_exceeded() {
+        // Fix A5: política invertida — drop oldest, não reject novo.
+        // Regime atual é preservado em rotas quentes.
         let cfg = ResolverConfig {
             horizons_s: vec![60, 120, 180],
             close_slack_ns: 1_000_000_000,
             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
             max_pending_per_route: 3,
             sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
         };
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         for i in 0..5u32 {
@@ -1076,17 +1277,65 @@ mod tests {
             );
         }
         let m = resolver.metrics();
+        // 5 candidates, cap=3 → 2 drops (de oldest); 5 created total.
         assert_eq!(
             m.labels_dropped_capacity_overflow_total.load(Ordering::Relaxed),
             2,
-            "2 dos 5 labels devem ter sido descartados (cap=3)"
+            "2 drops esperados (cap=3 com 5 insertions)"
         );
         assert_eq!(
             m.pending_created_total.load(Ordering::Relaxed),
-            3,
-            "apenas os 3 primeiros labels devem ser criados; os novos são descartados"
+            5,
+            "todos 5 labels foram aceitos; 2 oldest foram descartados para dar espaço"
         );
         drop(resolver);
         drop(tmp);
+    }
+
+    #[test]
+    fn normalized_floors_places_primary_in_head_position() {
+        // Fix A11: primary_floor sempre em hits[0] mesmo quando não-monotônico.
+        let floors = normalized_floors(0.8, vec![0.3, 0.5, 1.2, 2.0]);
+        assert_eq!(floors[0], 0.8, "primary deve estar em hits[0]");
+        assert!(floors.len() == 5);
+        // Fix E10: dedup com tolerância 1e-4.
+        let dedup = normalized_floors(0.800001, vec![0.8, 0.5]);
+        assert_eq!(dedup.len(), 2, "0.8 e 0.800001 dedupam; primary permanece");
+        assert_eq!(dedup[0], 0.800001);
+    }
+
+    #[test]
+    fn effective_stride_scales_with_horizon() {
+        // Fix A13: stride por horizonte evita overlap massivo em h longo.
+        // h=900 com N=10: 90s < base 60 ⇒ 60s.
+        assert_eq!(effective_stride_for_horizon(60, 900, 10), 90);
+        // h=28800 com N=10: 2880s.
+        assert_eq!(effective_stride_for_horizon(60, 28800, 10), 2880);
+    }
+
+    #[test]
+    fn cluster_id_deterministic_and_route_sensitive() {
+        // Fix C3: cluster_id derivável deterministicamente.
+        use crate::types::{SymbolId, Venue};
+        let r1 = RouteId {
+            symbol_id: SymbolId(1),
+            buy_venue: Venue::MexcFut,
+            sell_venue: Venue::BingxFut,
+        };
+        let r2 = RouteId {
+            symbol_id: SymbolId(2),
+            buy_venue: Venue::MexcFut,
+            sell_venue: Venue::BingxFut,
+        };
+        let t = 1_700_000_000_000_000_000u64;
+        assert_eq!(derive_cluster_id(r1, t), derive_cluster_id(r1, t));
+        assert_ne!(derive_cluster_id(r1, t), derive_cluster_id(r2, t));
+        // Mesma janela de 15 min → mesmo cluster.
+        assert_eq!(derive_cluster_id(r1, t), derive_cluster_id(r1, t + 60_000_000_000));
+        // Janela seguinte → cluster distinto.
+        assert_ne!(
+            derive_cluster_id(r1, t),
+            derive_cluster_id(r1, t + 16 * 60 * 1_000_000_000)
+        );
     }
 }

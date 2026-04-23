@@ -272,12 +272,15 @@ mod tests {
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
                 detail: "t".into(),
             },
-            model_version: "a3-0.1.0".into(),
+            ci_method: "wilson_marginal",
+            model_version: "baseline-a3-0.2.0".into(),
+            source_kind: crate::ml::contract::SourceKind::Baseline,
             emitted_at: 1_000,
             valid_until: 2_000,
         })

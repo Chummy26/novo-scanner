@@ -38,6 +38,32 @@ pub struct VenueFoldMetrics {
     pub simulated_pnl_aggregated: f32,
 }
 
+/// Status geral do LOVO (fix D14).
+///
+/// Antes `passes_hard_gates()` retornava `false` por construção quando o
+/// report tinha `folds: []`, levando o dashboard a reportar "FAIL" quando
+/// o correto era "UNAVAILABLE" (ausência de evidência ≠ evidência de
+/// reprovação).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LovoStatus {
+    /// Nenhum fold real foi gerado (modelo ainda não existe).
+    Unavailable,
+    /// Folds presentes e todos os gates hard passaram.
+    Passing,
+    /// Folds presentes mas ao menos um gate hard falhou.
+    Failing,
+}
+
+impl LovoStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LovoStatus::Unavailable => "unavailable",
+            LovoStatus::Passing => "passing",
+            LovoStatus::Failing => "failing",
+        }
+    }
+}
+
 /// Relatório consolidado LOVO.
 #[derive(Debug, Clone)]
 pub struct LovoReport {
@@ -54,6 +80,9 @@ pub struct LovoReport {
 
 impl LovoReport {
     /// Avalia se LOVO passa os gates hard do ADR-023.
+    ///
+    /// Retorna `false` quando `folds` está vazio — mas essa é semanticamente
+    /// distinta de reprovação. Use `status()` para distinguir.
     pub fn passes_hard_gates(&self) -> bool {
         if self.folds.is_empty() {
             return false;
@@ -61,6 +90,18 @@ impl LovoReport {
         self.precision_at_10_worst_drop <= 0.15
             && self.ece_worst <= 0.08
             && self.coverage_worst >= 0.85
+    }
+
+    /// Fix D14: status tripartido que distingue "sem dados" de "reprovado".
+    pub fn status(&self) -> LovoStatus {
+        if self.folds.is_empty() {
+            return LovoStatus::Unavailable;
+        }
+        if self.passes_hard_gates() {
+            LovoStatus::Passing
+        } else {
+            LovoStatus::Failing
+        }
     }
 
     /// Soft gate alerta (não bloqueia).
@@ -191,5 +232,26 @@ mod tests {
             !r.passes_hard_gates(),
             "placeholder sem folds não pode sinalizar robustez cross-venue"
         );
+    }
+
+    #[test]
+    fn status_distinguishes_unavailable_from_failing() {
+        // Fix D14: empty → Unavailable (não Failing).
+        let empty = LovoReport::from_folds(vec![]);
+        assert_eq!(empty.status(), LovoStatus::Unavailable);
+
+        // Folds + gates ok → Passing.
+        let pass = LovoReport::from_folds(vec![
+            mk_fold(Venue::BinanceFut, 0.80, 0.02, 0.93, 100.0),
+            mk_fold(Venue::MexcFut, 0.70, 0.04, 0.90, 50.0),
+        ]);
+        assert_eq!(pass.status(), LovoStatus::Passing);
+
+        // Folds + gate violado → Failing.
+        let fail = LovoReport::from_folds(vec![
+            mk_fold(Venue::BinanceFut, 0.90, 0.02, 0.93, 100.0),
+            mk_fold(Venue::MexcFut, 0.30, 0.02, 0.93, 100.0), // drop enorme
+        ]);
+        assert_eq!(fail.status(), LovoStatus::Failing);
     }
 }

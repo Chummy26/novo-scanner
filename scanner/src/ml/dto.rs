@@ -108,6 +108,11 @@ pub const STATUS_IC_WIDTH_LIMIT: f32 = 0.20;
 /// Classifica `TradeSetup` em status badge CLAUDE.md.
 ///
 /// Ordem de precedência (mais restritivo primeiro):
+/// 0. **Fix D4**: `calibration_status=Suspended` → `LOW_CONFIDENCE`;
+///    `calibration_status=Degraded` → `CAUTION`. CLAUDE.md §Critérios:
+///    "se o modelo diz 80%, ~80% precisam realizar-se". ECE entre 0.05-0.10
+///    (Degraded) contradiz `ENTER`; kill switch ativo (Suspended) exige
+///    `LOW_CONFIDENCE`.
 /// 1. `LOW_CONFIDENCE` — `ic_width >= STATUS_IC_WIDTH_LIMIT`.
 /// 2. `FLOOR` — `gross_profit_target < STATUS_GROSS_FLOOR_PCT`.
 /// 3. `CAUTION` — `p_hit < STATUS_P_FLOOR` OR (`p_hit < STATUS_P_STRONG` AND
@@ -118,6 +123,12 @@ pub const STATUS_IC_WIDTH_LIMIT: f32 = 0.20;
 /// sem forecast condicional, evitamos `ENTER` direto para forçar revisão
 /// manual pelo operador.
 pub fn classify_trade_status(s: &TradeSetup) -> &'static str {
+    // 0. Fix D4: calibration_status precede todos os outros gates.
+    match s.calibration_status {
+        CalibStatus::Suspended => return "LOW_CONFIDENCE",
+        CalibStatus::Degraded => return "CAUTION",
+        CalibStatus::Ok => {}
+    }
     // 1. IC width gate (precede tudo — se IC é ruim, o P não é confiável).
     if let Some((lo, hi)) = s.p_hit_ci {
         let width = hi - lo;
@@ -155,6 +166,7 @@ pub fn abstain_status_label(reason: AbstainReason) -> &'static str {
         AbstainReason::InsufficientData => "INSUFFICIENT_DATA",
         AbstainReason::LowConfidence => "LOW_CONFIDENCE",
         AbstainReason::LongTail => "LONG_TAIL",
+        AbstainReason::Cooldown => "COOLDOWN",
     }
 }
 
@@ -172,6 +184,8 @@ pub struct TradeSetupDto {
     pub p_hit: Option<f32>,
     pub p_hit_ci_lo: Option<f32>,
     pub p_hit_ci_hi: Option<f32>,
+    /// Fix D2: método usado para IC (wilson_marginal | conformal_split | ...).
+    pub ci_method: &'static str,
 
     pub exit_q25: Option<f32>,
     pub exit_q50: Option<f32>,
@@ -186,12 +200,20 @@ pub struct TradeSetupDto {
     pub cluster_id: Option<u32>,
     pub cluster_size: u8,
     pub cluster_rank: u8,
+    /// Fix D3: status explícito da detecção de cluster.
+    pub cluster_detection_status: &'static str,
 
     pub calibration_status: &'static str,
     pub reason_kind: &'static str,
-    pub reason_detail: String,
+    /// Fix D17: estrutura fechada — zero prosa free-form.
+    pub reason_entry_percentile_24h: Option<f32>,
+    pub reason_regime_posterior_top: f32,
+    pub reason_regime_dominant_idx: u8,
+    pub reason_tail_z_score: Option<f32>,
 
     pub model_version: String,
+    /// Fix D15: fonte canônica via enum string.
+    pub source_kind: &'static str,
     pub emitted_at_ns: u64,
     pub valid_until_ns: u64,
 }
@@ -210,6 +232,7 @@ impl From<&TradeSetup> for TradeSetupDto {
             p_hit: s.p_hit,
             p_hit_ci_lo,
             p_hit_ci_hi,
+            ci_method: s.ci_method,
             exit_q25: s.exit_q25,
             exit_q50: s.exit_q50,
             exit_q75: s.exit_q75,
@@ -221,14 +244,19 @@ impl From<&TradeSetup> for TradeSetupDto {
             cluster_id: s.cluster_id,
             cluster_size: s.cluster_size,
             cluster_rank: s.cluster_rank,
+            cluster_detection_status: s.cluster_detection_status,
             calibration_status: match s.calibration_status {
                 CalibStatus::Ok => "ok",
                 CalibStatus::Degraded => "degraded",
                 CalibStatus::Suspended => "suspended",
             },
             reason_kind: reason_kind_label(s.reason.kind),
-            reason_detail: s.reason.detail.clone(),
+            reason_entry_percentile_24h: s.reason.detail.entry_percentile_24h,
+            reason_regime_posterior_top: s.reason.detail.regime_posterior_top,
+            reason_regime_dominant_idx: s.reason.detail.regime_dominant_idx,
+            reason_tail_z_score: s.reason.detail.tail_z_score,
             model_version: s.model_version.clone(),
+            source_kind: s.source_kind.as_str(),
             emitted_at_ns: s.emitted_at,
             valid_until_ns: s.valid_until,
         }
@@ -298,6 +326,7 @@ pub enum AbstainReasonDto {
     InsufficientData,
     LowConfidence,
     LongTail,
+    Cooldown,
 }
 
 impl From<AbstainReason> for AbstainReasonDto {
@@ -307,6 +336,7 @@ impl From<AbstainReason> for AbstainReasonDto {
             AbstainReason::InsufficientData => AbstainReasonDto::InsufficientData,
             AbstainReason::LowConfidence => AbstainReasonDto::LowConfidence,
             AbstainReason::LongTail => AbstainReasonDto::LongTail,
+            AbstainReason::Cooldown => AbstainReasonDto::Cooldown,
         }
     }
 }
@@ -432,12 +462,15 @@ mod tests {
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
                 detail: "test".into(),
             },
-            model_version: "a3-0.1.0".into(),
+            ci_method: "wilson_marginal",
+            model_version: "baseline-a3-0.2.0".into(),
+            source_kind: crate::ml::contract::SourceKind::Baseline,
             emitted_at: 1_700_000_000_000_000_000,
             valid_until: 1_700_000_150_000_000_000,
         }

@@ -801,12 +801,15 @@ mod tests {
                 cluster_id: None,
                 cluster_size: 1,
                 cluster_rank: 1,
+                cluster_detection_status: "not_implemented",
                 calibration_status: CalibStatus::Degraded,
                 reason: TradeReason {
                     kind: ReasonKind::Combined,
                     detail: "t".into(),
                 },
-                model_version: "test".into(),
+                ci_method: "wilson_marginal",
+                model_version: "baseline-a3-0.2.0".into(),
+                source_kind: crate::ml::contract::SourceKind::Baseline,
                 emitted_at,
                 valid_until: emitted_at + 30_000_000_000,
             }
@@ -817,20 +820,18 @@ mod tests {
             acc.push(EconomicEvent::new(
                 &mk_setup(1_000_000_000 + i * 1_000_000_000),
                 TradeOutcome::Realized {
-                    enter_realized_pct: 2.0,
                     exit_realized_pct: -1.0,
                     horizon_observed_ms: 100,
                 },
                 2_000_000_000 + i * 1_000_000_000,
-                false,
             ));
         }
+        #[allow(deprecated)]
         for i in 0..7u64 {
             acc.push(EconomicEvent::new(
                 &mk_setup(10_000_000_000 + i * 1_000_000_000),
                 TradeOutcome::WindowMiss,
                 11_000_000_000 + i * 1_000_000_000,
-                false,
             ));
         }
 
@@ -987,12 +988,15 @@ mod tests {
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
                 detail: "test".into(),
             },
-            model_version: "a3-0.1.0".into(),
+            ci_method: "wilson_marginal",
+            model_version: "baseline-a3-0.2.0".into(),
+            source_kind: crate::ml::contract::SourceKind::Baseline,
             emitted_at: 1_700_000_000_000_000_000,
             valid_until: 1_700_000_150_000_000_000,
         });

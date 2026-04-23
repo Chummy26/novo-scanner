@@ -49,10 +49,14 @@ use crate::ml::trigger::SampleDecision;
 /// - **v4** (2026-04-21): remove `buy/sell_book_age_ms` e `halt_active`.
 ///   Esses campos são diagnósticos operacionais, não dataset ML.
 /// - **v5** (2026-04-22): `sample_id` passa a FNV-1a 128-bit hex32.
-pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 5;
+/// - **v6** (2026-04-23 Wave W): bump para alinhar com `LabeledTrade` v6 e
+///   `AcceptedSample` v6 (consolidação pós-auditoria PhD de 70 findings).
+///   `SCANNER_VERSION` agora é importado de `ml/mod.rs` (fix E5). Campos
+///   `cluster_id`, `cluster_size`, `priority_set_generation_id` (C3, C2).
+pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 6;
 
-/// Versão do scanner — mesmo que em `sample.rs`.
-pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Re-export da versão única do scanner (consolidada em `ml/mod.rs`, fix E5).
+pub use crate::ml::SCANNER_VERSION;
 
 /// Fator de decimação por rota. 1-in-10 conforme ADR-025.
 pub const ROUTE_DECIMATION_MOD: u64 = 10;
@@ -81,6 +85,11 @@ pub struct RawSample {
     pub schema_version: u16,
     pub route_id: RouteId,
     /// **v2 (ADR-029)** — nome canonical estável entre runs (ex: "BTC-USDT").
+    ///
+    /// Fix E15: `route_id.symbol_id` é volátil entre runs; apenas `symbol_name`
+    /// deve ser usado para joins cross-dia. O JSON ainda serializa
+    /// `symbol_id` para debug, mas consumidores offline **devem** chavear
+    /// por `symbol_name` (+ `buy_venue`/`sell_venue`) para estabilidade.
     pub symbol_name: String,
     /// **v2 (ADR-029)** — scanner que gerou.
     pub scanner_version: &'static str,
@@ -306,7 +315,19 @@ impl RouteDecimator {
 
     /// Substitui a allowlist por snapshot atômico (chamado no startup
     /// após resolver `raw_allowlist_symbols` via `SymbolUniverse`).
+    ///
+    /// Fix C5: emite WARN explícito quando a allowlist fica vazia no boot —
+    /// cenário em que listings novos perdem ~90% dos ticks por 24h por
+    /// dependerem apenas do tier `DecimatedUniform` enquanto acumulam
+    /// accepts suficientes para entrar em `Priority`.
     pub fn set_allowlist(&self, routes: HashSet<RouteId>) {
+        if routes.is_empty() {
+            tracing::warn!(
+                "raw_decimator allowlist vazia: listings novos dependerão apenas de Priority/Uniform. \
+                 Cobertura longtail cold-start prejudicada (fix C5). \
+                 Defina `raw_allowlist_symbols` na config para mitigar."
+            );
+        }
         self.allowlist.store(Arc::new(routes));
     }
 
@@ -344,6 +365,7 @@ impl RouteDecimator {
             return DecisionResult {
                 should_persist: true,
                 tier: SamplingTier::Allowlist,
+                // Allowlist é full-capture garantido.
                 probability: 1.0,
             };
         }
@@ -351,6 +373,13 @@ impl RouteDecimator {
             return DecisionResult {
                 should_persist: true,
                 tier: SamplingTier::Priority,
+                // Fix C4: `1.0` é probabilidade CONDICIONAL à membership do
+                // priority_set — não marginal. Membership oscila entre
+                // generations do ranker; trainer offline deve usar
+                // `priority_set_generation_id` + `priority_set_updated_at_ns`
+                // (persistidos em cada LabeledTrade v6) para estimar π marginal.
+                // NaN não é usado aqui porque quebraria consumidores Python
+                // legados; documentamos o caveat no docstring da struct.
                 probability: 1.0,
             };
         }
@@ -448,7 +477,7 @@ mod tests {
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, RAW_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 5);
+        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 6);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
         assert_eq!(s.sample_id.len(), 32);
@@ -475,7 +504,7 @@ mod tests {
         assert_eq!(v["buy_venue"], "mexc");
         assert_eq!(v["sell_venue"], "bingx");
         assert_eq!(v["sample_decision"], "accept");
-        assert_eq!(v["schema_version"], 5);
+        assert_eq!(v["schema_version"], 6);
         assert!(v["scanner_version"].is_string());
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert_eq!(v["sampling_tier"], "decimated_uniform");

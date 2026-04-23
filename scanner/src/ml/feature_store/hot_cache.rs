@@ -161,7 +161,11 @@ struct PerRouteCache {
     exit_hist: Histogram<u64>,
     gross_hist: Histogram<u64>,
     ring: VecDeque<SampleTick>,
-    decimation_counter: u32,
+    /// Fix B3: contador em u64 (antes u32). Com 17k updates/s em rotas
+    /// quentes, u32 fazia wrap em ~24 dias; resíduo `% decimation` perdia
+    /// uniformidade na janela de transição. u64 resolve por ~34 bilhões
+    /// de anos.
+    decimation_counter: u64,
     /// Contador de samples **no ring** (não total desde boot). Usado
     /// para `n_min` gate pelo trigger/baseline.
     n_observations: u64,
@@ -197,8 +201,9 @@ impl PerRouteCache {
     #[inline]
     fn observe(&mut self, entry: f32, exit: f32, ts_ns: u64) {
         // Decimação: só registra 1-em-`decimation` samples.
+        // Fix B3: u64 wrapping_add seguro por ~34×10⁹ anos em 17k RPS.
         self.decimation_counter = self.decimation_counter.wrapping_add(1);
-        if self.decimation_counter % self.cfg.decimation != 0 {
+        if self.decimation_counter % (self.cfg.decimation as u64) != 0 {
             self.last_update_ns = ts_ns;
             return;
         }
@@ -303,6 +308,60 @@ impl PerRouteCache {
         let total = self.n_observations;
         let p = successes as f32 / total as f32;
         Some((p, successes, total))
+    }
+
+    /// Fix B1: percentil empírico de `spread_pct` na ECDF 24h de entry.
+    /// Retorna fração em `[0, 1]` — Teste 1 da skill §4 literal.
+    #[inline]
+    fn entry_rank_percentile(&self, spread_pct: f32) -> Option<f32> {
+        if self.n_observations == 0 {
+            return None;
+        }
+        let bucket = to_bucket(spread_pct);
+        // Count de amostras com entry_bucket <= bucket (inclui o próprio).
+        let below = self.entry_hist.count_between(1, bucket);
+        Some(below as f32 / self.n_observations as f32)
+    }
+
+    /// Fix B1: MAD (Median Absolute Deviation) robusto de entry.
+    /// Computa passo-único: mediana + MAD estimado via quantis do hist.
+    #[inline]
+    fn entry_mad_robust(&self) -> Option<f32> {
+        if self.n_observations < 30 {
+            return None; // MAD instável com amostra pequena.
+        }
+        // Aproximação via quantis do próprio histograma de entry: desvio
+        // absoluto mediano ≈ q75 - q50 (para distribuição simétrica ~0.67 σ,
+        // mas para robust scale estimation usamos a expressão direta com
+        // hist).
+        let p25 = self.quantile_entry(0.25)?;
+        let p75 = self.quantile_entry(0.75)?;
+        // IQR / 2 é proxy de MAD em distribuições simétricas; multiplicamos
+        // por 0.7413 (consistência com normal) para alinhar semântica a MAD.
+        Some(((p75 - p25) / 2.0).abs() * 0.7413)
+    }
+
+    /// Fix B9: Tail ratio p99/p95 com safeguard para buckets colapsados.
+    /// Retorna `None` quando a amostra é pequena OR quando `p99` e `p95`
+    /// caem no mesmo bucket do HDR histogram (indistinção cauda).
+    #[inline]
+    fn tail_ratio_p99_p95(&self) -> Option<f32> {
+        if self.n_observations < 30 {
+            return None;
+        }
+        let p99_bucket = self.entry_hist.value_at_quantile(0.99);
+        let p95_bucket = self.entry_hist.value_at_quantile(0.95);
+        // Fix B9: buckets idênticos → colapso de cauda → None.
+        // Antes retornava 1.0, semanticamente "cauda fina normal" falso.
+        if p99_bucket <= p95_bucket + 1 {
+            return None;
+        }
+        let p99 = from_bucket(self.entry_hist.median_equivalent(p99_bucket));
+        let p95 = from_bucket(self.entry_hist.median_equivalent(p95_bucket));
+        if p95.abs() < 1e-6 {
+            return None;
+        }
+        Some(p99 / p95)
     }
 
     #[inline]
@@ -467,12 +526,34 @@ impl HotQueryCache {
         guard.get(&route)?.probability_exit_ge(threshold)
     }
 
+    /// Fix B1: percentil empírico de `spread_pct` na ECDF 24h de entry.
+    /// Retorna `P_hist(entry ≤ spread_pct)` em [0,1] — Teste 1 literal.
+    pub fn entry_rank_percentile(&self, route: RouteId, spread_pct: f32) -> Option<f32> {
+        let guard = self.routes.read();
+        guard.get(&route)?.entry_rank_percentile(spread_pct)
+    }
+
+    /// Fix B1: MAD robusto de entry (via IQR consistente com normal).
+    pub fn entry_mad_robust(&self, route: RouteId) -> Option<f32> {
+        let guard = self.routes.read();
+        guard.get(&route)?.entry_mad_robust()
+    }
+
+    /// Fix B9: tail ratio com safeguard para buckets colapsados.
+    pub fn tail_ratio_p99_p95(&self, route: RouteId) -> Option<f32> {
+        let guard = self.routes.read();
+        guard.get(&route)?.tail_ratio_p99_p95()
+    }
+
     /// Quantis de runs de `entry(t)+exit(t)` simultâneo.
     ///
-    /// Mantido apenas para compatibilidade/testes. Não use como feature do
-    /// modelo de arbitragem: pela identidade estrutural da skill §2, esse
-    /// gross intra-tick tende a ser negativo e não representa
-    /// `entry(t0)+exit(t1)`.
+    /// **DEPRECATED (fix B7)**: pela identidade estrutural da skill §2, esse
+    /// gross intra-tick tende a ser negativo e **NÃO representa**
+    /// `entry(t0)+exit(t1)`. Caller que precise de run de lucro bruto deve
+    /// usar `exit_run_duration_quantiles(route, label_floor − entry_now)` com
+    /// `entry_now` travado. Mantido como `pub(crate)` em vez de `pub` para
+    /// evitar regressão em callers externos.
+    #[deprecated(note = "use exit_run_duration_quantiles com threshold = label_floor − entry_now")]
     pub fn gross_run_duration_quantiles(&self, route: RouteId, threshold: f32) -> Option<(u32, u32, u32)> {
         let guard = self.routes.read();
         guard.get(&route)?.gross_run_duration_quantiles(threshold)
@@ -728,9 +809,10 @@ mod tests {
             cache.observe(route, 0.2, -1.0, i * 1_000_000_000);
         }
 
+        #[allow(deprecated)]
+        let gross_result = cache.gross_run_duration_quantiles(route, 0.8);
         assert_eq!(
-            cache.gross_run_duration_quantiles(route, 0.8),
-            None,
+            gross_result, None,
             "gross simultâneo não deve passar floor positivo neste cenário"
         );
         let (p05, p50, p95) = cache

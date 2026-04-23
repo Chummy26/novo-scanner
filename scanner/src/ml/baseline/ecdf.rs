@@ -270,16 +270,42 @@ impl BaselineA3 {
 
         let valid_until = now_ns + (self.cfg.valid_for_s as u64) * 1_000_000_000;
 
+        // Fix D1: gross_profit_target deriva de exit_q50 (mediano), não de
+        // exit_at_min (alvo conservador). Para consistência com CLAUDE.md
+        // §Output "L = enter + exit_q50".
+        let gross_profit_central = current_entry + p50_x;
+
+        // Fix D17: ReasonDetail estruturado — zero prosa free-form.
+        let percentile = self.cache.entry_rank_percentile(route, current_entry);
+        let z = self
+            .cache
+            .entry_mad_robust(route)
+            .and_then(|mad| {
+                if mad.abs() < 1e-6 {
+                    None
+                } else {
+                    Some((current_entry - p50_e) / mad)
+                }
+            });
+        let reason_detail = crate::ml::contract::ReasonDetail {
+            entry_percentile_24h: percentile,
+            regime_posterior_top: 1.0,
+            regime_dominant_idx: 0,
+            tail_z_score: z,
+        };
+
         let setup = TradeSetup {
             route_id: route,
             entry_now: current_entry,
             exit_target: exit_at_min,
-            gross_profit_target: current_entry + exit_at_min,
+            gross_profit_target: gross_profit_central,
             // A3 não possui forecast condicional calibrado; expor `P_hit`
             // como Some(p_realize) confundiria taxa marginal com objetivo
             // central. Mantém None e guarda a ECDF em diagnostics.
             p_hit: None,
             p_hit_ci: None,
+            // Fix D2: método declarado — Wilson marginal, não conformal.
+            ci_method: "wilson_marginal",
             exit_q25: Some(p25_x),
             exit_q50: Some(p50_x),
             exit_q75: Some(p75_x),
@@ -307,18 +333,20 @@ impl BaselineA3 {
             cluster_id: None,                       // detector vem em M1.3
             cluster_size: 1,
             cluster_rank: 1,
+            // Fix D3: status explícito distingue "não implementado" de
+            // "cluster detectado mas tamanho 1".
+            cluster_detection_status: "not_implemented",
             // `Degraded` sinaliza que estamos em baseline/safety-net, não no
             // modelo A2 completo. UI deve mostrar `?/100` até que a
             // calibração do modelo principal esteja estabelecida.
             calibration_status: CalibStatus::Degraded,
             reason: TradeReason {
                 kind: ReasonKind::Tail,
-                detail: format!(
-                    "entry {:.2}% + exit_typical {:.2}% ≥ floor_gross {:.2}% | n={} | degraded_marginal_proxy",
-                    current_entry, exit_typical, floor_gross, n
-                ),
+                detail: reason_detail,
             },
             model_version: self.cfg.model_version.to_string(),
+            // Fix D15: fonte canônica via enum — baseline A3 é Baseline, não Model.
+            source_kind: crate::ml::contract::SourceKind::Baseline,
             emitted_at: now_ns,
             valid_until,
         };
@@ -494,7 +522,9 @@ mod tests {
                 // Sanity checks em campos-chave do ADR-016.
                 assert_eq!(setup.route_id, route);
                 assert_eq!(setup.entry_now, 3.8);
-                assert_eq!(setup.gross_profit_target, setup.entry_now + setup.exit_target);
+                // Fix D1: gross_profit_target deriva de entry_now + exit_q50.
+                let q50 = setup.exit_q50.expect("q50 presente em baseline trade");
+                assert_eq!(setup.gross_profit_target, setup.entry_now + q50);
                 // Pós-auditoria: min/typical/peak podem coincidir quando
                 // piso econômico empurra os 3 níveis para cima. Apenas
                 // invariante monotônico ≤ é exigido.

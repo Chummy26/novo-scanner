@@ -62,7 +62,20 @@ use crate::ml::trigger::{SampleDecision, SamplingTrigger};
 ///
 /// Default: 1 ciclo do scanner = 150 ms. Trade só pode realizar em
 /// tick posterior ao da emissão.
+///
+/// Fix E22: relação com `DEFAULT_CLOSE_SLACK_NS` do label_resolver.
+/// `MIN_HORIZON_NS` governa latência mínima entre emit e resolve no
+/// `EconomicTracker`; `DEFAULT_CLOSE_SLACK_NS` governa slack pós-deadline
+/// no label_resolver. Ambas são escalas temporais do pipeline que estão
+/// relacionadas: `CLOSE_SLACK ≥ MIN_HORIZON × N` onde N é tolerância a
+/// cadência variável. Se ajustar uma, verificar a outra.
 pub const MIN_HORIZON_NS: u64 = 150_000_000;
+
+/// Largura máxima de IC 95% antes de abstenção por `LowConfidence`.
+///
+/// Fix E2: valor derivado de Wilson marginal — assume distribuição Bernoulli
+/// i.i.d. Se IC passar a conformal (fix D2), 0.20 é de literatura diferente;
+/// trocar por `ConformalConfig::ic_width_threshold` em Marco 2.
 pub const IC_WIDTH_LIMIT: f32 = 0.20;
 
 // ---------------------------------------------------------------------------
@@ -104,6 +117,11 @@ pub struct MlServer {
     label_floors_pct: Vec<f32>,
     last_trade_emit_by_route: Mutex<AHashMap<RouteId, u64>>,
     recommendation_cooldown_ns: u64,
+    // Fix C13: fingerprint da config runtime persistida em cada record.
+    runtime_config_hash: String,
+    // Fix C2: geração do priority_set (incrementado em set_priority_set_and_bump).
+    priority_set_generation_id: AtomicU64,
+    priority_set_updated_at_ns: AtomicU64,
 }
 
 fn enforce_recommendation_invariants(
@@ -195,16 +213,15 @@ pub struct ServerMetrics {
 struct PendingEconomicTrade {
     setup: TradeSetup,
     last_exit_pct: f32,
-    from_model: bool,
 }
 
 impl PendingEconomicTrade {
     fn new(setup: TradeSetup, initial_exit_pct: f32) -> Self {
-        let from_model = !setup.model_version.starts_with("baseline-");
+        // Fix D15: `from_model` agora deriva de `setup.source_kind` — enum
+        // explícito substitui prefix match frágil `!starts_with("baseline-")`.
         Self {
             setup,
             last_exit_pct: initial_exit_pct,
-            from_model,
         }
     }
 
@@ -225,7 +242,6 @@ impl PendingEconomicTrade {
         }
 
         self.last_exit_pct = exit_spread;
-        let entry_realized_pct = self.setup.entry_now;
         if exit_spread >= self.setup.exit_target {
             // Fix pós-auditoria L14: horizonte em milissegundos para
             // evitar truncamento a 0 em realizações sub-segundo.
@@ -233,29 +249,23 @@ impl PendingEconomicTrade {
                 .saturating_sub(self.setup.emitted_at)
                 .saturating_div(1_000_000)
                 .min(u32::MAX as u64) as u32;
+            // Fix D9: TradeOutcome::Realized não carrega mais `enter_realized_pct`.
             return Some(EconomicEvent::new(
                 &self.setup,
                 TradeOutcome::Realized {
-                    enter_realized_pct: entry_realized_pct,
                     exit_realized_pct: exit_spread,
                     horizon_observed_ms,
                 },
                 now_ns,
-                self.from_model,
             ));
         }
 
         if now_ns >= self.setup.valid_until {
+            // Fix D9: TradeOutcome::ExitMiss sem enter_realized.
             let outcome = TradeOutcome::ExitMiss {
-                enter_realized_pct: entry_realized_pct,
                 forced_exit_pct: self.last_exit_pct,
             };
-            return Some(EconomicEvent::new(
-                &self.setup,
-                outcome,
-                now_ns,
-                self.from_model,
-            ));
+            return Some(EconomicEvent::new(&self.setup, outcome, now_ns));
         }
 
         None
@@ -347,16 +357,11 @@ impl EconomicTracker {
             while let Some(pending) = queue.pop_front() {
                 if now_ns >= pending.setup.valid_until {
                     // Timeout — gera outcome com última observação em cache.
+                    // Fix D9: sem `enter_realized_pct` (skill §3.1).
                     let outcome = TradeOutcome::ExitMiss {
-                        enter_realized_pct: pending.setup.entry_now,
                         forced_exit_pct: pending.last_exit_pct,
                     };
-                    let evt = EconomicEvent::new(
-                        &pending.setup,
-                        outcome,
-                        now_ns,
-                        pending.from_model,
-                    );
+                    let evt = EconomicEvent::new(&pending.setup, outcome, now_ns);
                     self.accumulator.push(evt);
                     closed += 1;
                 } else {
@@ -378,6 +383,21 @@ impl EconomicTracker {
 
 impl MlServer {
     pub fn new(baseline: BaselineA3, trigger: SamplingTrigger) -> Self {
+        // Fix C13: computa fingerprint da config relevante do scanner no momento
+        // da inicialização. Permite trainer distinguir datasets gerados com
+        // `n_min=500` vs `n_min=1000`, floor diferentes, etc.
+        let config_blob = format!(
+            "trigger_n_min={}|tail_q={}|min_vol_usd={}|floor_pct={}|label_stride_s={}",
+            trigger.config().n_min,
+            trigger.config().tail_quantile,
+            trigger.config().min_vol24_usd,
+            baseline.config().floor_pct,
+            60,
+        );
+        let runtime_config_hash = format!(
+            "{:016x}",
+            crate::ml::util::fnv1a_64(config_blob.as_bytes())
+        );
         Self {
             baseline,
             trigger,
@@ -394,7 +414,18 @@ impl MlServer {
             label_floors_pct: DEFAULT_LABEL_FLOORS_PCT.to_vec(),
             last_trade_emit_by_route: Mutex::new(AHashMap::with_capacity(4096)),
             recommendation_cooldown_ns: 60 * 1_000_000_000,
+            runtime_config_hash,
+            priority_set_generation_id: AtomicU64::new(0),
+            priority_set_updated_at_ns: AtomicU64::new(0),
         }
+    }
+
+    /// Fix C2: incrementa geração do priority_set e registra timestamp de update.
+    /// Deve ser chamado por quem instala novo snapshot em
+    /// `raw_decimator.set_priority_set()`.
+    pub fn bump_priority_set_generation(&self, now_ns: u64) {
+        self.priority_set_generation_id.fetch_add(1, Ordering::Relaxed);
+        self.priority_set_updated_at_ns.store(now_ns, Ordering::Relaxed);
     }
 
     /// Conecta o `RawSampleWriter` (ADR-025). Até ser chamado, o server
@@ -761,6 +792,21 @@ impl MlServer {
         let exit_p50_pre_observe = self.baseline.cache().quantile_exit(route, 0.50);
         let exit_p75_pre_observe = self.baseline.cache().quantile_exit(route, 0.75);
         let exit_p95_pre_observe = self.baseline.cache().quantile_exit(route, 0.95);
+        // Fix B1: percentil empírico de entry_now na ECDF 24h (Teste 1 literal).
+        let entry_rank_pre_observe = self
+            .baseline
+            .cache()
+            .entry_rank_percentile(route, entry_spread);
+        // Fix B1: magnitude e escala robusta para z-score downstream.
+        let entry_minus_p50_pre = entry_p50_pre_observe.map(|p50| entry_spread - p50);
+        let entry_mad_pre = self.baseline.cache().entry_mad_robust(route);
+        // Fix B2: frequência empírica P_hist(exit ≥ floor − entry_now) (Teste 2).
+        let exit_threshold_for_primary_floor = self.label_floor_pct - entry_spread;
+        let p_exit_ge_floor_pre = self
+            .baseline
+            .cache()
+            .probability_exit_ge(route, exit_threshold_for_primary_floor)
+            .map(|(p, _, _)| p);
         // PIT: duração histórica dos runs em que a saída teria satisfeito
         // o floor primário dado o entry travado AGORA.
         //
@@ -768,26 +814,33 @@ impl MlServer {
         // skill §2 isso é estruturalmente negativo e tornava `gross_run_*`
         // nulo em massa. O threshold correto para o histórico de saída é:
         //     exit >= label_floor - entry_locked(t0)
-        let exit_threshold_for_primary_floor = self.label_floor_pct - entry_spread;
         let (gross_run_p05_pre_observe, gross_run_p50_pre_observe, gross_run_p95_pre_observe) =
             self.baseline
                 .cache()
                 .exit_run_duration_quantiles(route, exit_threshold_for_primary_floor)
                 .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
                 .unwrap_or((None, None, None));
+        // Fix A4: run condicional em exit_p50_24h (sem condicionamento em entry atual).
+        let exit_excess_run_pre = exit_p50_pre_observe.and_then(|threshold| {
+            self.baseline
+                .cache()
+                .exit_run_duration_quantiles(route, threshold)
+                .map(|(_, p50, _)| p50)
+        });
         let listing_age_days_pre_observe = self.listing.listing_age_days(route, now_ns);
-        // Fix pós-auditoria: popular `tail_ratio_p99_p95` usando o mesmo
-        // cache pré-observe (PIT). Feature contínua que o baseline já
-        // computa para o gate LongTail; expor como input do modelo
-        // permite aprender regimes de cauda sem re-derivar. None se
-        // histórico insuficiente ou p95 ≈ 0 (divisão instável).
-        let tail_ratio_pre_observe = {
-            let p99 = self.baseline.cache().quantile_entry(route, 0.99);
-            let p95 = self.baseline.cache().quantile_entry(route, 0.95);
-            match (p99, p95) {
-                (Some(p99v), Some(p95v)) if p95v.abs() > 1e-6 => Some(p99v / p95v),
-                _ => None,
-            }
+        // Fix B9: tail ratio com safeguard para buckets colapsados.
+        let tail_ratio_pre_observe = self.baseline.cache().tail_ratio_p99_p95(route);
+        // Fix C7: estado PIT do cache em t0 para reconstrutibilidade offline.
+        let n_cache_obs_pre = self.baseline.cache().n_observations(route) as u32;
+        let oldest_cache_ts_pre = self.baseline.cache().last_update_ns(route).saturating_sub(
+            self.baseline.cache().config().window_ns,
+        );
+        // Fix B4: log de volume mínimo e razão — substituem uso de volume absoluto.
+        let min_vol = buy_vol24_usd.min(sell_vol24_usd).max(1.0);
+        let log_min_vol = Some(min_vol.ln() as f32);
+        let vol_ratio = {
+            let max_v = buy_vol24_usd.max(sell_vol24_usd).max(1.0);
+            Some((max_v / min_vol) as f32)
         };
 
         if clean {
@@ -854,24 +907,51 @@ impl MlServer {
             let features_t0 = FeaturesT0 {
                 buy_vol24: buy_vol24_usd,
                 sell_vol24: sell_vol24_usd,
+                log_min_vol24_usd: log_min_vol,
+                vol_ratio,
                 tail_ratio_p99_p95: tail_ratio_pre_observe,
                 entry_p25_24h: entry_p25_pre_observe,
                 entry_p50_24h: entry_p50_pre_observe,
                 entry_p75_24h: entry_p75_pre_observe,
                 entry_p95_24h: entry_p95_pre_observe,
+                entry_rank_percentile_24h: entry_rank_pre_observe,
+                entry_minus_p50_24h: entry_minus_p50_pre,
+                entry_mad_robust_24h: entry_mad_pre,
                 exit_p25_24h: exit_p25_pre_observe,
                 exit_p50_24h: exit_p50_pre_observe,
                 exit_p75_24h: exit_p75_pre_observe,
                 exit_p95_24h: exit_p95_pre_observe,
+                p_exit_ge_label_floor_minus_entry_24h: p_exit_ge_floor_pre,
                 gross_run_p05_s: gross_run_p05_pre_observe,
                 gross_run_p50_s: gross_run_p50_pre_observe,
                 gross_run_p95_s: gross_run_p95_pre_observe,
+                exit_excess_run_s: exit_excess_run_pre,
+                n_cache_observations_at_t0: n_cache_obs_pre,
+                oldest_cache_ts_ns: oldest_cache_ts_pre,
                 listing_age_days: listing_age_days_pre_observe,
             };
             // Probabilidade efetiva do label é desconhecida online: o labeler
             // usa stride por rota, então IPW correto depende da taxa observada
             // de candidates/accepts por rota e deve ser estimado offline.
             let label_sampling_probability = f32::NAN;
+            // Fix A6: contadores de RouteRanking para IPW offline.
+            let (candidates_24h, accepts_24h) = self
+                .route_ranking
+                .as_ref()
+                .and_then(|r| {
+                    let top = r.top_k(usize::MAX);
+                    top.into_iter().find_map(|(rid, score)| {
+                        if rid == route {
+                            Some((
+                                score.candidate_count_24h.min(u32::MAX as u64) as u32,
+                                score.accept_count_24h.min(u32::MAX as u64) as u32,
+                            ))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .unwrap_or((0, 0));
             let policy = PolicyMetadata {
                 baseline_model_version: self
                     .baseline
@@ -884,7 +964,11 @@ impl MlServer {
                 baseline_derived_exit_at_min: baseline_exit_at_min,
                 baseline_floor_pct: self.baseline.config().floor_pct,
                 label_stride_s: self.label_stride_s,
+                effective_stride_s: self.label_stride_s,
                 label_sampling_probability,
+                candidates_in_route_last_24h: candidates_24h,
+                accepts_in_route_last_24h: accepts_24h,
+                ci_method: "wilson_marginal",
             };
             let label_sample_id = accepted
                 .as_ref()
@@ -898,6 +982,25 @@ impl MlServer {
                         route.sell_venue,
                     )
                 });
+            // Fix C3/C13/C2: metadados v6 persistidos em cada record.
+            let cluster_id = crate::ml::persistence::label_resolver::derive_cluster_id(
+                route, now_ns,
+            );
+            let runtime_config_hash = self.runtime_config_hash.clone();
+            let (priority_gen, priority_updated_ns) = self
+                .route_ranking
+                .as_ref()
+                .map(|_r| {
+                    // Generation ID avança via counter atômico no MlServer;
+                    // exposto como snapshot leitura-barata aqui.
+                    (
+                        self.priority_set_generation_id
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        self.priority_set_updated_at_ns
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    )
+                })
+                .unwrap_or((0, 0));
             resolver.on_candidate(
                 label_sample_id,
                 sample_dec.reason_label(),
@@ -914,6 +1017,12 @@ impl MlServer {
                 tier.as_str(),
                 label_sampling_probability,
                 self.label_stride_s,
+                cluster_id,
+                1, // cluster_size — detector correlacional atualiza offline.
+                1, // cluster_rank — idem.
+                runtime_config_hash,
+                priority_gen.min(u32::MAX as u64) as u32,
+                priority_updated_ns,
             );
         }
 
@@ -952,6 +1061,8 @@ impl MlServer {
                 AbstainReason::InsufficientData => &self.metrics.rec_abstain_insufficient_data,
                 AbstainReason::LowConfidence => &self.metrics.rec_abstain_low_confidence,
                 AbstainReason::LongTail => &self.metrics.rec_abstain_long_tail,
+                // Fix E4: Cooldown reusa bucket de low_confidence para métricas.
+                AbstainReason::Cooldown => &self.metrics.rec_abstain_low_confidence,
             },
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -1133,14 +1244,18 @@ mod tests {
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Tail,
                 detail: "test".into(),
             },
+            ci_method: "wilson_marginal",
             model_version: "test-0.1.0".into(),
+            source_kind: crate::ml::contract::SourceKind::Baseline,
             emitted_at: 1_700_000_000_000_000_000,
-            valid_until: 1_700_000_030_000_000_000,
+            // Fix D10: valid_until ≥ 2 × t_hit_p75_s (3120s); usar 7000s para folga.
+            valid_until: 1_700_000_000_000_000_000 + 7000 * 1_000_000_000,
         };
         setup.baseline_diagnostics.as_mut().unwrap().gross_profit_p25 = 0.5;
         setup
@@ -1377,12 +1492,15 @@ mod tests {
             cluster_id: None,
             cluster_size: 1,
             cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
             calibration_status: CalibStatus::Degraded,
             reason: TradeReason {
                 kind: ReasonKind::Tail,
                 detail: "test".into(),
             },
+            ci_method: "wilson_marginal",
             model_version: "baseline-a3-test".into(),
+            source_kind: crate::ml::contract::SourceKind::Baseline,
             emitted_at: t_emit,
             valid_until: t_emit + 30_000_000_000,
         };
@@ -1558,8 +1676,11 @@ mod tests {
                 horizons_s: vec![1],
                 close_slack_ns: 1_000_000_000,
                 route_vanish_idle_ns: 60 * 1_000_000_000,
+                route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
                 max_pending_per_route: 100,
                 sweeper_interval: Duration::from_secs(10),
+                label_stride_base_s: 60,
+                n_events_target_per_horizon: 10,
             },
             handle,
         ));
@@ -1621,8 +1742,11 @@ mod tests {
                 horizons_s: vec![1, 2, 3],
                 close_slack_ns: 1_000_000_000,
                 route_vanish_idle_ns: 60 * 1_000_000_000,
+                route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
                 max_pending_per_route: 100,
                 sweeper_interval: Duration::from_secs(10),
+                label_stride_base_s: 60,
+                n_events_target_per_horizon: 10,
             },
             handle,
         ));

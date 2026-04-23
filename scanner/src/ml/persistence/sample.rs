@@ -25,12 +25,13 @@ use crate::ml::trigger::SampleDecision;
 /// - **v4** (2026-04-21): remove `buy/sell_book_age_ms`; book age é
 ///   diagnóstico operacional de corretora, não dado do dataset ML.
 /// - **v5** (2026-04-22): `sample_id` passa a FNV-1a 128-bit hex32.
-pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 5;
+/// - **v6** (2026-04-23 Wave W): bump coordenado com `LabeledTrade` v6 e
+///   `RawSample` v6 pós-auditoria PhD de 70 findings. `SCANNER_VERSION`
+///   importado de `ml/mod.rs` (fix E5).
+pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 6;
 
-/// Versão do scanner no momento da serialização. Injetado pelo crate
-/// via `env!("CARGO_PKG_VERSION")`. Permite debugging retrospectivo de
-/// bugs introduzidos em versões específicas.
-pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Re-export da versão única do scanner (consolidada em `ml/mod.rs`, fix E5).
+pub use crate::ml::SCANNER_VERSION;
 
 /// Uma observação aceita pelo trigger, pronta para gravação.
 ///
@@ -224,7 +225,7 @@ mod tests {
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, ACCEPTED_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(s.schema_version, 5);
+        assert_eq!(s.schema_version, 6);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
         assert_eq!(s.sample_id.len(), 32);
@@ -256,7 +257,7 @@ mod tests {
         assert_eq!(v["sample_decision"], "accept");
         assert_eq!(v["was_recommended"], false);
         assert!(v["scanner_version"].is_string());
-        assert_eq!(v["schema_version"], 5);
+        assert_eq!(v["schema_version"], 6);
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert!(
             v.get("buy_book_age_ms").is_none(),
