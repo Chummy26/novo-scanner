@@ -240,12 +240,6 @@ impl LabeledJsonlWriter {
         Ok((BufWriter::with_capacity(64 * 1024, file), path))
     }
 
-    pub fn total_written(&self) -> u64 {
-        self.total_written
-    }
-    pub fn total_dropped(&self) -> u64 {
-        self.total_dropped
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,8 +252,9 @@ mod tests {
     use crate::ml::contract::RouteId;
     use crate::ml::persistence::labeled_trade::{
         CensorReason, FeaturesT0, FloorHitLabel, LabelOutcome, LabeledTrade, PolicyMetadata,
-        LABELED_TRADE_SCHEMA_VERSION, SCANNER_VERSION,
+        LABELED_TRADE_SCHEMA_VERSION,
     };
+    use crate::ml::SCANNER_VERSION;
     use crate::types::{SymbolId, Venue};
 
     fn mk_label(horizon_s: u32, ts_written_ns: u64) -> LabeledTrade {
@@ -312,7 +307,9 @@ mod tests {
                 listing_age_days: None,
             },
             audit_hindsight_best_exit_pct: Some(-0.3),
-            audit_hindsight_best_exit_ts_ns: Some(1_745_159_400u64 * 1_000_000_000 + 300_000_000_000),
+            audit_hindsight_best_exit_ts_ns: Some(
+                1_745_159_400u64 * 1_000_000_000 + 300_000_000_000,
+            ),
             audit_hindsight_best_gross_pct: Some(2.2),
             audit_hindsight_t_to_best_s: Some(300),
             n_clean_future_samples: 60,
@@ -427,7 +424,7 @@ mod tests {
         let ts14 = 1_745_159_400u64 * 1_000_000_000;
         let mut l = mk_label(900, ts14);
         l.outcome = LabelOutcome::Censored;
-        l.censor_reason = Some(CensorReason::RouteVanished);
+        l.censor_reason = Some(CensorReason::RouteDelisted);
         l.audit_hindsight_best_exit_pct = None;
         l.audit_hindsight_best_gross_pct = None;
         handle.try_send(l).expect("send censored");
@@ -441,7 +438,7 @@ mod tests {
         let content = std::fs::read_to_string(files[0].as_ref().unwrap().path()).unwrap();
         let v: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
         assert_eq!(v["outcome"], "censored");
-        assert_eq!(v["censor_reason"], "route_vanished");
+        assert_eq!(v["censor_reason"], "route_delisted");
     }
 
     #[tokio::test]

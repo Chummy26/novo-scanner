@@ -292,21 +292,11 @@ impl JsonlWriter {
             .unwrap_or(0);
         let filename = format!("{}_{}.jsonl", self.cfg.file_prefix, start_ts);
         let path = dir_path.join(filename);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         info!(path = %path.display(), "ML writer: abrindo novo arquivo");
         Ok((BufWriter::with_capacity(64 * 1024, file), path))
     }
 
-    pub fn total_written(&self) -> u64 {
-        self.total_written
-    }
-
-    pub fn total_dropped(&self) -> u64 {
-        self.total_dropped
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,19 +424,37 @@ mod tests {
         // Hora 14 (14:30).
         let s1 = AcceptedSample::new(
             1_745_159_400u64 * 1_000_000_000,
-            0, route, "BTC-USDT", 2.0, -1.0, 1e6, 1e6,
+            0,
+            route,
+            "BTC-USDT",
+            2.0,
+            -1.0,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         // Hora 15 (15:00).
         let s2 = AcceptedSample::new(
             1_745_161_200u64 * 1_000_000_000,
-            1, route, "BTC-USDT", 2.1, -1.1, 1e6, 1e6,
+            1,
+            route,
+            "BTC-USDT",
+            2.1,
+            -1.1,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         // Hora 15 ainda (15:01).
         let s3 = AcceptedSample::new(
             1_745_161_260u64 * 1_000_000_000,
-            2, route, "BTC-USDT", 2.2, -1.2, 1e6, 1e6,
+            2,
+            route,
+            "BTC-USDT",
+            2.2,
+            -1.2,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         handle.try_send(s1).expect("send s1");
@@ -549,7 +557,13 @@ mod tests {
         let (_writer, handle) = JsonlWriter::create(cfg);
         let s = AcceptedSample::new(
             1_745_159_400u64 * 1_000_000_000,
-            0, mk_route(), "BTC-USDT", 2.0, -1.0, 1e6, 1e6,
+            0,
+            mk_route(),
+            "BTC-USDT",
+            2.0,
+            -1.0,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         // Primeiro envio OK.

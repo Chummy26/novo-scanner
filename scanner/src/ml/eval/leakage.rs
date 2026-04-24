@@ -65,7 +65,7 @@ impl LeakageAuditReport {
         tests.iter().all(|t| matches!(t, LeakageTestResult::Pass))
     }
 
-/// Conta tests em cada status.
+    /// Conta tests em cada status.
     pub fn summary(&self) -> (usize, usize, usize) {
         let tests = [
             &self.shuffling_temporal,
@@ -130,9 +130,7 @@ pub fn run_full_audit() -> LeakageAuditReport {
         if ecdf_ok && serving_ok {
             LeakageTestResult::Pass
         } else if !ecdf_ok {
-            LeakageTestResult::Fail(
-                "baseline feature path references output-side fields".into(),
-            )
+            LeakageTestResult::Fail("baseline feature path references output-side fields".into())
         } else {
             LeakageTestResult::Fail(
                 "serving.rs FeaturesT0 literal contains forbidden output-side field".into(),
@@ -142,13 +140,17 @@ pub fn run_full_audit() -> LeakageAuditReport {
 
     let dataset_wide_statistics = if source_lacks_any(
         include_str!("../feature_store/hot_cache.rs"),
-        &["global_mean", "global_std", "dataset_mean", "dataset_std", "full_dataset"],
+        &[
+            "global_mean",
+            "global_std",
+            "dataset_mean",
+            "dataset_std",
+            "full_dataset",
+        ],
     ) {
         LeakageTestResult::Pass
     } else {
-        LeakageTestResult::Fail(
-            "feature store contains dataset-wide statistics".into(),
-        )
+        LeakageTestResult::Fail("feature store contains dataset-wide statistics".into())
     };
 
     let purge_verification = if purge_window_excludes_expired_samples() {
@@ -217,23 +219,15 @@ fn temporal_ordering_guard() -> bool {
         buy_venue: Venue::MexcFut,
         sell_venue: Venue::BingxFut,
     };
-    let (rec, dec, accepted) = server.on_opportunity(
-        0,
-        route,
-        "BTC-USDT",
-        3.2,
-        -0.4,
-        1e6,
-        1e6,
-        1,
-    );
+    let (rec, dec, accepted) = server.on_opportunity(0, route, "BTC-USDT", 3.2, -0.4, 1e6, 1e6, 1);
     matches!(
         rec,
         Recommendation::Abstain {
             reason: AbstainReason::InsufficientData,
             ..
         }
-    ) && dec == SampleDecision::RejectInsufficientHistory && accepted.is_none()
+    ) && dec == SampleDecision::RejectInsufficientHistory
+        && accepted.is_none()
 }
 
 fn purge_window_excludes_expired_samples() -> bool {
@@ -282,22 +276,6 @@ mod tests {
     #[test]
     fn audit_reports_purge_window_passes() {
         assert!(purge_window_excludes_expired_samples());
-    }
-
-    #[test]
-    fn audit_source_scans_detect_forbidden_globals() {
-        assert!(source_lacks_any(
-            include_str!("../feature_store/hot_cache.rs"),
-            &["global_mean", "global_std", "dataset_mean", "dataset_std", "full_dataset"],
-        ));
-    }
-
-    #[test]
-    fn audit_source_scans_detect_output_fields_not_used_as_features() {
-        assert!(source_lacks_any(
-            include_str!("../baseline/ecdf.rs"),
-            &["sample_decision", "was_recommended", "outcome", "pnl"],
-        ));
     }
 
     #[test]

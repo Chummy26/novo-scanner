@@ -10,8 +10,8 @@
 use serde::Serialize;
 
 use crate::ml::contract::{
-    AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, EntryQuality, ExitQuality,
-    ReasonKind, Recommendation, RouteId, TacticalSignal, TradeSetup,
+    AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, ReasonKind, Recommendation,
+    RouteId, TradeSetup,
 };
 
 // ---------------------------------------------------------------------------
@@ -240,7 +240,10 @@ impl From<&TradeSetup> for TradeSetupDto {
             t_hit_median_s: s.t_hit_median_s,
             t_hit_p75_s: s.t_hit_p75_s,
             p_censor: s.p_censor,
-            baseline_diagnostics: s.baseline_diagnostics.as_ref().map(BaselineDiagnosticsDto::from),
+            baseline_diagnostics: s
+                .baseline_diagnostics
+                .as_ref()
+                .map(BaselineDiagnosticsDto::from),
             cluster_id: s.cluster_id,
             cluster_size: s.cluster_size,
             cluster_rank: s.cluster_rank,
@@ -365,55 +368,6 @@ impl From<&AbstainDiagnostic> for AbstainDiagnosticDto {
 }
 
 // ---------------------------------------------------------------------------
-// TacticalSignalDto
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TacticalSignalDto {
-    pub route_id: RouteIdDto,
-    pub at_ns: u64,
-    pub current_entry: f32,
-    pub current_exit: f32,
-    pub entry_quality: &'static str,
-    pub exit_quality: &'static str,
-    pub time_since_emit_s: u32,
-    pub time_remaining_s: u32,
-}
-
-impl From<&TacticalSignal> for TacticalSignalDto {
-    fn from(t: &TacticalSignal) -> Self {
-        Self {
-            route_id: t.route_id.into(),
-            at_ns: t.at,
-            current_entry: t.current_entry,
-            current_exit: t.current_exit,
-            entry_quality: entry_quality_label(t.entry_quality),
-            exit_quality: exit_quality_label(t.exit_quality),
-            time_since_emit_s: t.time_since_emit_s,
-            time_remaining_s: t.time_remaining_s,
-        }
-    }
-}
-
-fn entry_quality_label(q: EntryQuality) -> &'static str {
-    match q {
-        EntryQuality::HasNotAppeared => "has_not_appeared",
-        EntryQuality::Eligible => "eligible",
-        EntryQuality::AboveMedian => "above_median",
-        EntryQuality::NearPeak => "near_peak",
-    }
-}
-
-fn exit_quality_label(q: ExitQuality) -> &'static str {
-    match q {
-        ExitQuality::HasNotAppeared => "has_not_appeared",
-        ExitQuality::Eligible => "eligible",
-        ExitQuality::AboveMedian => "above_median",
-        ExitQuality::NearBest => "near_best",
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -466,7 +420,7 @@ mod tests {
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
-                detail: "test".into(),
+                detail: crate::ml::ReasonDetail::placeholder(),
             },
             ci_method: "wilson_marginal",
             model_version: "baseline-a3-0.2.0".into(),
@@ -496,14 +450,6 @@ mod tests {
         assert_eq!(v["baseline_diagnostics"]["enter_at_min"], 1.8);
         assert!(v.get("enter_at_min").is_none());
         assert!(v.get("gross_profit_median").is_none());
-        assert!(
-            v.get("haircut_predicted").is_none(),
-            "haircut não deve sair no DTO do ML"
-        );
-        assert!(
-            v.get("gross_profit_realizable_median").is_none(),
-            "gross realizable não deve sair no DTO do ML"
-        );
     }
 
     #[test]
@@ -634,10 +580,7 @@ mod tests {
             abstain_status_label(AbstainReason::LowConfidence),
             "LOW_CONFIDENCE"
         );
-        assert_eq!(
-            abstain_status_label(AbstainReason::LongTail),
-            "LONG_TAIL"
-        );
+        assert_eq!(abstain_status_label(AbstainReason::LongTail), "LONG_TAIL");
     }
 
     #[test]

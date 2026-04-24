@@ -21,7 +21,7 @@
 //! | `ml_broadcaster_no_subscribers_total` | Counter | — | Publicações sem consumers ativos |
 //! | `ml_broadcaster_was_recommended_total` | Counter | — | Publicações com ≥1 consumer no envio — proxy de entrega |
 //! | `ml_economic_emissions_total` | Counter | — | Eventos econômicos acumulados |
-//! | `ml_economic_outcomes_total` | CounterVec | `outcome` | realized/window_miss/exit_miss |
+//! | `ml_economic_outcomes_total` | CounterVec | `outcome` | realized/window_miss/exit_miss/censored |
 //! | `ml_economic_pnl_aggregated_usd` | Gauge | — | PnL bruto simulado agregado (USD, capital hipotético 10k) |
 //!
 //! Alertmanager + Grafana consomem esses nomes (não mudar sem warning).
@@ -29,9 +29,7 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use prometheus::{
-    Gauge, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
-};
+use prometheus::{Gauge, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
 
 use crate::ml::broadcast::{BroadcasterMetrics, RecommendationBroadcaster};
 use crate::ml::economic::EconomicMetrics;
@@ -144,8 +142,8 @@ struct BroadcasterSnapshot {
 struct EconomicSnapshot {
     n_emissions_total: u64,
     n_realized_total: u64,
-    n_window_miss_total: u64,
     n_exit_miss_total: u64,
+    n_censored_total: u64,
     pnl_aggregated_usd_times_10k: i64,
 }
 
@@ -342,7 +340,9 @@ impl MlPrometheusMetrics {
         }
         // Pre-touch labels Wave T.
         for reason in &["channel_full", "channel_closed"] {
-            raw_samples_dropped_total.with_label_values(&[reason]).inc_by(0);
+            raw_samples_dropped_total
+                .with_label_values(&[reason])
+                .inc_by(0);
         }
         for tier in &["allowlist", "priority", "decimated_uniform"] {
             raw_samples_emitted_by_tier_total
@@ -350,10 +350,14 @@ impl MlPrometheusMetrics {
                 .inc_by(0);
         }
         for kind in &["trade", "abstain"] {
-            broadcaster_published_total.with_label_values(&[kind]).inc_by(0);
+            broadcaster_published_total
+                .with_label_values(&[kind])
+                .inc_by(0);
         }
         for outcome in &["realized", "window_miss", "exit_miss"] {
-            economic_outcomes_total.with_label_values(&[outcome]).inc_by(0);
+            economic_outcomes_total
+                .with_label_values(&[outcome])
+                .inc_by(0);
         }
         // Wave U pre-touch.
         for reason in &["channel_full", "channel_closed"] {
@@ -363,9 +367,7 @@ impl MlPrometheusMetrics {
         }
         // Wave V pre-touch.
         for outcome in &["realized", "miss", "censored"] {
-            labels_written_total
-                .with_label_values(&[outcome])
-                .inc_by(0);
+            labels_written_total.with_label_values(&[outcome]).inc_by(0);
         }
         for reason in &["channel_full", "channel_closed"] {
             labels_dropped_writer_total
@@ -466,7 +468,8 @@ impl MlPrometheusMetrics {
             .set(server.baseline().cache().routes_tracked() as i64);
 
         // Raw samples do ServerMetrics.
-        self.raw_samples_emitted_total.inc_by(diff!(raw_samples_emitted));
+        self.raw_samples_emitted_total
+            .inc_by(diff!(raw_samples_emitted));
         self.raw_samples_emitted_by_tier_total
             .with_label_values(&["allowlist"])
             .inc_by(diff!(raw_samples_emitted_allowlist));
@@ -532,7 +535,9 @@ impl MlPrometheusMetrics {
         let written_miss = rm.labels_written_miss_total.load(Ordering::Relaxed);
         let written_censored = rm.labels_written_censored_total.load(Ordering::Relaxed);
         let drop_full = rm.labels_dropped_channel_full_total.load(Ordering::Relaxed);
-        let drop_closed = rm.labels_dropped_channel_closed_total.load(Ordering::Relaxed);
+        let drop_closed = rm
+            .labels_dropped_channel_closed_total
+            .load(Ordering::Relaxed);
         let drop_cap = rm
             .labels_dropped_capacity_overflow_total
             .load(Ordering::Relaxed);
@@ -605,8 +610,7 @@ impl MlPrometheusMetrics {
         self.last_broadcaster.abstain_published_total = abstain;
         self.last_broadcaster.no_subscribers_total = no_subs;
         self.last_broadcaster.was_recommended_publications = recommended;
-        self.last_broadcaster.published_total =
-            bm.published_total.load(Ordering::Relaxed);
+        self.last_broadcaster.published_total = bm.published_total.load(Ordering::Relaxed);
         self.last_broadcaster.lagged_frames_total = lagged;
     }
 
@@ -614,51 +618,48 @@ impl MlPrometheusMetrics {
     pub fn update_from_economic(&mut self, em: &EconomicMetrics) {
         let emissions = em.n_emissions_total.load(Ordering::Relaxed);
         let realized = em.n_realized_total.load(Ordering::Relaxed);
-        let window_miss = em.n_window_miss_total.load(Ordering::Relaxed);
         let exit_miss = em.n_exit_miss_total.load(Ordering::Relaxed);
+        let censored = em.n_censored_total.load(Ordering::Relaxed);
         let pnl_x10k = em.pnl_aggregated_usd_times_10k.load(Ordering::Relaxed);
 
         let d_emissions = emissions.saturating_sub(self.last_economic.n_emissions_total);
         let d_realized = realized.saturating_sub(self.last_economic.n_realized_total);
-        let d_window_miss = window_miss.saturating_sub(self.last_economic.n_window_miss_total);
         let d_exit_miss = exit_miss.saturating_sub(self.last_economic.n_exit_miss_total);
+        let d_censored = censored.saturating_sub(self.last_economic.n_censored_total);
 
         self.economic_emissions_total.inc_by(d_emissions);
         self.economic_outcomes_total
             .with_label_values(&["realized"])
             .inc_by(d_realized);
         self.economic_outcomes_total
-            .with_label_values(&["window_miss"])
-            .inc_by(d_window_miss);
-        self.economic_outcomes_total
             .with_label_values(&["exit_miss"])
             .inc_by(d_exit_miss);
+        self.economic_outcomes_total
+            .with_label_values(&["censored"])
+            .inc_by(d_censored);
 
-        // Gauge = valor absoluto atual em USD (divide /10_000 para reverter scaling).
         let pnl_usd = (pnl_x10k as f64) / 10_000.0;
         self.economic_pnl_aggregated_usd.set(pnl_usd);
 
-        // Wave U — ECE e obs count (gauges absolutos).
         let ece_bps = em.calibration_ece_bps.load(Ordering::Relaxed);
         self.calibration_ece.set((ece_bps as f64) / 10_000.0);
         let obs = em.calibration_observations.load(Ordering::Relaxed);
         self.calibration_observations.set(obs as i64);
 
-        // F2-R4 — Taxa de recomendação prematura acumulada.
-        // `n_window_miss_total / n_emissions_total`. Se emissions=0, set 0
-        // (sem dados é melhor que NaN em dashboard). Valores acumulados
-        // desde startup; idealmente janela rolling, mas isso é Marco 2.
-        let premature_rate = if emissions > 0 {
-            (window_miss as f64) / (emissions as f64)
+        // Taxa de exit miss acumulada: `exit_miss / observed_emissions`.
+        // Censurados não entram no denominador (horizonte não observável).
+        let observed_emissions = emissions.saturating_sub(censored);
+        let exit_miss_rate = if observed_emissions > 0 {
+            (exit_miss as f64) / (observed_emissions as f64)
         } else {
             0.0
         };
-        self.premature_recommendation_rate.set(premature_rate);
+        self.premature_recommendation_rate.set(exit_miss_rate);
 
         self.last_economic.n_emissions_total = emissions;
         self.last_economic.n_realized_total = realized;
-        self.last_economic.n_window_miss_total = window_miss;
         self.last_economic.n_exit_miss_total = exit_miss;
+        self.last_economic.n_censored_total = censored;
         self.last_economic.pnl_aggregated_usd_times_10k = pnl_x10k;
     }
 }
@@ -678,12 +679,8 @@ fn snapshot(m: &Arc<ServerMetrics>) -> ServerMetricsSnapshot {
         rec_abstain_low_confidence: m.rec_abstain_low_confidence.load(Ordering::Relaxed),
         rec_abstain_long_tail: m.rec_abstain_long_tail.load(Ordering::Relaxed),
         raw_samples_emitted: m.raw_samples_emitted.load(Ordering::Relaxed),
-        raw_samples_emitted_allowlist: m
-            .raw_samples_emitted_allowlist
-            .load(Ordering::Relaxed),
-        raw_samples_emitted_priority: m
-            .raw_samples_emitted_priority
-            .load(Ordering::Relaxed),
+        raw_samples_emitted_allowlist: m.raw_samples_emitted_allowlist.load(Ordering::Relaxed),
+        raw_samples_emitted_priority: m.raw_samples_emitted_priority.load(Ordering::Relaxed),
         raw_samples_emitted_decimated_uniform: m
             .raw_samples_emitted_decimated_uniform
             .load(Ordering::Relaxed),
@@ -753,10 +750,10 @@ mod tests {
 
     #[test]
     fn premature_recommendation_rate_is_window_miss_over_emissions() {
-        use crate::ml::economic::{EconomicAccumulator, EconomicEvent, TradeOutcome};
         use crate::ml::contract::{
             BaselineDiagnostics, CalibStatus, ReasonKind, TradeReason, TradeSetup,
         };
+        use crate::ml::economic::{EconomicAccumulator, EconomicEvent, TradeOutcome};
 
         let registry = Registry::new();
         let mut m = MlPrometheusMetrics::register(&registry).expect("register");
@@ -805,7 +802,7 @@ mod tests {
                 calibration_status: CalibStatus::Degraded,
                 reason: TradeReason {
                     kind: ReasonKind::Combined,
-                    detail: "t".into(),
+                    detail: crate::ml::ReasonDetail::placeholder(),
                 },
                 ci_method: "wilson_marginal",
                 model_version: "baseline-a3-0.2.0".into(),
@@ -826,17 +823,16 @@ mod tests {
                 2_000_000_000 + i * 1_000_000_000,
             ));
         }
-        #[allow(deprecated)]
         for i in 0..7u64 {
             acc.push(EconomicEvent::new(
                 &mk_setup(10_000_000_000 + i * 1_000_000_000),
-                TradeOutcome::WindowMiss,
+                TradeOutcome::ExitMiss { forced_exit_pct: -2.0 },
                 11_000_000_000 + i * 1_000_000_000,
             ));
         }
 
         m.update_from_economic(&acc.metrics());
-        // 7 window_miss / 10 emissions = 0.7
+        // 7 exit_miss / 10 emissions = 0.7
         let rate = m.premature_recommendation_rate.get();
         assert!(
             (rate - 0.7).abs() < 1e-6,
@@ -992,7 +988,7 @@ mod tests {
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
-                detail: "test".into(),
+                detail: crate::ml::ReasonDetail::placeholder(),
             },
             ci_method: "wilson_marginal",
             model_version: "baseline-a3-0.2.0".into(),

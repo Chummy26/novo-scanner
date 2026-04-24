@@ -30,8 +30,9 @@ use parking_lot::Mutex;
 use crate::ml::contract::RouteId;
 use crate::ml::persistence::labeled_trade::{
     CensorReason, FeaturesT0, FloorHitLabel, LabelOutcome, LabeledTrade, PolicyMetadata,
-    LABELED_TRADE_SCHEMA_VERSION, SCANNER_VERSION,
+    LABELED_TRADE_SCHEMA_VERSION,
 };
+use crate::ml::SCANNER_VERSION;
 use crate::ml::persistence::labeled_writer::{LabeledWriterHandle, LabeledWriterSendError};
 
 /// Padrões de horizonte (s) — fix A7.
@@ -215,11 +216,7 @@ impl Default for ResolverConfig {
 /// overlap massivo entre labels de longo horizonte que inflavam calibração
 /// de `P@8h` em ordens de magnitude.
 #[inline]
-pub fn effective_stride_for_horizon(
-    base_s: u32,
-    horizon_s: u32,
-    n_events_target: u32,
-) -> u32 {
+pub fn effective_stride_for_horizon(base_s: u32, horizon_s: u32, n_events_target: u32) -> u32 {
     if n_events_target == 0 {
         return base_s;
     }
@@ -256,8 +253,8 @@ pub struct LabelResolver {
 }
 
 struct ResolverInner {
-    /// Pending labels por rota. VecDeque preserva ordem FIFO para manter
-    /// labels antigos quando houver overflow; novos pendings são recusados.
+    /// Pending labels por rota. Em overflow, labels antigos podem ser
+    /// descartados para preservar representatividade do regime atual.
     pending_by_route: AHashMap<RouteId, VecDeque<PendingLabel>>,
     /// Último `ts_ns` em que um label foi criado por rota (para stride).
     last_label_ts: AHashMap<RouteId, u64>,
@@ -284,9 +281,11 @@ impl LabelResolver {
         &self.cfg.horizons_s
     }
 
-    /// Compatibilidade para callers que ainda rotulam apenas Accept/floor primario.
+    /// Helper de teste: atalho para `on_candidate` com defaults Accept.
+    /// Não exposto em produção — callers reais usam `on_candidate` direto.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn on_accepted(
+    pub(crate) fn on_accepted(
         &self,
         sample_id: String,
         ts_emit_ns: u64,
@@ -318,7 +317,6 @@ impl LabelResolver {
             sampling_tier,
             sampling_probability,
             label_stride_s,
-            // Defaults v6 para callers legados — derivam placeholder aceitável.
             derive_cluster_id(route_id, ts_emit_ns),
             1,
             1,
@@ -460,21 +458,22 @@ impl LabelResolver {
                     // nanos, igualdade exata tem probabilidade ~0). Consolidado
                     // em `>=` — fecha na primeira observação pós-deadline.
                     if now_ns >= deadline {
-                        // Ainda aceita a observação se está próxima do deadline
-                        // — slot.observed_until_ns fica no min(now, deadline) para
-                        // preservar semântica de janela truncada.
+                        // Observação pós-deadline apenas comprova que a janela foi
+                        // observada até o horizonte. Ela NÃO pode criar first-hit:
+                        // o label é falsificável só dentro de [t0, t0+h].
                         slot.observed_until_ns = deadline;
-                        // Aproveita observação atual se `gross >= floor` —
-                        // fecha `Realized` em vez de `Miss`.
-                        let gross = entry_locked + exit_spread;
-                        if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
-                            slot.first_exit_ge_floor_ts_ns = Some(now_ns);
-                            slot.first_exit_ge_floor_pct = Some(exit_spread);
-                        }
-                        for hit in slot.floor_hits.iter_mut() {
-                            if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none() {
-                                hit.first_exit_ge_floor_ts_ns = Some(now_ns);
-                                hit.first_exit_ge_floor_pct = Some(exit_spread);
+                        if now_ns == deadline {
+                            let gross = entry_locked + exit_spread;
+                            if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
+                                slot.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                slot.first_exit_ge_floor_pct = Some(exit_spread);
+                            }
+                            for hit in slot.floor_hits.iter_mut() {
+                                if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none()
+                                {
+                                    hit.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                    hit.first_exit_ge_floor_pct = Some(exit_spread);
+                                }
                             }
                         }
                         slot.closed = true;
@@ -518,7 +517,7 @@ impl LabelResolver {
 
         for (pending, idx) in to_write {
             let outcome = LabelOutcome::from_pending(&pending, idx);
-            self.write_closed_horizon(pending, idx, now_ns, outcome);
+            self.write_closed_horizon_with_reason(pending, idx, now_ns, outcome, None);
         }
     }
 
@@ -546,8 +545,7 @@ impl LabelResolver {
                         // separação para preservar independência de censura.
                         let dormant = idle_for >= self.cfg.route_vanish_idle_ns;
                         let delisted = idle_for >= self.cfg.route_delisted_idle_ns;
-                        let expired =
-                            now_ns >= deadline.saturating_add(self.cfg.close_slack_ns);
+                        let expired = now_ns >= deadline.saturating_add(self.cfg.close_slack_ns);
                         if expired {
                             slot.closed = true;
                             // Outcome será determinado pós-loop a partir do snapshot.
@@ -559,11 +557,7 @@ impl LabelResolver {
                             } else {
                                 CensorReason::RouteDormant
                             };
-                            closed_this_sweep.push((
-                                idx,
-                                LabelOutcome::Censored,
-                                Some(reason),
-                            ));
+                            closed_this_sweep.push((idx, LabelOutcome::Censored, Some(reason)));
                         }
                     }
                     if !closed_this_sweep.is_empty() {
@@ -579,12 +573,11 @@ impl LabelResolver {
                             // Censored sem reason específico (caminho
                             // teoricamente inalcançável dado o gate acima),
                             // usa `RouteDormant` como fallback conservador.
-                            let final_reason =
-                                if matches!(final_outcome, LabelOutcome::Censored) {
-                                    reason.or(Some(CensorReason::RouteDormant))
-                                } else {
-                                    reason
-                                };
+                            let final_reason = if matches!(final_outcome, LabelOutcome::Censored) {
+                                reason.or(Some(CensorReason::RouteDormant))
+                            } else {
+                                reason
+                            };
                             to_write.push((snap.clone(), idx, final_outcome, final_reason));
                         }
                     }
@@ -654,16 +647,6 @@ impl LabelResolver {
         n
     }
 
-    fn write_closed_horizon(
-        &self,
-        pending: PendingLabel,
-        idx: usize,
-        now_ns: u64,
-        outcome: LabelOutcome,
-    ) {
-        self.write_closed_horizon_with_reason(pending, idx, now_ns, outcome, None);
-    }
-
     fn write_closed_horizon_with_reason(
         &self,
         pending: PendingLabel,
@@ -677,20 +660,18 @@ impl LabelResolver {
             .best_exit_pct_so_far
             .map(|e| pending.entry_locked_pct + e);
         let t_to_best = slot.best_exit_ts_ns_so_far.map(|ts| {
-            ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000)
-                .min(u32::MAX as u64) as u32
+            ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000).min(u32::MAX as u64) as u32
         });
         let t_to_first_hit = slot.first_exit_ge_floor_ts_ns.map(|ts| {
-            ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000)
-                .min(u32::MAX as u64) as u32
+            ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000).min(u32::MAX as u64) as u32
         });
         let label_floor_hits = slot
             .floor_hits
             .iter()
             .map(|hit| {
                 let t_to_first_hit_s = hit.first_exit_ge_floor_ts_ns.map(|ts| {
-                    ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000)
-                        .min(u32::MAX as u64) as u32
+                    ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000).min(u32::MAX as u64)
+                        as u32
                 });
                 FloorHitLabel {
                     floor_pct: hit.floor_pct,
@@ -755,7 +736,9 @@ impl LabelResolver {
 
         match self.writer.try_send(label) {
             Ok(()) => {
-                self.metrics.labels_written_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .labels_written_total
+                    .fetch_add(1, Ordering::Relaxed);
                 match outcome {
                     LabelOutcome::Realized => self
                         .metrics
@@ -901,7 +884,11 @@ mod tests {
 
     async fn setup_resolver(
         cfg: ResolverConfig,
-    ) -> (Arc<LabelResolver>, tempfile::TempDir, tokio::task::JoinHandle<()>) {
+    ) -> (
+        Arc<LabelResolver>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let wcfg = LabeledWriterConfig {
             data_dir: tmp.path().to_path_buf(),
@@ -935,9 +922,19 @@ mod tests {
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t_emit = 1_000_000_000u64;
         resolver.on_accepted(
-            "sid_a".into(), t_emit, 1, mk_route(), "BTC-USDT".into(),
-            2.5, -1.2, mk_features(), 0.8, mk_policy(),
-            "allowlist", 1.0, 0,
+            "sid_a".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
         );
         // t+1s: exit=-1.5 → gross = 2.5 + (-1.5) = 1.0 >= floor 0.8 → hit!
         resolver.on_clean_observation(mk_route(), t_emit + 1_000_000_000, 2.0, -1.5);
@@ -968,24 +965,69 @@ mod tests {
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t_emit = 1_000_000_000u64;
         resolver.on_accepted(
-            "sid_m".into(), t_emit, 1, mk_route(), "BTC-USDT".into(),
-            2.5, -1.2, mk_features(), 10.0, mk_policy(), // floor absurdo
-            "allowlist", 1.0, 0,
+            "sid_m".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            10.0,
+            mk_policy(), // floor absurdo
+            "allowlist",
+            1.0,
+            0,
         );
         // Observações com exit muito negativo → nunca hita floor 10%.
         for i in 1..=5u64 {
-            resolver.on_clean_observation(
-                mk_route(),
-                t_emit + i * 1_000_000_000,
-                2.0,
-                -2.0,
-            );
+            resolver.on_clean_observation(mk_route(), t_emit + i * 1_000_000_000, 2.0, -2.0);
         }
         resolver.sweep(t_emit + 10_000_000_000);
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert!(m.labels_written_miss_total.load(Ordering::Relaxed) >= 1);
         assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 0);
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn post_deadline_hit_does_not_realize_horizon() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![2],
+            close_slack_ns: 60_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+            label_stride_base_s: 60,
+            n_events_target_per_horizon: 10,
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t_emit = 1_000_000_000u64;
+        resolver.on_accepted(
+            "sid_late".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
+        );
+        // t+3s fica fora do horizonte de 2s. Mesmo com gross=1.5 >= floor,
+        // não pode ser marcado como realized para esse horizonte.
+        resolver.on_clean_observation(mk_route(), t_emit + 3_000_000_000, 1.9, -0.5);
+        sleep(Duration::from_millis(150)).await;
+        let m = resolver.metrics();
+        assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.labels_written_miss_total.load(Ordering::Relaxed), 1);
         drop(resolver);
         drop(tmp);
     }
@@ -1005,9 +1047,19 @@ mod tests {
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t_emit = 1_000_000_000u64;
         resolver.on_accepted(
-            "sid_incomplete".into(), t_emit, 1, mk_route(), "BTC-USDT".into(),
-            2.5, -1.2, mk_features(), 10.0, mk_policy(),
-            "allowlist", 1.0, 0,
+            "sid_incomplete".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            10.0,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
         );
         resolver.on_clean_observation(mk_route(), t_emit + 5_000_000_000, 2.0, -2.0);
         resolver.sweep(t_emit + 12_000_000_000);
@@ -1034,9 +1086,19 @@ mod tests {
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t_emit = 1_000_000_000u64;
         resolver.on_accepted(
-            "sid_c".into(), t_emit, 1, mk_route(), "BTC-USDT".into(),
-            2.5, -1.2, mk_features(), 0.8, mk_policy(),
-            "allowlist", 1.0, 0,
+            "sid_c".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
         );
         // Sem observações; só sweeper após 6s.
         resolver.sweep(t_emit + 6_000_000_000);
@@ -1053,25 +1115,55 @@ mod tests {
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t0 = 1_000_000_000u64;
         let created_a = resolver.on_accepted(
-            "sid1".into(), t0, 1, mk_route(), "BTC-USDT".into(),
-            2.5, -1.2, mk_features(), 0.8, mk_policy(),
-            "allowlist", 1.0, 60, // stride 60s
+            "sid1".into(),
+            t0,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            60, // stride 60s
         );
         assert!(created_a);
         // 30s depois — dentro do stride → skip.
         let created_b = resolver.on_accepted(
-            "sid2".into(), t0 + 30_000_000_000, 2, mk_route(), "BTC-USDT".into(),
-            2.5, -1.2, mk_features(), 0.8, mk_policy(),
-            "allowlist", 1.0, 60,
+            "sid2".into(),
+            t0 + 30_000_000_000,
+            2,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            60,
         );
         assert!(!created_b);
         let m = resolver.metrics();
         assert_eq!(m.stride_skipped_total.load(Ordering::Relaxed), 1);
         // 61s depois — stride expirado → cria.
         let created_c = resolver.on_accepted(
-            "sid3".into(), t0 + 61_000_000_000, 3, mk_route(), "BTC-USDT".into(),
-            2.5, -1.2, mk_features(), 0.8, mk_policy(),
-            "allowlist", 1.0, 60,
+            "sid3".into(),
+            t0 + 61_000_000_000,
+            3,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            60,
         );
         assert!(created_c);
         drop(resolver);
@@ -1093,9 +1185,19 @@ mod tests {
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t0 = 1_000_000_000u64;
         resolver.on_accepted(
-            "sid".into(), t0, 1, mk_route(), "BTC-USDT".into(),
-            2.0, -1.5, mk_features(), 0.5, mk_policy(),
-            "allowlist", 1.0, 0,
+            "sid".into(),
+            t0,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.5,
+            mk_features(),
+            0.5,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
         );
         // t+2s: exit=-1.0 → gross=1.0 (hit)
         resolver.on_clean_observation(mk_route(), t0 + 2_000_000_000, 1.9, -1.0);
@@ -1115,14 +1217,27 @@ mod tests {
         let (resolver, tmp, _task) = setup_resolver(cfg).await;
         let t0 = 1_000_000_000u64;
         resolver.on_accepted(
-            "sid".into(), t0, 1, mk_route(), "BTC-USDT".into(),
-            2.0, -1.0, mk_features(), 0.8, mk_policy(),
-            "allowlist", 1.0, 0,
+            "sid".into(),
+            t0,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
         );
         // Sem observações → observed_until == t_emit < qualquer deadline → Censored.
         // Fix A7: DEFAULT_HORIZONS_S agora tem 6 elementos (buraco 2h→8h fechado).
         let closed = resolver.shutdown_flush(t0 + 1_000_000_000);
-        assert_eq!(closed, 6, "6 horizontes default (fix A7) devem ter sido fechados");
+        assert_eq!(
+            closed, 6,
+            "6 horizontes default (fix A7) devem ter sido fechados"
+        );
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert_eq!(
@@ -1159,7 +1274,8 @@ mod tests {
             1,
             mk_route(),
             "BTC-USDT".into(),
-            2.0, -1.0,
+            2.0,
+            -1.0,
             mk_features(),
             0.5,
             mk_policy(),
@@ -1216,7 +1332,8 @@ mod tests {
             1,
             mk_route(),
             "BTC-USDT".into(),
-            2.0, -1.0,
+            2.0,
+            -1.0,
             mk_features(),
             10.0, // floor inalcançável → nunca hita
             mk_policy(),
@@ -1227,12 +1344,7 @@ mod tests {
         // Observações continuam chegando (rota não sumiu) até além do último
         // deadline (6s), mas nunca hitam o floor de 10%.
         for i in 1..=7u64 {
-            resolver.on_clean_observation(
-                mk_route(),
-                t0 + i * 1_000_000_000,
-                1.9,
-                -2.0,
-            );
+            resolver.on_clean_observation(mk_route(), t0 + i * 1_000_000_000, 1.9, -2.0);
         }
         // Shutdown em t0+7s — slot 900s/1800s/2h (no config test: 2/4/6s)
         // todos têm observed_until >= deadline → Miss, não Censored.
@@ -1272,14 +1384,21 @@ mod tests {
                 i,
                 mk_route(),
                 "BTC-USDT".into(),
-                2.5, -1.2, mk_features(), 0.8, mk_policy(),
-                "allowlist", 1.0, 0, // sem stride
+                2.5,
+                -1.2,
+                mk_features(),
+                0.8,
+                mk_policy(),
+                "allowlist",
+                1.0,
+                0, // sem stride
             );
         }
         let m = resolver.metrics();
         // 5 candidates, cap=3 → 2 drops (de oldest); 5 created total.
         assert_eq!(
-            m.labels_dropped_capacity_overflow_total.load(Ordering::Relaxed),
+            m.labels_dropped_capacity_overflow_total
+                .load(Ordering::Relaxed),
             2,
             "2 drops esperados (cap=3 com 5 insertions)"
         );
@@ -1331,7 +1450,10 @@ mod tests {
         assert_eq!(derive_cluster_id(r1, t), derive_cluster_id(r1, t));
         assert_ne!(derive_cluster_id(r1, t), derive_cluster_id(r2, t));
         // Mesma janela de 15 min → mesmo cluster.
-        assert_eq!(derive_cluster_id(r1, t), derive_cluster_id(r1, t + 60_000_000_000));
+        assert_eq!(
+            derive_cluster_id(r1, t),
+            derive_cluster_id(r1, t + 60_000_000_000)
+        );
         // Janela seguinte → cluster distinto.
         assert_ne!(
             derive_cluster_id(r1, t),

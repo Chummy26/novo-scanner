@@ -19,7 +19,12 @@ pub enum InvariantError {
     ExitQuantilesNotMonotonic { q25: f32, q50: f32, q75: f32 },
     /// Diagnósticos do baseline violam monotonicidade de gross.
     BaselineGrossQuantilesNotMonotonic {
-        p10: f32, p25: f32, median: f32, p75: f32, p90: f32, p95: f32,
+        p10: f32,
+        p25: f32,
+        median: f32,
+        p75: f32,
+        p90: f32,
+        p95: f32,
     },
     /// Diagnósticos do baseline violam `enter_at_min <= enter_typical <= enter_peak_p95`.
     BaselineEnterLevelsNotMonotonic { min: f32, typical: f32, peak: f32 },
@@ -52,10 +57,7 @@ pub enum InvariantError {
     /// Fix D10: janela de validade (`valid_until - emitted_at`) menor que
     /// o dobro do `t_hit_p75_s` previsto. 100% das recomendações expiram
     /// antes do p75 ⇒ `ExitMiss` forçado sistematicamente.
-    ValidityWindowShorterThanPredictedHorizon {
-        valid_for_s: u64,
-        t_hit_p75_s: u32,
-    },
+    ValidityWindowShorterThanPredictedHorizon { valid_for_s: u64, t_hit_p75_s: u32 },
     /// Fix E18: `p_hit` abaixo do piso configurado de emissão (precision-first).
     PHitBelowEmissionFloor { p_hit: f32, floor: f32 },
 }
@@ -98,12 +100,18 @@ pub fn verify_tradesetup_with_floor(
 
     if let Some(p) = s.p_hit {
         if !p.is_finite() {
-            return Err(InvariantError::NonFiniteField { field: "p_hit", value: p });
+            return Err(InvariantError::NonFiniteField {
+                field: "p_hit",
+                value: p,
+            });
         }
     }
     if let Some(p) = s.p_censor {
         if !p.is_finite() {
-            return Err(InvariantError::NonFiniteField { field: "p_censor", value: p });
+            return Err(InvariantError::NonFiniteField {
+                field: "p_censor",
+                value: p,
+            });
         }
     }
 
@@ -130,11 +138,7 @@ pub fn verify_tradesetup_with_floor(
     match (s.exit_q25, s.exit_q50, s.exit_q75) {
         (Some(q25), Some(q50), Some(q75)) => {
             if !(q25 <= q50 && q50 <= q75) {
-                return Err(InvariantError::ExitQuantilesNotMonotonic {
-                    q25,
-                    q50,
-                    q75,
-                });
+                return Err(InvariantError::ExitQuantilesNotMonotonic { q25, q50, q75 });
             }
         }
         (None, None, None) => {}
@@ -150,11 +154,7 @@ pub fn verify_tradesetup_with_floor(
     match (s.t_hit_p25_s, s.t_hit_median_s, s.t_hit_p75_s) {
         (Some(p25), Some(median), Some(p75)) => {
             if !(p25 <= median && median <= p75) {
-                return Err(InvariantError::TimeToHitQuantilesNotMonotonic {
-                    p25,
-                    median,
-                    p75,
-                });
+                return Err(InvariantError::TimeToHitQuantilesNotMonotonic { p25, median, p75 });
             }
         }
         (None, None, None) => {}
@@ -216,10 +216,16 @@ pub fn verify_tradesetup_with_floor(
             ("baseline.gross_profit_p75", d.gross_profit_p75),
             ("baseline.gross_profit_p90", d.gross_profit_p90),
             ("baseline.gross_profit_p95", d.gross_profit_p95),
-            ("baseline.historical_base_rate_24h", d.historical_base_rate_24h),
+            (
+                "baseline.historical_base_rate_24h",
+                d.historical_base_rate_24h,
+            ),
         ] {
             if !v.is_finite() {
-                return Err(InvariantError::NonFiniteField { field: name, value: v });
+                return Err(InvariantError::NonFiniteField {
+                    field: name,
+                    value: v,
+                });
             }
         }
         if !(d.gross_profit_p10 <= d.gross_profit_p25
@@ -245,7 +251,10 @@ pub fn verify_tradesetup_with_floor(
             });
         }
         for (name, v) in [
-            ("baseline.historical_base_rate_24h", d.historical_base_rate_24h),
+            (
+                "baseline.historical_base_rate_24h",
+                d.historical_base_rate_24h,
+            ),
             ("baseline.p_enter_hit", d.p_enter_hit),
             ("baseline.p_exit_hit_given_enter", d.p_exit_hit_given_enter),
         ] {
@@ -257,7 +266,11 @@ pub fn verify_tradesetup_with_floor(
             }
         }
         let (lo, hi) = d.historical_base_rate_ci;
-        if !(0.0 <= lo && lo <= d.historical_base_rate_24h && d.historical_base_rate_24h <= hi && hi <= 1.0) {
+        if !(0.0 <= lo
+            && lo <= d.historical_base_rate_24h
+            && d.historical_base_rate_24h <= hi
+            && hi <= 1.0)
+        {
             return Err(InvariantError::ConfidenceIntervalInconsistent {
                 p: d.historical_base_rate_24h,
                 lo,
@@ -285,9 +298,7 @@ pub fn verify_tradesetup_with_floor(
     // 10. Fix D5: censura é primeira ordem (skill §6). Emitir `t_hit_median_s`
     //     sem `p_censor` é epistemologicamente desonesto — esconde que a
     //     distribuição de T pode estar truncada por desaparecimento de rota.
-    if (s.t_hit_median_s.is_some()
-        || s.t_hit_p25_s.is_some()
-        || s.t_hit_p75_s.is_some())
+    if (s.t_hit_median_s.is_some() || s.t_hit_p25_s.is_some() || s.t_hit_p75_s.is_some())
         && s.p_censor.is_none()
     {
         return Err(InvariantError::TimeToHitWithoutCensorProbability);
@@ -344,7 +355,7 @@ mod tests {
             },
             entry_now: 2.0,
             exit_target: -1.0,
-            gross_profit_target: 1.0,  // entry_now + exit_q50
+            gross_profit_target: 1.0, // entry_now + exit_q50
             p_hit: Some(0.83),
             p_hit_ci: Some((0.77, 0.88)),
             ci_method: "wilson_marginal",
@@ -398,7 +409,10 @@ mod tests {
         let mut s = valid();
         s.baseline_diagnostics.as_mut().unwrap().gross_profit_p10 = 5.0; // maior que median
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::BaselineGrossQuantilesNotMonotonic { .. }));
+        assert!(matches!(
+            err,
+            InvariantError::BaselineGrossQuantilesNotMonotonic { .. }
+        ));
     }
 
     #[test]
@@ -406,7 +420,10 @@ mod tests {
         let mut s = valid();
         s.p_hit = Some(1.5);
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::ProbabilityOutOfUnitInterval { .. }));
+        assert!(matches!(
+            err,
+            InvariantError::ProbabilityOutOfUnitInterval { .. }
+        ));
     }
 
     #[test]
@@ -414,7 +431,10 @@ mod tests {
         let mut s = valid();
         s.p_hit_ci = Some((0.10, 0.20)); // p_hit=0.83 está fora
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::ConfidenceIntervalInconsistent { .. }));
+        assert!(matches!(
+            err,
+            InvariantError::ConfidenceIntervalInconsistent { .. }
+        ));
     }
 
     #[test]
@@ -439,7 +459,10 @@ mod tests {
         let mut s = valid();
         s.valid_until = s.emitted_at;
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::ValidUntilBeforeEmittedAt { .. }));
+        assert!(matches!(
+            err,
+            InvariantError::ValidUntilBeforeEmittedAt { .. }
+        ));
     }
 
     #[test]
@@ -449,7 +472,10 @@ mod tests {
         s.t_hit_median_s = Some(100);
         s.t_hit_p75_s = Some(200);
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::TimeToHitQuantilesNotMonotonic { .. }));
+        assert!(matches!(
+            err,
+            InvariantError::TimeToHitQuantilesNotMonotonic { .. }
+        ));
     }
 
     #[test]
@@ -457,7 +483,10 @@ mod tests {
         let mut s = valid();
         s.baseline_diagnostics.as_mut().unwrap().enter_at_min = 3.0; // > typical
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::BaselineEnterLevelsNotMonotonic { .. }));
+        assert!(matches!(
+            err,
+            InvariantError::BaselineEnterLevelsNotMonotonic { .. }
+        ));
     }
 
     // ---- Fix D1 + E1: gross_profit_target deriva de exit_q50 ------------
@@ -469,7 +498,12 @@ mod tests {
         s.gross_profit_target = 0.5; // discrepa de entry_now(2.0) + q50(-1.0) = 1.0
         let err = verify_tradesetup(&s).unwrap_err();
         match err {
-            InvariantError::GrossIdentityMismatch { gross, entry, exit_q50, delta } => {
+            InvariantError::GrossIdentityMismatch {
+                gross,
+                entry,
+                exit_q50,
+                delta,
+            } => {
                 assert!((gross - 0.5).abs() < 1e-6);
                 assert!((entry - 2.0).abs() < 1e-6);
                 assert!((exit_q50 - (-1.0)).abs() < 1e-6);
@@ -497,7 +531,10 @@ mod tests {
         let mut s = valid();
         s.p_censor = None;
         let err = verify_tradesetup(&s).unwrap_err();
-        assert!(matches!(err, InvariantError::TimeToHitWithoutCensorProbability));
+        assert!(matches!(
+            err,
+            InvariantError::TimeToHitWithoutCensorProbability
+        ));
     }
 
     #[test]

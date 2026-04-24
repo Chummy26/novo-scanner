@@ -256,21 +256,11 @@ impl RawSampleWriter {
             .unwrap_or(0);
         let filename = format!("{}_{}.jsonl", self.cfg.file_prefix, start_ts);
         let path = dir_path.join(filename);
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         info!(path = %path.display(), "ML raw writer: abrindo novo arquivo");
         Ok((BufWriter::with_capacity(64 * 1024, file), path))
     }
 
-    pub fn total_written(&self) -> u64 {
-        self.total_written
-    }
-
-    pub fn total_dropped(&self) -> u64 {
-        self.total_dropped
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -314,13 +304,25 @@ mod tests {
         // Hora 14.
         let s1 = RawSample::new(
             1_745_159_400u64 * 1_000_000_000,
-            0, route, "BTC-USDT", 2.0, -1.0, 1e6, 1e6,
+            0,
+            route,
+            "BTC-USDT",
+            2.0,
+            -1.0,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         // Hora 15.
         let s2 = RawSample::new(
             1_745_161_200u64 * 1_000_000_000,
-            1, route, "BTC-USDT", 2.1, -1.1, 1e6, 1e6,
+            1,
+            route,
+            "BTC-USDT",
+            2.1,
+            -1.1,
+            1e6,
+            1e6,
             SampleDecision::RejectBelowTail,
         );
         handle.try_send(s1).expect("send s1");
@@ -395,7 +397,11 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(parquet_files.len(), 1, "raw writer deve finalizar em parquet");
+        assert_eq!(
+            parquet_files.len(),
+            1,
+            "raw writer deve finalizar em parquet"
+        );
         assert!(
             jsonl_files.is_empty(),
             "jsonl intermediário do raw writer deve ser removido após compactação"
@@ -419,7 +425,13 @@ mod tests {
         let (_writer, handle) = RawSampleWriter::create(cfg);
         let s = RawSample::new(
             1_745_159_400u64 * 1_000_000_000,
-            0, mk_route(), "BTC-USDT", 2.0, -1.0, 1e6, 1e6,
+            0,
+            mk_route(),
+            "BTC-USDT",
+            2.0,
+            -1.0,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         assert!(handle.try_send(s.clone()).is_ok());

@@ -134,7 +134,7 @@ impl CacheConfig {
     pub fn for_testing() -> Self {
         Self {
             decimation: 1,
-            window_ns: u64::MAX, // sem expiração por padrão em tests
+            window_ns: u64::MAX,           // sem expiração por padrão em tests
             rebuild_interval_ns: u64::MAX, // sem rebuild por padrão
             ring_initial_capacity: 64,
         }
@@ -150,24 +150,18 @@ impl CacheConfig {
 #[derive(Debug, Clone, Copy)]
 struct SampleTick {
     ts_ns: u64,
-    entry_bucket: u32, // cabe em u32 (BUCKET_MAX = 200_000)
+    entry_bucket: u32,
     exit_bucket: u32,
-    gross_bucket: u32,
 }
 
-/// Estado de uma rota: três histogramas (entry, exit, gross) + ring decimado + contadores.
 struct PerRouteCache {
     entry_hist: Histogram<u64>,
     exit_hist: Histogram<u64>,
-    gross_hist: Histogram<u64>,
     ring: VecDeque<SampleTick>,
-    /// Fix B3: contador em u64 (antes u32). Com 17k updates/s em rotas
-    /// quentes, u32 fazia wrap em ~24 dias; resíduo `% decimation` perdia
-    /// uniformidade na janela de transição. u64 resolve por ~34 bilhões
-    /// de anos.
+    /// Wrap seguro por ~34×10⁹ anos em 17k RPS.
     decimation_counter: u64,
-    /// Contador de samples **no ring** (não total desde boot). Usado
-    /// para `n_min` gate pelo trigger/baseline.
+    /// Contador de samples no ring (não total desde boot). Usado para
+    /// `n_min` gate pelo trigger/baseline.
     n_observations: u64,
     last_update_ns: u64,
     last_rebuild_ns: u64,
@@ -178,17 +172,14 @@ impl PerRouteCache {
     fn new(cfg: CacheConfig) -> Self {
         // Range [1, 200_000] cobre spread ∈ [-10%, +10%]. sigfig=2 com
         // median_equivalent em queries → bucket effective ≈ 0.01% em
-        // spreads típicos. Memória: ~14 KB/histograma × 2 × 2600 rotas ≈ 73 MB.
-        let entry_hist = Histogram::<u64>::new_with_bounds(1, BUCKET_MAX, 2)
-            .expect("hdrhistogram init");
-        let exit_hist = Histogram::<u64>::new_with_bounds(1, BUCKET_MAX, 2)
-            .expect("hdrhistogram init");
-        let gross_hist = Histogram::<u64>::new_with_bounds(1, BUCKET_MAX, 2)
-            .expect("hdrhistogram init");
+        // spreads típicos.
+        let entry_hist =
+            Histogram::<u64>::new_with_bounds(1, BUCKET_MAX, 2).expect("hdrhistogram init");
+        let exit_hist =
+            Histogram::<u64>::new_with_bounds(1, BUCKET_MAX, 2).expect("hdrhistogram init");
         Self {
             entry_hist,
             exit_hist,
-            gross_hist,
             ring: VecDeque::with_capacity(cfg.ring_initial_capacity),
             decimation_counter: 0,
             n_observations: 0,
@@ -200,8 +191,6 @@ impl PerRouteCache {
 
     #[inline]
     fn observe(&mut self, entry: f32, exit: f32, ts_ns: u64) {
-        // Decimação: só registra 1-em-`decimation` samples.
-        // Fix B3: u64 wrapping_add seguro por ~34×10⁹ anos em 17k RPS.
         self.decimation_counter = self.decimation_counter.wrapping_add(1);
         if self.decimation_counter % (self.cfg.decimation as u64) != 0 {
             self.last_update_ns = ts_ns;
@@ -210,17 +199,13 @@ impl PerRouteCache {
 
         let eb = to_bucket(entry);
         let xb = to_bucket(exit);
-        let gb = to_bucket(entry + exit);
 
-        // Push into ring.
         self.ring.push_back(SampleTick {
             ts_ns,
             entry_bucket: eb as u32,
             exit_bucket: xb as u32,
-            gross_bucket: gb as u32,
         });
 
-        // Expira samples > janela.
         let cutoff = ts_ns.saturating_sub(self.cfg.window_ns);
         let mut expired = 0u64;
         while let Some(front) = self.ring.front() {
@@ -237,21 +222,16 @@ impl PerRouteCache {
         if expired > 0 {
             self.entry_hist.reset();
             self.exit_hist.reset();
-            self.gross_hist.reset();
             for s in &self.ring {
                 let _ = self.entry_hist.record(s.entry_bucket as u64);
                 let _ = self.exit_hist.record(s.exit_bucket as u64);
-                let _ = self.gross_hist.record(s.gross_bucket as u64);
             }
             self.last_rebuild_ns = ts_ns;
         } else {
-            // Fast path: incremental record.
             let _ = self.entry_hist.record(eb);
             let _ = self.exit_hist.record(xb);
-            let _ = self.gross_hist.record(gb);
         }
 
-        // n_observations = samples atualmente no ring (pós-expiração).
         self.n_observations = self.ring.len() as u64;
         self.last_update_ns = ts_ns;
     }
@@ -274,28 +254,6 @@ impl PerRouteCache {
         let v = self.exit_hist.value_at_quantile(q);
         let mid = self.exit_hist.median_equivalent(v);
         Some(from_bucket(mid))
-    }
-
-    #[inline]
-    fn quantile_gross(&self, q: f64) -> Option<f32> {
-        if self.n_observations == 0 {
-            return None;
-        }
-        let v = self.gross_hist.value_at_quantile(q);
-        let mid = self.gross_hist.median_equivalent(v);
-        Some(from_bucket(mid))
-    }
-
-    #[inline]
-    fn probability_gross_ge(&self, threshold: f32) -> Option<(f32, u64, u64)> {
-        if self.n_observations == 0 {
-            return None;
-        }
-        let low = to_bucket(threshold);
-        let successes = self.gross_hist.count_between(low, BUCKET_MAX);
-        let total = self.n_observations;
-        let p = successes as f32 / total as f32;
-        Some((p, successes, total))
     }
 
     #[inline]
@@ -377,44 +335,6 @@ impl PerRouteCache {
     }
 
     #[inline]
-    fn gross_run_duration_quantiles(&self, threshold: f32) -> Option<(u32, u32, u32)> {
-        if self.n_observations == 0 {
-            return None;
-        }
-
-        let floor_bucket = to_bucket(threshold) as u32;
-        let mut runs: Vec<u64> = Vec::new();
-        let mut active_start: Option<u64> = None;
-        let mut last_ts: Option<u64> = None;
-
-        for s in &self.ring {
-            last_ts = Some(s.ts_ns);
-            if s.gross_bucket >= floor_bucket {
-                if active_start.is_none() {
-                    active_start = Some(s.ts_ns);
-                }
-            } else if let Some(start) = active_start.take() {
-                runs.push((s.ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000);
-            }
-        }
-
-        if let (Some(start), Some(end)) = (active_start, last_ts) {
-            runs.push((end.saturating_sub(start) + 999_999_999) / 1_000_000_000);
-        }
-
-        if runs.is_empty() {
-            return None;
-        }
-
-        runs.sort_unstable();
-        Some((
-            quantile_sorted_u64(&runs, 0.05),
-            quantile_sorted_u64(&runs, 0.50),
-            quantile_sorted_u64(&runs, 0.95),
-        ))
-    }
-
-    #[inline]
     fn exit_run_duration_quantiles(&self, exit_threshold: f32) -> Option<(u32, u32, u32)> {
         if self.n_observations == 0 {
             return None;
@@ -487,7 +407,9 @@ impl HotQueryCache {
     /// ~14 min a 6 RPS (500 × 10 / 6 ≈ 833s).
     pub fn observe(&self, route: RouteId, entry_spread: f32, exit_spread: f32, ts_ns: u64) {
         let mut guard = self.routes.write();
-        let cache = guard.entry(route).or_insert_with(|| PerRouteCache::new(self.cfg));
+        let cache = guard
+            .entry(route)
+            .or_insert_with(|| PerRouteCache::new(self.cfg));
         cache.observe(entry_spread, exit_spread, ts_ns);
     }
 
@@ -501,19 +423,9 @@ impl HotQueryCache {
         guard.get(&route)?.quantile_exit(q)
     }
 
-    pub fn quantile_gross(&self, route: RouteId, q: f64) -> Option<f32> {
-        let guard = self.routes.read();
-        guard.get(&route)?.quantile_gross(q)
-    }
-
     pub fn n_observations(&self, route: RouteId) -> u64 {
         let guard = self.routes.read();
         guard.get(&route).map(|c| c.n_observations).unwrap_or(0)
-    }
-
-    pub fn probability_gross_ge(&self, route: RouteId, threshold: f32) -> Option<(f32, u64, u64)> {
-        let guard = self.routes.read();
-        guard.get(&route)?.probability_gross_ge(threshold)
     }
 
     pub fn probability_entry_ge(&self, route: RouteId, threshold: f32) -> Option<(f32, u64, u64)> {
@@ -545,20 +457,6 @@ impl HotQueryCache {
         guard.get(&route)?.tail_ratio_p99_p95()
     }
 
-    /// Quantis de runs de `entry(t)+exit(t)` simultâneo.
-    ///
-    /// **DEPRECATED (fix B7)**: pela identidade estrutural da skill §2, esse
-    /// gross intra-tick tende a ser negativo e **NÃO representa**
-    /// `entry(t0)+exit(t1)`. Caller que precise de run de lucro bruto deve
-    /// usar `exit_run_duration_quantiles(route, label_floor − entry_now)` com
-    /// `entry_now` travado. Mantido como `pub(crate)` em vez de `pub` para
-    /// evitar regressão em callers externos.
-    #[deprecated(note = "use exit_run_duration_quantiles com threshold = label_floor − entry_now")]
-    pub fn gross_run_duration_quantiles(&self, route: RouteId, threshold: f32) -> Option<(u32, u32, u32)> {
-        let guard = self.routes.read();
-        guard.get(&route)?.gross_run_duration_quantiles(threshold)
-    }
-
     /// Quantis de duração dos runs históricos em que `exit_spread >= threshold`.
     ///
     /// Para labels ML, o caller deve passar `threshold = label_floor - entry_now`.
@@ -570,12 +468,27 @@ impl HotQueryCache {
         exit_threshold: f32,
     ) -> Option<(u32, u32, u32)> {
         let guard = self.routes.read();
-        guard.get(&route)?.exit_run_duration_quantiles(exit_threshold)
+        guard
+            .get(&route)?
+            .exit_run_duration_quantiles(exit_threshold)
     }
 
     pub fn last_update_ns(&self, route: RouteId) -> u64 {
         let guard = self.routes.read();
         guard.get(&route).map(|c| c.last_update_ns).unwrap_or(0)
+    }
+
+    /// Timestamp real da observação mais antiga atualmente retida no ring.
+    ///
+    /// Diferente de `last_update_ns - window_ns`: rotas frias ou recém-listadas
+    /// podem ter apenas minutos de histórico dentro de uma janela configurada
+    /// para 24h. Esse valor é usado no dataset para medir cobertura PIT real.
+    pub fn oldest_observation_ns(&self, route: RouteId) -> u64 {
+        let guard = self.routes.read();
+        guard
+            .get(&route)
+            .and_then(|c| c.ring.front().map(|s| s.ts_ns))
+            .unwrap_or(0)
     }
 
     pub fn routes_tracked(&self) -> usize {
@@ -745,7 +658,10 @@ mod tests {
         // Sample em ts=2000 expira todos os anteriores (0..9 < 2000 - 1000 = 1000).
         cache.observe(route, 3.0, -1.5, 2000);
         let n = cache.n_observations(route);
-        assert_eq!(n, 1, "após ts=2000 com janela 1000, só resta a última; got {n}");
+        assert_eq!(
+            n, 1,
+            "após ts=2000 com janela 1000, só resta a última; got {n}"
+        );
         // Quantile reflete o novo sample.
         let p50 = cache.quantile_entry(route, 0.5).unwrap();
         assert!((p50 - 3.0).abs() < 0.1);
@@ -771,7 +687,10 @@ mod tests {
         }
         // Agora p50 deveria refletir apenas samples 5.0 (os 0.5 expiraram).
         let p50 = cache.quantile_entry(route, 0.5).unwrap();
-        assert!(p50 >= 4.8 && p50 <= 5.2, "p50 = {p50}, expected ~5.0 após expiração");
+        assert!(
+            p50 >= 4.8 && p50 <= 5.2,
+            "p50 = {p50}, expected ~5.0 após expiração"
+        );
     }
 
     #[test]
@@ -798,27 +717,34 @@ mod tests {
     }
 
     #[test]
-    fn exit_run_duration_quantiles_use_exit_threshold_not_same_tick_gross() {
+    fn exit_run_duration_quantiles_measures_exit_only_not_gross_intra_tick() {
         let cache = mk_cache();
         let route = mk_route(1);
-
-        // Mesmo com `entry + exit` simultâneo sempre abaixo do floor 0.8,
-        // uma entrada atual de 2.0% precisaria apenas de exit >= -1.2%.
-        // O run histórico de saída deve existir e alimentar T/IC sem oracle.
         for i in 0..5u64 {
             cache.observe(route, 0.2, -1.0, i * 1_000_000_000);
         }
-
-        #[allow(deprecated)]
-        let gross_result = cache.gross_run_duration_quantiles(route, 0.8);
-        assert_eq!(
-            gross_result, None,
-            "gross simultâneo não deve passar floor positivo neste cenário"
-        );
         let (p05, p50, p95) = cache
             .exit_run_duration_quantiles(route, -1.2)
             .expect("exit >= -1.2 deveria formar um run histórico");
         assert_eq!((p05, p50, p95), (4, 4, 4));
+    }
+
+    #[test]
+    fn oldest_observation_ns_uses_real_ring_front() {
+        let cache = mk_cache();
+        let route = mk_route(1);
+
+        cache.observe(route, 2.0, -1.0, 1_000);
+        cache.observe(route, 2.1, -0.9, 2_000);
+
+        assert_eq!(cache.oldest_observation_ns(route), 1_000);
+        assert_ne!(
+            cache.oldest_observation_ns(route),
+            cache
+                .last_update_ns(route)
+                .saturating_sub(cache.config().window_ns),
+            "oldest cache ts must not be synthesized from a full 24h window"
+        );
     }
 
     #[test]

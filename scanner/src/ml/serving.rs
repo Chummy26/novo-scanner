@@ -29,54 +29,32 @@
 //! - Ou se benchmark mostrar que inline A3 impacta latência do scanner
 //!   além de ~5% do budget de 150 ms.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::collections::VecDeque;
 
-use ahash::AHashMap;
-use parking_lot::Mutex;
 use crate::ml::baseline::BaselineA3;
-use crate::ml::contract::{
-    AbstainDiagnostic, AbstainReason, Recommendation, RouteId, TradeSetup,
-};
+use crate::ml::contract::{AbstainDiagnostic, AbstainReason, Recommendation, RouteId, TradeSetup};
+use crate::ml::economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome};
 use crate::ml::eval::verify_tradesetup;
-use crate::ml::economic::{
-    EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome,
-};
 use crate::ml::listing_history::ListingHistory;
+use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
+use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::persistence::{
     AcceptedSample, FeaturesT0, LabelResolver, PolicyMetadata, RawSample, RawWriterHandle,
     RouteDecimator, RouteRanking, SamplingTier,
 };
-use crate::ml::persistence::label_resolver::DEFAULT_LABEL_FLOORS_PCT;
-use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::trigger::{SampleDecision, SamplingTrigger};
+use ahash::AHashMap;
+use parking_lot::Mutex;
 
 /// Horizonte mínimo (ns) antes de um trade pending poder ser resolvido.
-///
-/// Fix pós-auditoria 2026-04-21: a identidade estrutural §2 da skill
-/// (`S_entrada(t) + S_saída(t) = -(bid_ask_A + bid_ask_B)/ref`) é
-/// sempre negativa no mesmo instante. Permitir resolução intra-tick
-/// (quando `now == emitted_at`) fabrica `Realized` com
-/// `horizon_observed_ms = 0` violando física da estratégia.
-///
-/// Default: 1 ciclo do scanner = 150 ms. Trade só pode realizar em
-/// tick posterior ao da emissão.
-///
-/// Fix E22: relação com `DEFAULT_CLOSE_SLACK_NS` do label_resolver.
-/// `MIN_HORIZON_NS` governa latência mínima entre emit e resolve no
-/// `EconomicTracker`; `DEFAULT_CLOSE_SLACK_NS` governa slack pós-deadline
-/// no label_resolver. Ambas são escalas temporais do pipeline que estão
-/// relacionadas: `CLOSE_SLACK ≥ MIN_HORIZON × N` onde N é tolerância a
-/// cadência variável. Se ajustar uma, verificar a outra.
-pub const MIN_HORIZON_NS: u64 = 150_000_000;
+/// Identidade §2 da skill: soma intra-tick sempre negativa; trade só realiza
+/// em tick posterior ao da emissão. Default: 1 ciclo do scanner = 150 ms.
+const MIN_HORIZON_NS: u64 = 150_000_000;
 
 /// Largura máxima de IC 95% antes de abstenção por `LowConfidence`.
-///
-/// Fix E2: valor derivado de Wilson marginal — assume distribuição Bernoulli
-/// i.i.d. Se IC passar a conformal (fix D2), 0.20 é de literatura diferente;
-/// trocar por `ConformalConfig::ic_width_threshold` em Marco 2.
-pub const IC_WIDTH_LIMIT: f32 = 0.20;
+const IC_WIDTH_LIMIT: f32 = 0.20;
 
 // ---------------------------------------------------------------------------
 // MlServer
@@ -115,6 +93,7 @@ pub struct MlServer {
     label_stride_s: u32,
     label_floor_pct: f32,
     label_floors_pct: Vec<f32>,
+    label_horizons_s: Vec<u32>,
     last_trade_emit_by_route: Mutex<AHashMap<RouteId, u64>>,
     recommendation_cooldown_ns: u64,
     // Fix C13: fingerprint da config runtime persistida em cada record.
@@ -122,6 +101,50 @@ pub struct MlServer {
     // Fix C2: geração do priority_set (incrementado em set_priority_set_and_bump).
     priority_set_generation_id: AtomicU64,
     priority_set_updated_at_ns: AtomicU64,
+}
+
+fn compute_runtime_config_hash(
+    trigger: crate::ml::trigger::SamplingConfig,
+    baseline: crate::ml::baseline::BaselineConfig,
+    label_stride_s: u32,
+    label_floor_pct: f32,
+    label_floors_pct: &[f32],
+    label_horizons_s: &[u32],
+    raw_decimation_mod: u64,
+    recommendation_cooldown_ns: u64,
+) -> String {
+    let floors = label_floors_pct
+        .iter()
+        .map(|v| format!("{:.6}", v))
+        .collect::<Vec<_>>()
+        .join(",");
+    let horizons = label_horizons_s
+        .iter()
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let config_blob = format!(
+        concat!(
+            "scanner_version={}|trigger_n_min={}|tail_q={:.6}|min_vol_usd={:.6}|",
+            "baseline_floor_pct={:.6}|baseline_n_min={}|baseline_valid_for_s={}|",
+            "label_stride_s={}|label_floor_pct={:.6}|label_floors_pct=[{}]|",
+            "label_horizons_s=[{}]|raw_decimation_mod={}|recommendation_cooldown_ns={}"
+        ),
+        crate::ml::SCANNER_VERSION,
+        trigger.n_min,
+        trigger.tail_quantile,
+        trigger.min_vol24_usd,
+        baseline.floor_pct,
+        baseline.n_min,
+        baseline.valid_for_s,
+        label_stride_s,
+        label_floor_pct,
+        floors,
+        horizons,
+        raw_decimation_mod,
+        recommendation_cooldown_ns,
+    );
+    format!("{:016x}", crate::ml::util::fnv1a_64(config_blob.as_bytes()))
 }
 
 fn enforce_recommendation_invariants(
@@ -213,6 +236,7 @@ pub struct ServerMetrics {
 struct PendingEconomicTrade {
     setup: TradeSetup,
     last_exit_pct: f32,
+    last_observed_ns: u64,
 }
 
 impl PendingEconomicTrade {
@@ -220,6 +244,7 @@ impl PendingEconomicTrade {
         // Fix D15: `from_model` agora deriva de `setup.source_kind` — enum
         // explícito substitui prefix match frágil `!starts_with("baseline-")`.
         Self {
+            last_observed_ns: setup.emitted_at,
             setup,
             last_exit_pct: initial_exit_pct,
         }
@@ -237,10 +262,24 @@ impl PendingEconomicTrade {
         // do próximo tick do scanner — viola física da estratégia.
         if now_ns < self.setup.emitted_at.saturating_add(MIN_HORIZON_NS) {
             // Apenas registra último exit observado; não avalia hit ainda.
+            self.last_observed_ns = now_ns;
             self.last_exit_pct = exit_spread;
             return None;
         }
 
+        if now_ns > self.setup.valid_until {
+            // Observação pós-valid_until fecha a janela, mas não pode criar
+            // realização fora do horizonte declarado. Usa o último exit
+            // observado dentro da janela como forced exit.
+            let outcome = TradeOutcome::ExitMiss {
+                forced_exit_pct: self.last_exit_pct,
+            };
+            self.last_observed_ns = now_ns;
+            self.last_exit_pct = exit_spread;
+            return Some(EconomicEvent::new(&self.setup, outcome, now_ns));
+        }
+
+        self.last_observed_ns = now_ns;
         self.last_exit_pct = exit_spread;
         if exit_spread >= self.setup.exit_target {
             // Fix pós-auditoria L14: horizonte em milissegundos para
@@ -314,13 +353,7 @@ impl EconomicTracker {
         }
     }
 
-    fn resolve_route(
-        &mut self,
-        route: RouteId,
-        entry_spread: f32,
-        exit_spread: f32,
-        now_ns: u64,
-    ) {
+    fn resolve_route(&mut self, route: RouteId, entry_spread: f32, exit_spread: f32, now_ns: u64) {
         let Some(mut queue) = self.pending_by_route.remove(&route) else {
             return;
         };
@@ -356,10 +389,15 @@ impl EconomicTracker {
             let mut keep = VecDeque::with_capacity(queue.len());
             while let Some(pending) = queue.pop_front() {
                 if now_ns >= pending.setup.valid_until {
-                    // Timeout — gera outcome com última observação em cache.
-                    // Fix D9: sem `enter_realized_pct` (skill §3.1).
-                    let outcome = TradeOutcome::ExitMiss {
-                        forced_exit_pct: pending.last_exit_pct,
+                    // Timeout só vira miss quando o horizonte foi observado
+                    // com dado limpo. Rota silenciosa antes de `valid_until`
+                    // é censura, não PnL bruto forçado.
+                    let outcome = if pending.last_observed_ns >= pending.setup.valid_until {
+                        TradeOutcome::ExitMiss {
+                            forced_exit_pct: pending.last_exit_pct,
+                        }
+                    } else {
+                        TradeOutcome::Censored
                     };
                     let evt = EconomicEvent::new(&pending.setup, outcome, now_ns);
                     self.accumulator.push(evt);
@@ -383,20 +421,21 @@ impl EconomicTracker {
 
 impl MlServer {
     pub fn new(baseline: BaselineA3, trigger: SamplingTrigger) -> Self {
-        // Fix C13: computa fingerprint da config relevante do scanner no momento
-        // da inicialização. Permite trainer distinguir datasets gerados com
-        // `n_min=500` vs `n_min=1000`, floor diferentes, etc.
-        let config_blob = format!(
-            "trigger_n_min={}|tail_q={}|min_vol_usd={}|floor_pct={}|label_stride_s={}",
-            trigger.config().n_min,
-            trigger.config().tail_quantile,
-            trigger.config().min_vol24_usd,
-            baseline.config().floor_pct,
+        // Fix C13: fingerprint da config efetiva do dataset. Builders abaixo
+        // recomputam depois de aplicar raw/label/cooldown config.
+        let raw_decimator = RouteDecimator::new();
+        let label_floors_pct = DEFAULT_LABEL_FLOORS_PCT.to_vec();
+        let label_horizons_s = DEFAULT_HORIZONS_S.to_vec();
+        let recommendation_cooldown_ns = 60 * 1_000_000_000;
+        let runtime_config_hash = compute_runtime_config_hash(
+            trigger.config(),
+            baseline.config(),
             60,
-        );
-        let runtime_config_hash = format!(
-            "{:016x}",
-            crate::ml::util::fnv1a_64(config_blob.as_bytes())
+            0.8,
+            &label_floors_pct,
+            &label_horizons_s,
+            raw_decimator.modulus(),
+            recommendation_cooldown_ns,
         );
         Self {
             baseline,
@@ -405,27 +444,55 @@ impl MlServer {
             economic: Mutex::new(EconomicTracker::new()),
             metrics: Arc::new(ServerMetrics::default()),
             cycle_seq: AtomicU64::new(0),
-            raw_decimator: RouteDecimator::new(),
+            raw_decimator,
             raw_writer: None,
             route_ranking: None,
             label_resolver: None,
             label_stride_s: 60,
             label_floor_pct: 0.8,
-            label_floors_pct: DEFAULT_LABEL_FLOORS_PCT.to_vec(),
+            label_floors_pct,
+            label_horizons_s,
             last_trade_emit_by_route: Mutex::new(AHashMap::with_capacity(4096)),
-            recommendation_cooldown_ns: 60 * 1_000_000_000,
+            recommendation_cooldown_ns,
             runtime_config_hash,
             priority_set_generation_id: AtomicU64::new(0),
             priority_set_updated_at_ns: AtomicU64::new(0),
         }
     }
 
+    fn refresh_runtime_config_hash(&mut self) {
+        self.runtime_config_hash = compute_runtime_config_hash(
+            self.trigger.config(),
+            self.baseline.config(),
+            self.label_stride_s,
+            self.label_floor_pct,
+            &self.label_floors_pct,
+            &self.label_horizons_s,
+            self.raw_decimator.modulus(),
+            self.recommendation_cooldown_ns,
+        );
+    }
+
     /// Fix C2: incrementa geração do priority_set e registra timestamp de update.
     /// Deve ser chamado por quem instala novo snapshot em
     /// `raw_decimator.set_priority_set()`.
     pub fn bump_priority_set_generation(&self, now_ns: u64) {
-        self.priority_set_generation_id.fetch_add(1, Ordering::Relaxed);
-        self.priority_set_updated_at_ns.store(now_ns, Ordering::Relaxed);
+        self.priority_set_generation_id
+            .fetch_add(1, Ordering::Relaxed);
+        self.priority_set_updated_at_ns
+            .store(now_ns, Ordering::Relaxed);
+    }
+
+    fn priority_set_metadata_snapshot(&self) -> (u32, u64) {
+        if self.route_ranking.is_none() {
+            return (0, 0);
+        }
+        let generation = self
+            .priority_set_generation_id
+            .load(Ordering::Relaxed)
+            .min(u32::MAX as u64) as u32;
+        let updated_at = self.priority_set_updated_at_ns.load(Ordering::Relaxed);
+        (generation, updated_at)
     }
 
     /// Conecta o `RawSampleWriter` (ADR-025). Até ser chamado, o server
@@ -439,6 +506,7 @@ impl MlServer {
     /// querem capturar toda a série).
     pub fn with_raw_decimator(mut self, decimator: RouteDecimator) -> Self {
         self.raw_decimator = decimator;
+        self.refresh_runtime_config_hash();
         self
     }
 
@@ -451,15 +519,9 @@ impl MlServer {
 
     /// Wave V: conecta resolvedor de labels supervisionados.
     pub fn with_label_resolver(mut self, resolver: Arc<LabelResolver>) -> Self {
+        self.label_horizons_s = resolver.horizons().to_vec();
         self.label_resolver = Some(resolver);
-        self
-    }
-
-    /// Wave V: ajusta parâmetros de labeling.
-    pub fn with_label_params(mut self, stride_s: u32, floor_pct: f32) -> Self {
-        self.label_stride_s = stride_s;
-        self.label_floor_pct = floor_pct;
-        self.label_floors_pct = DEFAULT_LABEL_FLOORS_PCT.to_vec();
+        self.refresh_runtime_config_hash();
         self
     }
 
@@ -472,11 +534,13 @@ impl MlServer {
         self.label_stride_s = stride_s;
         self.label_floor_pct = floor_pct;
         self.label_floors_pct = floors_pct;
+        self.refresh_runtime_config_hash();
         self
     }
 
     pub fn with_recommendation_cooldown_s(mut self, cooldown_s: u32) -> Self {
         self.recommendation_cooldown_ns = (cooldown_s as u64) * 1_000_000_000;
+        self.refresh_runtime_config_hash();
         self
     }
 
@@ -484,20 +548,8 @@ impl MlServer {
         &self.raw_decimator
     }
 
-    pub fn route_ranking(&self) -> Option<Arc<RouteRanking>> {
-        self.route_ranking.as_ref().map(Arc::clone)
-    }
-
     pub fn baseline(&self) -> &BaselineA3 {
         &self.baseline
-    }
-
-    pub fn trigger(&self) -> SamplingTrigger {
-        self.trigger
-    }
-
-    pub fn listing(&self) -> &ListingHistory {
-        &self.listing
     }
 
     pub fn metrics(&self) -> Arc<ServerMetrics> {
@@ -535,7 +587,7 @@ impl MlServer {
         if let Some(prev) = last_by_route.get(&route) {
             if now_ns < prev.saturating_add(self.recommendation_cooldown_ns) {
                 return Recommendation::Abstain {
-                    reason: AbstainReason::LowConfidence,
+                    reason: AbstainReason::Cooldown,
                     diagnostic: AbstainDiagnostic {
                         n_observations,
                         ci_width_if_emitted: setup.p_hit_ci.map(|(lo, hi)| (hi - lo).max(0.0)),
@@ -602,7 +654,8 @@ impl MlServer {
                 .raw_decimator
                 .decide_for_sample(route, now_ns, cycle_seq);
             if dr.should_persist {
-                let raw = RawSample::with_tier(
+                let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
+                let raw = RawSample::with_tier_and_priority_metadata(
                     now_ns,
                     cycle_seq,
                     route,
@@ -614,10 +667,14 @@ impl MlServer {
                     sample_dec,
                     dr.tier,
                     dr.probability,
+                    priority_gen,
+                    priority_updated_ns,
                 );
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
-                        self.metrics.raw_samples_emitted.fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .raw_samples_emitted
+                            .fetch_add(1, Ordering::Relaxed);
                         self.bump_raw_sample_tier_metric(dr.tier);
                     }
                     Err(crate::ml::persistence::RawWriterSendError::ChannelFull) => {
@@ -690,7 +747,9 @@ impl MlServer {
         sell_vol24_usd: f64,
         now_ns: u64,
     ) -> (Recommendation, SampleDecision, Option<AcceptedSample>) {
-        self.metrics.opportunities_seen.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .opportunities_seen
+            .fetch_add(1, Ordering::Relaxed);
 
         // 0. **C5** — registra lifecycle da rota (first_seen / last_seen).
         //    Anti-survivorship; alimenta feature `listing_age_days`.
@@ -728,7 +787,8 @@ impl MlServer {
                 .raw_decimator
                 .decide_for_sample(route, now_ns, cycle_seq);
             if dr.should_persist {
-                let raw = RawSample::with_tier(
+                let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
+                let raw = RawSample::with_tier_and_priority_metadata(
                     now_ns,
                     cycle_seq,
                     route,
@@ -740,10 +800,14 @@ impl MlServer {
                     sample_dec,
                     dr.tier,
                     dr.probability,
+                    priority_gen,
+                    priority_updated_ns,
                 );
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
-                        self.metrics.raw_samples_emitted.fetch_add(1, Ordering::Relaxed);
+                        self.metrics
+                            .raw_samples_emitted
+                            .fetch_add(1, Ordering::Relaxed);
                         self.bump_raw_sample_tier_metric(dr.tier);
                     }
                     Err(crate::ml::persistence::RawWriterSendError::ChannelFull) => {
@@ -832,9 +896,7 @@ impl MlServer {
         let tail_ratio_pre_observe = self.baseline.cache().tail_ratio_p99_p95(route);
         // Fix C7: estado PIT do cache em t0 para reconstrutibilidade offline.
         let n_cache_obs_pre = self.baseline.cache().n_observations(route) as u32;
-        let oldest_cache_ts_pre = self.baseline.cache().last_update_ns(route).saturating_sub(
-            self.baseline.cache().config().window_ns,
-        );
+        let oldest_cache_ts_pre = self.baseline.cache().oldest_observation_ns(route);
         // Fix B4: log de volume mínimo e razão — substituem uso de volume absoluto.
         let min_vol = buy_vol24_usd.min(sell_vol24_usd).max(1.0);
         let log_min_vol = Some(min_vol.ln() as f32);
@@ -891,19 +953,18 @@ impl MlServer {
                 baseline_base_rate,
                 baseline_enter_at_min,
                 baseline_exit_at_min,
-            ) =
-                match &rec {
-                    Recommendation::Trade(ts) => {
-                        let d = ts.baseline_diagnostics.as_ref();
-                        (
-                            true,
-                            d.map(|d| d.historical_base_rate_24h),
-                            d.map(|d| d.enter_at_min),
-                            d.map(|d| d.exit_at_min),
-                        )
-                    }
-                    Recommendation::Abstain { .. } => (false, None, None, None),
-                };
+            ) = match &rec {
+                Recommendation::Trade(ts) => {
+                    let d = ts.baseline_diagnostics.as_ref();
+                    (
+                        true,
+                        d.map(|d| d.historical_base_rate_24h),
+                        d.map(|d| d.enter_at_min),
+                        d.map(|d| d.exit_at_min),
+                    )
+                }
+                Recommendation::Abstain { .. } => (false, None, None, None),
+            };
             let features_t0 = FeaturesT0 {
                 buy_vol24: buy_vol24_usd,
                 sell_vol24: sell_vol24_usd,
@@ -953,11 +1014,7 @@ impl MlServer {
                 })
                 .unwrap_or((0, 0));
             let policy = PolicyMetadata {
-                baseline_model_version: self
-                    .baseline
-                    .config()
-                    .model_version
-                    .to_string(),
+                baseline_model_version: self.baseline.config().model_version.to_string(),
                 baseline_recommended,
                 baseline_historical_base_rate_24h: baseline_base_rate,
                 baseline_derived_enter_at_min: baseline_enter_at_min,
@@ -983,24 +1040,10 @@ impl MlServer {
                     )
                 });
             // Fix C3/C13/C2: metadados v6 persistidos em cada record.
-            let cluster_id = crate::ml::persistence::label_resolver::derive_cluster_id(
-                route, now_ns,
-            );
+            let cluster_id =
+                crate::ml::persistence::label_resolver::derive_cluster_id(route, now_ns);
             let runtime_config_hash = self.runtime_config_hash.clone();
-            let (priority_gen, priority_updated_ns) = self
-                .route_ranking
-                .as_ref()
-                .map(|_r| {
-                    // Generation ID avança via counter atômico no MlServer;
-                    // exposto como snapshot leitura-barata aqui.
-                    (
-                        self.priority_set_generation_id
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                        self.priority_set_updated_at_ns
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    )
-                })
-                .unwrap_or((0, 0));
+            let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
             resolver.on_candidate(
                 label_sample_id,
                 sample_dec.reason_label(),
@@ -1021,7 +1064,7 @@ impl MlServer {
                 1, // cluster_size — detector correlacional atualiza offline.
                 1, // cluster_rank — idem.
                 runtime_config_hash,
-                priority_gen.min(u32::MAX as u64) as u32,
+                priority_gen,
                 priority_updated_ns,
             );
         }
@@ -1045,9 +1088,7 @@ impl MlServer {
         match tier {
             SamplingTier::Allowlist => &self.metrics.raw_samples_emitted_allowlist,
             SamplingTier::Priority => &self.metrics.raw_samples_emitted_priority,
-            SamplingTier::DecimatedUniform => {
-                &self.metrics.raw_samples_emitted_decimated_uniform
-            }
+            SamplingTier::DecimatedUniform => &self.metrics.raw_samples_emitted_decimated_uniform,
         }
         .fetch_add(1, Ordering::Relaxed);
     }
@@ -1130,9 +1171,8 @@ mod tests {
     fn first_observations_abstain_insufficient_data() {
         let server = mk_server();
         let route = mk_route();
-        let (rec, dec, _accepted) = server.on_opportunity(
-            0, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6, 1,
-        );
+        let (rec, dec, _accepted) =
+            server.on_opportunity(0, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6, 1);
         use crate::ml::contract::AbstainReason;
         match rec {
             Recommendation::Abstain { reason, .. } => {
@@ -1176,9 +1216,8 @@ mod tests {
     fn first_observation_does_not_self_prime_recommendation() {
         let server = mk_server_with_min_history(1);
         let route = mk_route();
-        let (rec, dec, accepted) = server.on_opportunity(
-            0, route, "BTC-USDT", 3.2, -0.4, 1e6, 1e6, 1,
-        );
+        let (rec, dec, accepted) =
+            server.on_opportunity(0, route, "BTC-USDT", 3.2, -0.4, 1e6, 1e6, 1);
         match rec {
             Recommendation::Abstain { reason, .. } => {
                 assert_eq!(reason, AbstainReason::InsufficientData);
@@ -1195,13 +1234,15 @@ mod tests {
         let route = mk_route();
         // 10 observações — todas rejeitadas (insufficient).
         for i in 0..10 {
-            server.on_opportunity(
-                i as u32, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6, i,
-            );
+            server.on_opportunity(i as u32, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6, i);
         }
         let m = server.metrics();
         assert_eq!(m.opportunities_seen.load(Ordering::Relaxed), 10);
-        assert_eq!(m.sample_rejects_insufficient_history.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            m.sample_rejects_insufficient_history
+                .load(Ordering::Relaxed),
+            10
+        );
         assert_eq!(m.rec_abstain_insufficient_data.load(Ordering::Relaxed), 10);
     }
 
@@ -1248,7 +1289,7 @@ mod tests {
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Tail,
-                detail: "test".into(),
+                detail: crate::ml::ReasonDetail::placeholder(),
             },
             ci_method: "wilson_marginal",
             model_version: "test-0.1.0".into(),
@@ -1257,7 +1298,11 @@ mod tests {
             // Fix D10: valid_until ≥ 2 × t_hit_p75_s (3120s); usar 7000s para folga.
             valid_until: 1_700_000_000_000_000_000 + 7000 * 1_000_000_000,
         };
-        setup.baseline_diagnostics.as_mut().unwrap().gross_profit_p25 = 0.5;
+        setup
+            .baseline_diagnostics
+            .as_mut()
+            .unwrap()
+            .gross_profit_p25 = 0.5;
         setup
     }
 
@@ -1276,7 +1321,11 @@ mod tests {
             }
             other => panic!("expected Abstain, got {:?}", other),
         }
-        assert_eq!(counter.load(Ordering::Relaxed), 1, "contador de invariants blocked deve subir");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "contador de invariants blocked deve subir"
+        );
     }
 
     #[test]
@@ -1327,18 +1376,18 @@ mod tests {
             );
         }
         // Agora tenta emitir com current_entry alto.
-        let (rec, _, _) = server.on_opportunity(
-            201, route, "BTC-USDT", 3.8, 0.2, 1e6, 1e6, 201,
-        );
+        let (rec, _, _) = server.on_opportunity(201, route, "BTC-USDT", 3.8, 0.2, 1e6, 1e6, 201);
         match rec {
             Recommendation::Trade(setup) => {
                 assert_eq!(setup.route_id, route);
-                assert!(setup
-                    .baseline_diagnostics
-                    .as_ref()
-                    .unwrap()
-                    .historical_base_rate_24h
-                    > 0.0);
+                assert!(
+                    setup
+                        .baseline_diagnostics
+                        .as_ref()
+                        .unwrap()
+                        .historical_base_rate_24h
+                        > 0.0
+                );
                 assert!(setup.p_hit.is_none());
                 assert!(setup.t_hit_median_s.is_none());
             }
@@ -1357,15 +1406,13 @@ mod tests {
         let t2 = t1 + 1_000_000_000;
 
         let _ = server.on_opportunity(0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0);
-        let (first, _, _) =
-            server.on_opportunity(1, route, "BTC-USDT", 3.1, 0.6, 1e6, 1e6, t1);
+        let (first, _, _) = server.on_opportunity(1, route, "BTC-USDT", 3.1, 0.6, 1e6, 1e6, t1);
         assert!(matches!(first, Recommendation::Trade(_)));
 
-        let (second, _, _) =
-            server.on_opportunity(2, route, "BTC-USDT", 3.2, 0.7, 1e6, 1e6, t2);
+        let (second, _, _) = server.on_opportunity(2, route, "BTC-USDT", 3.2, 0.7, 1e6, 1e6, t2);
         match second {
             Recommendation::Abstain { reason, .. } => {
-                assert_eq!(reason, AbstainReason::LowConfidence);
+                assert_eq!(reason, AbstainReason::Cooldown);
             }
             other => panic!("expected cooldown Abstain, got {:?}", other),
         }
@@ -1385,15 +1432,12 @@ mod tests {
         let t2: u64 = t1 + 1_000_000_000;
 
         // Tick 0: populate cache (entry=3.0, exit=0.5 → gross=3.5, bem acima do floor).
-        let (_rec, dec, _) = server.on_opportunity(
-            0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0,
-        );
+        let (_rec, dec, _) = server.on_opportunity(0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0);
         assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
 
         // Tick 1: agora cache tem 1 sample ≥ n_min. Emite Trade.
-        let (rec, _dec, _accepted) = server.on_opportunity(
-            1, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t1,
-        );
+        let (rec, _dec, _accepted) =
+            server.on_opportunity(1, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t1);
         let setup = match rec {
             Recommendation::Trade(s) => s,
             Recommendation::Abstain { reason, .. } => panic!("esperava Trade, got {:?}", reason),
@@ -1403,15 +1447,20 @@ mod tests {
         assert_eq!(setup.entry_now, 3.0);
         assert!(setup.exit_target <= 0.5 + 0.01);
 
-        let (_rec, _dec, _accepted) = server.on_opportunity(
-            2, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t2,
-        );
+        let (_rec, _dec, _accepted) =
+            server.on_opportunity(2, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t2);
 
         let econ = server.economic_metrics();
-        assert_eq!(econ.n_emissions_total.load(Ordering::Relaxed), 1,
-                   "1 emissão esperada no tick 1");
-        assert_eq!(econ.n_realized_total.load(Ordering::Relaxed), 1,
-                   "1 realização esperada no tick 2 (após grace period)");
+        assert_eq!(
+            econ.n_emissions_total.load(Ordering::Relaxed),
+            1,
+            "1 emissão esperada no tick 1"
+        );
+        assert_eq!(
+            econ.n_realized_total.load(Ordering::Relaxed),
+            1,
+            "1 realização esperada no tick 2 (após grace period)"
+        );
     }
 
     #[test]
@@ -1425,16 +1474,14 @@ mod tests {
         let t_emit: u64 = t0 + 1_000_000_000;
 
         // Primeiro popula cache.
-        let _ = server.on_opportunity(
-            0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0,
-        );
+        let _ = server.on_opportunity(0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0);
 
         // Tick de emissão: entry E exit já favoráveis no MESMO tick.
-        let (rec, _, _) = server.on_opportunity(
-            1, route, "BTC-USDT", 3.5, 0.5, 1e6, 1e6, t_emit,
+        let (rec, _, _) = server.on_opportunity(1, route, "BTC-USDT", 3.5, 0.5, 1e6, 1e6, t_emit);
+        assert!(
+            matches!(rec, Recommendation::Trade(_)),
+            "cache populado deve emitir Trade no 2º tick"
         );
-        assert!(matches!(rec, Recommendation::Trade(_)),
-                "cache populado deve emitir Trade no 2º tick");
 
         // SEM fix, trade realizaria no mesmo tick em horizon=0s
         // (violando skill §2). COM fix, grace MIN_HORIZON_NS bloqueia.
@@ -1453,23 +1500,20 @@ mod tests {
         let t0: u64 = 1_000_000_000;
         let t_emit: u64 = t0 + 1_000_000_000;
 
-        let _ = server.on_opportunity(
-            0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0,
-        );
-        let (rec, _, _) = server.on_opportunity(
-            1, route, "BTC-USDT", 3.0, 0.4, 1e6, 1e6, t_emit,
-        );
+        let _ = server.on_opportunity(0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0);
+        let (rec, _, _) = server.on_opportunity(1, route, "BTC-USDT", 3.0, 0.4, 1e6, 1e6, t_emit);
         assert!(matches!(rec, Recommendation::Trade(_)));
 
         let closed = server.economic_sweep(t_emit + 31_000_000_000);
         let econ = server.economic_metrics();
         assert_eq!(closed, 1);
         assert_eq!(econ.n_emissions_total.load(Ordering::Relaxed), 1);
-        assert_eq!(econ.n_exit_miss_total.load(Ordering::Relaxed), 1);
+        assert_eq!(econ.n_censored_total.load(Ordering::Relaxed), 1);
+        assert_eq!(econ.n_exit_miss_total.load(Ordering::Relaxed), 0);
     }
 
     #[test]
-    fn economic_sweeper_uses_emit_tick_exit_when_route_silences() {
+    fn economic_sweeper_censors_when_route_silences() {
         use crate::ml::contract::{CalibStatus, ReasonKind, TradeReason, TradeSetup};
 
         let route = mk_route();
@@ -1496,7 +1540,7 @@ mod tests {
             calibration_status: CalibStatus::Degraded,
             reason: TradeReason {
                 kind: ReasonKind::Tail,
-                detail: "test".into(),
+                detail: crate::ml::ReasonDetail::placeholder(),
             },
             ci_method: "wilson_marginal",
             model_version: "baseline-a3-test".into(),
@@ -1518,20 +1562,17 @@ mod tests {
         let window = tracker
             .accumulator
             .snapshot_window(60, t_emit + 31_000_000_000);
-        assert_eq!(window.n_exit_miss, 1);
-        assert!(
-            (window.simulated_pnl_aggregated_usd - 70.0).abs() < 1e-3,
-            "timeout deve usar o exit observado na emissão, não default 0.0; pnl={}",
-            window.simulated_pnl_aggregated_usd,
-        );
+        assert_eq!(window.n_censored, 1);
+        assert_eq!(window.n_exit_miss, 0);
+        assert_eq!(window.simulated_pnl_aggregated_usd, 0.0);
     }
 
     #[tokio::test]
     async fn raw_writer_receives_all_samples_with_modulus_1() {
         // ADR-025 gate de aceitação #2 — com `modulus=1`, toda observação
         // passa pelo writer, independentemente do trigger aceitar.
-        use crate::ml::persistence::{RawSampleWriter, RawWriterConfig};
         use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
+        use crate::ml::persistence::{RawSampleWriter, RawWriterConfig};
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -1557,7 +1598,13 @@ mod tests {
         // (n_min=100), mas todas devem aparecer no RawSample dataset.
         for i in 0..50 {
             server.on_opportunity(
-                i as u32, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6,
+                i as u32,
+                route,
+                "BTC-USDT",
+                2.5,
+                -0.8,
+                1e6,
+                1e6,
                 1_745_159_400u64 * 1_000_000_000 + i as u64,
             );
         }
@@ -1603,8 +1650,8 @@ mod tests {
     async fn pit_sample_decision_preserved_in_raw_sample() {
         // ADR-025 gate de aceitação #3 — o veredito do trigger persistido
         // no RawSample deve ser idêntico ao retornado por on_opportunity.
-        use crate::ml::persistence::{RawSampleWriter, RawWriterConfig};
         use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
+        use crate::ml::persistence::{RawSampleWriter, RawWriterConfig};
         use std::time::Duration;
 
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -1629,7 +1676,13 @@ mod tests {
         // Observação que o trigger sinaliza RejectInsufficientHistory
         // (sem histórico acumulado).
         let (_, sample_dec, _) = server.on_opportunity(
-            0, route, "BTC-USDT", 2.5, -0.8, 1e6, 1e6,
+            0,
+            route,
+            "BTC-USDT",
+            2.5,
+            -0.8,
+            1e6,
+            1e6,
             1_745_159_400u64 * 1_000_000_000,
         );
         assert_eq!(sample_dec, SampleDecision::RejectInsufficientHistory);
@@ -1755,32 +1808,15 @@ mod tests {
         let route = mk_route();
         let t0 = 1_745_159_400u64 * 1_000_000_000;
         server.on_opportunity(0, route, "BTC-USDT", 1.0, -1.0, 1e6, 1e6, t0);
-        server.on_opportunity(
-            1,
-            route,
-            "BTC-USDT",
-            9.0,
-            2.0,
-            1e6,
-            1e6,
-            t0 + 1,
-        );
+        server.on_opportunity(1, route, "BTC-USDT", 9.0, 2.0, 1e6, 1e6, t0 + 1);
         let pre_entry_p50 = server.baseline.cache().quantile_entry(route, 0.50).unwrap();
 
         let server = server
             .with_label_resolver(Arc::clone(&resolver))
-            .with_label_params(0, 0.8)
+            .with_label_config(0, 0.8, DEFAULT_LABEL_FLOORS_PCT.to_vec())
             .with_raw_decimator(RouteDecimator::with_modulus(1));
-        let (_rec, dec, accepted) = server.on_opportunity(
-            2,
-            route,
-            "BTC-USDT",
-            9.0,
-            2.5,
-            1e6,
-            1e6,
-            t0 + 2_000_000_000,
-        );
+        let (_rec, dec, accepted) =
+            server.on_opportunity(2, route, "BTC-USDT", 9.0, 2.5, 1e6, 1e6, t0 + 2_000_000_000);
         assert_eq!(dec, SampleDecision::Accept);
         assert!(accepted.is_some());
         resolver.on_clean_observation(route, t0 + 3_000_000_000, 8.0, 2.6);

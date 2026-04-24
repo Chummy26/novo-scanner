@@ -53,25 +53,18 @@ pub mod util;
 pub const SCANNER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use contract::{
-    AbstainDiagnostic,
-    AbstainReason,
-    CalibStatus,
-    EntryQuality,
-    ExitQuality,
-    ReasonDetail,
-    ReasonKind,
-    Recommendation,
-    RouteId,
-    SourceKind,
-    TacticalSignal,
-    TradeReason,
-    TradeSetup,
+    AbstainDiagnostic, AbstainReason, CalibStatus, ReasonDetail, ReasonKind, Recommendation,
+    RouteId, SourceKind, TradeReason, TradeSetup,
 };
 
 pub use broadcast::{BroadcasterMetrics, RecommendationBroadcaster, RecommendationFrame};
-pub use dto::{RecommendationDto, TradeSetupDto, TacticalSignalDto};
-pub use economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome, WindowMetrics};
-pub use eval::{verify_tradesetup, verify_tradesetup_with_floor, InvariantError, DEFAULT_P_HIT_EMISSION_FLOOR};
+pub use dto::{RecommendationDto, TradeSetupDto};
+pub use economic::{
+    EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome, WindowMetrics,
+};
+pub use eval::{
+    verify_tradesetup, verify_tradesetup_with_floor, InvariantError, DEFAULT_P_HIT_EMISSION_FLOOR,
+};
 pub use retention::{
     DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy, RetentionSweepReport,
 };

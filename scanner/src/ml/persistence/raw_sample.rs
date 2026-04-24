@@ -1,14 +1,16 @@
 //! Schema de persistência — `RawSample` (ADR-025).
 //!
-//! Stream contínuo, **pré-trigger**, decimado 1-in-10 por rota. Paralelo
-//! ao [`AcceptedSample`](super::sample::AcceptedSample) (que é pós-trigger).
+//! Stream contínuo, **pré-trigger**, decimado no residual por observação.
+//! Paralelo ao [`AcceptedSample`](super::sample::AcceptedSample) (que é
+//! pós-trigger).
 //!
 //! # Por que dois streams
 //!
-//! `AcceptedSample` serve ao **treino supervisionado**: já filtrado, fácil
-//! de consumir. Mas filtrar antes de medir viola o princípio de análise
-//! empírica — gates E1/E2/E4/E6/E8/E10/E11 (ADR-018) e ADRs 019/020/023
-//! exigem a distribuição **pré-filtro** para evitar viés de seleção:
+//! `AcceptedSample` serve como candidato pós-trigger e material de auditoria.
+//! O alvo supervisionado vive em `LabeledTrade`. Filtrar antes de medir viola
+//! o princípio de análise empírica — gates E1/E2/E4/E6/E8/E10/E11 (ADR-018)
+//! e ADRs 019/020/023 exigem a distribuição **pré-filtro** para evitar viés de
+//! seleção:
 //!
 //! - Persistência D_{x=2%} (E4): precisa todos os cruzamentos em 2%.
 //! - LOVO per-venue (E11): precisa cobertura por venue sem depender apenas
@@ -16,14 +18,13 @@
 //! - Simulação pnl_bruto (ADR-019): precisa `exit_spread(t₁)` para todo
 //!   par `(rota, t₀)` candidato.
 //!
-//! # Decimação determinística por rota
+//! # Decimação residual determinística por observação
 //!
-//! `hash(route) mod 10 == 0` → persiste **toda observação** daquela rota.
-//! Demais rotas são descartadas. Preserva correlação serial intra-rota
-//! (crítico para Hurst E2 e correlação E8 `corr(entry, exit) ≈ −0.93`).
+//! `hash(route, ts_ns, cycle_seq) mod 10 == 0` persiste cerca de 10% dos ticks
+//! residuais. Rotas em `allowlist` ou `priority` continuam full-capture.
 //!
-//! ~260 de 2600 rotas capturadas; compensa via bootstrap estratificado
-//! em gates agregados e cobertura identical per-rota em gates per-rota.
+//! O campo `sampling_probability` e os metadados do `priority_set` permitem
+//! ponderação offline sem transformar o stream bruto em label supervisionado.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -53,13 +54,17 @@ use crate::ml::trigger::SampleDecision;
 ///   `AcceptedSample` v6 (consolidação pós-auditoria PhD de 70 findings).
 ///   `SCANNER_VERSION` agora é importado de `ml/mod.rs` (fix E5). Campos
 ///   `cluster_id`, `cluster_size`, `priority_set_generation_id` (C3, C2).
-pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 6;
+/// - **v7** (2026-04-23): adiciona `priority_set_generation_id` e
+///   `priority_set_updated_at_ns` no próprio RawSample. Sem esses campos,
+///   o tier `priority` tinha `sampling_probability=1.0` condicional, mas
+///   não carregava a geração que permite estimar a probabilidade marginal
+///   offline.
+pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 7;
 
-/// Re-export da versão única do scanner (consolidada em `ml/mod.rs`, fix E5).
-pub use crate::ml::SCANNER_VERSION;
+use crate::ml::SCANNER_VERSION;
 
 /// Fator de decimação por rota. 1-in-10 conforme ADR-025.
-pub const ROUTE_DECIMATION_MOD: u64 = 10;
+pub(crate) const ROUTE_DECIMATION_MOD: u64 = 10;
 
 /// Amostra bruta do scanner, **pré-trigger**. Emitida por toda chamada
 /// `MlServer::on_opportunity` para rotas selecionadas pela decimação.
@@ -106,11 +111,19 @@ pub struct RawSample {
     /// **v3** — probabilidade de amostragem efetiva (auditoria para treino).
     /// `allowlist`/`priority` = 1.0; `decimated_uniform` = 1/modulus.
     pub sampling_probability: f32,
+    /// Geração do priority_set vigente no instante da amostra. `0` significa
+    /// que nenhum rerank foi instalado ainda ou que o tier não depende de
+    /// priority membership.
+    pub priority_set_generation_id: u32,
+    /// Timestamp ns do último rerank instalado. `0` quando ainda não houve.
+    pub priority_set_updated_at_ns: u64,
 }
 
 impl RawSample {
+    /// Helper de teste — produção usa `with_tier_and_priority_metadata`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         ts_ns: u64,
         cycle_seq: u32,
         route_id: RouteId,
@@ -121,19 +134,25 @@ impl RawSample {
         sell_vol24: f64,
         sample_decision: SampleDecision,
     ) -> Self {
-        // Default tier "decimated_uniform" + probabilidade 1.0 (a API legada
-        // não sabe tier). Caminhos novos devem usar [`RawSample::with_tier`].
         Self::with_tier(
-            ts_ns, cycle_seq, route_id, symbol_name,
-            entry_spread, exit_spread,
-            buy_vol24, sell_vol24, sample_decision,
-            SamplingTier::DecimatedUniform, 1.0,
+            ts_ns,
+            cycle_seq,
+            route_id,
+            symbol_name,
+            entry_spread,
+            exit_spread,
+            buy_vol24,
+            sell_vol24,
+            sample_decision,
+            SamplingTier::DecimatedUniform,
+            1.0,
         )
     }
 
-    /// Construtor novo (Wave V) com tier e probabilidade explícitos.
+    /// Helper de teste — produção usa `with_tier_and_priority_metadata`.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
-    pub fn with_tier(
+    pub(crate) fn with_tier(
         ts_ns: u64,
         cycle_seq: u32,
         route_id: RouteId,
@@ -148,8 +167,11 @@ impl RawSample {
     ) -> Self {
         let symbol_name = symbol_name.into();
         let sample_id = sample_id_of(
-            ts_ns, cycle_seq, &symbol_name,
-            route_id.buy_venue, route_id.sell_venue,
+            ts_ns,
+            cycle_seq,
+            &symbol_name,
+            route_id.buy_venue,
+            route_id.sell_venue,
         );
         Self {
             ts_ns,
@@ -166,6 +188,54 @@ impl RawSample {
             sample_decision,
             sampling_tier: sampling_tier.as_str(),
             sampling_probability,
+            priority_set_generation_id: 0,
+            priority_set_updated_at_ns: 0,
+        }
+    }
+
+    /// Construtor com metadados de geração do `priority_set` congelados em t0.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_tier_and_priority_metadata(
+        ts_ns: u64,
+        cycle_seq: u32,
+        route_id: RouteId,
+        symbol_name: impl Into<String>,
+        entry_spread: f32,
+        exit_spread: f32,
+        buy_vol24: f64,
+        sell_vol24: f64,
+        sample_decision: SampleDecision,
+        sampling_tier: SamplingTier,
+        sampling_probability: f32,
+        priority_set_generation_id: u32,
+        priority_set_updated_at_ns: u64,
+    ) -> Self {
+        let symbol_name = symbol_name.into();
+        let sample_id = sample_id_of(
+            ts_ns,
+            cycle_seq,
+            &symbol_name,
+            route_id.buy_venue,
+            route_id.sell_venue,
+        );
+        Self {
+            ts_ns,
+            cycle_seq,
+            schema_version: RAW_SAMPLE_SCHEMA_VERSION,
+            route_id,
+            symbol_name,
+            scanner_version: SCANNER_VERSION,
+            sample_id,
+            entry_spread,
+            exit_spread,
+            buy_vol24,
+            sell_vol24,
+            sample_decision,
+            sampling_tier: sampling_tier.as_str(),
+            sampling_probability,
+            priority_set_generation_id,
+            priority_set_updated_at_ns,
         }
     }
 
@@ -181,7 +251,8 @@ impl RawSample {
                 r#""entry_spread":{},"exit_spread":{},"#,
                 r#""buy_vol24":{},"sell_vol24":{},"#,
                 r#""sample_decision":"{}","#,
-                r#""sampling_tier":"{}","sampling_probability":{}}}"#,
+                r#""sampling_tier":"{}","sampling_probability":{},"#,
+                r#""priority_set_generation_id":{},"priority_set_updated_at_ns":{}}}"#,
             ),
             self.ts_ns,
             self.cycle_seq,
@@ -201,6 +272,8 @@ impl RawSample {
             self.sample_decision.reason_label(),
             self.sampling_tier,
             format_f32(self.sampling_probability),
+            self.priority_set_generation_id,
+            self.priority_set_updated_at_ns,
         )
     }
 }
@@ -350,12 +423,7 @@ impl RouteDecimator {
     /// Decisão por observação. Allowlist e priority continuam full-capture;
     /// o residual é uniforme por `(route, ts_ns, cycle_seq)`.
     #[inline]
-    pub fn decide_for_sample(
-        &self,
-        route: RouteId,
-        ts_ns: u64,
-        cycle_seq: u32,
-    ) -> DecisionResult {
+    pub fn decide_for_sample(&self, route: RouteId, ts_ns: u64, cycle_seq: u32) -> DecisionResult {
         self.decide_inner(route, ts_ns, cycle_seq)
     }
 
@@ -477,7 +545,7 @@ mod tests {
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, RAW_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 6);
+        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 7);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
         assert_eq!(s.sample_id.len(), 32);
@@ -504,11 +572,13 @@ mod tests {
         assert_eq!(v["buy_venue"], "mexc");
         assert_eq!(v["sell_venue"], "bingx");
         assert_eq!(v["sample_decision"], "accept");
-        assert_eq!(v["schema_version"], 6);
+        assert_eq!(v["schema_version"], 7);
         assert!(v["scanner_version"].is_string());
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert_eq!(v["sampling_tier"], "decimated_uniform");
         assert!(v["sampling_probability"].as_f64().is_some());
+        assert_eq!(v["priority_set_generation_id"], 0);
+        assert_eq!(v["priority_set_updated_at_ns"], 0);
         assert!(v.get("buy_book_age_ms").is_none());
         assert!(v.get("sell_book_age_ms").is_none());
         assert!(v.get("halt_active").is_none());
@@ -517,11 +587,14 @@ mod tests {
     #[test]
     fn non_finite_floats_serialize_as_null() {
         let s = RawSample::new(
-            1, 0,
+            1,
+            0,
             mk_route(7, Venue::MexcFut, Venue::BingxFut),
             "ETH-USDT",
-            f32::NAN, f32::INFINITY,
-            f64::NEG_INFINITY, 1e6,
+            f32::NAN,
+            f32::INFINITY,
+            f64::NEG_INFINITY,
+            1e6,
             SampleDecision::RejectLowVolume,
         );
         let line = s.to_json_line();
@@ -558,13 +631,20 @@ mod tests {
         let d = RouteDecimator::with_modulus(10);
         // 2000 rotas sintéticas variando symbol_id e par venues.
         let venues = [
-            Venue::BinanceSpot, Venue::BinanceFut,
-            Venue::MexcSpot,    Venue::MexcFut,
-            Venue::KucoinSpot,  Venue::KucoinFut,
-            Venue::BitgetSpot,  Venue::BitgetFut,
-            Venue::GateSpot,    Venue::GateFut,
-            Venue::BingxSpot,   Venue::BingxFut,
-            Venue::XtSpot,      Venue::XtFut,
+            Venue::BinanceSpot,
+            Venue::BinanceFut,
+            Venue::MexcSpot,
+            Venue::MexcFut,
+            Venue::KucoinSpot,
+            Venue::KucoinFut,
+            Venue::BitgetSpot,
+            Venue::BitgetFut,
+            Venue::GateSpot,
+            Venue::GateFut,
+            Venue::BingxSpot,
+            Venue::BingxFut,
+            Venue::XtSpot,
+            Venue::XtFut,
         ];
         let mut total = 0;
         let mut accepted = 0;
@@ -598,13 +678,20 @@ mod tests {
         // crate de teste χ².
         let d = RouteDecimator::with_modulus(10);
         let venues = [
-            Venue::BinanceSpot, Venue::BinanceFut,
-            Venue::MexcSpot,    Venue::MexcFut,
-            Venue::KucoinSpot,  Venue::KucoinFut,
-            Venue::BitgetSpot,  Venue::BitgetFut,
-            Venue::GateSpot,    Venue::GateFut,
-            Venue::BingxSpot,   Venue::BingxFut,
-            Venue::XtSpot,      Venue::XtFut,
+            Venue::BinanceSpot,
+            Venue::BinanceFut,
+            Venue::MexcSpot,
+            Venue::MexcFut,
+            Venue::KucoinSpot,
+            Venue::KucoinFut,
+            Venue::BitgetSpot,
+            Venue::BitgetFut,
+            Venue::GateSpot,
+            Venue::GateFut,
+            Venue::BingxSpot,
+            Venue::BingxFut,
+            Venue::XtSpot,
+            Venue::XtFut,
         ];
         let mut per_venue_total = std::collections::HashMap::<Venue, u32>::new();
         let mut per_venue_accept = std::collections::HashMap::<Venue, u32>::new();
@@ -705,10 +792,17 @@ mod tests {
     fn with_tier_builds_sample_with_correct_labels() {
         let r = mk_route(42, Venue::MexcFut, Venue::BingxFut);
         let s = RawSample::with_tier(
-            1_700_000_000_000_000_000, 17, r, "BTC-USDT",
-            2.5, -0.8, 1e6, 2e6,
+            1_700_000_000_000_000_000,
+            17,
+            r,
+            "BTC-USDT",
+            2.5,
+            -0.8,
+            1e6,
+            2e6,
             SampleDecision::Accept,
-            SamplingTier::Allowlist, 1.0,
+            SamplingTier::Allowlist,
+            1.0,
         );
         assert_eq!(s.sampling_tier, "allowlist");
         assert!((s.sampling_probability - 1.0).abs() < f32::EPSILON);
@@ -720,12 +814,46 @@ mod tests {
     }
 
     #[test]
+    fn with_tier_and_priority_metadata_persists_generation() {
+        let r = mk_route(42, Venue::MexcFut, Venue::BingxFut);
+        let s = RawSample::with_tier_and_priority_metadata(
+            1_700_000_000_000_000_000,
+            17,
+            r,
+            "BTC-USDT",
+            2.5,
+            -0.8,
+            1e6,
+            2e6,
+            SampleDecision::Accept,
+            SamplingTier::Priority,
+            1.0,
+            9,
+            1_700_000_000_000_000_100,
+        );
+        let line = s.to_json_line();
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["sampling_tier"], "priority");
+        assert_eq!(v["priority_set_generation_id"], 9);
+        assert_eq!(
+            v["priority_set_updated_at_ns"],
+            1_700_000_000_000_000_100u64
+        );
+    }
+
+    #[test]
     fn default_new_uses_decimated_uniform_tier_for_backcompat() {
         // Cria via API legada — tier default para compat.
         let r = mk_route(1, Venue::MexcFut, Venue::BingxFut);
         let s = RawSample::new(
-            100, 1, r, "BTC-USDT",
-            2.0, -1.0, 1e6, 1e6,
+            100,
+            1,
+            r,
+            "BTC-USDT",
+            2.0,
+            -1.0,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         assert_eq!(s.sampling_tier, "decimated_uniform");

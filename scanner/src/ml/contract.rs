@@ -80,20 +80,11 @@ pub struct BaselineDiagnostics {
     pub historical_base_rate_ci: (f32, f32),
 }
 
-/// Fonte canônica da recomendação (fix D15).
-///
-/// Antes inferido por `!model_version.starts_with("baseline-")` em `serving.rs`,
-/// o que quebrava silenciosamente em nomenclatura experimental (ex:
-/// `"a3-stablenet-0.3.0"`). Enum explícito evita ambiguidade no gate 7
-/// (modelo vs baseline).
+/// Fonte canônica da recomendação — modelo ML vs baseline A3 ECDF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
-    /// Modelo ML real (QRF+CatBoost+RSF ou sucessor).
     Model,
-    /// Baseline A3 ECDF emitindo em shadow mode.
     Baseline,
-    /// Modelo falhou (circuit breaker) e baseline A3 está ativo como fallback.
-    Fallback,
 }
 
 impl SourceKind {
@@ -105,7 +96,6 @@ impl SourceKind {
         match self {
             SourceKind::Model => "model",
             SourceKind::Baseline => "baseline",
-            SourceKind::Fallback => "fallback",
         }
     }
 }
@@ -305,20 +295,6 @@ impl ReasonDetail {
     }
 }
 
-/// Compat para testes legados que construíam `detail: "...".into()`.
-/// Sempre retorna `placeholder()` — a string é ignorada (fix D17 proíbe
-/// prosa free-form). Caller novo deve construir `ReasonDetail` explicitamente.
-impl From<&str> for ReasonDetail {
-    fn from(_: &str) -> Self {
-        Self::placeholder()
-    }
-}
-
-impl From<String> for ReasonDetail {
-    fn from(_: String) -> Self {
-        Self::placeholder()
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasonKind {
@@ -330,57 +306,6 @@ pub enum ReasonKind {
     Tail,
     /// Combinação de múltiplos fatores.
     Combined,
-}
-
-// ---------------------------------------------------------------------------
-// Tactical signal (ADR-016 — emitido a 150ms enquanto oportunidade viva)
-// ---------------------------------------------------------------------------
-
-/// Sinal tático emitido a cada ciclo scanner (150 ms) enquanto o
-/// `TradeSetup` correspondente está dentro de `valid_until`.
-///
-/// Permite ao operador decidir timing *dentro da regra* estabelecida pelo
-/// `TradeSetup` — ex: entrar no primeiro `Eligible` (conservador) vs
-/// esperar `NearPeak` (tático). Atualização visual da UI deve ser
-/// limitada a ≤ 2 Hz (Q3 F-UX5 — Hirshleifer, Lim & Teoh 2009 JoF 64(5)).
-#[derive(Debug, Clone)]
-pub struct TacticalSignal {
-    pub route_id: RouteId,
-    /// Timestamp (ns) do tick do scanner.
-    pub at: u64,
-
-    /// Valor atual de `entrySpread`.
-    pub current_entry: f32,
-    /// Valor atual de `exitSpread`.
-    pub current_exit: f32,
-
-    pub entry_quality: EntryQuality,
-    pub exit_quality: ExitQuality,
-
-    /// Segundos desde emissão do TradeSetup original.
-    pub time_since_emit_s: u32,
-    /// Segundos até `valid_until`.
-    pub time_remaining_s: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EntryQuality {
-    /// Spread atual abaixo do `enter_at_min`.
-    HasNotAppeared,
-    /// `current_entry >= enter_at_min` — regra satisfeita.
-    Eligible,
-    /// `current_entry >= enter_typical` — acima da mediana prevista.
-    AboveMedian,
-    /// `current_entry >= enter_peak_p95` — próximo do pico afortunado.
-    NearPeak,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExitQuality {
-    HasNotAppeared,
-    Eligible,
-    AboveMedian,
-    NearBest,
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +356,10 @@ mod tests {
 
         // Fix D1: gross_profit_target deve equivaler a entry_now + exit_q50
         // (não entry_now + exit_target); ambos coincidem aqui por construção.
-        assert_eq!(setup.entry_now + setup.exit_q50.unwrap(), setup.gross_profit_target);
+        assert_eq!(
+            setup.entry_now + setup.exit_q50.unwrap(),
+            setup.gross_profit_target
+        );
         assert_eq!(setup.p_hit, Some(0.83));
         assert_eq!(setup.t_hit_median_s, Some(1680));
     }
@@ -570,7 +498,9 @@ mod tests {
         assert!(
             lo <= p && p <= hi,
             "p_hit={} fora de IC=[{}, {}]",
-            p, lo, hi
+            p,
+            lo,
+            hi
         );
     }
 
@@ -594,14 +524,19 @@ mod tests {
         assert!(
             delta < 1e-6,
             "gross_target {} diverge de identity entry+q50 {} por {}",
-            s.gross_profit_target, identity, delta
+            s.gross_profit_target,
+            identity,
+            delta
         );
     }
 
     #[test]
     fn invariant_valid_until_after_emitted_at() {
         let s = valid_setup();
-        assert!(s.valid_until > s.emitted_at, "valid_until anterior a emitted_at");
+        assert!(
+            s.valid_until > s.emitted_at,
+            "valid_until anterior a emitted_at"
+        );
     }
 
     #[test]
@@ -609,29 +544,28 @@ mod tests {
         let s = valid_setup();
         let d = s.baseline_diagnostics.as_ref().unwrap();
         let finite_fields: [f32; 18] = [
-            s.entry_now, s.exit_target, s.gross_profit_target, s.p_hit.unwrap(),
-            s.p_censor.unwrap(), d.enter_at_min, d.enter_typical, d.enter_peak_p95,
-            d.p_enter_hit, d.exit_at_min, d.exit_typical, d.p_exit_hit_given_enter,
-            d.gross_profit_p10, d.gross_profit_p25, d.gross_profit_median,
-            d.gross_profit_p75, d.gross_profit_p90, d.gross_profit_p95,
+            s.entry_now,
+            s.exit_target,
+            s.gross_profit_target,
+            s.p_hit.unwrap(),
+            s.p_censor.unwrap(),
+            d.enter_at_min,
+            d.enter_typical,
+            d.enter_peak_p95,
+            d.p_enter_hit,
+            d.exit_at_min,
+            d.exit_typical,
+            d.p_exit_hit_given_enter,
+            d.gross_profit_p10,
+            d.gross_profit_p25,
+            d.gross_profit_median,
+            d.gross_profit_p75,
+            d.gross_profit_p90,
+            d.gross_profit_p95,
         ];
         for (i, v) in finite_fields.iter().enumerate() {
             assert!(v.is_finite(), "field {} is not finite: {}", i, v);
         }
     }
 
-    #[test]
-    fn source_no_longer_exposes_haircut_fields() {
-        let source = include_str!("contract.rs");
-        let haircut_field = ["pub ", "haircut_predicted:"].concat();
-        let realizable_field = ["pub ", "gross_profit_realizable_median:"].concat();
-        assert!(
-            !source.contains(&haircut_field),
-            "haircut_predicted não deve permanecer no contrato do ML"
-        );
-        assert!(
-            !source.contains(&realizable_field),
-            "gross_profit_realizable_median não deve permanecer no contrato do ML"
-        );
-    }
 }

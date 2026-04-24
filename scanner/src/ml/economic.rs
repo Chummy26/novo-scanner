@@ -35,19 +35,10 @@ use crate::ml::contract::{RouteId, TradeSetup};
 /// Decisão: 10_000 USDT (ADR-019 §Capital hipotético fixo de referência).
 pub const CAPITAL_HYPOTHETICAL_USD: f64 = 10_000.0;
 
-/// Janela legada mantida para compatibilidade de métricas antigas.
-pub const DEFAULT_T_TRIGGER_MAX_S: u32 = 300;
-
-/// Custo estimado por recomendação (atenção do operador, ADR-019).
-/// Default: 0.1 bp = 0.001% do capital hipotético = 0.10 USDT por emissão.
-pub const DEFAULT_OPERATOR_ATTENTION_COST_USD: f64 = 0.10;
-
 /// Outcome resolvido de uma recomendação.
 ///
-/// Fix D9: `enter_realized_pct` removido das variantes — skill §3.1 afirma
-/// que `S_entrada(t0)` é preço executado imutável após entrada. Campo
-/// vestigial confundia consumidores Python. PnL agora deriva de
-/// `setup.entry_now + exit_realized_pct`.
+/// `entry_now` é imutável por skill §3.1 (preço executado). PnL bruto deriva
+/// de `entry_locked + exit_realized_pct` — entry é parâmetro externo.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TradeOutcome {
     /// Entry travado em t0 e saída realizada conforme regra.
@@ -55,35 +46,27 @@ pub enum TradeOutcome {
         exit_realized_pct: f32,
         horizon_observed_ms: u32,
     },
-    /// Variante legada deprecated: contrato atual sempre entra em `entry_now`
-    /// imediatamente, então `WindowMiss` é estruturalmente inalcançável.
-    /// Mantida temporariamente apenas para JSONL serialização de runs antigos.
-    #[deprecated(note = "contrato atual entra em t0 — WindowMiss é inalcançável")]
-    WindowMiss,
     /// Exit não atingiu threshold dentro de `T_max` — fechamento forçado.
     ExitMiss { forced_exit_pct: f32 },
+    /// Horizonte não observado com dados limpos até `valid_until`.
+    /// Não alimenta PnL agregado nem calibração.
+    Censored,
 }
 
 impl TradeOutcome {
     /// PnL bruto percentual dado `entry_now` travado em t0.
-    ///
-    /// Fix D9: entry travado é parâmetro externo (do `TradeSetup`), não
-    /// campo interno do outcome.
     pub fn gross_pnl_pct(&self, entry_locked_pct: f32) -> f32 {
-        #[allow(deprecated)]
         match *self {
-            TradeOutcome::Realized { exit_realized_pct, .. } => entry_locked_pct + exit_realized_pct,
-            TradeOutcome::WindowMiss => 0.0,
+            TradeOutcome::Realized { exit_realized_pct, .. } => {
+                entry_locked_pct + exit_realized_pct
+            }
             TradeOutcome::ExitMiss { forced_exit_pct } => entry_locked_pct + forced_exit_pct,
+            TradeOutcome::Censored => f32::NAN,
         }
     }
 
-    /// Valor indicativo bruto sobre `CAPITAL_HYPOTHETICAL_USD`.
-    ///
-    /// Fix D11: nome semântico — **não é PnL operacional real**. Capital
-    /// hipotético 10k USDT serve apenas como denominador de comparabilidade
-    /// (ADR-019). Fees, funding e slippage **não** estão incluídos — CLAUDE.md
-    /// §Fronteira ML proíbe modelar esses termos no ML.
+    /// Valor indicativo bruto sobre `CAPITAL_HYPOTHETICAL_USD` — não é PnL
+    /// operacional real; fees/funding/slippage excluídos (fronteira ML).
     pub fn indicative_gross_at_10k_ref_usd(&self, entry_locked_pct: f32) -> f64 {
         (self.gross_pnl_pct(entry_locked_pct) as f64 / 100.0) * CAPITAL_HYPOTHETICAL_USD
     }
@@ -130,21 +113,7 @@ pub struct EconomicEvent {
 }
 
 impl EconomicEvent {
-    pub fn new(
-        setup: &TradeSetup,
-        outcome: TradeOutcome,
-        resolved_ns: u64,
-    ) -> Self {
-        Self::with_sampling_probability(setup, outcome, resolved_ns, f32::NAN)
-    }
-
-    /// Fix D7: construtor que registra `sampling_probability` para IPW.
-    pub fn with_sampling_probability(
-        setup: &TradeSetup,
-        outcome: TradeOutcome,
-        resolved_ns: u64,
-        sampling_probability: f32,
-    ) -> Self {
+    pub fn new(setup: &TradeSetup, outcome: TradeOutcome, resolved_ns: u64) -> Self {
         let gross_pct = outcome.gross_pnl_pct(setup.entry_now);
         Self {
             ts_emitted_ns: setup.emitted_at,
@@ -156,7 +125,7 @@ impl EconomicEvent {
             outcome,
             gross_pnl_pct: gross_pct,
             indicative_gross_at_10k_ref_usd: (gross_pct as f64 / 100.0) * CAPITAL_HYPOTHETICAL_USD,
-            sampling_probability,
+            sampling_probability: f32::NAN,
             from_model: setup.source_kind.is_model(),
             p_hit_forecast: setup.p_hit,
         }
@@ -164,18 +133,17 @@ impl EconomicEvent {
 
     /// Serialização JSONL (persistência append-only `data/ml/economic/`).
     pub fn to_json_line(&self) -> String {
-        #[allow(deprecated)]
         let (outcome_label, exit_r, horizon) = match self.outcome {
             TradeOutcome::Realized {
                 exit_realized_pct,
                 horizon_observed_ms,
             } => (
                 "realized",
-                exit_realized_pct,
+                Some(exit_realized_pct),
                 horizon_observed_ms as i32,
             ),
-            TradeOutcome::WindowMiss => ("window_miss", 0.0, -1),
-            TradeOutcome::ExitMiss { forced_exit_pct } => ("exit_miss", forced_exit_pct, -1),
+            TradeOutcome::ExitMiss { forced_exit_pct } => ("exit_miss", Some(forced_exit_pct), -1),
+            TradeOutcome::Censored => ("censored", None, -1),
         };
         format!(
             concat!(
@@ -197,7 +165,7 @@ impl EconomicEvent {
             self.source_kind.as_str(),
             outcome_label,
             finite_or_null_f32(self.entry_locked_pct),
-            finite_or_null_f32(exit_r),
+            opt_f32_or_null(exit_r),
             horizon,
             finite_or_null_f32(self.gross_pnl_pct),
             finite_or_null_f64(self.indicative_gross_at_10k_ref_usd),
@@ -209,12 +177,25 @@ impl EconomicEvent {
 
 #[inline]
 fn finite_or_null_f32(v: f32) -> String {
-    if v.is_finite() { v.to_string() } else { "null".into() }
+    if v.is_finite() {
+        v.to_string()
+    } else {
+        "null".into()
+    }
+}
+
+#[inline]
+fn opt_f32_or_null(v: Option<f32>) -> String {
+    v.map(finite_or_null_f32).unwrap_or_else(|| "null".into())
 }
 
 #[inline]
 fn finite_or_null_f64(v: f64) -> String {
-    if v.is_finite() { v.to_string() } else { "null".into() }
+    if v.is_finite() {
+        v.to_string()
+    } else {
+        "null".into()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +208,8 @@ pub struct WindowMetrics {
     pub window_s: u32,
     pub n_emissions: u64,
     pub n_realized: u64,
-    pub n_window_miss: u64,
     pub n_exit_miss: u64,
+    pub n_censored: u64,
     pub simulated_pnl_aggregated_usd: f64,
     pub pnl_per_emission_median_usd: f64,
     pub pnl_per_emission_p10_usd: f64,
@@ -241,18 +222,13 @@ impl WindowMetrics {
             window_s,
             n_emissions: 0,
             n_realized: 0,
-            n_window_miss: 0,
             n_exit_miss: 0,
+            n_censored: 0,
             simulated_pnl_aggregated_usd: 0.0,
             pnl_per_emission_median_usd: 0.0,
             pnl_per_emission_p10_usd: 0.0,
             realization_rate: 0.0,
         }
-    }
-
-    /// Gate 7 (ADR-019): modelo vs baseline. Aqui somente agregado.
-    pub fn economic_value_minus(&self, baseline: &WindowMetrics) -> f64 {
-        self.simulated_pnl_aggregated_usd - baseline.simulated_pnl_aggregated_usd
     }
 }
 
@@ -280,8 +256,8 @@ pub struct EconomicAccumulator {
 pub struct EconomicMetrics {
     pub n_emissions_total: std::sync::atomic::AtomicU64,
     pub n_realized_total: std::sync::atomic::AtomicU64,
-    pub n_window_miss_total: std::sync::atomic::AtomicU64,
     pub n_exit_miss_total: std::sync::atomic::AtomicU64,
+    pub n_censored_total: std::sync::atomic::AtomicU64,
     /// PnL agregado USD × 1e4 (inteiro para evitar float atômico).
     /// Divide por 1e4 ao ler.
     pub pnl_aggregated_usd_times_10k: AtomicI64,
@@ -354,19 +330,9 @@ impl Default for CalibrationAccumulator {
 }
 
 impl CalibrationAccumulator {
-    /// Compat API — registra sem ts (sem decay). Use `record_at` em produção.
-    pub fn record(&mut self, p_hit: f32, realized: bool) {
-        self.record_at(p_hit, realized, 0, self.last_record_ns + 1);
-    }
 
     /// Registra observação com horizonte e timestamp (fix D6 + D8).
-    pub fn record_at(
-        &mut self,
-        p_hit: f32,
-        realized: bool,
-        horizon_observed_ms: u32,
-        now_ns: u64,
-    ) {
+    pub fn record_at(&mut self, p_hit: f32, realized: bool, horizon_observed_ms: u32, now_ns: u64) {
         // Decay exponencial sobre buckets por horizonte.
         if self.last_record_ns > 0 && now_ns > self.last_record_ns {
             let dt_ns = now_ns - self.last_record_ns;
@@ -587,50 +553,60 @@ impl EconomicAccumulator {
     /// Adiciona evento resolvido ao buffer + atualiza métricas atômicas
     /// + calibration tracker.
     pub fn push(&mut self, evt: EconomicEvent) {
-        self.metrics.n_emissions_total.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .n_emissions_total
+            .fetch_add(1, Ordering::Relaxed);
         let realized_bool = matches!(evt.outcome, TradeOutcome::Realized { .. });
-        #[allow(deprecated)]
         match evt.outcome {
             TradeOutcome::Realized { .. } => {
-                self.metrics.n_realized_total.fetch_add(1, Ordering::Relaxed);
-            }
-            TradeOutcome::WindowMiss => {
-                self.metrics.n_window_miss_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .n_realized_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
             TradeOutcome::ExitMiss { .. } => {
-                self.metrics.n_exit_miss_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .n_exit_miss_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            TradeOutcome::Censored => {
+                self.metrics
+                    .n_censored_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
-        let pnl_scaled = (evt.indicative_gross_at_10k_ref_usd * 10_000.0) as i64;
-        // Delta assinado preserva perdas e ganhos sem underflow/wrap.
-        self.metrics
-            .pnl_aggregated_usd_times_10k
-            .fetch_add(pnl_scaled, Ordering::Relaxed);
+        if evt.indicative_gross_at_10k_ref_usd.is_finite() {
+            let pnl_scaled = (evt.indicative_gross_at_10k_ref_usd * 10_000.0) as i64;
+            // Delta assinado preserva perdas e ganhos sem underflow/wrap.
+            self.metrics
+                .pnl_aggregated_usd_times_10k
+                .fetch_add(pnl_scaled, Ordering::Relaxed);
+        }
 
         // Fix D6: record_at com horizonte observado para ECE segregada.
         // Fix D8: ts_resolved_ns aciona decay exponencial 24h.
         if let Some(p_hit) = evt.p_hit_forecast {
-            #[allow(deprecated)]
+            if matches!(evt.outcome, TradeOutcome::Censored) {
+                self.events.push_back(evt);
+                while self.events.len() > self.max_events {
+                    self.events.pop_front();
+                }
+                return;
+            }
             let horizon_ms = match evt.outcome {
                 TradeOutcome::Realized { horizon_observed_ms, .. } => horizon_observed_ms,
                 TradeOutcome::ExitMiss { .. } => u32::MAX, // longest bucket
-                TradeOutcome::WindowMiss => 0,
+                TradeOutcome::Censored => unreachable!("censored returned before calibration"),
             };
-            self.calibration.record_at(
-                p_hit,
-                realized_bool,
-                horizon_ms,
-                evt.ts_resolved_ns,
-            );
+            self.calibration
+                .record_at(p_hit, realized_bool, horizon_ms, evt.ts_resolved_ns);
         }
         let ece_bps = (self.calibration.ece() * 10_000.0) as u64;
         self.metrics
             .calibration_ece_bps
             .store(ece_bps, Ordering::Relaxed);
-        self.metrics.calibration_observations.store(
-            self.calibration.total(),
-            Ordering::Relaxed,
-        );
+        self.metrics
+            .calibration_observations
+            .store(self.calibration.total(), Ordering::Relaxed);
 
         self.events.push_back(evt);
         while self.events.len() > self.max_events {
@@ -657,20 +633,21 @@ impl EconomicAccumulator {
             return WindowMetrics::empty(window_s);
         }
         let mut realized = 0u64;
-        #[allow(deprecated)]
-        let mut window_miss = 0u64;
         let mut exit_miss = 0u64;
+        let mut censored = 0u64;
         let mut total_usd = 0.0;
         let mut pnl_vec: Vec<f64> = Vec::with_capacity(relevant.len());
         // IPW: se `sampling_probability` ausente/NaN, peso = 1.0 (neutro).
         let mut weighted_realized = 0.0_f64;
         let mut weighted_n = 0.0_f64;
         for e in &relevant {
-            #[allow(deprecated)]
             match e.outcome {
                 TradeOutcome::Realized { .. } => realized += 1,
-                TradeOutcome::WindowMiss => window_miss += 1,
                 TradeOutcome::ExitMiss { .. } => exit_miss += 1,
+                TradeOutcome::Censored => censored += 1,
+            }
+            if matches!(e.outcome, TradeOutcome::Censored) {
+                continue;
             }
             let w: f64 = if e.sampling_probability.is_finite() && e.sampling_probability > 1e-6 {
                 1.0 / (e.sampling_probability as f64)
@@ -682,8 +659,23 @@ impl EconomicAccumulator {
             if is_realized {
                 weighted_realized += w;
             }
-            total_usd += e.indicative_gross_at_10k_ref_usd * w;
-            pnl_vec.push(e.indicative_gross_at_10k_ref_usd);
+            if e.indicative_gross_at_10k_ref_usd.is_finite() {
+                total_usd += e.indicative_gross_at_10k_ref_usd * w;
+                pnl_vec.push(e.indicative_gross_at_10k_ref_usd);
+            }
+        }
+        if pnl_vec.is_empty() {
+            return WindowMetrics {
+                window_s,
+                n_emissions: n,
+                n_realized: realized,
+                n_exit_miss: exit_miss,
+                n_censored: censored,
+                simulated_pnl_aggregated_usd: 0.0,
+                pnl_per_emission_median_usd: 0.0,
+                pnl_per_emission_p10_usd: 0.0,
+                realization_rate: 0.0,
+            };
         }
         pnl_vec.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median = pnl_vec[pnl_vec.len() / 2];
@@ -697,8 +689,8 @@ impl EconomicAccumulator {
             window_s,
             n_emissions: n,
             n_realized: realized,
-            n_window_miss: window_miss,
             n_exit_miss: exit_miss,
+            n_censored: censored,
             simulated_pnl_aggregated_usd: total_usd,
             pnl_per_emission_median_usd: median,
             pnl_per_emission_p10_usd: p10,
@@ -809,12 +801,30 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn window_miss_has_zero_pnl() {
-        let out = TradeOutcome::WindowMiss;
-        // WindowMiss ignora entry_locked — variante deprecated.
-        assert_eq!(out.gross_pnl_pct(2.5), 0.0);
-        assert_eq!(out.indicative_gross_at_10k_ref_usd(2.5), 0.0);
+    fn censored_outcome_does_not_feed_pnl_or_calibration() {
+        let mut acc = EconomicAccumulator::new();
+        let now_ns = 1_000_000_000_000;
+        let setup = mk_setup(now_ns - 500_000_000);
+        acc.push(EconomicEvent::new(&setup, TradeOutcome::Censored, now_ns));
+
+        let metrics = acc.metrics();
+        assert_eq!(metrics.n_censored_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.pnl_aggregated_usd_times_10k.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(metrics.calibration_observations.load(Ordering::Relaxed), 0);
+
+        let m = acc.snapshot_window(3600, now_ns);
+        assert_eq!(m.n_censored, 1);
+        assert_eq!(m.n_exit_miss, 0);
+        assert_eq!(m.simulated_pnl_aggregated_usd, 0.0);
+
+        let line = EconomicEvent::new(&setup, TradeOutcome::Censored, now_ns).to_json_line();
+        let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+        assert_eq!(v["outcome"], "censored");
+        assert!(v["exit_realized_pct"].is_null());
+        assert!(v["gross_pnl_pct"].is_null());
     }
 
     #[test]
@@ -831,20 +841,20 @@ mod tests {
             now_ns,
         ));
         let setup2 = mk_setup(now_ns - 400_000_000);
-        #[allow(deprecated)]
         acc.push(EconomicEvent::new(
             &setup2,
-            TradeOutcome::WindowMiss,
+            TradeOutcome::ExitMiss { forced_exit_pct: -3.0 },
             now_ns,
         ));
         let m = acc.snapshot_window(3600, now_ns);
         assert_eq!(m.n_emissions, 2);
         assert_eq!(m.n_realized, 1);
-        assert_eq!(m.n_window_miss, 1);
+        assert_eq!(m.n_exit_miss, 1);
         assert!((m.realization_rate - 0.5).abs() < 1e-4);
-        // Fix D9: gross agora é entry_locked(2.5) + exit_realized(-0.8) = 1.7%
-        // × 10k / 100 = 170 USD. Antes era com enter_realized=2.1 = 130 USD.
-        assert!((m.simulated_pnl_aggregated_usd - 170.0).abs() < 1e-2);
+        // Realized: entry(2.5) + exit_realized(-0.8) = 1.7% × 10k/100 = 170.
+        // ExitMiss: entry(2.5) + forced_exit(-3.0) = -0.5% × 10k/100 = -50.
+        // Total: 120 USD.
+        assert!((m.simulated_pnl_aggregated_usd - 120.0).abs() < 1e-2);
     }
 
     #[test]
@@ -865,7 +875,12 @@ mod tests {
             now_ns,
         ));
 
-        assert_eq!(acc.metrics().calibration_observations.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            acc.metrics()
+                .calibration_observations
+                .load(Ordering::Relaxed),
+            0
+        );
         assert_eq!(acc.calibration_ece(), 0.0);
     }
 
@@ -940,15 +955,9 @@ mod tests {
         let mut acc = EconomicAccumulator::with_capacity(3);
         let setup = mk_setup(1);
         for _ in 0..5 {
-            #[allow(deprecated)]
-            acc.push(EconomicEvent::new(
-                &setup,
-                TradeOutcome::WindowMiss,
-                2,
-            ));
+            acc.push(EconomicEvent::new(&setup, TradeOutcome::Censored, 2));
         }
         assert_eq!(acc.len(), 3);
-        // Counter atômico NÃO é truncado (registra todos 5).
         assert_eq!(acc.metrics().n_emissions_total.load(Ordering::Relaxed), 5);
     }
 
@@ -965,11 +974,11 @@ mod tests {
 
     #[test]
     fn horizon_bucket_idx_segregates_correctly() {
-        assert_eq!(horizon_bucket_idx(30_000), 0);       // 30s < 60s
-        assert_eq!(horizon_bucket_idx(120_000), 1);      // 2min < 5min
-        assert_eq!(horizon_bucket_idx(1_200_000), 2);    // 20min < 30min
-        assert_eq!(horizon_bucket_idx(3_600_000), 3);    // 1h < 2h
-        assert_eq!(horizon_bucket_idx(20_000_000), 4);   // 5h bucket longest
+        assert_eq!(horizon_bucket_idx(30_000), 0); // 30s < 60s
+        assert_eq!(horizon_bucket_idx(120_000), 1); // 2min < 5min
+        assert_eq!(horizon_bucket_idx(1_200_000), 2); // 20min < 30min
+        assert_eq!(horizon_bucket_idx(3_600_000), 3); // 1h < 2h
+        assert_eq!(horizon_bucket_idx(20_000_000), 4); // 5h bucket longest
     }
 
     #[test]
@@ -1015,7 +1024,8 @@ mod tests {
         assert!(
             ece_decayed < ece_fresh,
             "ECE decaída ({}) deveria ser menor que fresca ({})",
-            ece_decayed, ece_fresh
+            ece_decayed,
+            ece_fresh
         );
     }
 
@@ -1047,7 +1057,11 @@ mod tests {
         // Amostra grande (n=1000, p̂=0.7): IC deve conter 0.7 e ser apertado.
         let (lo, hi) = wilson_ci_95(1000, 700);
         assert!(lo < 0.70 && hi > 0.70);
-        assert!(hi - lo < 0.06, "IC muito largo para n=1000: width={}", hi - lo);
+        assert!(
+            hi - lo < 0.06,
+            "IC muito largo para n=1000: width={}",
+            hi - lo
+        );
     }
 
     #[test]
@@ -1060,7 +1074,8 @@ mod tests {
         assert!(
             width_small > width_large * 3.0,
             "IC pequeno não é significativamente mais largo: small={} large={}",
-            width_small, width_large
+            width_small,
+            width_large
         );
     }
 
@@ -1076,19 +1091,24 @@ mod tests {
     #[test]
     fn reliability_points_include_wilson_ic_and_stability_flag() {
         let mut c = CalibrationAccumulator::default();
+        let mut ts = 1u64;
         // Bucket [0.8, 0.9): 50 emissões, 40 realized → freq = 0.80
         for _ in 0..40 {
-            c.record(0.85, true);
+            c.record_at(0.85, true, 0, ts);
+            ts += 1;
         }
         for _ in 0..10 {
-            c.record(0.85, false);
+            c.record_at(0.85, false, 0, ts);
+            ts += 1;
         }
         // Bucket [0.5, 0.6): 15 emissões, 8 realized → instável (n<30)
         for _ in 0..8 {
-            c.record(0.55, true);
+            c.record_at(0.55, true, 0, ts);
+            ts += 1;
         }
         for _ in 0..7 {
-            c.record(0.55, false);
+            c.record_at(0.55, false, 0, ts);
+            ts += 1;
         }
 
         let pts = c.reliability_points();
@@ -1103,7 +1123,11 @@ mod tests {
         let small = pts.iter().find(|p| p.n == 15).unwrap();
         assert!(small.unstable, "n=15 < 30 deve ser unstable=true");
         let width = small.ic_upper - small.ic_lower;
-        assert!(width > 0.30, "IC de bucket pequeno deve ser largo: {}", width);
+        assert!(
+            width > 0.30,
+            "IC de bucket pequeno deve ser largo: {}",
+            width
+        );
     }
 
     #[test]

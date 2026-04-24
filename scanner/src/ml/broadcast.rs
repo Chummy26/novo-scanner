@@ -62,11 +62,6 @@ impl RecommendationFrame {
         }
     }
 
-    /// Serializa o DTO para linha JSON — usado pelo WS handler.
-    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(&self.dto)
-    }
-
     /// Serializa envelope do canal ML com tipo `"ml_recommendation"`.
     ///
     /// **Fix pós-auditoria 2026-04-21**: o envelope anterior reusava
@@ -176,14 +171,22 @@ impl RecommendationBroadcaster {
         rec: &Recommendation,
     ) -> bool {
         let frame = RecommendationFrame::from_recommendation(
-            cycle_seq, emitted_at_ns, route_id, symbol_name, rec,
+            cycle_seq,
+            emitted_at_ns,
+            route_id,
+            symbol_name,
+            rec,
         );
         match rec {
             Recommendation::Trade(_) => {
-                self.metrics.trade_published_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .trade_published_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
             Recommendation::Abstain { .. } => {
-                self.metrics.abstain_published_total.fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .abstain_published_total
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         self.metrics.published_total.fetch_add(1, Ordering::Relaxed);
@@ -276,7 +279,7 @@ mod tests {
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
-                detail: "t".into(),
+                detail: crate::ml::ReasonDetail::placeholder(),
             },
             ci_method: "wilson_marginal",
             model_version: "baseline-a3-0.2.0".into(),
@@ -307,10 +310,7 @@ mod tests {
         let had_consumers = b.publish(1, 100, mk_route(), "BTC-USDT", &r);
         assert!(!had_consumers);
         assert_eq!(b.metrics().published_total.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            b.metrics().no_subscribers_total.load(Ordering::Relaxed),
-            1
-        );
+        assert_eq!(b.metrics().no_subscribers_total.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -344,17 +344,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn frame_to_json_roundtrips() {
-        let b = RecommendationBroadcaster::new();
-        let mut rx = b.subscribe();
-        b.publish(1, 1, mk_route(), "BTC-USDT", &mk_trade());
-        let frame = rx.recv().await.unwrap();
-        let s = frame.to_json_string().unwrap();
-        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["kind"], "trade");
-    }
-
-    #[tokio::test]
     async fn multiple_subscribers_all_receive() {
         let b = RecommendationBroadcaster::new();
         let mut rx1 = b.subscribe();
@@ -372,7 +361,13 @@ mod tests {
         // bruto (evita confusão de semântica preço vs spread).
         let b = RecommendationBroadcaster::new();
         let mut rx = b.subscribe();
-        b.publish(7, 1_700_000_000_000_000_000, mk_route(), "BTC-USDT", &mk_trade());
+        b.publish(
+            7,
+            1_700_000_000_000_000_000,
+            mk_route(),
+            "BTC-USDT",
+            &mk_trade(),
+        );
         let frame = rx.recv().await.unwrap();
         let s = frame.to_scanner_like_json_string().unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
@@ -406,7 +401,10 @@ fn iso8601_from_secs(secs: i64, ms: u32) -> String {
     let h = time_secs / 3600;
     let mi = (time_secs % 3600) / 60;
     let s = time_secs % 60;
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, m, d, h, mi, s, ms)
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, m, d, h, mi, s, ms
+    )
 }
 
 fn civil_from_days(z: i64) -> (i32, u32, u32) {

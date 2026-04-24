@@ -30,8 +30,7 @@ use crate::ml::trigger::SampleDecision;
 ///   importado de `ml/mod.rs` (fix E5).
 pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 6;
 
-/// Re-export da versão única do scanner (consolidada em `ml/mod.rs`, fix E5).
-pub use crate::ml::SCANNER_VERSION;
+use crate::ml::SCANNER_VERSION;
 
 /// Uma observação aceita pelo trigger, pronta para gravação.
 ///
@@ -272,8 +271,14 @@ mod tests {
     #[test]
     fn non_finite_floats_serialize_as_null() {
         let mut s = AcceptedSample::new(
-            1, 0, mk_route(), "BTC-USDT", f32::NAN, f32::INFINITY,
-            f64::NEG_INFINITY, 1e6,
+            1,
+            0,
+            mk_route(),
+            "BTC-USDT",
+            f32::NAN,
+            f32::INFINITY,
+            f64::NEG_INFINITY,
+            1e6,
             SampleDecision::Accept,
         );
         s.mark_recommended();
@@ -288,7 +293,14 @@ mod tests {
     #[test]
     fn schema_version_in_output_matches_const() {
         let s = AcceptedSample::new(
-            1, 0, mk_route(), "ETH-USDT", 1.0, -1.0, 1e6, 1e6,
+            1,
+            0,
+            mk_route(),
+            "ETH-USDT",
+            1.0,
+            -1.0,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         let line = s.to_json_line();
@@ -304,7 +316,14 @@ mod tests {
         // Defensivo — nomes canonical normalmente não têm aspas/backslash,
         // mas garantimos que o escaping não quebra JSON.
         let s = AcceptedSample::new(
-            1, 0, mk_route(), "XYZ\"EVIL", 1.0, -1.0, 1e6, 1e6,
+            1,
+            0,
+            mk_route(),
+            "XYZ\"EVIL",
+            1.0,
+            -1.0,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         let line = s.to_json_line();
@@ -316,7 +335,14 @@ mod tests {
     fn empty_symbol_name_is_handled_gracefully() {
         // Caso fallback — universe lookup falhou retorna "".
         let s = AcceptedSample::new(
-            1, 0, mk_route(), "", 1.0, -1.0, 1e6, 1e6,
+            1,
+            0,
+            mk_route(),
+            "",
+            1.0,
+            -1.0,
+            1e6,
+            1e6,
             SampleDecision::Accept,
         );
         let line = s.to_json_line();

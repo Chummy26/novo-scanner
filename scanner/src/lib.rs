@@ -14,9 +14,9 @@ pub mod types;
 pub use config::Config;
 pub use error::{Error, Result};
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use std::path::PathBuf;
 
 use tracing::{info, warn};
 
@@ -131,8 +131,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let n_symbols = (universe.len() as u32).max(cfg.limits.max_symbols);
     let store = Arc::new(BookStore::with_capacity(n_symbols));
     let stale = new_stale_table(n_symbols);
-    let vol   = Arc::new(VolStore::with_capacity(n_symbols));
-    info!(n_symbols, "book store + staleness table + vol store allocated");
+    let vol = Arc::new(VolStore::with_capacity(n_symbols));
+    info!(
+        n_symbols,
+        "book store + staleness table + vol store allocated"
+    );
 
     // --- Scan counters (shared with /api/spread/debug) ---
     let counters = Arc::new(ScanCounters::default());
@@ -153,7 +156,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Arc::clone(&vol),
         )
         .with_ml_broadcaster(ml_broadcaster.clone());
-    let addr: std::net::SocketAddr = cfg.bind.parse()
+    let addr: std::net::SocketAddr = cfg
+        .bind
+        .parse()
         .map_err(|e| Error::Config(format!("invalid bind {:?}: {}", cfg.bind, e)))?;
     {
         let bs = bstate.clone();
@@ -166,13 +171,21 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     // --- Adapters ---
-    spawn_adapters(&cfg, Arc::clone(&universe), Arc::clone(&stale), Arc::clone(&vol), Arc::clone(&store));
+    spawn_adapters(
+        &cfg,
+        Arc::clone(&universe),
+        Arc::clone(&stale),
+        Arc::clone(&vol),
+        Arc::clone(&store),
+    );
 
     // --- REST vol poller (fills VolStore for venues whose WS omits 24h vol) ---
     {
         let u = Arc::clone(&universe);
         let v = Arc::clone(&vol);
-        tokio::spawn(async move { adapter::vol_poller::run(u, v).await; });
+        tokio::spawn(async move {
+            adapter::vol_poller::run(u, v).await;
+        });
     }
 
     // --- ML recomendador (M1.7) ---
@@ -209,9 +222,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         "raw_samples",
     )
     .await;
-    let (ml_raw_writer, ml_raw_writer_handle) =
-        RawSampleWriter::create(raw_writer_cfg);
-    tokio::spawn(async move { ml_raw_writer.run().await; });
+    let (ml_raw_writer, ml_raw_writer_handle) = RawSampleWriter::create(raw_writer_cfg);
+    tokio::spawn(async move {
+        ml_raw_writer.run().await;
+    });
 
     // --- Wave V: Labeled trade writer + resolver + ranker ---
     let mut labeled_writer_cfg = LabeledWriterConfig::default();
@@ -233,7 +247,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     .await;
     let label_flush_interval = labeled_writer_cfg.flush_interval;
     let (labeled_writer, labeled_handle) = LabeledJsonlWriter::create(labeled_writer_cfg);
-    tokio::spawn(async move { labeled_writer.run().await; });
+    tokio::spawn(async move {
+        labeled_writer.run().await;
+    });
 
     let resolver_cfg = ResolverConfig {
         horizons_s: cfg.ml.label_horizons_s.clone(),
@@ -243,7 +259,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let label_resolver = Arc::new(LabelResolver::new(resolver_cfg, labeled_handle));
 
     // Ranker rolling — 24h de buckets × 15 min.
-    let ranker = Arc::new(RouteRanking::new(now_ns(), cfg.ml.raw_sampling_target_coverage));
+    let ranker = Arc::new(RouteRanking::new(
+        now_ns(),
+        cfg.ml.raw_sampling_target_coverage,
+    ));
 
     let ml_server = Arc::new(
         MlServer::new(ml_baseline, SamplingTrigger::with_defaults())
@@ -277,6 +296,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                         if sell_v == buy_v || !coverage[sell_v.idx()] {
                             continue;
                         }
+                        if sell_v.as_str() == buy_v.as_str() {
+                            continue;
+                        }
                         // Skip spot/spot e spot-as-sell (regra do engine).
                         if buy_v.market() == crate::types::Market::Spot
                             && sell_v.market() == crate::types::Market::Spot
@@ -308,6 +330,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     {
         let ranker_clone = Arc::clone(&ranker);
         let decimator = ml_server.raw_decimator().clone();
+        let ml_for_priority_metadata = Arc::clone(&ml_server);
         let rerank_interval = Duration::from_secs(cfg.ml.raw_rerank_interval_s.max(60));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(rerank_interval);
@@ -317,6 +340,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 let priority = ranker_clone.snapshot_priority_set();
                 let n = priority.len();
                 decimator.set_priority_set(priority);
+                ml_for_priority_metadata.bump_priority_set_generation(now_ns());
                 info!(n_priority_routes = n, "ML rerank atualizou priority_set");
             }
         });
@@ -364,7 +388,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Some(m)
         }
         Err(e) => {
-            warn!("ML prometheus register failed: {} — métricas ML indisponíveis", e);
+            warn!(
+                "ML prometheus register failed: {} — métricas ML indisponíveis",
+                e
+            );
             None
         }
     };
@@ -413,7 +440,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     )
     .await;
     let (ml_writer, ml_writer_handle) = JsonlWriter::create(writer_cfg);
-    tokio::spawn(async move { ml_writer.run().await; });
+    tokio::spawn(async move {
+        ml_writer.run().await;
+    });
 
     // --- Dataset retention policy ---
     // Persistência física != janela estatística do modelo. O runtime
@@ -489,10 +518,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     // --- Spread engine loop (150ms) ---
-    let u_engine  = Arc::clone(&universe);
-    let s_engine  = Arc::clone(&store);
+    let u_engine = Arc::clone(&universe);
+    let s_engine = Arc::clone(&store);
     let st_engine = Arc::clone(&stale);
-    let v_engine  = Arc::clone(&vol);
+    let v_engine = Arc::clone(&vol);
     let threshold = cfg.entry_threshold_pct;
     let max_spread = cfg.max_spread_pct;
     let min_vol = cfg.min_vol_usd;
@@ -544,18 +573,20 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 }
 
 fn spawn_adapters(
-    cfg:       &Config,
-    universe:  Arc<SymbolUniverse>,
-    stale:     Arc<StaleTable>,
-    vol:       Arc<VolStore>,
-    store:     Arc<BookStore>,
+    cfg: &Config,
+    universe: Arc<SymbolUniverse>,
+    stale: Arc<StaleTable>,
+    vol: Arc<VolStore>,
+    store: Arc<BookStore>,
 ) {
-    let _ = vol;  // consumed below per-venue where applicable
+    let _ = vol; // consumed below per-venue where applicable
     use crate::types::Venue;
 
     if cfg.venues.is_enabled(Venue::BinanceSpot) {
         let a = adapter::binance_spot::BinanceSpotAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale));
+            Arc::clone(&universe),
+            Arc::clone(&stale),
+        );
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             if let Err(e) = a.run(&store).await {
@@ -565,7 +596,10 @@ fn spawn_adapters(
     }
     if cfg.venues.is_enabled(Venue::GateSpot) {
         let a = adapter::gate_spot::GateSpotAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale), Arc::clone(&vol));
+            Arc::clone(&universe),
+            Arc::clone(&stale),
+            Arc::clone(&vol),
+        );
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             if let Err(e) = a.run(&store).await {
@@ -575,7 +609,10 @@ fn spawn_adapters(
     }
     if cfg.venues.is_enabled(Venue::BitgetSpot) {
         let a = adapter::bitget::BitgetAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale), cfg.bitget_mode);
+            Arc::clone(&universe),
+            Arc::clone(&stale),
+            cfg.bitget_mode,
+        );
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             if let Err(e) = a.run(&store).await {
@@ -585,7 +622,10 @@ fn spawn_adapters(
     }
     if cfg.venues.is_enabled(Venue::BitgetFut) {
         let a = adapter::bitget_fut::BitgetFutAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale), cfg.bitget_mode);
+            Arc::clone(&universe),
+            Arc::clone(&stale),
+            cfg.bitget_mode,
+        );
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             if let Err(e) = a.run(&store).await {
@@ -595,7 +635,10 @@ fn spawn_adapters(
     }
     if cfg.venues.is_enabled(Venue::MexcFut) {
         let a = adapter::mexc_fut::MexcFutAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale), Arc::clone(&vol));
+            Arc::clone(&universe),
+            Arc::clone(&stale),
+            Arc::clone(&vol),
+        );
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             if let Err(e) = a.run(&store).await {
@@ -604,8 +647,7 @@ fn spawn_adapters(
         });
     }
     if cfg.venues.is_enabled(Venue::GateFut) {
-        let a = adapter::gate_fut::GateFutAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale));
+        let a = adapter::gate_fut::GateFutAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
         tokio::spawn(async move {
             if let Err(e) = a.run(&store).await {
@@ -614,60 +656,85 @@ fn spawn_adapters(
         });
     }
     if cfg.venues.is_enabled(Venue::BinanceFut) {
-        let a = adapter::binance_fut::BinanceFutAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale));
+        let a =
+            adapter::binance_fut::BinanceFutAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await { warn!("binance-fut adapter exited: {}", e); }
+            if let Err(e) = a.run(&store).await {
+                warn!("binance-fut adapter exited: {}", e);
+            }
         });
     }
     // (mexc-spot is handled below via REST polling)
     if cfg.venues.is_enabled(Venue::BingxSpot) {
-        let a = adapter::bingx_spot::BingxSpotAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale));
+        let a =
+            adapter::bingx_spot::BingxSpotAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await { warn!("bingx-spot adapter exited: {}", e); }
+            if let Err(e) = a.run(&store).await {
+                warn!("bingx-spot adapter exited: {}", e);
+            }
         });
     }
     if cfg.venues.is_enabled(Venue::BingxFut) {
-        let a = adapter::bingx_fut::BingxFutAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale));
+        let a = adapter::bingx_fut::BingxFutAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await { warn!("bingx-fut adapter exited: {}", e); }
+            if let Err(e) = a.run(&store).await {
+                warn!("bingx-fut adapter exited: {}", e);
+            }
         });
     }
     if cfg.venues.is_enabled(Venue::XtSpot) {
         let a = adapter::xt_spot::XtSpotAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale), Arc::clone(&vol));
+            Arc::clone(&universe),
+            Arc::clone(&stale),
+            Arc::clone(&vol),
+        );
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await { warn!("xt-spot adapter exited: {}", e); }
+            if let Err(e) = a.run(&store).await {
+                warn!("xt-spot adapter exited: {}", e);
+            }
         });
     }
     if cfg.venues.is_enabled(Venue::XtFut) {
         let a = adapter::xt_fut::XtFutAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale), Arc::clone(&vol));
+            Arc::clone(&universe),
+            Arc::clone(&stale),
+            Arc::clone(&vol),
+        );
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await { warn!("xt-fut adapter exited: {}", e); }
+            if let Err(e) = a.run(&store).await {
+                warn!("xt-fut adapter exited: {}", e);
+            }
         });
     }
-    if cfg.venues.is_enabled(Venue::KucoinSpot) && cfg.kucoin_mode != crate::config::KucoinMode::Disabled {
-        let a = adapter::kucoin::KucoinAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale));
+    if cfg.venues.is_enabled(Venue::KucoinSpot)
+        && cfg.kucoin_mode != crate::config::KucoinMode::Disabled
+    {
+        let a = adapter::kucoin::KucoinAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await { warn!("kucoin-spot adapter exited: {}", e); }
+            if let Err(e) = a.run(&store).await {
+                warn!("kucoin-spot adapter exited: {}", e);
+            }
         });
     }
-    if cfg.venues.is_enabled(Venue::KucoinFut) && cfg.kucoin_mode != crate::config::KucoinMode::Disabled {
+    if cfg.venues.is_enabled(Venue::KucoinFut)
+        && cfg.kucoin_mode != crate::config::KucoinMode::Disabled
+    {
         let a = adapter::kucoin_fut::KucoinFutAdapter::new(
-            Arc::clone(&universe), Arc::clone(&stale), Arc::clone(&vol));
+            Arc::clone(&universe),
+            Arc::clone(&stale),
+            Arc::clone(&vol),
+        );
         let store = Arc::clone(&store);
         tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await { warn!("kucoin-fut adapter exited: {}", e); }
+            if let Err(e) = a.run(&store).await {
+                warn!("kucoin-fut adapter exited: {}", e);
+            }
         });
     }
 
@@ -687,19 +754,19 @@ fn spawn_adapters(
 }
 
 async fn run_spread_engine(
-    universe:         Arc<SymbolUniverse>,
-    store:            Arc<BookStore>,
-    stale:            Arc<StaleTable>,
-    vol:              Arc<VolStore>,
-    counters:         Arc<ScanCounters>,
-    threshold_pct:    f64,
-    max_spread_pct:   f64,
-    min_vol_usd:      f64,
-    broadcast_ms:     u64,
-    bstate:           BroadcastState,
-    ml_server:        Arc<MlServer>,
-    ml_writer:        WriterHandle,
-    ml_broadcaster:   RecommendationBroadcaster,
+    universe: Arc<SymbolUniverse>,
+    store: Arc<BookStore>,
+    stale: Arc<StaleTable>,
+    vol: Arc<VolStore>,
+    counters: Arc<ScanCounters>,
+    threshold_pct: f64,
+    max_spread_pct: f64,
+    min_vol_usd: f64,
+    broadcast_ms: u64,
+    bstate: BroadcastState,
+    ml_server: Arc<MlServer>,
+    ml_writer: WriterHandle,
+    ml_broadcaster: RecommendationBroadcaster,
 ) {
     let mut buf: Vec<Opportunity> = Vec::with_capacity(1024);
     let mut ml_observations: Vec<Opportunity> = Vec::with_capacity(4096);
@@ -727,7 +794,9 @@ async fn run_spread_engine(
 
         let count = buf.len();
         if count > 0 {
-            obs::Metrics::init().opportunities_total.inc_by(count as u64);
+            obs::Metrics::init()
+                .opportunities_total
+                .inc_by(count as u64);
         }
 
         // --- ML pass (M1.7 shadow mode inline) ---
@@ -743,8 +812,8 @@ async fn run_spread_engine(
         let cycle_seq = ml_server.begin_cycle();
         for opp in &buf {
             let route = RouteId {
-                symbol_id:  opp.symbol_id,
-                buy_venue:  opp.buy_venue,
+                symbol_id: opp.symbol_id,
+                buy_venue: opp.buy_venue,
                 sell_venue: opp.sell_venue,
             };
             // ADR-029: resolver nome canonical ESTÁVEL (entre runs) via universe.
@@ -807,8 +876,8 @@ async fn run_spread_engine(
                 continue;
             }
             let route = RouteId {
-                symbol_id:  opp.symbol_id,
-                buy_venue:  opp.buy_venue,
+                symbol_id: opp.symbol_id,
+                buy_venue: opp.buy_venue,
                 sell_venue: opp.sell_venue,
             };
             let symbol_name = universe.canonical_name_of(opp.symbol_id);
@@ -834,8 +903,8 @@ async fn run_spread_engine(
 #[cfg(test)]
 mod tests {
     use crate::ml::contract::{
-        AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, ReasonKind, Recommendation,
-        RouteId, TradeReason, TradeSetup,
+        AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, ReasonKind,
+        Recommendation, RouteId, TradeReason, TradeSetup,
     };
     use crate::types::{SymbolId, Venue};
 
@@ -888,7 +957,7 @@ mod tests {
             calibration_status: CalibStatus::Ok,
             reason: TradeReason {
                 kind: ReasonKind::Combined,
-                detail: "test".into(),
+                detail: crate::ml::ReasonDetail::placeholder(),
             },
             model_version: "baseline-a3-0.2.0".into(),
             source_kind: SourceKind::Baseline,

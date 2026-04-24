@@ -76,8 +76,8 @@ use crate::ml::contract::RouteId;
 ///   - `SCANNER_VERSION` consolidado em `ml/mod.rs` (E5).
 pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 6;
 
-/// Re-export da versão única do scanner (consolidada em `ml/mod.rs`, fix E5).
-pub use crate::ml::SCANNER_VERSION;
+#[cfg(test)]
+use crate::ml::SCANNER_VERSION;
 
 /// Outcome resolvido de um horizonte do label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,23 +100,15 @@ impl LabelOutcome {
     }
 }
 
-/// Fix A2 + A8: CensorReason tipado distinguindo ilíquidez transitória vs
-/// delisting estrutural. `IncompleteWindow` removido (era dead code — nenhum
-/// caminho produzia esse valor em sweep, shutdown usa `Shutdown` explícito).
-///
-/// Skill §6: censura é primeira ordem; Kaplan-Meier exige independência
-/// entre mecanismo de censura e evento. Ilíquidez transitória (`RouteDormant`)
-/// é aleatória; delisting (`RouteDelisted`) é informativa. Separar permite
-/// trainer ajustar IPW por tipo.
+/// CensorReason tipado distinguindo ilíquidez transitória vs delisting
+/// estrutural. Skill §6: censura é primeira ordem; Kaplan-Meier exige
+/// independência entre mecanismo de censura e evento.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CensorReason {
-    /// Alias histórico: rota silenciou além do threshold, antes de classificar
-    /// como `Dormant`/`Delisted`. Mantido por compat com datasets pré-v6.
-    RouteVanished,
-    /// Rota ficou silenciosa entre `ROUTE_VANISH_IDLE_NS` e
-    /// `ROUTE_DELISTED_IDLE_NS` — padrão típico de baixa liquidez intradiária.
+    /// Rota silenciosa entre `ROUTE_VANISH_IDLE_NS` e `ROUTE_DELISTED_IDLE_NS` —
+    /// padrão típico de baixa liquidez intradiária.
     RouteDormant,
-    /// Rota silenciou além de `ROUTE_DELISTED_IDLE_NS` — evento estrutural
+    /// Rota silenciosa além de `ROUTE_DELISTED_IDLE_NS` — evento estrutural
     /// (delisting, halt, ticker rename). Censura informativa.
     RouteDelisted,
     /// Shutdown limpo do scanner; pendings sem horizonte completo.
@@ -126,7 +118,6 @@ pub enum CensorReason {
 impl CensorReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            CensorReason::RouteVanished => "route_vanished",
             CensorReason::RouteDormant => "route_dormant",
             CensorReason::RouteDelisted => "route_delisted",
             CensorReason::Shutdown => "shutdown",
@@ -604,17 +595,13 @@ mod tests {
             audit_hindsight_t_to_best_s: Some(300),
             n_clean_future_samples: 60,
             label_floor_pct: 0.8,
-            first_exit_ge_label_floor_ts_ns: Some(
-                1_700_000_000_000_000_000 + 120 * 1_000_000_000,
-            ),
+            first_exit_ge_label_floor_ts_ns: Some(1_700_000_000_000_000_000 + 120 * 1_000_000_000),
             first_exit_ge_label_floor_pct: Some(-1.7),
             t_to_first_hit_s: Some(120),
             label_floor_hits: vec![
                 FloorHitLabel {
                     floor_pct: 0.5,
-                    first_exit_ge_floor_ts_ns: Some(
-                        1_700_000_000_000_000_000 + 60 * 1_000_000_000,
-                    ),
+                    first_exit_ge_floor_ts_ns: Some(1_700_000_000_000_000_000 + 60 * 1_000_000_000),
                     first_exit_ge_floor_pct: Some(-1.9),
                     t_to_first_hit_s: Some(60),
                     realized: true,
@@ -681,14 +668,20 @@ mod tests {
         assert_eq!(v["label_floor_hits"].as_array().unwrap().len(), 3);
         assert_eq!(v["label_floor_hits"][0]["floor_pct"], 0.5);
         assert_eq!(v["label_floor_hits"][2]["realized"], false);
-        assert_eq!(v["policy_metadata"]["baseline_model_version"], "baseline-a3-0.2.0");
+        assert_eq!(
+            v["policy_metadata"]["baseline_model_version"],
+            "baseline-a3-0.2.0"
+        );
         assert_eq!(v["policy_metadata"]["ci_method"], "wilson_marginal");
         assert_eq!(v["policy_metadata"]["candidates_in_route_last_24h"], 10_000);
         assert_eq!(v["sampling_tier"], "allowlist");
         // Fix B1/B2/B4 — novas features exportadas.
         assert_eq!(v["features_t0"]["entry_rank_percentile_24h"], 0.75);
         assert_eq!(v["features_t0"]["entry_minus_p50_24h"], 0.5);
-        assert_eq!(v["features_t0"]["p_exit_ge_label_floor_minus_entry_24h"], 0.33);
+        assert_eq!(
+            v["features_t0"]["p_exit_ge_label_floor_minus_entry_24h"],
+            0.33
+        );
         assert_eq!(v["features_t0"]["vol_ratio"], 2.0);
         assert_eq!(v["features_t0"]["n_cache_observations_at_t0"], 850);
         assert_eq!(v["features_t0"]["entry_p95_24h"], 3.0);
@@ -697,7 +690,10 @@ mod tests {
         assert_eq!(v["features_t0"]["exit_excess_run_s"], 90);
         assert_eq!(v["features_t0"]["listing_age_days"], 14.0);
         // Fix A10 — renomeação protetora ativa.
-        assert!(v.get("best_exit_pct").is_none(), "nome antigo não deve sair no v6");
+        assert!(
+            v.get("best_exit_pct").is_none(),
+            "nome antigo não deve sair no v6"
+        );
         assert_eq!(v["audit_hindsight_best_exit_pct"], -0.3);
         assert!(v["features_t0"].get("buy_book_age_ms").is_none());
         assert!(v["features_t0"].get("sell_book_age_ms").is_none());
@@ -748,5 +744,4 @@ mod tests {
         assert!(l.observed_until_ns <= l.closed_ts_ns);
         assert!(l.closed_ts_ns <= l.written_ts_ns);
     }
-
 }

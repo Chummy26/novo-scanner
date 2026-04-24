@@ -38,32 +38,6 @@ pub struct VenueFoldMetrics {
     pub simulated_pnl_aggregated: f32,
 }
 
-/// Status geral do LOVO (fix D14).
-///
-/// Antes `passes_hard_gates()` retornava `false` por construção quando o
-/// report tinha `folds: []`, levando o dashboard a reportar "FAIL" quando
-/// o correto era "UNAVAILABLE" (ausência de evidência ≠ evidência de
-/// reprovação).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LovoStatus {
-    /// Nenhum fold real foi gerado (modelo ainda não existe).
-    Unavailable,
-    /// Folds presentes e todos os gates hard passaram.
-    Passing,
-    /// Folds presentes mas ao menos um gate hard falhou.
-    Failing,
-}
-
-impl LovoStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            LovoStatus::Unavailable => "unavailable",
-            LovoStatus::Passing => "passing",
-            LovoStatus::Failing => "failing",
-        }
-    }
-}
-
 /// Relatório consolidado LOVO.
 #[derive(Debug, Clone)]
 pub struct LovoReport {
@@ -80,9 +54,7 @@ pub struct LovoReport {
 
 impl LovoReport {
     /// Avalia se LOVO passa os gates hard do ADR-023.
-    ///
-    /// Retorna `false` quando `folds` está vazio — mas essa é semanticamente
-    /// distinta de reprovação. Use `status()` para distinguir.
+    /// Retorna `false` quando `folds` está vazio (ausência de evidência).
     pub fn passes_hard_gates(&self) -> bool {
         if self.folds.is_empty() {
             return false;
@@ -90,23 +62,6 @@ impl LovoReport {
         self.precision_at_10_worst_drop <= 0.15
             && self.ece_worst <= 0.08
             && self.coverage_worst >= 0.85
-    }
-
-    /// Fix D14: status tripartido que distingue "sem dados" de "reprovado".
-    pub fn status(&self) -> LovoStatus {
-        if self.folds.is_empty() {
-            return LovoStatus::Unavailable;
-        }
-        if self.passes_hard_gates() {
-            LovoStatus::Passing
-        } else {
-            LovoStatus::Failing
-        }
-    }
-
-    /// Soft gate alerta (não bloqueia).
-    pub fn economic_soft_gate_alert(&self) -> bool {
-        self.economic_value_worst < 0.0
     }
 
     /// Agrega a partir da lista de folds.
@@ -147,14 +102,6 @@ impl LovoReport {
             economic_value_worst: econ_worst,
         }
     }
-}
-
-/// Retorna um relatório não-aprovado enquanto não houver folds válidos.
-///
-/// Quando o treino real existir, este ponto pode ser trocado por um
-/// evaluator de venue-exclusion sem alterar o contrato externo.
-pub fn run_lovo_on_baseline_a3() -> LovoReport {
-    LovoReport::from_folds(vec![])
 }
 
 #[cfg(test)]
@@ -213,45 +160,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn soft_gate_alerts_when_economic_negative() {
-        let folds = vec![
-            mk_fold(Venue::BinanceFut, 0.80, 0.02, 0.93, 100.0),
-            mk_fold(Venue::MexcFut, 0.75, 0.02, 0.93, -50.0),
-        ];
-        let r = LovoReport::from_folds(folds);
-        assert!(r.passes_hard_gates());
-        assert!(r.economic_soft_gate_alert());
-    }
-
-    #[test]
-    fn baseline_placeholder_does_not_pass_hard_gates() {
-        let r = run_lovo_on_baseline_a3();
-        assert!(r.folds.is_empty());
-        assert!(
-            !r.passes_hard_gates(),
-            "placeholder sem folds não pode sinalizar robustez cross-venue"
-        );
-    }
-
-    #[test]
-    fn status_distinguishes_unavailable_from_failing() {
-        // Fix D14: empty → Unavailable (não Failing).
-        let empty = LovoReport::from_folds(vec![]);
-        assert_eq!(empty.status(), LovoStatus::Unavailable);
-
-        // Folds + gates ok → Passing.
-        let pass = LovoReport::from_folds(vec![
-            mk_fold(Venue::BinanceFut, 0.80, 0.02, 0.93, 100.0),
-            mk_fold(Venue::MexcFut, 0.70, 0.04, 0.90, 50.0),
-        ]);
-        assert_eq!(pass.status(), LovoStatus::Passing);
-
-        // Folds + gate violado → Failing.
-        let fail = LovoReport::from_folds(vec![
-            mk_fold(Venue::BinanceFut, 0.90, 0.02, 0.93, 100.0),
-            mk_fold(Venue::MexcFut, 0.30, 0.02, 0.93, 100.0), // drop enorme
-        ]);
-        assert_eq!(fail.status(), LovoStatus::Failing);
-    }
 }
