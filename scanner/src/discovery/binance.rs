@@ -22,12 +22,14 @@ impl BinanceDiscoverer {
     }
 
     #[allow(dead_code)]
-    fn check(v: Venue) { assert!(matches!(v, Venue::BinanceSpot | Venue::BinanceFut)); }
+    fn check(v: Venue) {
+        assert!(matches!(v, Venue::BinanceSpot | Venue::BinanceFut));
+    }
 
     fn url(&self) -> &'static str {
         match self.venue {
             Venue::BinanceSpot => "https://api.binance.com/api/v3/exchangeInfo",
-            Venue::BinanceFut  => "https://fapi.binance.com/fapi/v1/exchangeInfo",
+            Venue::BinanceFut => "https://fapi.binance.com/fapi/v1/exchangeInfo",
             _ => unreachable!(),
         }
     }
@@ -41,25 +43,32 @@ struct ExchangeInfo {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SymbolEntry {
-    symbol:    String,
-    status:    String,
+    symbol: String,
+    status: String,
     #[serde(default)]
     contract_type: Option<String>,
 }
 
 #[async_trait]
 impl Discoverer for BinanceDiscoverer {
-    fn venue(&self) -> Venue { self.venue }
+    fn venue(&self) -> Venue {
+        self.venue
+    }
 
     async fn fetch(&self, http: &reqwest::Client) -> Result<Vec<VenueSymbol>> {
-        let resp = http.get(self.url())
-            .send().await?
+        let resp = http
+            .get(self.url())
+            .send()
+            .await?
             .error_for_status()?
-            .json::<ExchangeInfo>().await?;
+            .json::<ExchangeInfo>()
+            .await?;
 
         let mut out = Vec::with_capacity(resp.symbols.len());
         for s in resp.symbols {
-            if s.status != "TRADING" { continue; }
+            if s.status != "TRADING" {
+                continue;
+            }
             // Futures: keep only PERPETUAL contracts (exclude dated quarterly futures).
             if matches!(self.venue, Venue::BinanceFut) {
                 match s.contract_type.as_deref() {
@@ -82,7 +91,8 @@ impl Discoverer for BinanceDiscoverer {
         }
         if out.is_empty() {
             return Err(Error::Discovery(format!(
-                "binance {}: 0 symbols returned (API change?)", self.venue.as_str()
+                "binance {}: 0 symbols returned (API change?)",
+                self.venue.as_str()
             )));
         }
         Ok(out)

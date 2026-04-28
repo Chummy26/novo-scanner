@@ -28,12 +28,15 @@ use crate::types::{now_ns, Price, Qty, Venue};
 
 pub struct BinanceSpotAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub url:      String,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub url: String,
 }
 
 impl BinanceSpotAdapter {
-    pub fn new(universe: Arc<SymbolUniverse>, stale: Arc<crate::spread::engine::StaleTable>) -> Self {
+    pub fn new(
+        universe: Arc<SymbolUniverse>,
+        stale: Arc<crate::spread::engine::StaleTable>,
+    ) -> Self {
         Self {
             universe,
             stale,
@@ -44,7 +47,9 @@ impl BinanceSpotAdapter {
 
 #[async_trait]
 impl Adapter for BinanceSpotAdapter {
-    fn venue(&self) -> Venue { Venue::BinanceSpot }
+    fn venue(&self) -> Venue {
+        Venue::BinanceSpot
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let backoff = BackoffPolicy::STANDARD;
@@ -56,7 +61,10 @@ impl Adapter for BinanceSpotAdapter {
                     attempt = 0;
                 }
                 Err(e) => {
-                    warn!(venue = "binance-spot", attempt, "adapter run_once failed: {}", e);
+                    warn!(
+                        venue = "binance-spot",
+                        attempt, "adapter run_once failed: {}", e
+                    );
                     let d = backoff.delay(attempt);
                     tokio::time::sleep(d).await;
                     attempt = attempt.saturating_add(1);
@@ -68,15 +76,18 @@ impl Adapter for BinanceSpotAdapter {
 
 impl BinanceSpotAdapter {
     async fn run_once(&self, store: &BookStore) -> Result<()> {
-        use tokio_websockets::{ClientBuilder, Message};
         use http::Uri;
+        use tokio_websockets::{ClientBuilder, Message};
 
-        let uri: Uri = self.url.parse()
+        let uri: Uri = self
+            .url
+            .parse()
             .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
         info!(venue = "binance-spot", "connecting to {}", self.url);
 
         let (mut client, _resp) = ClientBuilder::from_uri(uri)
-            .connect().await
+            .connect()
+            .await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
         info!(venue = "binance-spot", "ws connected");
@@ -92,9 +103,11 @@ impl BinanceSpotAdapter {
             let params: Vec<String> = chunk.iter().map(|s| format!("\"{}\"", s)).collect();
             let msg = format!(
                 r#"{{"method":"SUBSCRIBE","params":[{}],"id":{}}}"#,
-                params.join(","), i + 1
+                params.join(","),
+                i + 1
             );
-            client.send(Message::text(msg))
+            client
+                .send(Message::text(msg))
                 .await
                 .map_err(|e| Error::WebSocket(format!("subscribe: {}", e)))?;
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -181,20 +194,27 @@ where
     use sonic_rs::JsonValueTrait;
 
     // sonic-rs get() returns a LazyValue borrowing from `json` — zero-copy.
-    let Ok(sym_lv) = sonic_rs::get(json, &["s"]) else { return Ok(false); };
-    let Some(symbol) = sym_lv.as_str() else { return Ok(false); };
+    let Ok(sym_lv) = sonic_rs::get(json, &["s"]) else {
+        return Ok(false);
+    };
+    let Some(symbol) = sym_lv.as_str() else {
+        return Ok(false);
+    };
 
     let getstr = |k: &'static str| -> Result<f64> {
         let lv = sonic_rs::get(json, &[k])
             .map_err(|e| Error::Decode(format!("missing {}: {}", k, e)))?;
-        let s = lv.as_str().ok_or_else(|| Error::Decode(format!("{} not str", k)))?;
-        s.parse::<f64>().map_err(|_| Error::Decode(format!("{} not f64: {}", k, s)))
+        let s = lv
+            .as_str()
+            .ok_or_else(|| Error::Decode(format!("{} not str", k)))?;
+        s.parse::<f64>()
+            .map_err(|_| Error::Decode(format!("{} not f64: {}", k, s)))
     };
 
-    let bid_px  = Price::from_f64(getstr("b")?);
-    let bid_qty = Qty::from_f64(  getstr("B")?);
-    let ask_px  = Price::from_f64(getstr("a")?);
-    let ask_qty = Qty::from_f64(  getstr("A")?);
+    let bid_px = Price::from_f64(getstr("b")?);
+    let bid_qty = Qty::from_f64(getstr("B")?);
+    let ask_px = Price::from_f64(getstr("a")?);
+    let ask_qty = Qty::from_f64(getstr("A")?);
 
     f(symbol, bid_px, bid_qty, ask_px, ask_qty);
     Ok(true)
@@ -210,7 +230,8 @@ mod tests {
         let mut captured: Option<(String, Price, Qty, Price, Qty)> = None;
         let matched = parse_and_apply(js, |sym, bp, bq, ap, aq| {
             captured = Some((sym.to_string(), bp, bq, ap, aq));
-        }).unwrap();
+        })
+        .unwrap();
         assert!(matched);
         let (sym, bp, bq, ap, _aq) = captured.unwrap();
         assert_eq!(sym, "BTCUSDT");

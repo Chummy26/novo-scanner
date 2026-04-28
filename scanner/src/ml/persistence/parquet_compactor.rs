@@ -43,7 +43,7 @@ impl Default for ParquetCompactionConfig {
 /// migração em voo quando novo writer emite schema v7 e compactor em v6
 /// processa sem erro mas descarta campos novos.
 const EXPECTED_SCHEMA_VERSION_ACCEPTED: u16 = 6;
-const EXPECTED_SCHEMA_VERSION_RAW: u16 = 6;
+const EXPECTED_SCHEMA_VERSION_RAW: u16 = 7;
 const EXPECTED_SCHEMA_VERSION_LABELED: u16 = 6;
 
 fn expected_schema_version(kind: DatasetKind) -> u16 {
@@ -66,8 +66,8 @@ pub fn compact_jsonl_file(
         return Ok(None);
     }
 
-    let metadata = fs::metadata(jsonl_path)
-        .with_context(|| format!("metadata {}", jsonl_path.display()))?;
+    let metadata =
+        fs::metadata(jsonl_path).with_context(|| format!("metadata {}", jsonl_path.display()))?;
     if metadata.len() == 0 {
         if cfg.delete_jsonl_after_success {
             fs::remove_file(jsonl_path)
@@ -89,7 +89,10 @@ pub fn compact_jsonl_file(
     }
     if !first_line.trim().is_empty() {
         let v: serde_json::Value = serde_json::from_str(first_line.trim()).with_context(|| {
-            format!("parse first line for schema_version {}", jsonl_path.display())
+            format!(
+                "parse first line for schema_version {}",
+                jsonl_path.display()
+            )
         })?;
         let expected = expected_schema_version(dataset_kind);
         if let Some(got) = v.get("schema_version").and_then(|x| x.as_u64()) {
@@ -113,16 +116,15 @@ pub fn compact_jsonl_file(
         let _ = fs::remove_file(&temp_parquet_path);
     }
 
-    let input = File::open(jsonl_path)
-        .with_context(|| format!("open input {}", jsonl_path.display()))?;
+    let input =
+        File::open(jsonl_path).with_context(|| format!("open input {}", jsonl_path.display()))?;
     let reader = BufReader::new(input);
     let mut json_reader = ReaderBuilder::new(schema.clone())
         .with_batch_size(cfg.batch_size)
         .build(reader)
         .with_context(|| format!("build json reader for {}", jsonl_path.display()))?;
 
-    let zstd_level =
-        ZstdLevel::try_new(cfg.zstd_level).context("invalid parquet zstd level")?;
+    let zstd_level = ZstdLevel::try_new(cfg.zstd_level).context("invalid parquet zstd level")?;
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(zstd_level))
         .build();
@@ -239,6 +241,8 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             utf8_field("sample_decision"),
             utf8_field("sampling_tier"),
             f32_field("sampling_probability"),
+            u32_field("priority_set_generation_id"),
+            u64_field("priority_set_updated_at_ns"),
         ]),
         DatasetKind::LabeledTrades => Schema::new(vec![
             utf8_field("sample_id"),
@@ -416,7 +420,9 @@ mod tests {
         let jsonl = tmp.path().join("accepted.jsonl");
         write_lines(
             &jsonl,
-            &[r#"{"ts_ns":1,"cycle_seq":1,"schema_version":6,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","was_recommended":true}"#],
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":6,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","was_recommended":true}"#,
+            ],
         );
 
         let parquet = compact_jsonl_file(
@@ -437,7 +443,9 @@ mod tests {
         let jsonl = tmp.path().join("raw.jsonl");
         write_lines(
             &jsonl,
-            &[r#"{"ts_ns":1,"cycle_seq":1,"schema_version":6,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0}"#],
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":7,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"priority_set_generation_id":3,"priority_set_updated_at_ns":2}"#,
+            ],
         );
 
         let parquet = compact_jsonl_file(
@@ -518,7 +526,9 @@ mod tests {
         let jsonl = tmp.path().join("accepted_nulls.jsonl");
         write_lines(
             &jsonl,
-            &[r#"{"ts_ns":1,"cycle_seq":1,"schema_version":6,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":null,"exit_spread":null,"buy_vol24":null,"sell_vol24":null,"sample_decision":"accept","was_recommended":false}"#],
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":6,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":null,"exit_spread":null,"buy_vol24":null,"sell_vol24":null,"sample_decision":"accept","was_recommended":false}"#,
+            ],
         );
 
         let parquet = compact_jsonl_file(
@@ -540,13 +550,18 @@ mod tests {
         let jsonl = tmp.path().join("old.jsonl");
         write_lines(
             &jsonl,
-            &[r#"{"ts_ns":1,"cycle_seq":1,"schema_version":5,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","was_recommended":true}"#],
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":5,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","was_recommended":true}"#,
+            ],
         );
         let result = compact_jsonl_file(
             &jsonl,
             DatasetKind::AcceptedSamples,
             &ParquetCompactionConfig::default(),
         );
-        assert!(result.is_err(), "schema v5 deveria ser rejeitado pelo compactor v6");
+        assert!(
+            result.is_err(),
+            "schema v5 deveria ser rejeitado pelo compactor v6"
+        );
     }
 }

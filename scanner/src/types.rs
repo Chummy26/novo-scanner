@@ -71,33 +71,40 @@ impl Market {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum Venue {
-    BinanceSpot    = 0,
-    BinanceFut     = 1,
-    MexcSpot       = 2,
-    MexcFut        = 3,
-    BingxSpot      = 4,
-    BingxFut       = 5,
-    GateSpot       = 6,
-    GateFut        = 7,
-    KucoinSpot     = 8,
-    KucoinFut      = 9,
-    XtSpot         = 10,
-    XtFut          = 11,
-    BitgetSpot     = 12,
-    BitgetFut      = 13,
+    BinanceSpot = 0,
+    BinanceFut = 1,
+    MexcSpot = 2,
+    MexcFut = 3,
+    BingxSpot = 4,
+    BingxFut = 5,
+    GateSpot = 6,
+    GateFut = 7,
+    KucoinSpot = 8,
+    KucoinFut = 9,
+    XtSpot = 10,
+    XtFut = 11,
+    BitgetSpot = 12,
+    BitgetFut = 13,
 }
 
 pub const VENUE_COUNT: usize = 14;
 
 impl Venue {
     pub const ALL: [Venue; VENUE_COUNT] = [
-        Venue::BinanceSpot, Venue::BinanceFut,
-        Venue::MexcSpot, Venue::MexcFut,
-        Venue::BingxSpot, Venue::BingxFut,
-        Venue::GateSpot, Venue::GateFut,
-        Venue::KucoinSpot, Venue::KucoinFut,
-        Venue::XtSpot, Venue::XtFut,
-        Venue::BitgetSpot, Venue::BitgetFut,
+        Venue::BinanceSpot,
+        Venue::BinanceFut,
+        Venue::MexcSpot,
+        Venue::MexcFut,
+        Venue::BingxSpot,
+        Venue::BingxFut,
+        Venue::GateSpot,
+        Venue::GateFut,
+        Venue::KucoinSpot,
+        Venue::KucoinFut,
+        Venue::XtSpot,
+        Venue::XtFut,
+        Venue::BitgetSpot,
+        Venue::BitgetFut,
     ];
 
     #[inline(always)]
@@ -108,29 +115,39 @@ impl Venue {
     pub fn as_str(self) -> &'static str {
         match self {
             Venue::BinanceSpot => "binance",
-            Venue::BinanceFut  => "binance",
-            Venue::MexcSpot    => "mexc",
-            Venue::MexcFut     => "mexc",
-            Venue::BingxSpot   => "bingx",
-            Venue::BingxFut    => "bingx",
-            Venue::GateSpot    => "gate",
-            Venue::GateFut     => "gate",
-            Venue::KucoinSpot  => "kucoin",
-            Venue::KucoinFut   => "kucoin",
-            Venue::XtSpot      => "xt",
-            Venue::XtFut       => "xt",
-            Venue::BitgetSpot  => "bitget",
-            Venue::BitgetFut   => "bitget",
+            Venue::BinanceFut => "binance",
+            Venue::MexcSpot => "mexc",
+            Venue::MexcFut => "mexc",
+            Venue::BingxSpot => "bingx",
+            Venue::BingxFut => "bingx",
+            Venue::GateSpot => "gate",
+            Venue::GateFut => "gate",
+            Venue::KucoinSpot => "kucoin",
+            Venue::KucoinFut => "kucoin",
+            Venue::XtSpot => "xt",
+            Venue::XtFut => "xt",
+            Venue::BitgetSpot => "bitget",
+            Venue::BitgetFut => "bitget",
         }
     }
 
     #[inline(always)]
     pub fn market(self) -> Market {
         match self {
-            Venue::BinanceSpot | Venue::MexcSpot | Venue::BingxSpot
-            | Venue::GateSpot | Venue::XtSpot | Venue::KucoinSpot | Venue::BitgetSpot => Market::Spot,
-            Venue::BinanceFut | Venue::MexcFut | Venue::BingxFut
-            | Venue::GateFut  | Venue::XtFut | Venue::KucoinFut | Venue::BitgetFut => Market::Perp,
+            Venue::BinanceSpot
+            | Venue::MexcSpot
+            | Venue::BingxSpot
+            | Venue::GateSpot
+            | Venue::XtSpot
+            | Venue::KucoinSpot
+            | Venue::BitgetSpot => Market::Spot,
+            Venue::BinanceFut
+            | Venue::MexcFut
+            | Venue::BingxFut
+            | Venue::GateFut
+            | Venue::XtFut
+            | Venue::KucoinFut
+            | Venue::BitgetFut => Market::Perp,
         }
     }
 
@@ -153,18 +170,15 @@ impl Venue {
             // Top-5 — book updates frequentes, baseline 100ms é adequado.
             Venue::BinanceSpot | Venue::BinanceFut => 100,
             // Kucoin, Bitget, Gate — updates regulares; 500ms cobre.
-            Venue::KucoinSpot | Venue::KucoinFut
-            | Venue::BitgetSpot | Venue::BitgetFut => 500,
+            Venue::KucoinSpot | Venue::KucoinFut | Venue::BitgetSpot | Venue::BitgetFut => 500,
             Venue::GateSpot | Venue::GateFut => 1000,
             // MEXC — WS spot via REST polling ~1s; fut ~500ms.
             Venue::MexcSpot => 1500,
             Venue::MexcFut => 500,
             // BingX, XT — cadência lenta observada D2; 2s cobre folgadamente.
-            Venue::BingxSpot | Venue::BingxFut
-            | Venue::XtSpot | Venue::XtFut => 2000,
+            Venue::BingxSpot | Venue::BingxFut | Venue::XtSpot | Venue::XtFut => 2000,
         }
     }
-
 }
 
 impl fmt::Display for Venue {
@@ -181,8 +195,8 @@ impl fmt::Display for Venue {
 /// by the SAME `SymbolId`. Market comes from the `Venue` side of each leg.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CanonicalPair {
-    pub base:   String,
-    pub quote:  String,
+    pub base: String,
+    pub quote: String,
 }
 
 impl CanonicalPair {
@@ -191,7 +205,7 @@ impl CanonicalPair {
     }
 
     pub fn of(base: impl Into<String>, quote: impl Into<String>) -> Self {
-        let base  = base.into().to_ascii_uppercase();
+        let base = base.into().to_ascii_uppercase();
         let quote = quote.into().to_ascii_uppercase();
         Self { base, quote }
     }

@@ -67,7 +67,7 @@ raw_rerank_interval_s = 3600
 
 # Label cadence / floors.
 label_stride_s = 60
-label_horizons_s = [900, 1800, 7200, 28800]
+label_horizons_s = [900, 1800, 3600, 7200, 14400, 28800]
 label_sweeper_interval_s = 10
 label_floor_pct = 0.8
 label_floors_pct = [0.3, 0.5, 0.8, 1.2, 2.0, 3.0]

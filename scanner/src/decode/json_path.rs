@@ -22,19 +22,19 @@ where
     let val: sonic_rs::Value = sonic_rs::from_str(raw_array)
         .map_err(|e| Error::Decode(format!("level array parse: {}", e)))?;
 
-    let arr = val.as_array().ok_or_else(|| {
-        Error::Decode("expected array".to_string())
-    })?;
+    let arr = val
+        .as_array()
+        .ok_or_else(|| Error::Decode("expected array".to_string()))?;
 
     let mut count = 0usize;
     for lvl in arr {
-        let pair = lvl.as_array().ok_or_else(|| {
-            Error::Decode("level entry not an array".into())
-        })?;
+        let pair = lvl
+            .as_array()
+            .ok_or_else(|| Error::Decode("level entry not an array".into()))?;
         if pair.len() < 2 {
             return Err(Error::Decode("level entry missing px/qty".into()));
         }
-        let px  = parse_num_or_str(pair.get(0).unwrap())?;
+        let px = parse_num_or_str(pair.get(0).unwrap())?;
         let qty = parse_num_or_str(pair.get(1).unwrap())?;
         f(Price::from_f64(px), Qty::from_f64(qty));
         count += 1;

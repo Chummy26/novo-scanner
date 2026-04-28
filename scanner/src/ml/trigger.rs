@@ -132,9 +132,7 @@ impl SamplingTrigger {
     /// histórico usado para quantis de spread.
     #[inline]
     pub fn is_clean_data(&self, buy_vol24_usd: f64, sell_vol24_usd: f64) -> bool {
-        if buy_vol24_usd < self.cfg.min_vol24_usd
-            || sell_vol24_usd < self.cfg.min_vol24_usd
-        {
+        if buy_vol24_usd < self.cfg.min_vol24_usd || sell_vol24_usd < self.cfg.min_vol24_usd {
             return false;
         }
         true
@@ -153,9 +151,7 @@ impl SamplingTrigger {
         cache: &HotQueryCache,
     ) -> SampleDecision {
         // Gate 1 — volume mínimo (evita rotas ilíquidas cedo).
-        if buy_vol24_usd < self.cfg.min_vol24_usd
-            || sell_vol24_usd < self.cfg.min_vol24_usd
-        {
+        if buy_vol24_usd < self.cfg.min_vol24_usd || sell_vol24_usd < self.cfg.min_vol24_usd {
             return SampleDecision::RejectLowVolume;
         }
 

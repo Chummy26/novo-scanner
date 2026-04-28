@@ -20,21 +20,31 @@ impl BingxDiscoverer {
     fn url(&self) -> &'static str {
         match self.venue {
             Venue::BingxSpot => "https://open-api.bingx.com/openApi/spot/v1/common/symbols",
-            Venue::BingxFut  => "https://open-api.bingx.com/openApi/swap/v2/quote/contracts",
+            Venue::BingxFut => "https://open-api.bingx.com/openApi/swap/v2/quote/contracts",
             _ => unreachable!(),
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct SpotResp   { data: SpotData }
+struct SpotResp {
+    data: SpotData,
+}
 #[derive(Debug, Deserialize)]
-struct SpotData   { symbols: Vec<SpotSym> }
+struct SpotData {
+    symbols: Vec<SpotSym>,
+}
 #[derive(Debug, Deserialize)]
-struct SpotSym    { symbol: String, #[serde(default)] status: i32 }
+struct SpotSym {
+    symbol: String,
+    #[serde(default)]
+    status: i32,
+}
 
 #[derive(Debug, Deserialize)]
-struct FutResp    { data: Vec<FutContract> }
+struct FutResp {
+    data: Vec<FutContract>,
+}
 #[derive(Debug, Deserialize)]
 struct FutContract {
     symbol: String,
@@ -44,28 +54,52 @@ struct FutContract {
 
 #[async_trait]
 impl Discoverer for BingxDiscoverer {
-    fn venue(&self) -> Venue { self.venue }
+    fn venue(&self) -> Venue {
+        self.venue
+    }
 
     async fn fetch(&self, http: &reqwest::Client) -> Result<Vec<VenueSymbol>> {
         let mut out = Vec::new();
         match self.venue {
             Venue::BingxSpot => {
-                let r: SpotResp = http.get(self.url())
-                    .send().await?.error_for_status()?.json().await?;
+                let r: SpotResp = http
+                    .get(self.url())
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
                 for s in r.data.symbols {
-                    if s.status != 1 { continue; }
+                    if s.status != 1 {
+                        continue;
+                    }
                     if let Some(c) = normalize::parse(self.venue, &s.symbol) {
-                        out.push(VenueSymbol { venue: self.venue, raw: s.symbol, canonical: c });
+                        out.push(VenueSymbol {
+                            venue: self.venue,
+                            raw: s.symbol,
+                            canonical: c,
+                        });
                     }
                 }
             }
             Venue::BingxFut => {
-                let r: FutResp = http.get(self.url())
-                    .send().await?.error_for_status()?.json().await?;
+                let r: FutResp = http
+                    .get(self.url())
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
                 for c in r.data {
-                    if c.status != 1 { continue; }
+                    if c.status != 1 {
+                        continue;
+                    }
                     if let Some(can) = normalize::parse(self.venue, &c.symbol) {
-                        out.push(VenueSymbol { venue: self.venue, raw: c.symbol, canonical: can });
+                        out.push(VenueSymbol {
+                            venue: self.venue,
+                            raw: c.symbol,
+                            canonical: can,
+                        });
                     }
                 }
             }

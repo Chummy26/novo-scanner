@@ -18,7 +18,7 @@ const DEFAULT_CAP: usize = 512;
 
 pub struct HistoryStore {
     capacity: usize,
-    buckets:  AHashMap<String, Mutex<Ring>>,
+    buckets: AHashMap<String, Mutex<Ring>>,
 }
 
 struct Ring {
@@ -61,7 +61,7 @@ impl HistoryStore {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity: if capacity == 0 { DEFAULT_CAP } else { capacity },
-            buckets:  AHashMap::new(),
+            buckets: AHashMap::new(),
         }
     }
 
@@ -70,7 +70,8 @@ impl HistoryStore {
     pub fn record_batch(&mut self, ops: &[OpportunityDto]) {
         for op in ops {
             let sym = op.symbol.clone();
-            let ring = self.buckets
+            let ring = self
+                .buckets
                 .entry(sym)
                 .or_insert_with(|| Mutex::new(Ring::new(self.capacity)));
             ring.lock().push(op.clone());
@@ -80,13 +81,15 @@ impl HistoryStore {
     pub fn history_of(&self, symbol: &str) -> Vec<OpportunityDto> {
         match self.buckets.get(symbol) {
             Some(m) => m.lock().snapshot(),
-            None    => Vec::new(),
+            None => Vec::new(),
         }
     }
 }
 
 impl Default for HistoryStore {
-    fn default() -> Self { Self::new(DEFAULT_CAP) }
+    fn default() -> Self {
+        Self::new(DEFAULT_CAP)
+    }
 }
 
 #[cfg(test)]
@@ -98,12 +101,18 @@ mod tests {
             id: format!("{sym}-USDT-binance-spot-gate-future"),
             symbol: sym.into(),
             current: "USDT".into(),
-            buy_from: "binance".into(), sell_to: "gate".into(),
-            buy_type: "SPOT".into(), sell_type: "FUTURES".into(),
-            buy_price: 100.0, sell_price: 100.5,
-            entry_spread: entry, exit_spread: -entry,
-            buy_vol24: 0.0, sell_vol24: 0.0,
-            buy_book_age: 1, sell_book_age: 1,
+            buy_from: "binance".into(),
+            sell_to: "gate".into(),
+            buy_type: "SPOT".into(),
+            sell_type: "FUTURES".into(),
+            buy_price: 100.0,
+            sell_price: 100.5,
+            entry_spread: entry,
+            exit_spread: -entry,
+            buy_vol24: 0.0,
+            sell_vol24: 0.0,
+            buy_book_age: 1,
+            sell_book_age: 1,
         }
     }
 

@@ -80,7 +80,7 @@ pub struct MlConfig {
     #[serde(default = "default_label_stride_s")]
     pub label_stride_s: u32,
 
-    /// Horizontes em segundos. Default `[900, 1800, 7200, 28800]`.
+    /// Horizontes em segundos. Default `[900, 1800, 3600, 7200, 14400, 28800]`.
     #[serde(default = "default_label_horizons_s")]
     pub label_horizons_s: Vec<u32>,
 
@@ -258,82 +258,141 @@ impl Default for MlWindowConfig {
     }
 }
 
-fn default_raw_target_coverage()     -> f64      { 0.95 }
-fn default_raw_decimation_mod()      -> u64      { 10 }
-fn default_raw_rerank_interval_s()   -> u64      { 3600 }
-fn default_label_stride_s()          -> u32      { 60 }
-fn default_label_horizons_s()        -> Vec<u32>  { vec![900, 1800, 7200, 28800] }
-fn default_label_sweeper_interval_s()-> u64      { 10 }
-fn default_label_floor_pct()         -> f32      { 0.8 }
-fn default_label_floors_pct()        -> Vec<f32>  { vec![0.3, 0.5, 0.8, 1.2, 2.0, 3.0] }
-fn default_recommendation_cooldown_s()-> u32      { 60 }
-fn default_retention_enabled()       -> bool     { true }
-fn default_retention_sweep_interval_s() -> u64   { 3600 }
-fn default_retention_keep_recent_hours() -> u16  { 12 }
-fn default_raw_retention_days()      -> u16      { 30 }
-fn default_accepted_retention_days() -> u16      { 30 }
-fn default_labeled_retention_days()  -> u16      { 365 }
-fn default_parquet_enabled()         -> bool     { true }
-fn default_parquet_delete_jsonl_after_success() -> bool { true }
-fn default_parquet_batch_size()      -> usize    { 4096 }
-fn default_parquet_zstd_level()      -> i32      { 3 }
-fn default_train_window_days()       -> u16      { 90 }
-fn default_calibration_window_days() -> u16      { 21 }
-fn default_archive_reference_days()  -> u16      { 365 }
+fn default_raw_target_coverage() -> f64 {
+    0.95
+}
+fn default_raw_decimation_mod() -> u64 {
+    10
+}
+fn default_raw_rerank_interval_s() -> u64 {
+    3600
+}
+fn default_label_stride_s() -> u32 {
+    60
+}
+fn default_label_horizons_s() -> Vec<u32> {
+    vec![900, 1800, 3600, 7200, 14400, 28800]
+}
+fn default_label_sweeper_interval_s() -> u64 {
+    10
+}
+fn default_label_floor_pct() -> f32 {
+    0.8
+}
+fn default_label_floors_pct() -> Vec<f32> {
+    vec![0.3, 0.5, 0.8, 1.2, 2.0, 3.0]
+}
+fn default_recommendation_cooldown_s() -> u32 {
+    60
+}
+fn default_retention_enabled() -> bool {
+    true
+}
+fn default_retention_sweep_interval_s() -> u64 {
+    3600
+}
+fn default_retention_keep_recent_hours() -> u16 {
+    12
+}
+fn default_raw_retention_days() -> u16 {
+    30
+}
+fn default_accepted_retention_days() -> u16 {
+    30
+}
+fn default_labeled_retention_days() -> u16 {
+    365
+}
+fn default_parquet_enabled() -> bool {
+    true
+}
+fn default_parquet_delete_jsonl_after_success() -> bool {
+    true
+}
+fn default_parquet_batch_size() -> usize {
+    4096
+}
+fn default_parquet_zstd_level() -> i32 {
+    3
+}
+fn default_train_window_days() -> u16 {
+    90
+}
+fn default_calibration_window_days() -> u16 {
+    21
+}
+fn default_archive_reference_days() -> u16 {
+    365
+}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct VenueToggles {
-    #[serde(default = "enabled_default")] pub binance_spot:  bool,
-    #[serde(default = "enabled_default")] pub binance_fut:   bool,
-    #[serde(default = "enabled_default")] pub mexc_spot:     bool,
-    #[serde(default = "enabled_default")] pub mexc_fut:      bool,
-    #[serde(default = "enabled_default")] pub bingx_spot:    bool,
-    #[serde(default = "enabled_default")] pub bingx_fut:     bool,
-    #[serde(default = "enabled_default")] pub gate_spot:     bool,
-    #[serde(default = "enabled_default")] pub gate_fut:      bool,
+    #[serde(default = "enabled_default")]
+    pub binance_spot: bool,
+    #[serde(default = "enabled_default")]
+    pub binance_fut: bool,
+    #[serde(default = "enabled_default")]
+    pub mexc_spot: bool,
+    #[serde(default = "enabled_default")]
+    pub mexc_fut: bool,
+    #[serde(default = "enabled_default")]
+    pub bingx_spot: bool,
+    #[serde(default = "enabled_default")]
+    pub bingx_fut: bool,
+    #[serde(default = "enabled_default")]
+    pub gate_spot: bool,
+    #[serde(default = "enabled_default")]
+    pub gate_fut: bool,
     #[serde(default = "enabled_default", alias = "kucoin")]
-    pub kucoin_spot:  bool,
-    #[serde(default = "enabled_default")] pub kucoin_fut:    bool,
-    #[serde(default = "enabled_default")] pub xt_spot:       bool,
-    #[serde(default = "enabled_default")] pub xt_fut:        bool,
+    pub kucoin_spot: bool,
+    #[serde(default = "enabled_default")]
+    pub kucoin_fut: bool,
+    #[serde(default = "enabled_default")]
+    pub xt_spot: bool,
+    #[serde(default = "enabled_default")]
+    pub xt_fut: bool,
     #[serde(default = "enabled_default", alias = "bitget")]
-    pub bitget_spot:  bool,
-    #[serde(default = "enabled_default")] pub bitget_fut:    bool,
+    pub bitget_spot: bool,
+    #[serde(default = "enabled_default")]
+    pub bitget_fut: bool,
 }
 
 impl VenueToggles {
     pub fn is_enabled(&self, v: Venue) -> bool {
         match v {
             Venue::BinanceSpot => self.binance_spot,
-            Venue::BinanceFut  => self.binance_fut,
-            Venue::MexcSpot    => self.mexc_spot,
-            Venue::MexcFut     => self.mexc_fut,
-            Venue::BingxSpot   => self.bingx_spot,
-            Venue::BingxFut    => self.bingx_fut,
-            Venue::GateSpot    => self.gate_spot,
-            Venue::GateFut     => self.gate_fut,
-            Venue::KucoinSpot  => self.kucoin_spot,
-            Venue::KucoinFut   => self.kucoin_fut,
-            Venue::XtSpot      => self.xt_spot,
-            Venue::XtFut       => self.xt_fut,
-            Venue::BitgetSpot  => self.bitget_spot,
-            Venue::BitgetFut   => self.bitget_fut,
+            Venue::BinanceFut => self.binance_fut,
+            Venue::MexcSpot => self.mexc_spot,
+            Venue::MexcFut => self.mexc_fut,
+            Venue::BingxSpot => self.bingx_spot,
+            Venue::BingxFut => self.bingx_fut,
+            Venue::GateSpot => self.gate_spot,
+            Venue::GateFut => self.gate_fut,
+            Venue::KucoinSpot => self.kucoin_spot,
+            Venue::KucoinFut => self.kucoin_fut,
+            Venue::XtSpot => self.xt_spot,
+            Venue::XtFut => self.xt_fut,
+            Venue::BitgetSpot => self.bitget_spot,
+            Venue::BitgetFut => self.bitget_fut,
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Limits {
-    #[serde(default = "default_max_symbols")]   pub max_symbols: u32,
-    #[serde(default = "default_max_levels")]    pub max_levels:  u16,
-    #[serde(default = "default_history_len")]   pub history_len: u32,
+    #[serde(default = "default_max_symbols")]
+    pub max_symbols: u32,
+    #[serde(default = "default_max_levels")]
+    pub max_levels: u16,
+    #[serde(default = "default_history_len")]
+    pub history_len: u32,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
             max_symbols: default_max_symbols(),
-            max_levels:  default_max_levels(),
+            max_levels: default_max_levels(),
             history_len: default_history_len(),
         }
     }
@@ -369,15 +428,33 @@ pub enum BitgetMode {
     V3Uta,
 }
 
-fn default_bind()            -> String { "0.0.0.0:8000".into() }
-fn default_broadcast_ms()    -> u64    { 150 }
-fn default_entry_threshold() -> f64    { 0.20 } // 0.20%
-fn default_max_spread()      -> f64    { 30.0 }
-fn default_min_vol_usd()     -> f64    { 100_000.0 } // $100k min per leg
-fn default_max_symbols()     -> u32    { 4000 }
-fn default_max_levels()      -> u16    { 20 }
-fn default_history_len()     -> u32    { 512 }
-fn enabled_default()         -> bool   { true }
+fn default_bind() -> String {
+    "0.0.0.0:8000".into()
+}
+fn default_broadcast_ms() -> u64 {
+    150
+}
+fn default_entry_threshold() -> f64 {
+    0.20
+} // 0.20%
+fn default_max_spread() -> f64 {
+    30.0
+}
+fn default_min_vol_usd() -> f64 {
+    100_000.0
+} // $100k min per leg
+fn default_max_symbols() -> u32 {
+    4000
+}
+fn default_max_levels() -> u16 {
+    20
+}
+fn default_history_len() -> u32 {
+    512
+}
+fn enabled_default() -> bool {
+    true
+}
 
 /// Default frontend dir: tries `../novo frontend/frontend` relative to
 /// scanner working directory. Returns None if not found so we never hard-fail.
@@ -407,18 +484,18 @@ impl Config {
 
     pub fn default_in_memory() -> Self {
         Self {
-            bind:                "0.0.0.0:8000".into(),
-            broadcast_ms:        150,
+            bind: "0.0.0.0:8000".into(),
+            broadcast_ms: 150,
             entry_threshold_pct: 0.20,
-            max_spread_pct:      30.0,
-            min_vol_usd:         100_000.0,
-            frontend_dir:        default_frontend_dir(),
-            venues:              VenueToggles::default_enabled(),
-            limits:              Limits::default(),
-            core_pinning:        CorePinning::default(),
-            kucoin_mode:         KucoinMode::Classic,
-            bitget_mode:         BitgetMode::V2,
-            ml:                  MlConfig::default(),
+            max_spread_pct: 30.0,
+            min_vol_usd: 100_000.0,
+            frontend_dir: default_frontend_dir(),
+            venues: VenueToggles::default_enabled(),
+            limits: Limits::default(),
+            core_pinning: CorePinning::default(),
+            kucoin_mode: KucoinMode::Classic,
+            bitget_mode: BitgetMode::V2,
+            ml: MlConfig::default(),
         }
     }
 }
@@ -426,17 +503,23 @@ impl Config {
 impl VenueToggles {
     fn default_enabled() -> Self {
         Self {
-            binance_spot: true,  binance_fut: true,
-            mexc_spot:    true,  mexc_fut:    true,
-            bingx_spot:   true,  bingx_fut:   true,
-            gate_spot:    true,  gate_fut:    true,
-            kucoin_spot:  true,  kucoin_fut:  true,
-            xt_spot:      true,  xt_fut:      true,
-            bitget_spot:  true,  bitget_fut:  true,
+            binance_spot: true,
+            binance_fut: true,
+            mexc_spot: true,
+            mexc_fut: true,
+            bingx_spot: true,
+            bingx_fut: true,
+            gate_spot: true,
+            gate_fut: true,
+            kucoin_spot: true,
+            kucoin_fut: true,
+            xt_spot: true,
+            xt_fut: true,
+            bitget_spot: true,
+            bitget_fut: true,
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

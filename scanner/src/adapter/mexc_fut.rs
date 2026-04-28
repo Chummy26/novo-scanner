@@ -29,16 +29,16 @@ use crate::types::{now_ns, Price, Qty, Venue};
 
 pub struct MexcFutAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub vol:      Arc<crate::broadcast::VolStore>,
-    pub url:      String,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub vol: Arc<crate::broadcast::VolStore>,
+    pub url: String,
 }
 
 impl MexcFutAdapter {
     pub fn new(
         universe: Arc<SymbolUniverse>,
-        stale:    Arc<crate::spread::engine::StaleTable>,
-        vol:      Arc<crate::broadcast::VolStore>,
+        stale: Arc<crate::spread::engine::StaleTable>,
+        vol: Arc<crate::broadcast::VolStore>,
     ) -> Self {
         Self {
             universe,
@@ -51,7 +51,9 @@ impl MexcFutAdapter {
 
 #[async_trait]
 impl Adapter for MexcFutAdapter {
-    fn venue(&self) -> Venue { Venue::MexcFut }
+    fn venue(&self) -> Venue {
+        Venue::MexcFut
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let backoff = BackoffPolicy::STANDARD;
@@ -74,24 +76,35 @@ impl MexcFutAdapter {
         use http::Uri;
         use tokio_websockets::{ClientBuilder, Message};
 
-        let uri: Uri = self.url.parse()
+        let uri: Uri = self
+            .url
+            .parse()
             .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
         info!(venue = "mexc-fut", "connecting");
 
         let (mut client, _) = ClientBuilder::from_uri(uri)
-            .connect().await
+            .connect()
+            .await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
         // Per-symbol sub.ticker: only channel that emits bid1/ask1.
         let syms: Vec<String> = self.universe.per_venue[Venue::MexcFut.idx()]
-            .keys().cloned().collect();
-        info!(venue = "mexc-fut", count = syms.len(), "subscribing sub.ticker per-symbol");
+            .keys()
+            .cloned()
+            .collect();
+        info!(
+            venue = "mexc-fut",
+            count = syms.len(),
+            "subscribing sub.ticker per-symbol"
+        );
         for sym in &syms {
             let sub = format!(
                 r#"{{"method":"sub.ticker","param":{{"symbol":"{}"}},"gzip":false}}"#,
                 sym
             );
-            client.send(Message::text(sub)).await
+            client
+                .send(Message::text(sub))
+                .await
                 .map_err(|e| Error::WebSocket(format!("subscribe {}: {}", sym, e)))?;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -160,8 +173,8 @@ fn parse_and_apply<F>(json: &str, mut f: F) -> Result<()>
 where
     F: FnMut(&str, Price, Price, f64),
 {
-    let data_lv = sonic_rs::get(json, &["data"])
-        .map_err(|e| Error::Decode(format!("data: {}", e)))?;
+    let data_lv =
+        sonic_rs::get(json, &["data"]).map_err(|e| Error::Decode(format!("data: {}", e)))?;
     let v: sonic_rs::Value = sonic_rs::from_str(data_lv.as_raw_str())
         .map_err(|e| Error::Decode(format!("parse data: {}", e)))?;
 
@@ -205,7 +218,9 @@ where
         // that emit a live BBO. Better to leave the book un-committed for
         // this tick than to commit stale data (vol_poller + stale threshold
         // already handle the "never populated" case cleanly).
-        if bid <= 0.0 || ask <= 0.0 { continue; }
+        if bid <= 0.0 || ask <= 0.0 {
+            continue;
+        }
         // amount24 = USDT volume 24h; volume24 = contracts count.
         let vol24 = num("amount24");
         f(sym, Price::from_f64(bid), Price::from_f64(ask), vol24);
@@ -229,8 +244,16 @@ mod tests {
         parse_and_apply(js, |s, b, a, v| seen.push((s.to_string(), b, a, v))).unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].0, "BTC_USDT");
-        assert_eq!(seen[0].1, Price::from_f64(77056.8), "must use bid1, not maxBidPrice");
-        assert_eq!(seen[0].2, Price::from_f64(77056.9), "must use ask1, not minAskPrice");
+        assert_eq!(
+            seen[0].1,
+            Price::from_f64(77056.8),
+            "must use bid1, not maxBidPrice"
+        );
+        assert_eq!(
+            seen[0].2,
+            Price::from_f64(77056.9),
+            "must use ask1, not minAskPrice"
+        );
         assert_eq!(seen[0].3, 6_848_054_029.0);
     }
 
@@ -241,7 +264,13 @@ mod tests {
         // live BBO, and committing (last, last) creates ghost spreads.
         let js = r#"{"channel":"push.ticker","data":{"symbol":"XYZ_USDT","lastPrice":1.23,"amount24":10}}"#;
         let mut seen: Vec<(String, f64, f64)> = Vec::new();
-        parse_and_apply(js, |s, b, a, _| seen.push((s.to_string(), b.to_f64(), a.to_f64()))).unwrap();
-        assert!(seen.is_empty(), "frame without bid1/ask1 must be skipped, not flattened to last");
+        parse_and_apply(js, |s, b, a, _| {
+            seen.push((s.to_string(), b.to_f64(), a.to_f64()))
+        })
+        .unwrap();
+        assert!(
+            seen.is_empty(),
+            "frame without bid1/ask1 must be skipped, not flattened to last"
+        );
     }
 }

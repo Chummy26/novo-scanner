@@ -34,9 +34,7 @@ fn main() -> anyhow::Result<()> {
         .build()
         .context("build tokio runtime")?;
 
-    rt.block_on(async move {
-        scanner::run(cfg).await
-    })?;
+    rt.block_on(async move { scanner::run(cfg).await })?;
 
     Ok(())
 }

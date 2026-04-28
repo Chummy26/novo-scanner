@@ -78,10 +78,17 @@ mod tests {
 
     #[test]
     fn sample_id_is_hex32_lowercase() {
-        let id = sample_id_of(1_700_000_000_000_000_000, 42, "BTC-USDT",
-                              Venue::MexcFut, Venue::BingxFut);
+        let id = sample_id_of(
+            1_700_000_000_000_000_000,
+            42,
+            "BTC-USDT",
+            Venue::MexcFut,
+            Venue::BingxFut,
+        );
         assert_eq!(id.len(), 32);
-        assert!(id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -120,7 +127,7 @@ mod tests {
         // Mesmos nomes venue curtos, mas spot vs fut.
         // MexcSpot e MexcFut têm as_str() == "mexc" mas market() distinto.
         let a = sample_id_of(100, 1, "BTC-USDT", Venue::MexcSpot, Venue::BingxFut);
-        let b = sample_id_of(100, 1, "BTC-USDT", Venue::MexcFut,  Venue::BingxFut);
+        let b = sample_id_of(100, 1, "BTC-USDT", Venue::MexcFut, Venue::BingxFut);
         assert_ne!(a, b, "spot e fut da mesma venue devem gerar ids distintos");
     }
 }

@@ -28,16 +28,16 @@ use crate::types::{now_ns, Price, Qty, Venue};
 
 pub struct GateSpotAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub vol:      Arc<crate::broadcast::VolStore>,
-    pub url:      String,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub vol: Arc<crate::broadcast::VolStore>,
+    pub url: String,
 }
 
 impl GateSpotAdapter {
     pub fn new(
         universe: Arc<SymbolUniverse>,
-        stale:    Arc<crate::spread::engine::StaleTable>,
-        vol:      Arc<crate::broadcast::VolStore>,
+        stale: Arc<crate::spread::engine::StaleTable>,
+        vol: Arc<crate::broadcast::VolStore>,
     ) -> Self {
         Self {
             universe,
@@ -50,7 +50,9 @@ impl GateSpotAdapter {
 
 #[async_trait]
 impl Adapter for GateSpotAdapter {
-    fn venue(&self) -> Venue { Venue::GateSpot }
+    fn venue(&self) -> Venue {
+        Venue::GateSpot
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let backoff = BackoffPolicy::STANDARD;
@@ -73,19 +75,24 @@ impl GateSpotAdapter {
         use http::Uri;
         use tokio_websockets::{ClientBuilder, Message};
 
-        let uri: Uri = self.url.parse()
+        let uri: Uri = self
+            .url
+            .parse()
             .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
         info!(venue = "gate-spot", "connecting");
 
         let (mut client, _) = ClientBuilder::from_uri(uri)
-            .connect().await
+            .connect()
+            .await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
         // Subscribe per-symbol (not "!all" — server rejects the wildcard with
         // error code 2 on v4). We batch so the subscribe doesn't exceed the
         // 50 req/s rate limit.
         let syms: Vec<String> = self.universe.per_venue[Venue::GateSpot.idx()]
-            .keys().cloned().collect();
+            .keys()
+            .cloned()
+            .collect();
         info!(venue = "gate-spot", count = syms.len(), "subscribing");
         for chunk in syms.chunks(30) {
             let payload: Vec<String> = chunk.iter().map(|s| format!("\"{}\"", s)).collect();
@@ -94,7 +101,8 @@ impl GateSpotAdapter {
                 ts = now_ns() / 1_000_000_000,
                 list = payload.join(","),
             );
-            client.send(Message::text(sub))
+            client
+                .send(Message::text(sub))
                 .await
                 .map_err(|e| Error::WebSocket(format!("subscribe: {}", e)))?;
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -180,7 +188,9 @@ where
     use sonic_rs::JsonValueTrait;
     let sym_lv = sonic_rs::get(json, &["result", "currency_pair"])
         .map_err(|e| Error::Decode(format!("currency_pair: {}", e)))?;
-    let sym = sym_lv.as_str().ok_or_else(|| Error::Decode("currency_pair not str".into()))?;
+    let sym = sym_lv
+        .as_str()
+        .ok_or_else(|| Error::Decode("currency_pair not str".into()))?;
 
     // Gate emits "" (empty string) for bid/ask on newly listed / illiquid
     // symbols. Parsing as f64 would error and the caller swallows errors
@@ -188,9 +198,13 @@ where
     // as 0 and skip — keeps the symbol in the universe for when liquidity
     // arrives, instead of silently removing it.
     let bid_s = sonic_rs::get(json, &["result", "highest_bid"])
-        .ok().and_then(|lv| lv.as_str().map(|s| s.to_string())).unwrap_or_default();
+        .ok()
+        .and_then(|lv| lv.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     let ask_s = sonic_rs::get(json, &["result", "lowest_ask"])
-        .ok().and_then(|lv| lv.as_str().map(|s| s.to_string())).unwrap_or_default();
+        .ok()
+        .and_then(|lv| lv.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     let qvol = sonic_rs::get(json, &["result", "quote_volume"])
         .ok()
         .and_then(|lv| lv.as_str().and_then(|s| s.parse::<f64>().ok()))
@@ -198,7 +212,9 @@ where
 
     let bid_f = bid_s.parse::<f64>().unwrap_or(0.0);
     let ask_f = ask_s.parse::<f64>().unwrap_or(0.0);
-    if bid_f <= 0.0 || ask_f <= 0.0 { return Ok(()); }
+    if bid_f <= 0.0 || ask_f <= 0.0 {
+        return Ok(());
+    }
     f(sym, Price::from_f64(bid_f), Price::from_f64(ask_f), qvol);
     Ok(())
 }
@@ -215,7 +231,10 @@ mod tests {
                       "base_volume":"100","quote_volume":"4200000","change_percentage":"0.1"}
         }"#;
         let mut got: Option<(String, Price, Price, f64)> = None;
-        parse_and_apply(js, |sym, bid, ask, qv| { got = Some((sym.into(), bid, ask, qv)); }).unwrap();
+        parse_and_apply(js, |sym, bid, ask, qv| {
+            got = Some((sym.into(), bid, ask, qv));
+        })
+        .unwrap();
         let (sym, bid, ask, qv) = got.unwrap();
         assert_eq!(sym, "BTC_USDT");
         assert_eq!(bid, Price::from_f64(41999.0));

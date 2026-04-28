@@ -24,12 +24,15 @@ use crate::types::{now_ns, Price, Qty, Venue};
 
 pub struct BinanceFutAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub url:      String,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub url: String,
 }
 
 impl BinanceFutAdapter {
-    pub fn new(universe: Arc<SymbolUniverse>, stale: Arc<crate::spread::engine::StaleTable>) -> Self {
+    pub fn new(
+        universe: Arc<SymbolUniverse>,
+        stale: Arc<crate::spread::engine::StaleTable>,
+    ) -> Self {
         Self {
             universe,
             stale,
@@ -40,7 +43,9 @@ impl BinanceFutAdapter {
 
 #[async_trait]
 impl Adapter for BinanceFutAdapter {
-    fn venue(&self) -> Venue { Venue::BinanceFut }
+    fn venue(&self) -> Venue {
+        Venue::BinanceFut
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let backoff = BackoffPolicy::STANDARD;
@@ -63,12 +68,15 @@ impl BinanceFutAdapter {
         use http::Uri;
         use tokio_websockets::{ClientBuilder, Message};
 
-        let uri: Uri = self.url.parse()
+        let uri: Uri = self
+            .url
+            .parse()
             .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
         info!(venue = "binance-fut", "connecting");
 
         let (mut client, _) = ClientBuilder::from_uri(uri)
-            .connect().await
+            .connect()
+            .await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
         // Binance futures has 10-minute ping timeout — much more relaxed than spot.
@@ -123,19 +131,25 @@ where
     F: FnOnce(&str, Price, Qty, Price, Qty),
 {
     use sonic_rs::JsonValueTrait;
-    let Ok(sym_lv) = sonic_rs::get(json, &["s"]) else { return Ok(false); };
-    let Some(symbol) = sym_lv.as_str() else { return Ok(false); };
-
-    let getstr = |k: &'static str| -> Result<f64> {
-        let lv = sonic_rs::get(json, &[k])
-            .map_err(|e| Error::Decode(format!("{}: {}", k, e)))?;
-        let s = lv.as_str().ok_or_else(|| Error::Decode(format!("{} not str", k)))?;
-        s.parse::<f64>().map_err(|_| Error::Decode(format!("{} not f64", k)))
+    let Ok(sym_lv) = sonic_rs::get(json, &["s"]) else {
+        return Ok(false);
+    };
+    let Some(symbol) = sym_lv.as_str() else {
+        return Ok(false);
     };
 
-    let bid_px  = Price::from_f64(getstr("b")?);
+    let getstr = |k: &'static str| -> Result<f64> {
+        let lv = sonic_rs::get(json, &[k]).map_err(|e| Error::Decode(format!("{}: {}", k, e)))?;
+        let s = lv
+            .as_str()
+            .ok_or_else(|| Error::Decode(format!("{} not str", k)))?;
+        s.parse::<f64>()
+            .map_err(|_| Error::Decode(format!("{} not f64", k)))
+    };
+
+    let bid_px = Price::from_f64(getstr("b")?);
     let bid_qty = Qty::from_f64(getstr("B")?);
-    let ask_px  = Price::from_f64(getstr("a")?);
+    let ask_px = Price::from_f64(getstr("a")?);
     let ask_qty = Qty::from_f64(getstr("A")?);
     f(symbol, bid_px, bid_qty, ask_px, ask_qty);
     Ok(true)

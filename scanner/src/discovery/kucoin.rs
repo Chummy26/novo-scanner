@@ -24,14 +24,16 @@ impl KucoinDiscoverer {
     fn url(&self) -> &'static str {
         match self.venue {
             Venue::KucoinSpot => "https://api.kucoin.com/api/v2/symbols",
-            Venue::KucoinFut  => "https://api-futures.kucoin.com/api/v1/contracts/active",
+            Venue::KucoinFut => "https://api-futures.kucoin.com/api/v1/contracts/active",
             _ => unreachable!(),
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct SpotResp { data: Vec<SpotSym> }
+struct SpotResp {
+    data: Vec<SpotSym>,
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SpotSym {
@@ -41,7 +43,9 @@ struct SpotSym {
 }
 
 #[derive(Debug, Deserialize)]
-struct FutResp { data: Vec<FutContract> }
+struct FutResp {
+    data: Vec<FutContract>,
+}
 #[derive(Debug, Deserialize)]
 struct FutContract {
     symbol: String,
@@ -51,36 +55,63 @@ struct FutContract {
 
 #[async_trait]
 impl Discoverer for KucoinDiscoverer {
-    fn venue(&self) -> Venue { self.venue }
+    fn venue(&self) -> Venue {
+        self.venue
+    }
 
     async fn fetch(&self, http: &reqwest::Client) -> Result<Vec<VenueSymbol>> {
         let mut out = Vec::new();
         match self.venue {
             Venue::KucoinSpot => {
-                let r: SpotResp = http.get(self.url())
-                    .send().await?.error_for_status()?.json().await?;
+                let r: SpotResp = http
+                    .get(self.url())
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
                 for s in r.data {
-                    if !s.enable_trading { continue; }
+                    if !s.enable_trading {
+                        continue;
+                    }
                     if let Some(c) = normalize::parse(self.venue, &s.symbol) {
-                        out.push(VenueSymbol { venue: self.venue, raw: s.symbol, canonical: c });
+                        out.push(VenueSymbol {
+                            venue: self.venue,
+                            raw: s.symbol,
+                            canonical: c,
+                        });
                     }
                 }
             }
             Venue::KucoinFut => {
-                let r: FutResp = http.get(self.url())
-                    .send().await?.error_for_status()?.json().await?;
+                let r: FutResp = http
+                    .get(self.url())
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
                 for c in r.data {
                     let ok = c.status.is_empty() || c.status.eq_ignore_ascii_case("open");
-                    if !ok { continue; }
+                    if !ok {
+                        continue;
+                    }
                     if let Some(can) = normalize::parse(self.venue, &c.symbol) {
-                        out.push(VenueSymbol { venue: self.venue, raw: c.symbol, canonical: can });
+                        out.push(VenueSymbol {
+                            venue: self.venue,
+                            raw: c.symbol,
+                            canonical: can,
+                        });
                     }
                 }
             }
             _ => unreachable!(),
         }
         if out.is_empty() {
-            return Err(Error::Discovery(format!("kucoin {}: 0 symbols", self.venue)));
+            return Err(Error::Discovery(format!(
+                "kucoin {}: 0 symbols",
+                self.venue
+            )));
         }
         Ok(out)
     }

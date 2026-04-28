@@ -32,14 +32,14 @@ use crate::types::{now_ns, Price, Qty, Venue};
 
 pub struct KucoinAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub http:     reqwest::Client,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub http: reqwest::Client,
 }
 
 impl KucoinAdapter {
     pub fn new(
         universe: Arc<SymbolUniverse>,
-        stale:    Arc<crate::spread::engine::StaleTable>,
+        stale: Arc<crate::spread::engine::StaleTable>,
     ) -> Self {
         Self {
             universe,
@@ -55,7 +55,9 @@ impl KucoinAdapter {
 
 #[async_trait]
 impl Adapter for KucoinAdapter {
-    fn venue(&self) -> Venue { Venue::KucoinSpot }
+    fn venue(&self) -> Venue {
+        Venue::KucoinSpot
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let backoff = BackoffPolicy::STANDARD;
@@ -103,21 +105,34 @@ impl KucoinAdapter {
         use tokio_websockets::{ClientBuilder, Message};
 
         // 1. Fetch bullet token.
-        let bullet: BulletResp = self.http.post("https://api.kucoin.com/api/v1/bullet-public")
-            .send().await?
+        let bullet: BulletResp = self
+            .http
+            .post("https://api.kucoin.com/api/v1/bullet-public")
+            .send()
+            .await?
             .error_for_status()?
-            .json().await?;
+            .json()
+            .await?;
         let Some(server) = bullet.data.instance_servers.into_iter().next() else {
             return Err(Error::Protocol("bullet-public: no instanceServers".into()));
         };
         let connect_id = format!("{}", now_ns());
-        let url = format!("{}?token={}&connectId={}", server.endpoint, bullet.data.token, connect_id);
-        info!(venue = "kucoin", ping_ms = server.ping_interval_ms, "connecting via bullet-public");
+        let url = format!(
+            "{}?token={}&connectId={}",
+            server.endpoint, bullet.data.token, connect_id
+        );
+        info!(
+            venue = "kucoin",
+            ping_ms = server.ping_interval_ms,
+            "connecting via bullet-public"
+        );
 
-        let uri: Uri = url.parse()
+        let uri: Uri = url
+            .parse()
             .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
         let (mut client, _) = ClientBuilder::from_uri(uri)
-            .connect().await
+            .connect()
+            .await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
         // 2. Wait for welcome.
@@ -145,7 +160,9 @@ impl KucoinAdapter {
             r#"{{"id":"{}","type":"subscribe","topic":"/market/ticker:all","response":true}}"#,
             now_ns()
         );
-        client.send(Message::text(sub)).await
+        client
+            .send(Message::text(sub))
+            .await
             .map_err(|e| Error::WebSocket(format!("subscribe: {}", e)))?;
 
         // 4. Ping loop + ingest loop.
@@ -212,18 +229,24 @@ fn parse_and_apply<F>(json: &str, f: F) -> Result<()>
 where
     F: FnOnce(&str, Price, Price),
 {
-    let subj_lv = sonic_rs::get(json, &["subject"])
-        .map_err(|e| Error::Decode(format!("subject: {}", e)))?;
-    let sym = subj_lv.as_str().ok_or_else(|| Error::Decode("subject not str".into()))?;
+    let subj_lv =
+        sonic_rs::get(json, &["subject"]).map_err(|e| Error::Decode(format!("subject: {}", e)))?;
+    let sym = subj_lv
+        .as_str()
+        .ok_or_else(|| Error::Decode("subject not str".into()))?;
 
     let bid = sonic_rs::get(json, &["data", "bestBid"])
         .map_err(|e| Error::Decode(format!("bestBid: {}", e)))?
-        .as_str().ok_or_else(|| Error::Decode("bestBid not str".into()))?
-        .parse::<f64>().map_err(|_| Error::Decode("bestBid f64".into()))?;
+        .as_str()
+        .ok_or_else(|| Error::Decode("bestBid not str".into()))?
+        .parse::<f64>()
+        .map_err(|_| Error::Decode("bestBid f64".into()))?;
     let ask = sonic_rs::get(json, &["data", "bestAsk"])
         .map_err(|e| Error::Decode(format!("bestAsk: {}", e)))?
-        .as_str().ok_or_else(|| Error::Decode("bestAsk not str".into()))?
-        .parse::<f64>().map_err(|_| Error::Decode("bestAsk f64".into()))?;
+        .as_str()
+        .ok_or_else(|| Error::Decode("bestAsk not str".into()))?
+        .parse::<f64>()
+        .map_err(|_| Error::Decode("bestAsk f64".into()))?;
     f(sym, Price::from_f64(bid), Price::from_f64(ask));
     Ok(())
 }

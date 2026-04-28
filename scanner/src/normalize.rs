@@ -21,37 +21,74 @@ use crate::types::{CanonicalPair, Market, Venue};
 /// MEXC/Bitget spot. USDT/USDC/USDE etc. must precede USD, BUSD precedes BNB.
 pub const KNOWN_QUOTES: &[&str] = &[
     // 5 chars
-    "FDUSD",
-    // 4 chars (stablecoins before any base-asset-like 3-char)
+    "FDUSD", // 4 chars (stablecoins before any base-asset-like 3-char)
     "USDT", "USDC", "USDE", "USDF", "USD1", "USDS", "BUSD", "TUSD", "USDD",
     // 3 chars — fiat first (to avoid conflict with e.g. TRY+X crypto bases)
     "DAI", "EUR", "TRY", "BRL", "GBP", "USD", "KRW", "JPY",
     // 3 chars — crypto quote-assets
-    "BTC", "ETH", "BNB", "TRX", "SOL", "KCS",
-    // 2 chars
+    "BTC", "ETH", "BNB", "TRX", "SOL", "KCS", // 2 chars
     "XT",
 ];
 
 /// Bases that indicate leveraged ETF tokens — they must NOT enter the universe
 /// because their price is 3×/5× underlying, creating phantom spreads.
-pub const LEVERAGED_SUFFIXES: &[&str] = &[
-    "3L", "3S", "5L", "5S", "2L", "2S", "4L", "4S",
-];
+pub const LEVERAGED_SUFFIXES: &[&str] = &["3L", "3S", "5L", "5S", "2L", "2S", "4L", "4S"];
 
 /// Bases that are CFD / equity / index proxies listed on MEXC / Gate futures.
 /// Arbitrage between these and any crypto venue is nonsense.
 pub const CFD_BLOCKLIST: &[&str] = &[
     // Commodities
-    "SILVER", "GOLD", "PLATINUM", "PALLADIUM", "USOIL", "UKOIL",
-    "NATGAS", "COPPER", "CORN", "WHEAT",
+    "SILVER",
+    "GOLD",
+    "PLATINUM",
+    "PALLADIUM",
+    "USOIL",
+    "UKOIL",
+    "NATGAS",
+    "COPPER",
+    "CORN",
+    "WHEAT",
     // Equity / index CFDs
-    "SPX500", "NAS100", "DJ30", "UK100", "GER40", "FRA40", "HK50",
-    "TESLA", "TSLA", "TSLAX", "AAPL", "MSFT", "GOOG", "GOOGL", "AMZN",
-    "META", "NVDA", "NFLX", "BABA", "BIDU", "INTC", "AMD", "JPM",
-    "MSTR", "MSTRX", "COIN", "COINX", "MARA", "RIOT", "SPYX", "ESPORTS",
-    "TSM", "UBER", "SQ", "PYPL", "DIS", "WMT",
+    "SPX500",
+    "NAS100",
+    "DJ30",
+    "UK100",
+    "GER40",
+    "FRA40",
+    "HK50",
+    "TESLA",
+    "TSLA",
+    "TSLAX",
+    "AAPL",
+    "MSFT",
+    "GOOG",
+    "GOOGL",
+    "AMZN",
+    "META",
+    "NVDA",
+    "NFLX",
+    "BABA",
+    "BIDU",
+    "INTC",
+    "AMD",
+    "JPM",
+    "MSTR",
+    "MSTRX",
+    "COIN",
+    "COINX",
+    "MARA",
+    "RIOT",
+    "SPYX",
+    "ESPORTS",
+    "TSM",
+    "UBER",
+    "SQ",
+    "PYPL",
+    "DIS",
+    "WMT",
     // Volatility / derived
-    "EVIX", "VIX",
+    "EVIX",
+    "VIX",
 ];
 
 pub fn is_leveraged_token(base: &str) -> bool {
@@ -71,9 +108,9 @@ pub fn is_cfd_or_equity(base: &str) -> bool {
 pub fn parse(venue: Venue, raw: &str) -> Option<CanonicalPair> {
     let market = venue.market();
     match venue {
-        Venue::BinanceSpot | Venue::BinanceFut
-        | Venue::MexcSpot
-        | Venue::BitgetSpot => split_no_separator(raw, market),
+        Venue::BinanceSpot | Venue::BinanceFut | Venue::MexcSpot | Venue::BitgetSpot => {
+            split_no_separator(raw, market)
+        }
 
         Venue::BitgetFut => {
             // Bitget futures live symbols are `BTCUSDT_UMCBL` or bare `BTCUSDT`
@@ -87,9 +124,7 @@ pub fn parse(venue: Venue, raw: &str) -> Option<CanonicalPair> {
             split_by(raw, '_', market).map(uppercase_pair)
         }
 
-        Venue::BingxSpot | Venue::BingxFut => {
-            split_by(raw, '-', market).map(uppercase_pair)
-        }
+        Venue::BingxSpot | Venue::BingxFut => split_by(raw, '-', market).map(uppercase_pair),
 
         Venue::XtSpot => {
             // Lowercase + underscore (e.g., "btc_usdt")
@@ -98,7 +133,9 @@ pub fn parse(venue: Venue, raw: &str) -> Option<CanonicalPair> {
 
         Venue::KucoinSpot => {
             // "BTC-USDT"
-            split_by(raw, '-', market).map(uppercase_pair).map(kucoin_alias)
+            split_by(raw, '-', market)
+                .map(uppercase_pair)
+                .map(kucoin_alias)
         }
 
         Venue::KucoinFut => {
@@ -109,13 +146,17 @@ pub fn parse(venue: Venue, raw: &str) -> Option<CanonicalPair> {
             // on other venues. We reject anything whose stripped form ends
             // in `USD` (not `USDT`).
             let stripped = raw.strip_suffix('M').unwrap_or(raw);
-            if stripped.ends_with("USD") && !stripped.ends_with("USDT") && !stripped.ends_with("USDC") {
+            if stripped.ends_with("USD")
+                && !stripped.ends_with("USDT")
+                && !stripped.ends_with("USDC")
+            {
                 // inverse contract — drop
                 return None;
             }
             split_no_separator(stripped, market).map(kucoin_alias)
         }
-    }.and_then(reject_unwanted)
+    }
+    .and_then(reject_unwanted)
 }
 
 fn split_no_separator(raw: &str, market: Market) -> Option<CanonicalPair> {
@@ -124,7 +165,9 @@ fn split_no_separator(raw: &str, market: Market) -> Option<CanonicalPair> {
         if up.len() > quote.len() && up.ends_with(quote) {
             let base = &up[..up.len() - quote.len()];
             if !base.is_empty() {
-                return Some(apply_global_aliases(CanonicalPair::new(base, quote, market)));
+                return Some(apply_global_aliases(CanonicalPair::new(
+                    base, quote, market,
+                )));
             }
         }
     }
@@ -133,15 +176,19 @@ fn split_no_separator(raw: &str, market: Market) -> Option<CanonicalPair> {
 
 fn split_by(raw: &str, sep: char, market: Market) -> Option<CanonicalPair> {
     let mut it = raw.split(sep);
-    let base  = it.next()?;
+    let base = it.next()?;
     let quote = it.next()?;
-    if it.next().is_some() { return None; }
-    if base.is_empty() || quote.is_empty() { return None; }
+    if it.next().is_some() {
+        return None;
+    }
+    if base.is_empty() || quote.is_empty() {
+        return None;
+    }
     Some(CanonicalPair::new(base, quote, market))
 }
 
 fn uppercase_pair(mut p: CanonicalPair) -> CanonicalPair {
-    p.base  = p.base.to_ascii_uppercase();
+    p.base = p.base.to_ascii_uppercase();
     p.quote = p.quote.to_ascii_uppercase();
     apply_global_aliases(p)
 }
@@ -171,18 +218,20 @@ fn kucoin_alias(mut p: CanonicalPair) -> CanonicalPair {
 ///                   is LUNA. (LUNC remains its own asset — Terra Classic.)
 const ALIASES: &[(&str, &str)] = &[
     ("MATIC", "POL"),
-    ("FTM",   "S"),
-    ("BCHA",  "XEC"),
-    ("MKR",   "SKY"),
-    ("AGIX",  "ASI"),
+    ("FTM", "S"),
+    ("BCHA", "XEC"),
+    ("MKR", "SKY"),
+    ("AGIX", "ASI"),
     ("OCEAN", "ASI"),
-    ("FET",   "ASI"),
+    ("FET", "ASI"),
     ("LUNA2", "LUNA"),
 ];
 
 fn apply_global_aliases(mut p: CanonicalPair) -> CanonicalPair {
     for (old, new) in ALIASES {
-        if p.base == *old { p.base = (*new).to_string(); }
+        if p.base == *old {
+            p.base = (*new).to_string();
+        }
     }
     p
 }
@@ -190,8 +239,12 @@ fn apply_global_aliases(mut p: CanonicalPair) -> CanonicalPair {
 /// Final guard applied inside every venue splitter: drops leveraged tokens
 /// and CFD/equity proxies so they never enter the universe.
 fn reject_unwanted(p: CanonicalPair) -> Option<CanonicalPair> {
-    if is_leveraged_token(&p.base) { return None; }
-    if is_cfd_or_equity(&p.base) { return None; }
+    if is_leveraged_token(&p.base) {
+        return None;
+    }
+    if is_cfd_or_equity(&p.base) {
+        return None;
+    }
     Some(p)
 }
 
@@ -256,8 +309,10 @@ mod tests {
 
     #[test]
     fn kucoin_fut_inverse_rejected() {
-        assert!(parse(Venue::KucoinFut, "XBTUSDM").is_none(),
-                "inverse USD-settled perpetual must be dropped");
+        assert!(
+            parse(Venue::KucoinFut, "XBTUSDM").is_none(),
+            "inverse USD-settled perpetual must be dropped"
+        );
         assert!(parse(Venue::KucoinFut, "ETHUSDM").is_none());
     }
 
@@ -275,7 +330,7 @@ mod tests {
         assert_eq!(parse(Venue::BinanceSpot, "BTCGBP").unwrap().quote, "GBP");
         assert_eq!(parse(Venue::BinanceSpot, "USDTBRL").unwrap().quote, "BRL");
         assert_eq!(parse(Venue::KucoinSpot, "WIN-TRX").unwrap().quote, "TRX");
-        assert_eq!(parse(Venue::MexcSpot,   "AAVEUSD1").unwrap().quote, "USD1");
+        assert_eq!(parse(Venue::MexcSpot, "AAVEUSD1").unwrap().quote, "USD1");
         assert_eq!(parse(Venue::BitgetSpot, "BTCUSDE").unwrap().quote, "USDE");
     }
 
@@ -298,10 +353,12 @@ mod tests {
     fn longest_quote_first_disambiguation() {
         // BNBUSDT must go to BNB/USDT, not BN/BUSDT and not to a weird short-match.
         let p = parse(Venue::BinanceSpot, "BNBUSDT").unwrap();
-        assert_eq!(p.base, "BNB"); assert_eq!(p.quote, "USDT");
+        assert_eq!(p.base, "BNB");
+        assert_eq!(p.quote, "USDT");
         // BUSDUSDT: base=BUSD quote=USDT.
         let p = parse(Venue::BinanceSpot, "BUSDUSDT").unwrap();
-        assert_eq!(p.base, "BUSD"); assert_eq!(p.quote, "USDT");
+        assert_eq!(p.base, "BUSD");
+        assert_eq!(p.quote, "USDT");
     }
 
     #[test]
@@ -320,7 +377,7 @@ mod tests {
     fn market_doesnt_affect_canonical() {
         // Post-refactor: Market is ignored in CanonicalPair equality.
         let a = parse(Venue::BinanceSpot, "BTCUSDT").unwrap();
-        let b = parse(Venue::BinanceFut,  "BTCUSDT").unwrap();
+        let b = parse(Venue::BinanceFut, "BTCUSDT").unwrap();
         assert_eq!(a, b);
     }
 

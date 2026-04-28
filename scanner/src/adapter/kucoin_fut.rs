@@ -28,30 +28,35 @@ use crate::types::{now_ns, Price, Qty, Venue};
 
 pub struct KucoinFutAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub vol:      Arc<crate::broadcast::VolStore>,
-    pub http:     reqwest::Client,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub vol: Arc<crate::broadcast::VolStore>,
+    pub http: reqwest::Client,
 }
 
 impl KucoinFutAdapter {
     pub fn new(
         universe: Arc<SymbolUniverse>,
-        stale:    Arc<crate::spread::engine::StaleTable>,
-        vol:      Arc<crate::broadcast::VolStore>,
+        stale: Arc<crate::spread::engine::StaleTable>,
+        vol: Arc<crate::broadcast::VolStore>,
     ) -> Self {
         Self {
-            universe, stale, vol,
+            universe,
+            stale,
+            vol,
             http: reqwest::Client::builder()
                 .user_agent("scanner/0.1")
                 .timeout(Duration::from_secs(15))
-                .build().expect("reqwest client"),
+                .build()
+                .expect("reqwest client"),
         }
     }
 }
 
 #[async_trait]
 impl Adapter for KucoinFutAdapter {
-    fn venue(&self) -> Venue { Venue::KucoinFut }
+    fn venue(&self) -> Venue {
+        Venue::KucoinFut
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let backoff = BackoffPolicy::STANDARD;
@@ -70,7 +75,9 @@ impl Adapter for KucoinFutAdapter {
 }
 
 #[derive(Debug, Deserialize)]
-struct Bullet { data: BulletData }
+struct Bullet {
+    data: BulletData,
+}
 #[derive(Debug, Deserialize)]
 struct BulletData {
     token: String,
@@ -92,23 +99,36 @@ impl KucoinFutAdapter {
         use http::Uri;
         use tokio_websockets::{ClientBuilder, Message};
 
-        let bullet: Bullet = self.http
+        let bullet: Bullet = self
+            .http
             .post("https://api-futures.kucoin.com/api/v1/bullet-public")
-            .send().await?
+            .send()
+            .await?
             .error_for_status()?
-            .json().await?;
+            .json()
+            .await?;
         let Some(server) = bullet.data.instance_servers.into_iter().next() else {
-            return Err(Error::Protocol("kucoin-fut bullet: no instanceServers".into()));
+            return Err(Error::Protocol(
+                "kucoin-fut bullet: no instanceServers".into(),
+            ));
         };
         let connect_id = format!("{}", now_ns());
-        let url = format!("{}?token={}&connectId={}",
-                          server.endpoint, bullet.data.token, connect_id);
-        info!(venue = "kucoin-fut", ping_ms = server.ping_interval_ms, "connecting");
+        let url = format!(
+            "{}?token={}&connectId={}",
+            server.endpoint, bullet.data.token, connect_id
+        );
+        info!(
+            venue = "kucoin-fut",
+            ping_ms = server.ping_interval_ms,
+            "connecting"
+        );
 
-        let uri: Uri = url.parse()
+        let uri: Uri = url
+            .parse()
             .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
         let (mut client, _) = ClientBuilder::from_uri(uri)
-            .connect().await
+            .connect()
+            .await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
         // Wait welcome.
@@ -133,7 +153,9 @@ impl KucoinFutAdapter {
 
         // Subscribe: contractMarket/tickerV2:SYM1,SYM2,... (comma-separated, cap 100).
         let syms: Vec<String> = self.universe.per_venue[Venue::KucoinFut.idx()]
-            .keys().cloned().collect();
+            .keys()
+            .cloned()
+            .collect();
         info!(venue = "kucoin-fut", count = syms.len(), "subscribing");
         for (i, chunk) in syms.chunks(100).enumerate() {
             let topic = format!("/contractMarket/tickerV2:{}", chunk.join(","));
@@ -142,7 +164,9 @@ impl KucoinFutAdapter {
                 id = now_ns().wrapping_add(i as u64),
                 topic = topic,
             );
-            client.send(Message::text(sub)).await
+            client
+                .send(Message::text(sub))
+                .await
                 .map_err(|e| Error::WebSocket(format!("subscribe: {}", e)))?;
             tokio::time::sleep(Duration::from_millis(80)).await;
         }
@@ -205,22 +229,35 @@ where
 {
     let sym_lv = sonic_rs::get(json, &["data", "symbol"])
         .map_err(|e| Error::Decode(format!("data.symbol: {}", e)))?;
-    let sym = sym_lv.as_str().ok_or_else(|| Error::Decode("symbol not str".into()))?;
+    let sym = sym_lv
+        .as_str()
+        .ok_or_else(|| Error::Decode("symbol not str".into()))?;
     let num = |k: &str| -> f64 {
         sonic_rs::get(json, &["data", k])
             .ok()
             .and_then(|lv| {
-                if let Some(s) = lv.as_str() { s.parse::<f64>().ok() }
-                else { lv.as_f64() }
+                if let Some(s) = lv.as_str() {
+                    s.parse::<f64>().ok()
+                } else {
+                    lv.as_f64()
+                }
             })
             .unwrap_or(0.0)
     };
     let bid = num("bestBidPrice");
     let ask = num("bestAskPrice");
-    if bid <= 0.0 || ask <= 0.0 { return Ok(()); }
+    if bid <= 0.0 || ask <= 0.0 {
+        return Ok(());
+    }
     let bqty = num("bestBidSize");
     let aqty = num("bestAskSize");
-    f(sym, Price::from_f64(bid), Price::from_f64(ask), bqty.max(1.0), aqty.max(1.0));
+    f(
+        sym,
+        Price::from_f64(bid),
+        Price::from_f64(ask),
+        bqty.max(1.0),
+        aqty.max(1.0),
+    );
     Ok(())
 }
 

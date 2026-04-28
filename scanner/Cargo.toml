@@ -28,7 +28,7 @@ debug         = true
 
 [dependencies]
 tokio             = { version = "1", features = ["full", "parking_lot"] }
-tokio-websockets  = { version = "0.11", features = ["client", "simd", "rand", "native-tls", "sha1_smol"] }
+tokio-websockets  = { version = "0.11", features = ["client", "simd", "rand", "rustls-webpki-roots", "rustls-tls12", "ring", "sha1_smol"] }
 bytes             = "1"
 http              = "1"
 

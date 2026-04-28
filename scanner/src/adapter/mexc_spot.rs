@@ -31,12 +31,15 @@ use crate::types::{now_ns, Price, Qty, Venue};
 
 pub struct MexcSpotAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub url:      String,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub url: String,
 }
 
 impl MexcSpotAdapter {
-    pub fn new(universe: Arc<SymbolUniverse>, stale: Arc<crate::spread::engine::StaleTable>) -> Self {
+    pub fn new(
+        universe: Arc<SymbolUniverse>,
+        stale: Arc<crate::spread::engine::StaleTable>,
+    ) -> Self {
         Self {
             universe,
             stale,
@@ -47,7 +50,9 @@ impl MexcSpotAdapter {
 
 #[async_trait]
 impl Adapter for MexcSpotAdapter {
-    fn venue(&self) -> Venue { Venue::MexcSpot }
+    fn venue(&self) -> Venue {
+        Venue::MexcSpot
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let backoff = BackoffPolicy::STANDARD;
@@ -70,17 +75,23 @@ impl MexcSpotAdapter {
         use http::Uri;
         use tokio_websockets::{ClientBuilder, Message};
 
-        let uri: Uri = self.url.parse()
+        let uri: Uri = self
+            .url
+            .parse()
             .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
         info!(venue = "mexc-spot", "connecting");
 
         let (mut client, _) = ClientBuilder::from_uri(uri)
-            .connect().await
+            .connect()
+            .await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
         // Subscribe to miniTickers (aggregate — 1 subscription covers all).
-        let sub = r#"{"method":"SUBSCRIPTION","params":["spot@public.miniTickers.v3.api.pb@UTC+8"]}"#;
-        client.send(Message::text(sub.to_string())).await
+        let sub =
+            r#"{"method":"SUBSCRIPTION","params":["spot@public.miniTickers.v3.api.pb@UTC+8"]}"#;
+        client
+            .send(Message::text(sub.to_string()))
+            .await
             .map_err(|e| Error::WebSocket(format!("subscribe: {}", e)))?;
 
         let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
@@ -169,16 +180,22 @@ fn decode_push(buf: &[u8]) -> std::result::Result<Vec<(String, Price, Price)>, S
         let wtype = tag & 0x7;
         match (field, wtype) {
             // channel: string(1), wire=2 (length-delimited)
-            (1, 2) => { let _ = reader.read_string(buf); }
+            (1, 2) => {
+                let _ = reader.read_string(buf);
+            }
             // mini-ticker wrapper: typically at field 306 (length-delimited message).
             // Enter sub-reader.
             (306, 2) => {
-                let msg = reader.read_bytes(buf).map_err(|e| format!("miniTickers: {}", e))?;
+                let msg = reader
+                    .read_bytes(buf)
+                    .map_err(|e| format!("miniTickers: {}", e))?;
                 decode_mini_tickers_batch(msg, &mut out)?;
             }
             // every other tag: skip
             _ => {
-                if reader.read_unknown(buf, tag).is_err() { break; }
+                if reader.read_unknown(buf, tag).is_err() {
+                    break;
+                }
             }
         }
     }
@@ -187,13 +204,16 @@ fn decode_push(buf: &[u8]) -> std::result::Result<Vec<(String, Price, Price)>, S
 
 /// Decode `PublicMiniTickersBatchV3Api { repeated PublicMiniTickerV3Api items = 1; }`
 /// or legacy `PublicMiniTickersV3Api` (single entry). We handle both shapes.
-fn decode_mini_tickers_batch(buf: &[u8], out: &mut Vec<(String, Price, Price)>)
-    -> std::result::Result<(), String>
-{
+fn decode_mini_tickers_batch(
+    buf: &[u8],
+    out: &mut Vec<(String, Price, Price)>,
+) -> std::result::Result<(), String> {
     let mut reader = BytesReader::from_bytes(buf);
     let mut saw_items = false;
     while !reader.is_eof() {
-        let tag = reader.next_tag(buf).map_err(|e| format!("mini tag: {}", e))?;
+        let tag = reader
+            .next_tag(buf)
+            .map_err(|e| format!("mini tag: {}", e))?;
         let field = tag >> 3;
         let wtype = tag & 0x7;
         match (field, wtype) {
@@ -204,7 +224,9 @@ fn decode_mini_tickers_batch(buf: &[u8], out: &mut Vec<(String, Price, Price)>)
                 decode_one_mini_ticker(item, out)?;
             }
             _ => {
-                if reader.read_unknown(buf, tag).is_err() { break; }
+                if reader.read_unknown(buf, tag).is_err() {
+                    break;
+                }
             }
         }
     }
@@ -233,27 +255,48 @@ fn decode_mini_tickers_batch(buf: &[u8], out: &mut Vec<(String, Price, Price)>)
 /// For the aggregated 1-conn mode we use `price` (last trade) as both bid/ask
 /// — a degraded mode that still allows cross-venue comparison, at the cost
 /// of not knowing the actual spread inside the venue itself.
-fn decode_one_mini_ticker(buf: &[u8], out: &mut Vec<(String, Price, Price)>)
-    -> std::result::Result<(), String>
-{
+fn decode_one_mini_ticker(
+    buf: &[u8],
+    out: &mut Vec<(String, Price, Price)>,
+) -> std::result::Result<(), String> {
     let mut reader = BytesReader::from_bytes(buf);
     let mut symbol = String::new();
     let mut price_s = String::new();
     while !reader.is_eof() {
-        let tag = reader.next_tag(buf).map_err(|e| format!("one tag: {}", e))?;
+        let tag = reader
+            .next_tag(buf)
+            .map_err(|e| format!("one tag: {}", e))?;
         let field = tag >> 3;
         let wtype = tag & 0x7;
         match (field, wtype) {
-            (1, 2) => { symbol  = reader.read_string(buf).map_err(|e| format!("sym: {}", e))?.to_string(); }
-            (2, 2) => { price_s = reader.read_string(buf).map_err(|e| format!("price: {}", e))?.to_string(); }
+            (1, 2) => {
+                symbol = reader
+                    .read_string(buf)
+                    .map_err(|e| format!("sym: {}", e))?
+                    .to_string();
+            }
+            (2, 2) => {
+                price_s = reader
+                    .read_string(buf)
+                    .map_err(|e| format!("price: {}", e))?
+                    .to_string();
+            }
             _ => {
-                if reader.read_unknown(buf, tag).is_err() { break; }
+                if reader.read_unknown(buf, tag).is_err() {
+                    break;
+                }
             }
         }
     }
-    if symbol.is_empty() || price_s.is_empty() { return Ok(()); }
-    let Ok(p) = price_s.parse::<f64>() else { return Ok(()); };
-    if p <= 0.0 { return Ok(()); }
+    if symbol.is_empty() || price_s.is_empty() {
+        return Ok(());
+    }
+    let Ok(p) = price_s.parse::<f64>() else {
+        return Ok(());
+    };
+    if p <= 0.0 {
+        return Ok(());
+    }
     // Degraded mode: use last price as both bid and ask (see notes above).
     // When we upgrade to depth5/bookTicker streams in a later iteration,
     // this function's signature stays the same — only the decoded struct changes.
@@ -297,8 +340,12 @@ mod tests {
         let t2 = encode_ticker("ETHUSDT", "2100");
         let mut buf = Vec::new();
         // field 1 (items), wire 2: tag = 0x0A
-        buf.push(0x0A); buf.push(t1.len() as u8); buf.extend_from_slice(&t1);
-        buf.push(0x0A); buf.push(t2.len() as u8); buf.extend_from_slice(&t2);
+        buf.push(0x0A);
+        buf.push(t1.len() as u8);
+        buf.extend_from_slice(&t1);
+        buf.push(0x0A);
+        buf.push(t2.len() as u8);
+        buf.extend_from_slice(&t2);
         let mut out = Vec::new();
         decode_mini_tickers_batch(&buf, &mut out).unwrap();
         assert_eq!(out.len(), 2);
@@ -310,15 +357,22 @@ mod tests {
     fn decode_push_wrapper_with_batch() {
         let t1 = encode_ticker("BTCUSDT", "42000");
         let mut batch = Vec::new();
-        batch.push(0x0A); batch.push(t1.len() as u8); batch.extend_from_slice(&t1);
+        batch.push(0x0A);
+        batch.push(t1.len() as u8);
+        batch.extend_from_slice(&t1);
 
         let mut frame = Vec::new();
         // field 1 (channel) string "test"
-        frame.push(0x0A); frame.push(4); frame.extend_from_slice(b"test");
+        frame.push(0x0A);
+        frame.push(4);
+        frame.extend_from_slice(b"test");
         // field 306 wire 2. Tag = (306 << 3) | 2 = 2450 (varint)
         let tag: u32 = (306 << 3) | 2;
         let mut v = tag;
-        while v >= 0x80 { frame.push(((v & 0x7F) | 0x80) as u8); v >>= 7; }
+        while v >= 0x80 {
+            frame.push(((v & 0x7F) | 0x80) as u8);
+            v >>= 7;
+        }
         frame.push(v as u8);
         // length
         frame.push(batch.len() as u8);

@@ -28,11 +28,7 @@ use crate::types::{now_ns, Price, Qty, Venue};
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const ENDPOINT: &str = "https://api.mexc.com/api/v3/ticker/bookTicker";
 
-pub async fn run(
-    universe: Arc<SymbolUniverse>,
-    stale:    Arc<StaleTable>,
-    store:    Arc<BookStore>,
-) {
+pub async fn run(universe: Arc<SymbolUniverse>, stale: Arc<StaleTable>, store: Arc<BookStore>) {
     let http = reqwest::Client::builder()
         .user_agent("scanner/0.1 mexc-spot-rest")
         .timeout(Duration::from_secs(10))
@@ -48,7 +44,10 @@ pub async fn run(
         match poll_once(&http, &universe, &stale, &store).await {
             Ok(n) => {
                 if consecutive_fails > 0 {
-                    info!(venue = "mexc-spot", "recovered after {} failures", consecutive_fails);
+                    info!(
+                        venue = "mexc-spot",
+                        "recovered after {} failures", consecutive_fails
+                    );
                     consecutive_fails = 0;
                 }
                 debug!(venue = "mexc-spot", updated = n, "poll ok");
@@ -56,7 +55,12 @@ pub async fn run(
             Err(e) => {
                 consecutive_fails = consecutive_fails.saturating_add(1);
                 if consecutive_fails == 1 || consecutive_fails % 30 == 0 {
-                    warn!(venue = "mexc-spot", fails = consecutive_fails, "poll fail: {}", e);
+                    warn!(
+                        venue = "mexc-spot",
+                        fails = consecutive_fails,
+                        "poll fail: {}",
+                        e
+                    );
                 }
             }
         }
@@ -66,22 +70,22 @@ pub async fn run(
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 struct Entry {
-    symbol:    String,
+    symbol: String,
     #[serde(rename = "bidPrice", default)]
     bid_price: String,
     #[serde(rename = "askPrice", default)]
     ask_price: String,
-    #[serde(rename = "bidQty",   default)]
-    bid_qty:   String,
-    #[serde(rename = "askQty",   default)]
-    ask_qty:   String,
+    #[serde(rename = "bidQty", default)]
+    bid_qty: String,
+    #[serde(rename = "askQty", default)]
+    ask_qty: String,
 }
 
 async fn poll_once(
-    http:     &reqwest::Client,
+    http: &reqwest::Client,
     universe: &SymbolUniverse,
-    stale:    &StaleTable,
-    store:    &BookStore,
+    stale: &StaleTable,
+    store: &BookStore,
 ) -> Result<u32, String> {
     let t0 = std::time::Instant::now();
     let resp = http.get(ENDPOINT).send().await.map_err(|e| e.to_string())?;
@@ -93,22 +97,29 @@ async fn poll_once(
 
     // MEXC returns EITHER an array of entries OR a single object if `symbol`
     // is passed as query. Here we call with no query so we expect an array.
-    let v: sonic_rs::Value = sonic_rs::from_str(&text)
-        .map_err(|e| format!("parse: {}", e))?;
+    let v: sonic_rs::Value = sonic_rs::from_str(&text).map_err(|e| format!("parse: {}", e))?;
     let arr = v.as_array().ok_or("not array")?;
 
     let ts = now_ns();
     let mut n = 0u32;
     for entry in arr.iter() {
-        let obj = match entry.as_object() { Some(o) => o, None => continue };
-        let sym = match obj.get(&"symbol").and_then(|x| x.as_str()) { Some(s) => s, None => continue };
+        let obj = match entry.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        let sym = match obj.get(&"symbol").and_then(|x| x.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
         let bid_s = obj.get(&"bidPrice").and_then(|x| x.as_str()).unwrap_or("0");
         let ask_s = obj.get(&"askPrice").and_then(|x| x.as_str()).unwrap_or("0");
         let bqty_s = obj.get(&"bidQty").and_then(|x| x.as_str()).unwrap_or("0");
         let aqty_s = obj.get(&"askQty").and_then(|x| x.as_str()).unwrap_or("0");
         let bid = bid_s.parse::<f64>().unwrap_or(0.0);
         let ask = ask_s.parse::<f64>().unwrap_or(0.0);
-        if bid <= 0.0 || ask <= 0.0 { continue; }
+        if bid <= 0.0 || ask <= 0.0 {
+            continue;
+        }
 
         if let Some(sym_id) = universe.lookup(Venue::MexcSpot, sym) {
             store.slot(Venue::MexcSpot, sym_id).commit(

@@ -34,16 +34,16 @@ use crate::types::{now_ns, Price, Qty, Venue};
 
 pub struct XtFutAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub vol:      Arc<crate::broadcast::VolStore>,
-    pub url:      String,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub vol: Arc<crate::broadcast::VolStore>,
+    pub url: String,
 }
 
 impl XtFutAdapter {
     pub fn new(
         universe: Arc<SymbolUniverse>,
-        stale:    Arc<crate::spread::engine::StaleTable>,
-        vol:      Arc<crate::broadcast::VolStore>,
+        stale: Arc<crate::spread::engine::StaleTable>,
+        vol: Arc<crate::broadcast::VolStore>,
     ) -> Self {
         Self {
             universe,
@@ -56,7 +56,9 @@ impl XtFutAdapter {
 
 #[async_trait]
 impl Adapter for XtFutAdapter {
-    fn venue(&self) -> Venue { Venue::XtFut }
+    fn venue(&self) -> Venue {
+        Venue::XtFut
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let backoff = BackoffPolicy::STANDARD;
@@ -79,27 +81,37 @@ impl XtFutAdapter {
         use http::Uri;
         use tokio_websockets::{ClientBuilder, Message};
 
-        let uri: Uri = self.url.parse()
+        let uri: Uri = self
+            .url
+            .parse()
             .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
         info!(venue = "xt-fut", "connecting");
 
         let (mut client, _) = ClientBuilder::from_uri(uri)
-            .connect().await
+            .connect()
+            .await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
         // Subscribe: each symbol depth@5 channel (top-of-book from level-5
         // snapshot). Batch size 50 to stay well under XT's per-connection
         // depth subscription rate limit.
         let xt_symbols: Vec<String> = self.universe.per_venue[Venue::XtFut.idx()]
-            .keys().cloned().collect();
+            .keys()
+            .cloned()
+            .collect();
         for chunk in xt_symbols.chunks(50) {
             let params: Vec<String> = chunk.iter().map(|s| format!("depth@{},5", s)).collect();
             let sub = format!(
                 r#"{{"method":"subscribe","params":[{}],"id":"{}"}}"#,
-                params.iter().map(|p| format!("\"{}\"", p)).collect::<Vec<_>>().join(","),
+                params
+                    .iter()
+                    .map(|p| format!("\"{}\"", p))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 now_ns(),
             );
-            client.send(Message::text(sub))
+            client
+                .send(Message::text(sub))
                 .await
                 .map_err(|e| Error::WebSocket(format!("subscribe: {}", e)))?;
         }
@@ -164,17 +176,25 @@ where
     // XT futures depth@{sym},5 frame — same shape as spot:
     //   {"topic":"depth","event":"depth@btc_usdt,5",
     //    "data":{"s":"btc_usdt","b":[["px","qty"], ...],"a":[["px","qty"], ...]}}
-    let s_lv = sonic_rs::get(json, &["data", "s"])
-        .map_err(|e| Error::Decode(format!("data.s: {}", e)))?;
-    let sym = s_lv.as_str().ok_or_else(|| Error::Decode("data.s not str".into()))?;
+    let s_lv =
+        sonic_rs::get(json, &["data", "s"]).map_err(|e| Error::Decode(format!("data.s: {}", e)))?;
+    let sym = s_lv
+        .as_str()
+        .ok_or_else(|| Error::Decode("data.s not str".into()))?;
 
     let bid_s = sonic_rs::get(json, sonic_rs::pointer!["data", "b", 0, 0])
-        .ok().and_then(|lv| lv.as_str().map(|s| s.to_string())).unwrap_or_default();
+        .ok()
+        .and_then(|lv| lv.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     let ask_s = sonic_rs::get(json, sonic_rs::pointer!["data", "a", 0, 0])
-        .ok().and_then(|lv| lv.as_str().map(|s| s.to_string())).unwrap_or_default();
+        .ok()
+        .and_then(|lv| lv.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
     let bid_f = bid_s.parse::<f64>().unwrap_or(0.0);
     let ask_f = ask_s.parse::<f64>().unwrap_or(0.0);
-    if bid_f <= 0.0 || ask_f <= 0.0 { return Ok(()); }
+    if bid_f <= 0.0 || ask_f <= 0.0 {
+        return Ok(());
+    }
     f(sym, Price::from_f64(bid_f), Price::from_f64(ask_f));
     Ok(())
 }

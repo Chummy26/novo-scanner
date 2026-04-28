@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
     response::{IntoResponse, Json},
     routing::get,
     Router,
@@ -32,21 +35,21 @@ use crate::types::{now_ns, SymbolId, Venue};
 #[derive(Clone)]
 pub struct BroadcastState {
     /// Most recent snapshot of opportunities, cached for REST /opportunities.
-    pub latest:  Arc<RwLock<Vec<OpportunityDto>>>,
+    pub latest: Arc<RwLock<Vec<OpportunityDto>>>,
     /// Channel over which spread engine publishes each new snapshot.
-    pub tx:      broadcast::Sender<Arc<Vec<OpportunityDto>>>,
+    pub tx: broadcast::Sender<Arc<Vec<OpportunityDto>>>,
     /// Per-venue status (populated by adapters).
-    pub status:  Arc<RwLock<VenueStatus>>,
+    pub status: Arc<RwLock<VenueStatus>>,
     /// Per-symbol ring buffer of past opportunities.
     pub history: Arc<RwLock<HistoryStore>>,
     /// Optional references used by the /api/spread/status handler to compute
     /// real-time venue health (active/stale symbols). Populated at startup
     /// by the runtime wiring.
     pub universe: Option<Arc<SymbolUniverse>>,
-    pub store:    Option<Arc<BookStore>>,
-    pub stale:    Option<Arc<StaleTable>>,
+    pub store: Option<Arc<BookStore>>,
+    pub stale: Option<Arc<StaleTable>>,
     pub counters: Option<Arc<ScanCounters>>,
-    pub vol:      Option<Arc<crate::broadcast::VolStore>>,
+    pub vol: Option<Arc<crate::broadcast::VolStore>>,
     /// Broadcaster de `Recommendation` (ADR-026, Wave T). `None` em testes
     /// ou quando scanner roda sem pipeline ML. Injetado por `with_ml_broadcaster`.
     pub ml_broadcaster: Option<RecommendationBroadcaster>,
@@ -62,12 +65,12 @@ pub struct VenueStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VenueHealth {
-    pub venue:       String,
-    pub market:      String,
-    pub connected:   bool,
+    pub venue: String,
+    pub market: String,
+    pub connected: bool,
     pub last_frame_age_ms: u64,
     pub active_symbols: u32,
-    pub stale_symbols:  u32,
+    pub stale_symbols: u32,
 }
 
 impl BroadcastState {
@@ -76,13 +79,13 @@ impl BroadcastState {
         Self {
             latest: Arc::new(RwLock::new(Vec::new())),
             tx,
-            status:   Arc::new(RwLock::new(VenueStatus::default())),
-            history:  Arc::new(RwLock::new(HistoryStore::new(512))),
+            status: Arc::new(RwLock::new(VenueStatus::default())),
+            history: Arc::new(RwLock::new(HistoryStore::new(512))),
             universe: None,
-            store:    None,
-            stale:    None,
+            store: None,
+            stale: None,
             counters: None,
-            vol:      None,
+            vol: None,
             ml_broadcaster: None,
         }
     }
@@ -91,16 +94,16 @@ impl BroadcastState {
     pub fn with_refs(
         mut self,
         universe: Arc<SymbolUniverse>,
-        store:    Arc<BookStore>,
-        stale:    Arc<StaleTable>,
+        store: Arc<BookStore>,
+        stale: Arc<StaleTable>,
         counters: Arc<ScanCounters>,
-        vol:      Arc<crate::broadcast::VolStore>,
+        vol: Arc<crate::broadcast::VolStore>,
     ) -> Self {
         self.universe = Some(universe);
-        self.store    = Some(store);
-        self.stale    = Some(stale);
+        self.store = Some(store);
+        self.stale = Some(stale);
         self.counters = Some(counters);
-        self.vol      = Some(vol);
+        self.vol = Some(vol);
         self
     }
 
@@ -130,12 +133,15 @@ impl BroadcastState {
 }
 
 pub async fn serve(
-    addr:         impl Into<SocketAddr>,
-    state:        BroadcastState,
+    addr: impl Into<SocketAddr>,
+    state: BroadcastState,
     frontend_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let addr: SocketAddr = addr.into();
-    let cors = CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any);
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
 
     let mut app = Router::new()
         .route("/ws", get(ws_handler))
@@ -143,43 +149,43 @@ pub async fn serve(
         .route("/ws/ml/recommendations", get(ws_ml_recommendations))
         .route("/api/ml/recommendations/status", get(rest_ml_rec_status))
         .route("/api/spread/opportunities", get(rest_opportunities))
-        .route("/api/spread/status",        get(rest_status))
+        .route("/api/spread/status", get(rest_status))
         .route("/api/spread/history/:symbol", get(rest_history))
-        .route("/api/spread/debug",           get(rest_debug))
-        .route("/metrics",                  get(rest_metrics))
-        .route("/healthz",                  get(healthz))
+        .route("/api/spread/debug", get(rest_debug))
+        .route("/metrics", get(rest_metrics))
+        .route("/healthz", get(healthz))
         // Dev auth bypass: frontend's login screen calls these; we return
         // fabricated success so the dashboard opens without a real backend.
         // Do NOT enable in a production deployment — this is for the scanner
         // running on localhost alongside the existing SPA.
-        .route("/auth/login",               axum::routing::post(auth_login))
-        .route("/auth/register",            axum::routing::post(auth_login))
-        .route("/auth/profile",             get(auth_profile))
-        .route("/auth/me",                  get(auth_profile))
-        .route("/auth/otp/verify",          axum::routing::post(auth_otp_verify))
-        .route("/auth/otp/request",         axum::routing::post(auth_otp_request))
-        .route("/auth/otp/resend",          axum::routing::post(auth_otp_request))
-        .route("/auth/refresh",             axum::routing::post(auth_login))
-        .route("/auth/logout",              axum::routing::post(auth_empty_vec))
+        .route("/auth/login", axum::routing::post(auth_login))
+        .route("/auth/register", axum::routing::post(auth_login))
+        .route("/auth/profile", get(auth_profile))
+        .route("/auth/me", get(auth_profile))
+        .route("/auth/otp/verify", axum::routing::post(auth_otp_verify))
+        .route("/auth/otp/request", axum::routing::post(auth_otp_request))
+        .route("/auth/otp/resend", axum::routing::post(auth_otp_request))
+        .route("/auth/refresh", axum::routing::post(auth_login))
+        .route("/auth/logout", axum::routing::post(auth_empty_vec))
         .route("/auth/users/:id/permissions", get(auth_empty_vec))
-        .route("/auth/users/:id/roles",       get(auth_empty_vec))
-        .route("/auth/roles",                 get(auth_empty_vec))
-        .route("/auth/permissions",           get(auth_empty_vec))
-        .route("/auth/users",                 get(auth_empty_vec))
+        .route("/auth/users/:id/roles", get(auth_empty_vec))
+        .route("/auth/roles", get(auth_empty_vec))
+        .route("/auth/permissions", get(auth_empty_vec))
+        .route("/auth/users", get(auth_empty_vec))
         // Notifications: REST list + WS channel. The UI subscribes at login and
         // blocks rendering the side-nav until at least the handshake succeeds.
-        .route("/notifications",              get(auth_empty_vec))
-        .route("/notifications/ws",           get(notifications_ws))
+        .route("/notifications", get(auth_empty_vec))
+        .route("/notifications/ws", get(notifications_ws))
         // Finance widgets (account / bankrolls / balances). Return empty sets
         // so the dashboard renders even without a real finance backend.
-        .route("/finance/bankrolls",          get(auth_empty_vec))
-        .route("/finance/balances",           get(auth_empty_obj))
-        .route("/finance/transactions",       get(auth_empty_vec))
-        .route("/finance/exchanges",          get(auth_empty_vec))
+        .route("/finance/bankrolls", get(auth_empty_vec))
+        .route("/finance/balances", get(auth_empty_obj))
+        .route("/finance/transactions", get(auth_empty_vec))
+        .route("/finance/exchanges", get(auth_empty_vec))
         // Catch-all API placeholder: any /api/* that we don't know yet returns
         // [] instead of falling through to the SPA index, which the axios
         // consumer would try to JSON.parse and throw on.
-        .route("/api/*rest",                  get(auth_empty_vec))
+        .route("/api/*rest", get(auth_empty_vec))
         .with_state(state);
 
     if let Some(dir) = frontend_dir {
@@ -193,24 +199,24 @@ pub async fn serve(
             // status, which browsers then render as an error page. We roll a
             // minimal handler that reads the file and returns 200.
             let index_path: std::path::PathBuf = dir.join("index.html");
-            let serve_dir = ServeDir::new(&dir).fallback(
-                axum::routing::any(move || {
-                    let path = index_path.clone();
-                    async move {
-                        match tokio::fs::read(&path).await {
-                            Ok(bytes) => (
-                                http::StatusCode::OK,
-                                [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                                bytes,
-                            ).into_response(),
-                            Err(_) => (
-                                http::StatusCode::INTERNAL_SERVER_ERROR,
-                                "index.html not found",
-                            ).into_response(),
-                        }
+            let serve_dir = ServeDir::new(&dir).fallback(axum::routing::any(move || {
+                let path = index_path.clone();
+                async move {
+                    match tokio::fs::read(&path).await {
+                        Ok(bytes) => (
+                            http::StatusCode::OK,
+                            [(http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                            bytes,
+                        )
+                            .into_response(),
+                        Err(_) => (
+                            http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "index.html not found",
+                        )
+                            .into_response(),
                     }
-                })
-            );
+                }
+            }));
             app = app.fallback_service(serve_dir);
         } else {
             warn!(dir = %dir.display(), "frontend_dir not a directory — serving backend only");
@@ -220,8 +226,12 @@ pub async fn serve(
     let app = app.layer(cors);
 
     info!("broadcast server listening on {}", addr);
-    let listener = tokio::net::TcpListener::bind(addr).await.map_err(crate::error::Error::Io)?;
-    axum::serve(listener, app).await.map_err(|e| crate::error::Error::Other(e.to_string()))?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(crate::error::Error::Io)?;
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| crate::error::Error::Other(e.to_string()))?;
     Ok(())
 }
 
@@ -240,7 +250,9 @@ async fn handle_socket(mut socket: WebSocket, state: BroadcastState) {
         let latest = state.latest.read().clone();
         if !latest.is_empty() {
             let msg = scanner_frame(&latest);
-            if socket.send(Message::Text(msg)).await.is_err() { return; }
+            if socket.send(Message::Text(msg)).await.is_err() {
+                return;
+            }
         }
     }
 
@@ -285,32 +297,40 @@ async fn handle_socket(mut socket: WebSocket, state: BroadcastState) {
 fn scanner_frame(dtos: &[OpportunityDto]) -> String {
     let ts = chrono_iso_now();
     // Transform ages ms → seconds to match the frontend's expectation.
-    let data: Vec<serde_json::Value> = dtos.iter().map(|d| serde_json::json!({
-        "id":            d.id,
-        "symbol":        d.symbol,
-        "current":       d.current,
-        "buyFrom":       d.buy_from,
-        "sellTo":        d.sell_to,
-        "buyType":       d.buy_type,
-        "sellType":      d.sell_type,
-        "buyPrice":      d.buy_price,
-        "sellPrice":     d.sell_price,
-        "entrySpread":   d.entry_spread,
-        "exitSpread":    d.exit_spread,
-        "buyVol24":      d.buy_vol24,
-        "sellVol24":     d.sell_vol24,
-        "buyBookAge":    (d.buy_book_age  as f64) / 1000.0,
-        "sellBookAge":   (d.sell_book_age as f64) / 1000.0,
-    })).collect();
+    let data: Vec<serde_json::Value> = dtos
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "id":            d.id,
+                "symbol":        d.symbol,
+                "current":       d.current,
+                "buyFrom":       d.buy_from,
+                "sellTo":        d.sell_to,
+                "buyType":       d.buy_type,
+                "sellType":      d.sell_type,
+                "buyPrice":      d.buy_price,
+                "sellPrice":     d.sell_price,
+                "entrySpread":   d.entry_spread,
+                "exitSpread":    d.exit_spread,
+                "buyVol24":      d.buy_vol24,
+                "sellVol24":     d.sell_vol24,
+                "buyBookAge":    (d.buy_book_age  as f64) / 1000.0,
+                "sellBookAge":   (d.sell_book_age as f64) / 1000.0,
+            })
+        })
+        .collect();
     serde_json::json!({
         "timestamp": ts,
         "data":      data,
-    }).to_string()
+    })
+    .to_string()
 }
 
 fn chrono_iso_now() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     // RFC3339 epoch-seconds + milliseconds; good enough for the frontend's
     // `Date.parse`.
     let secs = d.as_secs() as i64;
@@ -323,10 +343,13 @@ fn iso8601_from_secs(secs: i64, ms: u32) -> String {
     // Very small civil-from-days: good for epoch > 1970. Sufficient here.
     let (date_days, time_secs) = (secs.div_euclid(86400), secs.rem_euclid(86400));
     let (y, m, d) = civil_from_days(date_days);
-    let h  =  time_secs / 3600;
-    let mi = (time_secs %  3600) / 60;
-    let s  =  time_secs %    60;
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", y, m, d, h, mi, s, ms)
+    let h = time_secs / 3600;
+    let mi = (time_secs % 3600) / 60;
+    let s = time_secs % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        y, m, d, h, mi, s, ms
+    )
 }
 
 // Howard Hinnant's `civil_from_days` algorithm (public domain).
@@ -334,11 +357,11 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as i64;
-    let yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
-    let doy = doe - (365*yoe + yoe/4 - yoe/100);
-    let mp = (5*doy + 2) / 153;
-    let d = doy - (153*mp+2)/5 + 1;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y as i32, m as u32, d as u32)
@@ -447,36 +470,47 @@ async fn rest_status(State(state): State<BroadcastState>) -> impl IntoResponse {
     Json(status)
 }
 
-fn compute_status(
-    universe: &SymbolUniverse,
-    store:    &BookStore,
-    stale:    &StaleTable,
-) -> VenueStatus {
+fn compute_status(universe: &SymbolUniverse, store: &BookStore, stale: &StaleTable) -> VenueStatus {
     let now = now_ns();
-    let mut venues: Vec<VenueHealth> = Venue::ALL.iter().map(|&v| {
-        let mut active = 0u32;
-        let mut stale_cnt = 0u32;
-        let mut min_age_ms: u64 = u64::MAX;
-        for i in 0..universe.len() {
-            let id = SymbolId(i as u32);
-            if !universe.coverage[i][v.idx()] { continue; }
-            let slot = store.slot(v, id);
-            if slot.is_uninitialized() { continue; }
-            active += 1;
-            let cell = stale.cell(v, id);
-            if crate::spread::staleness::is_stale_for(v, cell, now) { stale_cnt += 1; }
-            let age = cell.age_ms(now);
-            if age < min_age_ms { min_age_ms = age; }
-        }
-        VenueHealth {
-            venue:  v.as_str().to_string(),
-            market: v.market().as_str().to_string(),
-            connected: active > 0,
-            last_frame_age_ms: if min_age_ms == u64::MAX { 0 } else { min_age_ms },
-            active_symbols: active,
-            stale_symbols:  stale_cnt,
-        }
-    }).collect();
+    let mut venues: Vec<VenueHealth> = Venue::ALL
+        .iter()
+        .map(|&v| {
+            let mut active = 0u32;
+            let mut stale_cnt = 0u32;
+            let mut min_age_ms: u64 = u64::MAX;
+            for i in 0..universe.len() {
+                let id = SymbolId(i as u32);
+                if !universe.coverage[i][v.idx()] {
+                    continue;
+                }
+                let slot = store.slot(v, id);
+                if slot.is_uninitialized() {
+                    continue;
+                }
+                active += 1;
+                let cell = stale.cell(v, id);
+                if crate::spread::staleness::is_stale_for(v, cell, now) {
+                    stale_cnt += 1;
+                }
+                let age = cell.age_ms(now);
+                if age < min_age_ms {
+                    min_age_ms = age;
+                }
+            }
+            VenueHealth {
+                venue: v.as_str().to_string(),
+                market: v.market().as_str().to_string(),
+                connected: active > 0,
+                last_frame_age_ms: if min_age_ms == u64::MAX {
+                    0
+                } else {
+                    min_age_ms
+                },
+                active_symbols: active,
+                stale_symbols: stale_cnt,
+            }
+        })
+        .collect();
     venues.sort_by(|a, b| a.venue.cmp(&b.venue).then(a.market.cmp(&b.market)));
     VenueStatus {
         venues,
@@ -497,10 +531,18 @@ async fn rest_history(
 /// the scan engine (why candidates were dropped) and the top-5 spread
 /// candidates that made it into `latest`.
 async fn rest_debug(State(state): State<BroadcastState>) -> impl IntoResponse {
-    let counters = state.counters.as_ref().map(|c| c.snapshot()).unwrap_or_default();
+    let counters = state
+        .counters
+        .as_ref()
+        .map(|c| c.snapshot())
+        .unwrap_or_default();
     let latest = state.latest.read().clone();
     let mut top: Vec<OpportunityDto> = latest.clone();
-    top.sort_by(|a, b| b.entry_spread.partial_cmp(&a.entry_spread).unwrap_or(std::cmp::Ordering::Equal));
+    top.sort_by(|a, b| {
+        b.entry_spread
+            .partial_cmp(&a.entry_spread)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     top.truncate(20);
     let histogram: Vec<(String, usize)> = {
         let buckets = [0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0];
@@ -514,10 +556,18 @@ async fn rest_debug(State(state): State<BroadcastState>) -> impl IntoResponse {
                     break;
                 }
             }
-            if !placed { counts[buckets.len()] += 1; }
+            if !placed {
+                counts[buckets.len()] += 1;
+            }
         }
-        let labels = ["<0.2", "<0.5", "<1", "<2", "<5", "<10", "<25", "<50", "<100", ">=100"];
-        labels.iter().zip(counts.iter()).map(|(l, c)| (l.to_string(), *c)).collect()
+        let labels = [
+            "<0.2", "<0.5", "<1", "<2", "<5", "<10", "<25", "<50", "<100", ">=100",
+        ];
+        labels
+            .iter()
+            .zip(counts.iter())
+            .map(|(l, c)| (l.to_string(), *c))
+            .collect()
     };
     Json(serde_json::json!({
         "counters":          counters,
@@ -540,7 +590,9 @@ async fn rest_debug(State(state): State<BroadcastState>) -> impl IntoResponse {
     }))
 }
 
-async fn healthz() -> &'static str { "ok" }
+async fn healthz() -> &'static str {
+    "ok"
+}
 
 // ---- Dev auth bypass: all handlers return a fabricated authenticated user ----
 //
@@ -550,7 +602,7 @@ async fn healthz() -> &'static str { "ok" }
 
 fn dev_jwt() -> String {
     use base64::Engine;
-    let header  = r#"{"alg":"HS256","typ":"JWT"}"#;
+    let header = r#"{"alg":"HS256","typ":"JWT"}"#;
     let payload = serde_json::json!({
         "sub":            "1",
         "email":          "dev@localhost",
@@ -563,7 +615,8 @@ fn dev_jwt() -> String {
         "nbf":            1_700_000_000u64,
         "permissions":    ["*", "scanner.view", "scanner.manage"],
         "roles":          ["admin"],
-    }).to_string();
+    })
+    .to_string();
     let signature = b"dev-bypass-signature-not-verified";
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     format!(
@@ -706,7 +759,11 @@ async fn rest_metrics() -> impl IntoResponse {
     let mut buf = Vec::new();
     let mf = metrics.registry.gather();
     if encoder.encode(&mf, &mut buf).is_err() {
-        return (http::StatusCode::INTERNAL_SERVER_ERROR, "encode error".to_string()).into_response();
+        return (
+            http::StatusCode::INTERNAL_SERVER_ERROR,
+            "encode error".to_string(),
+        )
+            .into_response();
     }
     // Append HdrHistogram summaries manually (prometheus crate doesn't know about them).
     let mut extra = String::new();
@@ -717,7 +774,8 @@ async fn rest_metrics() -> impl IntoResponse {
                     "# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns\n\
                      # TYPE scanner_ingest_latency_ns_p99 gauge\n\
                      scanner_ingest_latency_ns_p99{{venue=\"{}\"}} {}\n",
-                    v.as_str(), h.value_at_quantile(0.99)
+                    v.as_str(),
+                    h.value_at_quantile(0.99)
                 ));
             }
         }

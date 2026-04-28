@@ -25,12 +25,15 @@ const BINGX_FUT_SUBS_PER_CONN: usize = 200; // same as spot, conservative
 
 pub struct BingxFutAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub url:      String,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub url: String,
 }
 
 impl BingxFutAdapter {
-    pub fn new(universe: Arc<SymbolUniverse>, stale: Arc<crate::spread::engine::StaleTable>) -> Self {
+    pub fn new(
+        universe: Arc<SymbolUniverse>,
+        stale: Arc<crate::spread::engine::StaleTable>,
+    ) -> Self {
         Self {
             universe,
             stale,
@@ -41,18 +44,25 @@ impl BingxFutAdapter {
 
 #[async_trait]
 impl Adapter for BingxFutAdapter {
-    fn venue(&self) -> Venue { Venue::BingxFut }
+    fn venue(&self) -> Venue {
+        Venue::BingxFut
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let all: Vec<String> = self.universe.per_venue[Venue::BingxFut.idx()]
-            .keys().cloned().collect();
+            .keys()
+            .cloned()
+            .collect();
         if all.is_empty() {
             warn!("bingx-fut: no symbols in universe; adapter idle");
             futures::future::pending::<()>().await;
             return Ok(());
         }
-        info!("bingx-fut: sharding {} symbols into {} conns",
-              all.len(), (all.len() + BINGX_FUT_SUBS_PER_CONN - 1) / BINGX_FUT_SUBS_PER_CONN);
+        info!(
+            "bingx-fut: sharding {} symbols into {} conns",
+            all.len(),
+            (all.len() + BINGX_FUT_SUBS_PER_CONN - 1) / BINGX_FUT_SUBS_PER_CONN
+        );
 
         let mut handles = Vec::new();
         for (i, chunk) in all.chunks(BINGX_FUT_SUBS_PER_CONN).enumerate() {
@@ -78,35 +88,45 @@ impl Adapter for BingxFutAdapter {
             });
             handles.push(h);
         }
-        for h in handles { let _ = h.await; }
+        for h in handles {
+            let _ = h.await;
+        }
         Ok(())
     }
 }
 
 async fn run_shard(
-    url:      &str,
-    symbols:  &[String],
+    url: &str,
+    symbols: &[String],
     universe: &SymbolUniverse,
-    stale:    &crate::spread::engine::StaleTable,
-    store:    &BookStore,
+    stale: &crate::spread::engine::StaleTable,
+    store: &BookStore,
 ) -> Result<()> {
     use http::Uri;
     use tokio_websockets::{ClientBuilder, Message};
 
-    let uri: Uri = url.parse()
+    let uri: Uri = url
+        .parse()
         .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
-    info!(venue = "bingx-fut", syms = symbols.len(), "connecting shard");
+    info!(
+        venue = "bingx-fut",
+        syms = symbols.len(),
+        "connecting shard"
+    );
 
     let (mut client, _) = ClientBuilder::from_uri(uri)
-        .connect().await
+        .connect()
+        .await
         .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
     for sym in symbols {
         let sub = format!(
             r#"{{"id":"{}","reqType":"sub","dataType":"{}@bookTicker"}}"#,
-            now_ns(), sym
+            now_ns(),
+            sym
         );
-        client.send(Message::text(sub))
+        client
+            .send(Message::text(sub))
             .await
             .map_err(|e| Error::WebSocket(format!("subscribe: {}", e)))?;
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -170,17 +190,25 @@ fn parse_and_apply<F>(json: &str, f: F) -> Result<()>
 where
     F: FnOnce(&str, Price, Price),
 {
-    let Ok(sym_lv) = sonic_rs::get(json, &["data", "s"]) else { return Ok(()); };
-    let Some(sym) = sym_lv.as_str() else { return Ok(()); };
+    let Ok(sym_lv) = sonic_rs::get(json, &["data", "s"]) else {
+        return Ok(());
+    };
+    let Some(sym) = sym_lv.as_str() else {
+        return Ok(());
+    };
 
     let b = sonic_rs::get(json, &["data", "b"])
         .map_err(|e| Error::Decode(format!("data.b: {}", e)))?
-        .as_str().ok_or_else(|| Error::Decode("data.b not str".into()))?
-        .parse::<f64>().map_err(|_| Error::Decode("data.b f64".into()))?;
+        .as_str()
+        .ok_or_else(|| Error::Decode("data.b not str".into()))?
+        .parse::<f64>()
+        .map_err(|_| Error::Decode("data.b f64".into()))?;
     let a = sonic_rs::get(json, &["data", "a"])
         .map_err(|e| Error::Decode(format!("data.a: {}", e)))?
-        .as_str().ok_or_else(|| Error::Decode("data.a not str".into()))?
-        .parse::<f64>().map_err(|_| Error::Decode("data.a f64".into()))?;
+        .as_str()
+        .ok_or_else(|| Error::Decode("data.a not str".into()))?
+        .parse::<f64>()
+        .map_err(|_| Error::Decode("data.a f64".into()))?;
     f(sym, Price::from_f64(b), Price::from_f64(a));
     Ok(())
 }

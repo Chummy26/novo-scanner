@@ -24,55 +24,90 @@ impl MexcDiscoverer {
     fn url(&self) -> &'static str {
         match self.venue {
             Venue::MexcSpot => "https://api.mexc.com/api/v3/exchangeInfo",
-            Venue::MexcFut  => "https://contract.mexc.com/api/v1/contract/detail",
+            Venue::MexcFut => "https://contract.mexc.com/api/v1/contract/detail",
             _ => unreachable!(),
         }
     }
 }
 
 #[derive(Debug, Deserialize)]
-struct SpotExchangeInfo { symbols: Vec<SpotSymbol> }
+struct SpotExchangeInfo {
+    symbols: Vec<SpotSymbol>,
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SpotSymbol { symbol: String, #[serde(default)] status: String }
+struct SpotSymbol {
+    symbol: String,
+    #[serde(default)]
+    status: String,
+}
 
 #[derive(Debug, Deserialize)]
-struct FutResp { data: Vec<FutContract> }
+struct FutResp {
+    data: Vec<FutContract>,
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FutContract {
     symbol: String,
     #[serde(default)]
-    state: i32,  // 0 = enabled typically
+    state: i32, // 0 = enabled typically
 }
 
 #[async_trait]
 impl Discoverer for MexcDiscoverer {
-    fn venue(&self) -> Venue { self.venue }
+    fn venue(&self) -> Venue {
+        self.venue
+    }
 
     async fn fetch(&self, http: &reqwest::Client) -> Result<Vec<VenueSymbol>> {
         let mut out = Vec::new();
         match self.venue {
             Venue::MexcSpot => {
-                let resp: SpotExchangeInfo = http.get(self.url())
-                    .send().await?.error_for_status()?.json().await?;
+                let resp: SpotExchangeInfo = http
+                    .get(self.url())
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
                 for s in resp.symbols {
-                    if s.status != "1" && s.status.to_ascii_uppercase() != "ENABLED" && !s.status.is_empty() {
+                    if s.status != "1"
+                        && s.status.to_ascii_uppercase() != "ENABLED"
+                        && !s.status.is_empty()
+                    {
                         // MEXC uses "1" for enabled in some versions; be lenient.
-                        if !matches!(s.status.as_str(), "1" | "ENABLED" | "TRADING") { continue; }
+                        if !matches!(s.status.as_str(), "1" | "ENABLED" | "TRADING") {
+                            continue;
+                        }
                     }
                     if let Some(canonical) = normalize::parse(self.venue, &s.symbol) {
-                        out.push(VenueSymbol { venue: self.venue, raw: s.symbol, canonical });
+                        out.push(VenueSymbol {
+                            venue: self.venue,
+                            raw: s.symbol,
+                            canonical,
+                        });
                     }
                 }
             }
             Venue::MexcFut => {
-                let resp: FutResp = http.get(self.url())
-                    .send().await?.error_for_status()?.json().await?;
+                let resp: FutResp = http
+                    .get(self.url())
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
                 for c in resp.data {
-                    if c.state != 0 { continue; }
+                    if c.state != 0 {
+                        continue;
+                    }
                     if let Some(canonical) = normalize::parse(self.venue, &c.symbol) {
-                        out.push(VenueSymbol { venue: self.venue, raw: c.symbol, canonical });
+                        out.push(VenueSymbol {
+                            venue: self.venue,
+                            raw: c.symbol,
+                            canonical,
+                        });
                     }
                 }
             }

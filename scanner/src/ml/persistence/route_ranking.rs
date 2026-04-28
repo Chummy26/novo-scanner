@@ -51,8 +51,7 @@ impl RouteScore {
     /// ordenação estável via `sort_by`. Primary = accept_count (correção Q1);
     /// secondary = candidate_count * (1 + vol).ln_1p() (Q1 desempate).
     pub fn composite(&self) -> (u64, f64) {
-        let secondary =
-            (self.candidate_count_24h as f64) * (1.0 + self.vol24_mean).ln_1p();
+        let secondary = (self.candidate_count_24h as f64) * (1.0 + self.vol24_mean).ln_1p();
         (self.accept_count_24h, secondary)
     }
 }
@@ -124,10 +123,10 @@ impl RouteRanking {
         for bucket in inner.buckets.iter() {
             for (route, stats) in bucket.iter() {
                 let s = agg.entry(*route).or_default();
-                s.accept_count_24h =
-                    s.accept_count_24h.saturating_add(stats.accept_count as u64);
-                s.candidate_count_24h =
-                    s.candidate_count_24h.saturating_add(stats.candidate_count as u64);
+                s.accept_count_24h = s.accept_count_24h.saturating_add(stats.accept_count as u64);
+                s.candidate_count_24h = s
+                    .candidate_count_24h
+                    .saturating_add(stats.candidate_count as u64);
                 if stats.n > 0 {
                     let weighted_sum = stats.vol24_sum;
                     // vol24_mean é running mean de bucket means — suficiente para desempate.
@@ -142,7 +141,9 @@ impl RouteRanking {
         // Divide vol24_mean pelo número de buckets não-vazios desta rota.
         // Aproximação — suficiente para ordenação relativa.
         for (route, score) in agg.iter_mut() {
-            let non_empty_buckets = inner.buckets.iter()
+            let non_empty_buckets = inner
+                .buckets
+                .iter()
                 .filter(|b| b.get(route).map(|s| s.n > 0).unwrap_or(false))
                 .count() as f64;
             if non_empty_buckets > 0.0 {
@@ -164,14 +165,14 @@ impl RouteRanking {
             return HashSet::new();
         }
 
-        let mut scored: Vec<(RouteId, (u64, f64))> = agg
-            .into_iter()
-            .map(|(r, s)| (r, s.composite()))
-            .collect();
+        let mut scored: Vec<(RouteId, (u64, f64))> =
+            agg.into_iter().map(|(r, s)| (r, s.composite())).collect();
         // Sort descendente: primeiro primary (accept_count), depois secondary.
         scored.sort_by(|a, b| {
             b.1 .0.cmp(&a.1 .0).then(
-                b.1 .1.partial_cmp(&a.1 .1).unwrap_or(std::cmp::Ordering::Equal),
+                b.1 .1
+                    .partial_cmp(&a.1 .1)
+                    .unwrap_or(std::cmp::Ordering::Equal),
             )
         });
 
@@ -210,7 +211,8 @@ impl RouteRanking {
         v.sort_by(|a, b| {
             let (pa, sa) = a.1.composite();
             let (pb, sb) = b.1.composite();
-            pb.cmp(&pa).then(sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal))
+            pb.cmp(&pa)
+                .then(sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal))
         });
         v.truncate(k);
         v
@@ -225,8 +227,8 @@ impl Inner {
         }
         // Rolar quantos buckets passaram. Se passaram > BUCKET_COUNT,
         // limpa tudo (gap longo).
-        let buckets_to_advance = ((target - self.current_bucket_start_ns) / BUCKET_NS)
-            .min(BUCKET_COUNT as u64) as usize;
+        let buckets_to_advance =
+            ((target - self.current_bucket_start_ns) / BUCKET_NS).min(BUCKET_COUNT as u64) as usize;
         for _ in 0..buckets_to_advance {
             self.current_idx = (self.current_idx + 1) % BUCKET_COUNT;
             self.buckets[self.current_idx].clear();

@@ -34,7 +34,7 @@ Ver `.claude/skills/spread-arbitrage-strategy/SKILL.md` para a aula conceitual c
 Design decisions e trade-offs registrados na memória de projeto (`project_architecture_decisions.md`, em `~/.claude/projects/.../memory/`). Summary:
 
 - **Runtime**: tokio multi-thread (Windows dev, Linux prod).
-- **WS**: tokio-websockets 0.11 + sha1_smol + native-tls + simd.
+- **WS**: tokio-websockets 0.11 + sha1_smol + rustls/webpki + simd.
 - **JSON**: sonic-rs `get()` returning `LazyValue<'a>` — zero-copy, no DOM.
 - **GZIP**: libdeflater com reusable `Decompressor` + bomb-guard.
 - **Protobuf**: quick-protobuf manual decode (MEXC spot) — sem codegen.
@@ -75,12 +75,12 @@ cargo run --release -- --config config.toml
 | BingX | Spot | JSON + GZIP | per-symbol `@bookTicker` | ⌈n/200⌉ |
 | BingX | Futures | JSON + GZIP | per-symbol `@bookTicker` | ⌈n/200⌉ |
 | Gate | Spot | JSON | `spot.tickers` `!all` | 1 |
-| Gate | Futures | JSON | `futures.tickers` `!all` | 1 |
+| Gate | Futures | JSON | `futures.book_ticker` batched | 1 |
 | Bitget | Spot | JSON | `ticker` batched ≤50/conn | ⌈n/50⌉ |
 | Bitget | Futures | JSON | `ticker` batched ≤50/conn | ⌈n/50⌉ |
 | KuCoin | Spot | JSON | `/market/ticker:all` | 1 |
 | KuCoin | Futures | JSON | `/contractMarket/ticker:all` | 1 |
-| XT | Spot | **GZIP+Base64 app-level** (D-14) | `ticker@{sym}` | 1 |
+| XT | Spot | JSON text (no permessage-deflate advertised) | `depth@{sym},5` | 1 |
 | XT | Futures | JSON | `ticker@{sym}` | 1 |
 
 **Auxiliares (não-WS):**
@@ -91,7 +91,7 @@ cargo run --release -- --config config.toml
 
 - D-04 MEXC spot URL `wbs-api.mexc.com/ws` (era `wbs.mexc.com/ws`, obsoleto desde ago/2025)
 - D-06 MEXC futures é JSON+GZIP, não Protobuf
-- D-14 XT spot é GZIP+Base64 em payload (não WS permessage-deflate)
+- D-14 XT spot atual usa `method=subscribe` + `depth@{sym},5`; manter handshake sem permessage-deflate até o cliente WS suportar descompressão dessa extensão
 - D-16 Bitget v2 para market data (v3 é order placement)
 - D-09 BingX futures ping server = 30s (não 5s como spot)
 - D-13 KuCoin default **OFF** em config (beta status Pro API + não testado)
@@ -115,7 +115,7 @@ Frontend conecta em `ws://localhost:8000/ws/scanner` (confirmado inspecionando b
 
 - **M9.1** fastrace spans com sampling 1% + force-sample >300µs
 - **M9.2** Threading de frame-arrival `Instant` nos adapters → `record_ingest(venue, ns_real)`
-- **M10** Validação wire real em staging (XT GZIP+Base64 vs permessage-deflate, BingX gzip vs zlib magic bytes, clock drift por venue)
+- **M10** Validação wire real em staging (XT handshake sem/acom permessage-deflate, BingX gzip vs zlib magic bytes, clock drift por venue)
 
 ## Done (recent)
 

@@ -15,8 +15,8 @@ use crate::types::{Venue, VENUE_COUNT};
 /// Build the universe once at startup. Returns an Arc shared by adapters +
 /// spread engine.
 pub async fn discover_all(
-    toggles:    &VenueToggles,
-    http:       &reqwest::Client,
+    toggles: &VenueToggles,
+    http: &reqwest::Client,
     discoverers: Vec<Arc<dyn Discoverer>>,
 ) -> Result<Arc<SymbolUniverse>> {
     // Run all enabled discoverers in parallel. Per-venue failures log a
@@ -30,8 +30,12 @@ pub async fn discover_all(
             let v = d.venue();
             match tokio::time::timeout(Duration::from_secs(30), d.fetch(&http)).await {
                 Ok(Ok(syms)) => {
-                    info!(venue = v.as_str(), mkt = v.market().as_str(),
-                          count = syms.len(), "discovery OK");
+                    info!(
+                        venue = v.as_str(),
+                        mkt = v.market().as_str(),
+                        count = syms.len(),
+                        "discovery OK"
+                    );
                     (v, syms)
                 }
                 Ok(Err(e)) => {

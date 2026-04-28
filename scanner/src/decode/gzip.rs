@@ -13,14 +13,14 @@ use libdeflater::{DecompressionError, Decompressor};
 pub struct GzipDecoder {
     decomp: Decompressor,
     /// Reusable output buffer; grown only if a frame exceeds current capacity.
-    out:    Vec<u8>,
+    out: Vec<u8>,
 }
 
 impl GzipDecoder {
     pub fn new(initial_capacity: usize) -> Self {
         Self {
             decomp: Decompressor::new(),
-            out:    Vec::with_capacity(initial_capacity),
+            out: Vec::with_capacity(initial_capacity),
         }
     }
 
@@ -35,7 +35,9 @@ impl GzipDecoder {
         // Empirical rule: decompressed size rarely exceeds 16× compressed for
         // small JSON-like payloads.
         let mut target = self.out.capacity().max(input.len() * 16).min(max_expand);
-        if target < 64 { target = 64; }
+        if target < 64 {
+            target = 64;
+        }
 
         loop {
             if self.out.len() < target {
@@ -145,6 +147,9 @@ mod tests {
         let compressed = gzip_compress(&big);
         let mut d = GzipDecoder::new(64);
         let res = d.decode(&compressed, 1024);
-        assert!(res.is_err(), "max_expand guard should reject oversized output");
+        assert!(
+            res.is_err(),
+            "max_expand guard should reject oversized output"
+        );
     }
 }

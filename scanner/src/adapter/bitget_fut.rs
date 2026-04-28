@@ -23,27 +23,34 @@ use crate::types::{now_ns, Price, Qty, Venue};
 
 pub struct BitgetFutAdapter {
     pub universe: Arc<SymbolUniverse>,
-    pub stale:    Arc<crate::spread::engine::StaleTable>,
-    pub url:      String,
+    pub stale: Arc<crate::spread::engine::StaleTable>,
+    pub url: String,
 }
 
 impl BitgetFutAdapter {
     pub fn new(
         universe: Arc<SymbolUniverse>,
-        stale:    Arc<crate::spread::engine::StaleTable>,
-        mode:     BitgetMode,
+        stale: Arc<crate::spread::engine::StaleTable>,
+        mode: BitgetMode,
     ) -> Self {
         let url = match mode {
-            BitgetMode::V2    => "wss://ws.bitget.com/v2/ws/public",
+            BitgetMode::V2 => "wss://ws.bitget.com/v2/ws/public",
             BitgetMode::V3Uta => "wss://ws.bitget.com/v3/ws/public",
-        }.to_string();
-        Self { universe, stale, url }
+        }
+        .to_string();
+        Self {
+            universe,
+            stale,
+            url,
+        }
     }
 }
 
 #[async_trait]
 impl Adapter for BitgetFutAdapter {
-    fn venue(&self) -> Venue { Venue::BitgetFut }
+    fn venue(&self) -> Venue {
+        Venue::BitgetFut
+    }
 
     async fn run(&self, store: &BookStore) -> Result<()> {
         let backoff = BackoffPolicy::BITGET;
@@ -66,12 +73,15 @@ impl BitgetFutAdapter {
         use http::Uri;
         use tokio_websockets::{ClientBuilder, Message};
 
-        let uri: Uri = self.url.parse()
+        let uri: Uri = self
+            .url
+            .parse()
             .map_err(|e| Error::WebSocket(format!("parse uri: {}", e)))?;
         info!(venue = "bitget-fut", url = %self.url, "connecting");
 
         let (mut client, _) = ClientBuilder::from_uri(uri)
-            .connect().await
+            .connect()
+            .await
             .map_err(|e| Error::WebSocket(format!("connect: {}", e)))?;
 
         // Subscribe in batches of ≤50 channels per subscribe message.
@@ -79,11 +89,18 @@ impl BitgetFutAdapter {
         let raws: Vec<&String> = per_venue_map.keys().collect();
         info!(venue = "bitget-fut", count = raws.len(), "subscribing");
         for chunk in raws.chunks(50) {
-            let args: Vec<String> = chunk.iter().map(|raw|
-                format!(r#"{{"instType":"USDT-FUTURES","channel":"ticker","instId":"{}"}}"#, raw)
-            ).collect();
+            let args: Vec<String> = chunk
+                .iter()
+                .map(|raw| {
+                    format!(
+                        r#"{{"instType":"USDT-FUTURES","channel":"ticker","instId":"{}"}}"#,
+                        raw
+                    )
+                })
+                .collect();
             let msg = format!(r#"{{"op":"subscribe","args":[{}]}}"#, args.join(","));
-            client.send(Message::text(msg))
+            client
+                .send(Message::text(msg))
                 .await
                 .map_err(|e| Error::WebSocket(format!("subscribe: {}", e)))?;
             tokio::time::sleep(Duration::from_millis(80)).await;
@@ -144,22 +161,36 @@ fn parse_and_apply<F>(json: &str, f: F) -> Result<()>
 where
     F: FnOnce(&str, Price, Price),
 {
-    let data_lv = sonic_rs::get(json, &["data"])
-        .map_err(|e| Error::Decode(format!("data: {}", e)))?;
+    let data_lv =
+        sonic_rs::get(json, &["data"]).map_err(|e| Error::Decode(format!("data: {}", e)))?;
     let v: sonic_rs::Value = sonic_rs::from_str(data_lv.as_raw_str())
         .map_err(|e| Error::Decode(format!("parse data: {}", e)))?;
-    let arr = v.as_array().ok_or_else(|| Error::Decode("data not array".into()))?;
-    let Some(entry) = arr.iter().next() else { return Ok(()); };
-    let obj = entry.as_object().ok_or_else(|| Error::Decode("entry not object".into()))?;
-    let sym = obj.get(&"instId").and_then(|x| x.as_str())
+    let arr = v
+        .as_array()
+        .ok_or_else(|| Error::Decode("data not array".into()))?;
+    let Some(entry) = arr.iter().next() else {
+        return Ok(());
+    };
+    let obj = entry
+        .as_object()
+        .ok_or_else(|| Error::Decode("entry not object".into()))?;
+    let sym = obj
+        .get(&"instId")
+        .and_then(|x| x.as_str())
         .ok_or_else(|| Error::Decode("instId".into()))?;
-    let bid = obj.get(&"bidPr").and_then(|x| x.as_str())
+    let bid = obj
+        .get(&"bidPr")
+        .and_then(|x| x.as_str())
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
-    let ask = obj.get(&"askPr").and_then(|x| x.as_str())
+    let ask = obj
+        .get(&"askPr")
+        .and_then(|x| x.as_str())
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
-    if bid <= 0.0 || ask <= 0.0 { return Ok(()); }
+    if bid <= 0.0 || ask <= 0.0 {
+        return Ok(());
+    }
     f(sym, Price::from_f64(bid), Price::from_f64(ask));
     Ok(())
 }

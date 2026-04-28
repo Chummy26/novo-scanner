@@ -68,14 +68,10 @@ impl ModelWindowPolicy {
             return Err("ml.windows.calibration_window_days deve ser > 0".into());
         }
         if self.archive_reference_days < self.train_window_days {
-            return Err(
-                "ml.windows.archive_reference_days deve ser >= train_window_days".into(),
-            );
+            return Err("ml.windows.archive_reference_days deve ser >= train_window_days".into());
         }
         if self.calibration_window_days > self.train_window_days {
-            return Err(
-                "ml.windows.calibration_window_days deve ser <= train_window_days".into(),
-            );
+            return Err("ml.windows.calibration_window_days deve ser <= train_window_days".into());
         }
         Ok(())
     }
@@ -434,8 +430,14 @@ mod tests {
         let report = sweep_datasets(&datasets, &policy, now).unwrap();
 
         assert!(!old_raw.exists(), "raw antigo deveria ser removido");
-        assert!(old_labeled.exists(), "labeled antigo deve sobreviver TTL longo");
-        assert!(recent_raw.exists(), "guard recent hours deve preservar partição atual");
+        assert!(
+            old_labeled.exists(),
+            "labeled antigo deve sobreviver TTL longo"
+        );
+        assert!(
+            recent_raw.exists(),
+            "guard recent hours deve preservar partição atual"
+        );
 
         let raw_report = report
             .datasets

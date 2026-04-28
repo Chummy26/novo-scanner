@@ -26,8 +26,7 @@ pub struct TopOfBookSnapshot {
 impl TopOfBookSnapshot {
     #[inline(always)]
     pub fn is_valid(&self) -> bool {
-        !self.bid_px.is_zero() && !self.ask_px.is_zero()
-            && self.ask_px >= self.bid_px
+        !self.bid_px.is_zero() && !self.ask_px.is_zero() && self.ask_px >= self.bid_px
     }
 }
 
@@ -37,7 +36,7 @@ impl TopOfBookSnapshot {
 #[repr(align(64))]
 pub struct TopOfBook {
     /// Writer-owned sequence counter. Even = committed; odd = write-in-progress.
-    seq:    AtomicU64,
+    seq: AtomicU64,
     bid_px: AtomicU64,
     bid_qty: AtomicU64,
     ask_px: AtomicU64,
@@ -45,8 +44,8 @@ pub struct TopOfBook {
     /// Monotonic ingest sequence (unrelated to seqlock seq).
     seq_ingest: AtomicU64,
     /// Client wall-clock ns at commit time.
-    ts_ns:  AtomicU64,
-    _pad:   [u8; 0],
+    ts_ns: AtomicU64,
+    _pad: [u8; 0],
 }
 
 impl Default for TopOfBook {
@@ -58,14 +57,14 @@ impl Default for TopOfBook {
 impl TopOfBook {
     pub const fn new() -> Self {
         Self {
-            seq:        AtomicU64::new(0),
-            bid_px:     AtomicU64::new(0),
-            bid_qty:    AtomicU64::new(0),
-            ask_px:     AtomicU64::new(0),
-            ask_qty:    AtomicU64::new(0),
+            seq: AtomicU64::new(0),
+            bid_px: AtomicU64::new(0),
+            bid_qty: AtomicU64::new(0),
+            ask_px: AtomicU64::new(0),
+            ask_qty: AtomicU64::new(0),
             seq_ingest: AtomicU64::new(0),
-            ts_ns:      AtomicU64::new(0),
-            _pad:       [],
+            ts_ns: AtomicU64::new(0),
+            _pad: [],
         }
     }
 
@@ -111,17 +110,19 @@ impl TopOfBook {
             let s1 = self.seq.load(Ordering::Acquire);
             if s1 & 1 == 1 {
                 // Writer in progress.
-                if retries == 0 { return None; }
+                if retries == 0 {
+                    return None;
+                }
                 retries -= 1;
                 std::hint::spin_loop();
                 continue;
             }
-            let bid_px     = self.bid_px.load(Ordering::Relaxed);
-            let bid_qty    = self.bid_qty.load(Ordering::Relaxed);
-            let ask_px     = self.ask_px.load(Ordering::Relaxed);
-            let ask_qty    = self.ask_qty.load(Ordering::Relaxed);
+            let bid_px = self.bid_px.load(Ordering::Relaxed);
+            let bid_qty = self.bid_qty.load(Ordering::Relaxed);
+            let ask_px = self.ask_px.load(Ordering::Relaxed);
+            let ask_qty = self.ask_qty.load(Ordering::Relaxed);
             let seq_ingest = self.seq_ingest.load(Ordering::Relaxed);
-            let ts_ns      = self.ts_ns.load(Ordering::Relaxed);
+            let ts_ns = self.ts_ns.load(Ordering::Relaxed);
             let s2 = self.seq.load(Ordering::Acquire);
             if s2 == s1 {
                 return Some(TopOfBookSnapshot {
@@ -133,7 +134,9 @@ impl TopOfBook {
                     ts_ns,
                 });
             }
-            if retries == 0 { return None; }
+            if retries == 0 {
+                return None;
+            }
             retries -= 1;
             std::hint::spin_loop();
         }
@@ -163,9 +166,9 @@ unsafe impl Sync for TopOfBook {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::thread;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn size_is_cache_line() {
@@ -180,8 +183,10 @@ mod tests {
         let t = TopOfBook::new();
         assert!(t.is_uninitialized());
         t.commit(
-            Price::from_f64(100.0), Qty::from_f64(1.0),
-            Price::from_f64(101.0), Qty::from_f64(1.0),
+            Price::from_f64(100.0),
+            Qty::from_f64(1.0),
+            Price::from_f64(101.0),
+            Qty::from_f64(1.0),
             42,
         );
         assert!(!t.is_uninitialized());
@@ -191,8 +196,10 @@ mod tests {
     fn commit_and_read() {
         let t = TopOfBook::new();
         t.commit(
-            Price::from_f64(42000.50), Qty::from_f64(0.25),
-            Price::from_f64(42001.00), Qty::from_f64(0.30),
+            Price::from_f64(42000.50),
+            Qty::from_f64(0.25),
+            Price::from_f64(42001.00),
+            Qty::from_f64(0.30),
             123_456_789,
         );
         let s = t.read().expect("read");
@@ -264,7 +271,8 @@ mod tests {
                                 diff,
                                 super::super::super::types::FIXED_POINT_SCALE as i64,
                                 "torn read: bid={} ask={}",
-                                s.bid_px.to_f64(), s.ask_px.to_f64()
+                                s.bid_px.to_f64(),
+                                s.ask_px.to_f64()
                             );
                         }
                     }

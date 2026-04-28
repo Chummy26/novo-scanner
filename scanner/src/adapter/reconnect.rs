@@ -4,40 +4,42 @@ use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
 pub struct BackoffPolicy {
-    pub initial:   Duration,
-    pub max:       Duration,
-    pub factor:    f64,
+    pub initial: Duration,
+    pub max: Duration,
+    pub factor: f64,
     /// Fractional jitter applied on each attempt; 0.25 = ±25%.
-    pub jitter:    f64,
+    pub jitter: f64,
 }
 
 impl BackoffPolicy {
     pub const IMMEDIATE: Self = Self {
         initial: Duration::from_millis(0),
-        max:     Duration::from_millis(0),
-        factor:  1.0,
-        jitter:  0.0,
+        max: Duration::from_millis(0),
+        factor: 1.0,
+        jitter: 0.0,
     };
 
     pub const STANDARD: Self = Self {
         initial: Duration::from_secs(1),
-        max:     Duration::from_secs(60),
-        factor:  2.0,
-        jitter:  0.25,
+        max: Duration::from_secs(60),
+        factor: 2.0,
+        jitter: 0.25,
     };
 
     pub const BITGET: Self = Self {
         // 3s→60s heuristic (not in official docs per PhD#5 D-17;
         // derived from community SDKs)
         initial: Duration::from_secs(3),
-        max:     Duration::from_secs(60),
-        factor:  2.0,
-        jitter:  0.25,
+        max: Duration::from_secs(60),
+        factor: 2.0,
+        jitter: 0.25,
     };
 
     /// Compute the duration for attempt `n` (0-indexed).
     pub fn delay(&self, attempt: u32) -> Duration {
-        if self.initial.is_zero() { return Duration::ZERO; }
+        if self.initial.is_zero() {
+            return Duration::ZERO;
+        }
         let base_ms = self.initial.as_millis() as f64 * self.factor.powi(attempt as i32);
         let base = Duration::from_millis(base_ms.min(self.max.as_millis() as f64) as u64);
         if self.jitter == 0.0 {

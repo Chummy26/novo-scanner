@@ -16,14 +16,14 @@ use crate::types::{Venue, VENUE_COUNT};
 /// Global metrics registry + shared instruments.
 pub struct Metrics {
     pub registry: Registry,
-    pub ws_frames_total:    IntCounterVec, // labels: venue
-    pub stale_drops_total:  IntCounterVec,
-    pub asym_drops_total:   IntCounterVec,
+    pub ws_frames_total: IntCounterVec, // labels: venue
+    pub stale_drops_total: IntCounterVec,
+    pub asym_drops_total: IntCounterVec,
     pub opportunities_total: IntCounter,
     /// Per-venue ingest-latency histograms (frame decode + book write), ns.
     pub ingest_hist: [Mutex<Histogram<u64>>; VENUE_COUNT],
     /// Spread-engine cycle latency histogram, ns.
-    pub cycle_hist:  Mutex<Histogram<u64>>,
+    pub cycle_hist: Mutex<Histogram<u64>>,
 }
 
 static METRICS: OnceCell<Metrics> = OnceCell::new();
@@ -35,24 +35,36 @@ impl Metrics {
             let ws_frames_total = IntCounterVec::new(
                 Opts::new("scanner_ws_frames_total", "WebSocket frames ingested"),
                 &["venue"],
-            ).expect("register ws_frames_total");
+            )
+            .expect("register ws_frames_total");
             let stale_drops_total = IntCounterVec::new(
                 Opts::new("scanner_stale_drops_total", "Stale-frame drops"),
                 &["venue"],
-            ).expect("register stale_drops_total");
+            )
+            .expect("register stale_drops_total");
             let asym_drops_total = IntCounterVec::new(
                 Opts::new("scanner_asymmetry_drops_total", "Asymmetric-feed drops"),
                 &["venue"],
-            ).expect("register asym_drops_total");
+            )
+            .expect("register asym_drops_total");
             let opportunities_total = IntCounter::new(
                 "scanner_opportunities_total",
                 "Opportunities emitted to clients",
-            ).expect("register opportunities_total");
+            )
+            .expect("register opportunities_total");
 
-            registry.register(Box::new(ws_frames_total.clone())).expect("reg");
-            registry.register(Box::new(stale_drops_total.clone())).expect("reg");
-            registry.register(Box::new(asym_drops_total.clone())).expect("reg");
-            registry.register(Box::new(opportunities_total.clone())).expect("reg");
+            registry
+                .register(Box::new(ws_frames_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(stale_drops_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(asym_drops_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(opportunities_total.clone()))
+                .expect("reg");
 
             // HdrHistogram: track 1ns..10s with 3 sig figs. Per-venue instance
             // so recording is contention-scoped to each adapter task.
@@ -79,7 +91,9 @@ impl Metrics {
             let v = ns.min(10_000_000_000);
             let _ = h.record(v.max(1));
         }
-        self.ws_frames_total.with_label_values(&[venue.as_str()]).inc();
+        self.ws_frames_total
+            .with_label_values(&[venue.as_str()])
+            .inc();
     }
 
     #[inline]
@@ -110,9 +124,15 @@ mod tests {
     #[test]
     fn record_ingest_increments_counter() {
         let m = Metrics::init();
-        let before = m.ws_frames_total.with_label_values(&[Venue::BinanceSpot.as_str()]).get();
+        let before = m
+            .ws_frames_total
+            .with_label_values(&[Venue::BinanceSpot.as_str()])
+            .get();
         m.record_ingest(Venue::BinanceSpot, 250);
-        let after = m.ws_frames_total.with_label_values(&[Venue::BinanceSpot.as_str()]).get();
+        let after = m
+            .ws_frames_total
+            .with_label_values(&[Venue::BinanceSpot.as_str()])
+            .get();
         assert_eq!(after, before + 1);
     }
 }

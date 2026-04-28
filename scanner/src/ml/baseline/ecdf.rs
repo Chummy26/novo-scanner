@@ -6,8 +6,8 @@
 //! simultâneo como label econômico.
 
 use crate::ml::contract::{
-    AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, ReasonKind,
-    Recommendation, RouteId, TradeReason, TradeSetup,
+    AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, ReasonKind, Recommendation,
+    RouteId, TradeReason, TradeSetup,
 };
 use crate::ml::feature_store::HotQueryCache;
 
@@ -155,10 +155,12 @@ impl BaselineA3 {
         // contrário não há oportunidade *tática agora*.
         let p50_entry = match self.cache.quantile_entry(route, 0.50) {
             Some(v) => v,
-            None => return Recommendation::Abstain {
-                reason: AbstainReason::InsufficientData,
-                diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
-            },
+            None => {
+                return Recommendation::Abstain {
+                    reason: AbstainReason::InsufficientData,
+                    diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+                }
+            }
         };
         if current_entry + quantile_tolerance < p50_entry {
             return Recommendation::Abstain {
@@ -175,20 +177,26 @@ impl BaselineA3 {
         }
 
         // Lookup de quantis marginais.
-        let (_p10_e, _p25_e, p50_e, _p75_e, _p90_e, p95_e) = match all_quantiles_entry(&self.cache, route) {
-            Some(qs) => qs,
-            None => return Recommendation::Abstain {
-                reason: AbstainReason::InsufficientData,
-                diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
-            },
-        };
-        let (p10_x, p25_x, p50_x, p75_x, p90_x, p95_x) = match all_quantiles_exit(&self.cache, route) {
-            Some(qs) => qs,
-            None => return Recommendation::Abstain {
-                reason: AbstainReason::InsufficientData,
-                diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
-            },
-        };
+        let (_p10_e, _p25_e, p50_e, _p75_e, _p90_e, p95_e) =
+            match all_quantiles_entry(&self.cache, route) {
+                Some(qs) => qs,
+                None => {
+                    return Recommendation::Abstain {
+                        reason: AbstainReason::InsufficientData,
+                        diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+                    }
+                }
+            };
+        let (p10_x, p25_x, p50_x, p75_x, p90_x, p95_x) =
+            match all_quantiles_exit(&self.cache, route) {
+                Some(qs) => qs,
+                None => {
+                    return Recommendation::Abstain {
+                        reason: AbstainReason::InsufficientData,
+                        diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+                    }
+                }
+            };
 
         // Preliminares — podem ser ajustados abaixo para respeitar
         // invariante monotônico `enter_at_min ≤ enter_typical ≤ enter_peak_p95`.
@@ -243,18 +251,22 @@ impl BaselineA3 {
 
         let (p_enter_hit, _, _) = match self.cache.probability_entry_ge(route, enter_at_min) {
             Some(stats) => stats,
-            None => return Recommendation::Abstain {
-                reason: AbstainReason::InsufficientData,
-                diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
-            },
+            None => {
+                return Recommendation::Abstain {
+                    reason: AbstainReason::InsufficientData,
+                    diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+                }
+            }
         };
         let (p_exit_hit, exit_success_count, exit_total_count) =
             match self.cache.probability_exit_ge(route, exit_at_min) {
                 Some(stats) => stats,
-                None => return Recommendation::Abstain {
-                    reason: AbstainReason::InsufficientData,
-                    diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
-                },
+                None => {
+                    return Recommendation::Abstain {
+                        reason: AbstainReason::InsufficientData,
+                        diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+                    }
+                }
             };
         let p_realize = p_exit_hit;
         let success_count = exit_success_count;
@@ -264,9 +276,8 @@ impl BaselineA3 {
         // têm autocorrelação ρ ≈ 0.9 em janelas de segundos (Lahiri 2003);
         // n efetivo independente é ~10% do amostral.
         let n_eff_divisor: u64 = 10;
-        let (ic_low, ic_high) = wilson_interval_autocorrelated(
-            success_count, total_count, n_eff_divisor,
-        );
+        let (ic_low, ic_high) =
+            wilson_interval_autocorrelated(success_count, total_count, n_eff_divisor);
 
         let valid_until = now_ns + (self.cfg.valid_for_s as u64) * 1_000_000_000;
 
@@ -277,16 +288,13 @@ impl BaselineA3 {
 
         // Fix D17: ReasonDetail estruturado — zero prosa free-form.
         let percentile = self.cache.entry_rank_percentile(route, current_entry);
-        let z = self
-            .cache
-            .entry_mad_robust(route)
-            .and_then(|mad| {
-                if mad.abs() < 1e-6 {
-                    None
-                } else {
-                    Some((current_entry - p50_e) / mad)
-                }
-            });
+        let z = self.cache.entry_mad_robust(route).and_then(|mad| {
+            if mad.abs() < 1e-6 {
+                None
+            } else {
+                Some((current_entry - p50_e) / mad)
+            }
+        });
         let reason_detail = crate::ml::contract::ReasonDetail {
             entry_percentile_24h: percentile,
             regime_posterior_top: 1.0,
@@ -330,7 +338,7 @@ impl BaselineA3 {
                 historical_base_rate_24h: p_realize,
                 historical_base_rate_ci: (ic_low, ic_high),
             }),
-            cluster_id: None,                       // detector vem em M1.3
+            cluster_id: None, // detector vem em M1.3
             cluster_size: 1,
             cluster_rank: 1,
             // Fix D3: status explícito distingue "não implementado" de
@@ -398,11 +406,7 @@ fn all_quantiles_exit(
 /// a margem usa `n_eff = total / autocorr_divisor`. IC fica correspondentemente
 /// mais largo — honesto sobre incerteza real. Se `autocorr_divisor = 1`,
 /// comportamento equivalente a `wilson_interval`.
-fn wilson_interval_autocorrelated(
-    successes: u64,
-    total: u64,
-    autocorr_divisor: u64,
-) -> (f32, f32) {
+fn wilson_interval_autocorrelated(successes: u64, total: u64, autocorr_divisor: u64) -> (f32, f32) {
     if total == 0 {
         return (0.0, 1.0);
     }
@@ -416,7 +420,10 @@ fn wilson_interval_autocorrelated(
     let denom = 1.0 + z2 / n;
     let centre = (phat + z2 / (2.0 * n)) / denom;
     let margin = z * ((phat * (1.0 - phat) / n + z2 / (4.0 * n * n)).sqrt()) / denom;
-    ((centre - margin).max(0.0) as f32, (centre + margin).min(1.0) as f32)
+    (
+        (centre - margin).max(0.0) as f32,
+        (centre + margin).min(1.0) as f32,
+    )
 }
 
 fn diagnostic_insufficient(n: u64, version: &'static str) -> AbstainDiagnostic {
@@ -528,7 +535,10 @@ mod tests {
                 // Pós-auditoria: min/typical/peak podem coincidir quando
                 // piso econômico empurra os 3 níveis para cima. Apenas
                 // invariante monotônico ≤ é exigido.
-                let diag = setup.baseline_diagnostics.as_ref().expect("baseline diagnostics");
+                let diag = setup
+                    .baseline_diagnostics
+                    .as_ref()
+                    .expect("baseline diagnostics");
                 assert!(diag.enter_at_min <= diag.enter_typical);
                 assert!(diag.enter_typical <= diag.enter_peak_p95);
                 assert!(diag.gross_profit_p10 <= diag.gross_profit_median);
@@ -587,7 +597,10 @@ mod tests {
         let rec = a3.recommend(route, 4.0, 1.0, 42);
         match rec {
             Recommendation::Trade(setup) => {
-                let diag = setup.baseline_diagnostics.as_ref().expect("baseline diagnostics");
+                let diag = setup
+                    .baseline_diagnostics
+                    .as_ref()
+                    .expect("baseline diagnostics");
                 assert!(diag.gross_profit_p10 >= 0.5);
                 assert!(diag.historical_base_rate_24h > 0.5);
                 assert!(setup.t_hit_median_s.is_none());
@@ -617,7 +630,10 @@ mod tests {
         let rec = a3.recommend(route, 2.1, -0.4, 1_700_000_000_000_000_000);
         match rec {
             Recommendation::Trade(setup) => {
-                let diag = setup.baseline_diagnostics.as_ref().expect("baseline diagnostics");
+                let diag = setup
+                    .baseline_diagnostics
+                    .as_ref()
+                    .expect("baseline diagnostics");
                 // Taxa degradada segue P(exit >= floor - enter_typical).
                 assert!(
                     (diag.historical_base_rate_24h - 1.0).abs() < f32::EPSILON,
@@ -665,7 +681,10 @@ mod tests {
         let rec = a3.recommend(route, 2.0, -1.5, 1_700_000_000_000_000_000);
         match rec {
             Recommendation::Trade(setup) => {
-                let diag = setup.baseline_diagnostics.as_ref().expect("baseline diagnostics");
+                let diag = setup
+                    .baseline_diagnostics
+                    .as_ref()
+                    .expect("baseline diagnostics");
                 assert!(diag.gross_profit_p10 < cfg.floor_pct);
                 assert!(diag.gross_profit_median >= cfg.floor_pct);
                 assert_eq!(setup.calibration_status, CalibStatus::Degraded);

@@ -14,7 +14,7 @@ pub const MAX_LEVELS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Level {
-    pub px:  Price,
+    pub px: Price,
     pub qty: Qty,
 }
 
@@ -22,7 +22,7 @@ pub struct Level {
 pub struct DepthBook {
     pub bids: Vec<Level>, // descending
     pub asks: Vec<Level>, // ascending
-    pub seq:  u64,
+    pub seq: u64,
 }
 
 impl DepthBook {
@@ -30,7 +30,7 @@ impl DepthBook {
         Self {
             bids: Vec::with_capacity(MAX_LEVELS),
             asks: Vec::with_capacity(MAX_LEVELS),
-            seq:  0,
+            seq: 0,
         }
     }
 
@@ -45,12 +45,16 @@ impl DepthBook {
         self.bids.clear();
         self.bids.extend_from_slice(bids);
         self.bids.sort_unstable_by(|a, b| b.px.cmp(&a.px));
-        if self.bids.len() > MAX_LEVELS { self.bids.truncate(MAX_LEVELS); }
+        if self.bids.len() > MAX_LEVELS {
+            self.bids.truncate(MAX_LEVELS);
+        }
 
         self.asks.clear();
         self.asks.extend_from_slice(asks);
         self.asks.sort_unstable_by(|a, b| a.px.cmp(&b.px));
-        if self.asks.len() > MAX_LEVELS { self.asks.truncate(MAX_LEVELS); }
+        if self.asks.len() > MAX_LEVELS {
+            self.asks.truncate(MAX_LEVELS);
+        }
 
         self.seq = seq;
     }
@@ -84,7 +88,9 @@ impl DepthBook {
 }
 
 impl Default for DepthBook {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Apply a single level. `descending` flags bid-side sort order.
@@ -97,10 +103,12 @@ impl Default for DepthBook {
 /// farthest-from-top level to keep the invariant (zero alloc after warmup).
 fn apply_sorted(v: &mut Vec<Level>, px: Price, qty: Qty, descending: bool) {
     // Binary search by price in sorted order.
-    let cmp = |a: &Level| if descending {
-        a.px.cmp(&px).reverse() // descending: larger comes first
-    } else {
-        a.px.cmp(&px)
+    let cmp = |a: &Level| {
+        if descending {
+            a.px.cmp(&px).reverse() // descending: larger comes first
+        } else {
+            a.px.cmp(&px)
+        }
     };
     match v.binary_search_by(cmp) {
         Ok(idx) => {
@@ -111,7 +119,9 @@ fn apply_sorted(v: &mut Vec<Level>, px: Price, qty: Qty, descending: bool) {
             }
         }
         Err(idx) => {
-            if qty.0 == 0 { return; } // remove of nonexistent level
+            if qty.0 == 0 {
+                return;
+            } // remove of nonexistent level
             if v.len() >= MAX_LEVELS {
                 // Full: drop the worst level (end of Vec) if the new one would rank better,
                 // else ignore. For descending bids, end = smallest bid; for ascending asks,
@@ -132,7 +142,10 @@ mod tests {
     use super::*;
 
     fn l(px: f64, qty: f64) -> Level {
-        Level { px: Price::from_f64(px), qty: Qty::from_f64(qty) }
+        Level {
+            px: Price::from_f64(px),
+            qty: Qty::from_f64(qty),
+        }
     }
 
     #[test]
@@ -158,7 +171,14 @@ mod tests {
 
         // Update qty on existing level.
         b.apply_bid(Price::from_f64(100.0), Qty::from_f64(5.0));
-        assert_eq!(b.bids.iter().find(|l| l.px == Price::from_f64(100.0)).unwrap().qty, Qty::from_f64(5.0));
+        assert_eq!(
+            b.bids
+                .iter()
+                .find(|l| l.px == Price::from_f64(100.0))
+                .unwrap()
+                .qty,
+            Qty::from_f64(5.0)
+        );
 
         // Insert a new bid that becomes new top.
         let top = b.apply_bid(Price::from_f64(103.0), Qty::from_f64(2.0));
@@ -167,7 +187,11 @@ mod tests {
 
         // Remove a level.
         b.apply_bid(Price::from_f64(101.0), Qty::from_f64(0.0));
-        assert!(b.bids.iter().find(|l| l.px == Price::from_f64(101.0)).is_none());
+        assert!(b
+            .bids
+            .iter()
+            .find(|l| l.px == Price::from_f64(101.0))
+            .is_none());
     }
 
     #[test]

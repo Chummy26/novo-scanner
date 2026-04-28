@@ -40,11 +40,17 @@ pub struct StaleState {
 }
 
 impl Default for StaleState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StaleState {
-    pub const fn new() -> Self { Self { last_ts: AtomicU64::new(0) } }
+    pub const fn new() -> Self {
+        Self {
+            last_ts: AtomicU64::new(0),
+        }
+    }
 
     /// Single-writer per cell — the adapter's parse-apply loop.
     #[inline]
@@ -57,7 +63,9 @@ impl StaleState {
     #[inline]
     pub fn age_ms(&self, now_ns: u64) -> u64 {
         let prev = self.last_ts.load(Ordering::Relaxed);
-        if prev == 0 { return u64::MAX; }
+        if prev == 0 {
+            return u64::MAX;
+        }
         (now_ns.saturating_sub(prev)) / 1_000_000
     }
 
@@ -94,14 +102,14 @@ unsafe impl Sync for StaleState {}
 pub const fn stale_threshold_ms(v: Venue) -> u64 {
     match v {
         Venue::BinanceSpot | Venue::BinanceFut => 15_000,
-        Venue::MexcSpot                         => 5_000,
-        Venue::MexcFut                          => 10_000,
-        Venue::BingxSpot   | Venue::BingxFut   => 30_000,
-        Venue::GateSpot                         => 60_000,
-        Venue::GateFut                          => 30_000,
-        Venue::KucoinSpot  | Venue::KucoinFut  => 30_000,
-        Venue::XtSpot      | Venue::XtFut      => 30_000,
-        Venue::BitgetSpot  | Venue::BitgetFut  => 30_000,
+        Venue::MexcSpot => 5_000,
+        Venue::MexcFut => 10_000,
+        Venue::BingxSpot | Venue::BingxFut => 30_000,
+        Venue::GateSpot => 60_000,
+        Venue::GateFut => 30_000,
+        Venue::KucoinSpot | Venue::KucoinFut => 30_000,
+        Venue::XtSpot | Venue::XtFut => 30_000,
+        Venue::BitgetSpot | Venue::BitgetFut => 30_000,
     }
 }
 
@@ -150,7 +158,7 @@ mod tests {
         s.update(t);
         // 45 seconds of silence: still fresh under Gate's 60s threshold.
         assert!(!is_stale_for(Venue::GateSpot, &s, t + 45_000_000_000));
-        assert!(is_stale_for(Venue::GateSpot,  &s, t + 65_000_000_000));
+        assert!(is_stale_for(Venue::GateSpot, &s, t + 65_000_000_000));
     }
 
     #[test]
@@ -160,7 +168,7 @@ mod tests {
         let t = 1_000_000_000u64;
         s.update(t);
         assert!(!is_stale_for(Venue::MexcSpot, &s, t + 4_000_000_000));
-        assert!(is_stale_for(Venue::MexcSpot,  &s, t + 6_000_000_000));
+        assert!(is_stale_for(Venue::MexcSpot, &s, t + 6_000_000_000));
     }
 
     #[test]

@@ -5,8 +5,8 @@
 //!   `Opportunity` events when a valid, non-stale, non-asymmetric spread
 //!   exceeds the threshold.
 
-pub mod staleness;
 pub mod engine;
+pub mod staleness;
 
 pub use engine::{Opportunity, ScanCounters};
 pub use staleness::StaleState;
