@@ -36,24 +36,6 @@ impl Default for ParquetCompactionConfig {
     }
 }
 
-/// Schema versions esperadas para cada dataset kind (fix C9).
-///
-/// Compactor rejeita arquivos cujo `schema_version` na primeira linha não
-/// bate com a versão compilada. Evita perda silenciosa de campos durante
-/// migração em voo quando novo writer emite schema v7 e compactor em v6
-/// processa sem erro mas descarta campos novos.
-const EXPECTED_SCHEMA_VERSION_ACCEPTED: u16 = 6;
-const EXPECTED_SCHEMA_VERSION_RAW: u16 = 7;
-const EXPECTED_SCHEMA_VERSION_LABELED: u16 = 6;
-
-fn expected_schema_version(kind: DatasetKind) -> u16 {
-    match kind {
-        DatasetKind::AcceptedSamples => EXPECTED_SCHEMA_VERSION_ACCEPTED,
-        DatasetKind::RawSamples => EXPECTED_SCHEMA_VERSION_RAW,
-        DatasetKind::LabeledTrades => EXPECTED_SCHEMA_VERSION_LABELED,
-    }
-}
-
 pub fn compact_jsonl_file(
     jsonl_path: &Path,
     dataset_kind: DatasetKind,
@@ -76,7 +58,7 @@ pub fn compact_jsonl_file(
         return Ok(None);
     }
 
-    // Fix C9: valida `schema_version` na primeira linha antes de compactar.
+    // valida `schema_version` na primeira linha antes de compactar.
     // Divergência → fail-loud em vez de perda silenciosa.
     let first_line_reader = File::open(jsonl_path)
         .with_context(|| format!("open for schema-check {}", jsonl_path.display()))?;
@@ -94,7 +76,11 @@ pub fn compact_jsonl_file(
                 jsonl_path.display()
             )
         })?;
-        let expected = expected_schema_version(dataset_kind);
+        let expected: u16 = match dataset_kind {
+            DatasetKind::AcceptedSamples => 6,
+            DatasetKind::RawSamples => 7,
+            DatasetKind::LabeledTrades => 6,
+        };
         if let Some(got) = v.get("schema_version").and_then(|x| x.as_u64()) {
             if got != expected as u64 {
                 anyhow::bail!(
@@ -252,7 +238,7 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             u32_field("cycle_seq"),
             u16_field("schema_version"),
             utf8_field("scanner_version"),
-            // Fix C3/C13/C2: metadados v6.
+            // metadados v6.
             utf8_field("cluster_id"),
             u32_field("cluster_size"),
             u32_field("cluster_rank"),
@@ -301,7 +287,7 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
                     f32_field("listing_age_days"),
                 ],
             ),
-            // Fix A10: renomeação protetora.
+            // renomeação protetora.
             f32_field("audit_hindsight_best_exit_pct"),
             u64_field("audit_hindsight_best_exit_ts_ns"),
             f32_field("audit_hindsight_best_gross_pct"),
@@ -520,7 +506,7 @@ mod tests {
 
     #[test]
     fn compactor_preserves_nulls_and_non_finite_floats() {
-        // Fix E11: JSONL com `null` em campos nullable deve produzir Parquet
+        // JSONL com `null` em campos nullable deve produzir Parquet
         // válido com os nulls preservados.
         let tmp = tempfile::tempdir().expect("tmp");
         let jsonl = tmp.path().join("accepted_nulls.jsonl");
@@ -545,7 +531,7 @@ mod tests {
 
     #[test]
     fn compactor_rejects_schema_version_mismatch() {
-        // Fix C9: arquivo com schema_version != 6 deve falhar loud.
+        // arquivo com schema_version != 6 deve falhar loud.
         let tmp = tempfile::tempdir().expect("tmp");
         let jsonl = tmp.path().join("old.jsonl");
         write_lines(

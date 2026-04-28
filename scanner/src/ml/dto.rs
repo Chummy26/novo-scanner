@@ -123,7 +123,7 @@ pub const STATUS_IC_WIDTH_LIMIT: f32 = 0.20;
 /// sem forecast condicional, evitamos `ENTER` direto para forçar revisão
 /// manual pelo operador.
 pub fn classify_trade_status(s: &TradeSetup) -> &'static str {
-    // 0. Fix D4: calibration_status precede todos os outros gates.
+    // 0. calibration_status precede todos os outros gates.
     match s.calibration_status {
         CalibStatus::Suspended => return "LOW_CONFIDENCE",
         CalibStatus::Degraded => return "CAUTION",
@@ -184,7 +184,7 @@ pub struct TradeSetupDto {
     pub p_hit: Option<f32>,
     pub p_hit_ci_lo: Option<f32>,
     pub p_hit_ci_hi: Option<f32>,
-    /// Fix D2: método usado para IC (wilson_marginal | conformal_split | ...).
+    /// método usado para IC (wilson_marginal | conformal_split | ...).
     pub ci_method: &'static str,
 
     pub exit_q25: Option<f32>,
@@ -200,19 +200,19 @@ pub struct TradeSetupDto {
     pub cluster_id: Option<u32>,
     pub cluster_size: u8,
     pub cluster_rank: u8,
-    /// Fix D3: status explícito da detecção de cluster.
+    /// status explícito da detecção de cluster.
     pub cluster_detection_status: &'static str,
 
     pub calibration_status: &'static str,
     pub reason_kind: &'static str,
-    /// Fix D17: estrutura fechada — zero prosa free-form.
+    /// estrutura fechada — zero prosa free-form.
     pub reason_entry_percentile_24h: Option<f32>,
     pub reason_regime_posterior_top: f32,
     pub reason_regime_dominant_idx: u8,
     pub reason_tail_z_score: Option<f32>,
 
     pub model_version: String,
-    /// Fix D15: fonte canônica via enum string.
+    /// fonte canônica via enum string.
     pub source_kind: &'static str,
     pub emitted_at_ns: u64,
     pub valid_until_ns: u64,

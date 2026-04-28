@@ -66,7 +66,7 @@ pub struct WriterConfig {
 
 impl Default for WriterConfig {
     fn default() -> Self {
-        let hostname = hostname_best_effort();
+        let hostname = crate::ml::util::hostname_best_effort();
         let pid = std::process::id();
         Self {
             data_dir: PathBuf::from("data/ml/accepted_samples"),
@@ -77,12 +77,6 @@ impl Default for WriterConfig {
             parquet: ParquetCompactionConfig::default(),
         }
     }
-}
-
-fn hostname_best_effort() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "scanner".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -308,52 +302,14 @@ impl JsonlWriter {
 /// Uses UTC. Precisão: hora (3600 s). Particionamento compatível com
 /// Hive/Spark/DataFusion partition pruning.
 pub fn hour_key_for_ns(ns: u64) -> String {
-    let secs = ns / 1_000_000_000;
-    // Algoritmo simples para UTC (sem timezone crate).
-    // Válido até 2106-02-07 (u32 seconds overflow; ns cobre muito além disso).
-    let days = secs / 86_400;
-    let hour = (secs % 86_400) / 3600;
-    let (year, month, day) = days_to_ymd(days);
+    let secs = (ns / 1_000_000_000) as i64;
+    let days = secs.div_euclid(86_400);
+    let hour = (secs.rem_euclid(86_400)) / 3600;
+    let (year, month, day) = crate::ml::util::civil_from_days(days);
     format!(
         "year={:04}/month={:02}/day={:02}/hour={:02}",
         year, month, day, hour
     )
-}
-
-/// Conversão de dias UNIX para (year, month, day) UTC. Implementação
-/// canônica simples; não depende de crate.
-fn days_to_ymd(days: u64) -> (u32, u32, u32) {
-    // 1970-01-01 = day 0.
-    let mut y: i64 = 1970;
-    let mut remaining = days as i64;
-    loop {
-        let days_in_year = if is_leap(y) { 366 } else { 365 };
-        if remaining < days_in_year {
-            break;
-        }
-        remaining -= days_in_year;
-        y += 1;
-    }
-    let month_lengths = if is_leap(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut month = 1;
-    for &mlen in &month_lengths {
-        if remaining < mlen {
-            break;
-        }
-        remaining -= mlen;
-        month += 1;
-    }
-    let day = remaining + 1;
-    (y as u32, month, day as u32)
-}
-
-#[inline]
-fn is_leap(y: i64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
 }
 
 // ---------------------------------------------------------------------------

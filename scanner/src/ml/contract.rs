@@ -119,7 +119,7 @@ pub struct TradeSetup {
     pub entry_now: f32,
     pub exit_target: f32,
     /// Lucro bruto central derivado do quantil mediano: `entry_now + exit_q50`.
-    /// Fix D1: antes `gross_profit_target = entry_now + exit_target`, o que
+    /// antes `gross_profit_target = entry_now + exit_target`, o que
     /// viola CLAUDE.md §Output "L = enter + exit_q50; não duplica incerteza".
     /// Quando `exit_q50` é `None`, fallback para `entry_now + exit_target` por
     /// compat; invariante `eval::verify_tradesetup` exige igualdade com
@@ -127,7 +127,7 @@ pub struct TradeSetup {
     pub gross_profit_target: f32,
     pub p_hit: Option<f32>,
     pub p_hit_ci: Option<(f32, f32)>,
-    /// Método usado para construir `p_hit_ci` (fix D2).
+    /// Método usado para construir `p_hit_ci`.
     ///
     /// Convenções:
     /// - `"wilson_marginal"` — baseline A3 ECDF; IC via Wilson 1927 sobre base
@@ -161,7 +161,7 @@ pub struct TradeSetup {
     pub cluster_size: u8,
     /// Ranking desta rota dentro do cluster (1 = melhor).
     pub cluster_rank: u8,
-    /// Status explícito da detecção de cluster (fix D3).
+    /// Status explícito da detecção de cluster.
     ///
     /// `"not_implemented"` quando o detector correlacional ainda não está
     /// ativo — `cluster_id=None, cluster_size=1, cluster_rank=1` são literais
@@ -174,7 +174,7 @@ pub struct TradeSetup {
     // --- Metadata --------------------------------------------------------
     pub reason: TradeReason,
     pub model_version: String,
-    /// Fonte canônica (fix D15) — substitui prefix match frágil em serving.rs.
+    /// Fonte canônica — substitui prefix match frágil em serving.rs.
     pub source_kind: SourceKind,
     /// Instante da emissão (nanosegundos desde UNIX_EPOCH).
     pub emitted_at: u64,
@@ -210,7 +210,7 @@ pub enum AbstainReason {
     LongTail,
     /// Cooldown pós-emissão — rota teve `Trade` emitido recentemente e a
     /// política operacional bloqueia re-emissão dentro da janela
-    /// `recommendation_cooldown_ns` (fix E4). Distinto de `NoOpportunity`:
+    /// `recommendation_cooldown_ns`. Distinto de `NoOpportunity`:
     /// não significa que o sinal sumiu, significa que o operador já foi
     /// avisado e UI não deve repetir a notificação.
     Cooldown,
@@ -257,7 +257,7 @@ pub enum CalibStatus {
 /// Razão categorizada para operador entender *por que* esta recomendação.
 ///
 /// Quatro categorias simples (Q3 F-UX5 F-UX1 — SHAP fica offline). UI mapeia
-/// em ícones; `ReasonDetail` expõe apenas números determinísticos (fix D17)
+/// em ícones; `ReasonDetail` expõe apenas números determinísticos
 /// para respeitar CLAUDE.md §Output "nenhuma prosa qualitativa se não for
 /// derivada deterministicamente dos números".
 #[derive(Debug, Clone, PartialEq)]
@@ -354,7 +354,7 @@ mod tests {
             valid_until: 1_700_000_150_000_000_000,
         };
 
-        // Fix D1: gross_profit_target deve equivaler a entry_now + exit_q50
+        // gross_profit_target deve equivaler a entry_now + exit_q50
         // (não entry_now + exit_target); ambos coincidem aqui por construção.
         assert_eq!(
             setup.entry_now + setup.exit_q50.unwrap(),
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn invariant_identity_gross_central_equals_entry_plus_q50() {
-        // Fix D1: gross_profit_target deriva de `entry_now + exit_q50` (CLAUDE.md
+        // gross_profit_target deriva de `entry_now + exit_q50` (CLAUDE.md
         // §Output "L = enter + exit_q50; não duplica incerteza"). Quando
         // exit_q50 existe, é a identidade autoritativa; exit_target pode
         // divergir (é alvo probabilístico distinto do quantil mediano).

@@ -317,20 +317,8 @@ fn civil_hour_to_epoch(year: u32, month: u32, day: u32, hour: u32) -> io::Result
             format!("hora inválida: {}", hour),
         ));
     }
-    let days = days_from_civil(year as i64, month as i64, day as i64);
+    let days = crate::ml::util::days_from_civil(year as i64, month as i64, day as i64);
     Ok((days as u64) * 24 + hour as u64)
-}
-
-// Howard Hinnant / civil-from-days inverse, adaptado para dias desde
-// 1970-01-01 UTC.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = year - if month <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let month_index = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * month_index + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
 }
 
 pub fn human_bytes(bytes: u64) -> String {

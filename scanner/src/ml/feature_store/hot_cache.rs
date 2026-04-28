@@ -268,7 +268,7 @@ impl PerRouteCache {
         Some((p, successes, total))
     }
 
-    /// Fix B1: percentil empírico de `spread_pct` na ECDF 24h de entry.
+    /// percentil empírico de `spread_pct` na ECDF 24h de entry.
     /// Retorna fração em `[0, 1]` — Teste 1 da skill §4 literal.
     #[inline]
     fn entry_rank_percentile(&self, spread_pct: f32) -> Option<f32> {
@@ -281,7 +281,7 @@ impl PerRouteCache {
         Some(below as f32 / self.n_observations as f32)
     }
 
-    /// Fix B1: MAD (Median Absolute Deviation) robusto de entry.
+    /// MAD (Median Absolute Deviation) robusto de entry.
     /// Computa passo-único: mediana + MAD estimado via quantis do hist.
     #[inline]
     fn entry_mad_robust(&self) -> Option<f32> {
@@ -299,7 +299,7 @@ impl PerRouteCache {
         Some(((p75 - p25) / 2.0).abs() * 0.7413)
     }
 
-    /// Fix B9: Tail ratio p99/p95 com safeguard para buckets colapsados.
+    /// Tail ratio p99/p95 com safeguard para buckets colapsados.
     /// Retorna `None` quando a amostra é pequena OR quando `p99` e `p95`
     /// caem no mesmo bucket do HDR histogram (indistinção cauda).
     #[inline]
@@ -309,7 +309,7 @@ impl PerRouteCache {
         }
         let p99_bucket = self.entry_hist.value_at_quantile(0.99);
         let p95_bucket = self.entry_hist.value_at_quantile(0.95);
-        // Fix B9: buckets idênticos → colapso de cauda → None.
+        // buckets idênticos → colapso de cauda → None.
         // Antes retornava 1.0, semanticamente "cauda fina normal" falso.
         if p99_bucket <= p95_bucket + 1 {
             return None;
@@ -438,20 +438,20 @@ impl HotQueryCache {
         guard.get(&route)?.probability_exit_ge(threshold)
     }
 
-    /// Fix B1: percentil empírico de `spread_pct` na ECDF 24h de entry.
+    /// percentil empírico de `spread_pct` na ECDF 24h de entry.
     /// Retorna `P_hist(entry ≤ spread_pct)` em [0,1] — Teste 1 literal.
     pub fn entry_rank_percentile(&self, route: RouteId, spread_pct: f32) -> Option<f32> {
         let guard = self.routes.read();
         guard.get(&route)?.entry_rank_percentile(spread_pct)
     }
 
-    /// Fix B1: MAD robusto de entry (via IQR consistente com normal).
+    /// MAD robusto de entry (via IQR consistente com normal).
     pub fn entry_mad_robust(&self, route: RouteId) -> Option<f32> {
         let guard = self.routes.read();
         guard.get(&route)?.entry_mad_robust()
     }
 
-    /// Fix B9: tail ratio com safeguard para buckets colapsados.
+    /// tail ratio com safeguard para buckets colapsados.
     pub fn tail_ratio_p99_p95(&self, route: RouteId) -> Option<f32> {
         let guard = self.routes.read();
         guard.get(&route)?.tail_ratio_p99_p95()

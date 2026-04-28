@@ -7,27 +7,8 @@ use crate::ml::contract::RouteId;
 use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::trigger::SampleDecision;
 
-/// Versão atual do schema. Bump quando adicionar/remover/renomear campos.
-///
-/// # Histórico
-///
-/// - **v1** (original): `ts_ns, cycle_seq, schema_version, symbol_id,
-///   buy_venue, sell_venue, buy_market, sell_market, entry_spread,
-///   exit_spread, buy/sell_vol24, sample_decision, was_recommended`.
-/// - **v2** (ADR-029, 2026-04-21): adiciona `symbol_name` (string canonical
-///   "BASE-QUOTE", ex: "BTC-USDT") e `scanner_version` (env `CARGO_PKG_VERSION`).
-///   Motivação: `symbol_id` é atribuído dinamicamente em discovery e NÃO é
-///   estável entre runs → join retrospectivo de dados diários exige nome
-///   canonical. Sem v2, 30 dias de coleta viram inúteis se universo mudar.
-/// - **v3** (Wave V dataset PhD, 2026-04-21): adiciona `sample_id` (hash
-///   determinístico FNV-1a hex16) para join cross-schema com `RawSample`
-///   e `LabeledTrade`. Correção PhD Q5.
-/// - **v4** (2026-04-21): remove `buy/sell_book_age_ms`; book age é
-///   diagnóstico operacional de corretora, não dado do dataset ML.
-/// - **v5** (2026-04-22): `sample_id` passa a FNV-1a 128-bit hex32.
-/// - **v6** (2026-04-23 Wave W): bump coordenado com `LabeledTrade` v6 e
-///   `RawSample` v6 pós-auditoria PhD de 70 findings. `SCANNER_VERSION`
-///   importado de `ml/mod.rs` (fix E5).
+/// Versão atual do schema do `AcceptedSample`. Bump em qualquer alteração
+/// de campos persistidos. Histórico em git log.
 pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 6;
 
 use crate::ml::SCANNER_VERSION;

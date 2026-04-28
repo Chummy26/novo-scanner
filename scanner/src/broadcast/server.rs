@@ -575,16 +575,17 @@ async fn rest_debug(State(state): State<BroadcastState>) -> impl IntoResponse {
         "top_spreads":       top,
         "spread_histogram":  histogram,
         // All 14 venues now expose real BBO to the book store:
-        //   - XT spot/fut:   depth@{sym},5 (M24)
+        //   - XT spot:       method=subscribe params=[depth@{sym},5] (current Spot Public)
+        //   - XT fut:        ticker@{sym}
         //   - MEXC fut:      bid1/ask1 with skip-if-empty (M21, M25)
-        //   - Gate fut:      highest_bid/lowest_ask with skip-if-empty (M25)
+        //   - Gate fut:      futures.book_ticker b/a with skip-if-empty
         //   - MEXC spot:     REST /ticker/bookTicker 1Hz
         //   - others:        dedicated bookTicker / best-bid-ask channels
         "last_price_only_venues": [],
         "notes": {
-            "xt_depth":      "M24: XT spot uses {\"sub\":\"depth@sym,5\"} (futures-style method/params wrapper silently drops on spot). XT fut keeps method/params since that works there.",
+            "xt_depth":      "XT spot uses current Spot Public subscribe shape {\"method\":\"subscribe\",\"params\":[\"depth@sym,5\"]}; client sends text ping and does not advertise permessage-deflate.",
             "mexc_fut_fix":  "M21+M25: sub.ticker per-symbol, bid1/ask1 only; no lastPrice fallback.",
-            "gate_fut_fix":  "M25: highest_bid/lowest_ask only; no `last` fallback.",
+            "gate_fut_fix":  "Gate futures uses futures.book_ticker with b/a/B/A; no `last` fallback.",
             "bingx_bbo_driven":"BingX spot/fut subscribe {sym}@bookTicker which is BBO-driven (no heartbeat on illiquid pairs). The fix is a different channel — not a tighter threshold.",
         }
     }))

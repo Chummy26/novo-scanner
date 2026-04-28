@@ -44,7 +44,7 @@ pub mod serving;
 pub mod trigger;
 pub mod util;
 
-/// Versão única do scanner para todos os schemas de dataset (fix E5).
+/// Versão única do scanner para todos os schemas de dataset.
 ///
 /// Antes existia uma `const SCANNER_VERSION` replicada em `raw_sample.rs`,
 /// `sample.rs` e `labeled_trade.rs`. Se um fosse alterado por engano (override
@@ -62,9 +62,7 @@ pub use dto::{RecommendationDto, TradeSetupDto};
 pub use economic::{
     EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome, WindowMetrics,
 };
-pub use eval::{
-    verify_tradesetup, verify_tradesetup_with_floor, InvariantError, DEFAULT_P_HIT_EMISSION_FLOOR,
-};
+pub use eval::{verify_tradesetup, InvariantError};
 pub use retention::{
     DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy, RetentionSweepReport,
 };

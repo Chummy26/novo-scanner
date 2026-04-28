@@ -41,7 +41,7 @@ pub enum InvariantError {
     ValidUntilBeforeEmittedAt { emitted_at: u64, valid_until: u64 },
     /// Algum campo numérico é NaN ou infinito.
     NonFiniteField { field: &'static str, value: f32 },
-    /// Fix E1: identidade `gross_profit_target = entry_now + exit_q50` violada.
+    /// identidade `gross_profit_target = entry_now + exit_q50` violada.
     /// Antes aparecia como `NonFiniteField{field: "gross_profit_target_identity"}`,
     /// semantically impróprio (campos são finitos, identidade que quebrou).
     GrossIdentityMismatch {
@@ -50,36 +50,30 @@ pub enum InvariantError {
         exit_q50: f32,
         delta: f32,
     },
-    /// Fix D5: `t_hit_*_s` está presente mas `p_censor` é `None`.
+    /// `t_hit_*_s` está presente mas `p_censor` é `None`.
     /// CLAUDE.md §Output: "T é distribuição com P_censura explícito;
     /// omiti-la distorce o risco de recomendação."
     TimeToHitWithoutCensorProbability,
-    /// Fix D10: janela de validade (`valid_until - emitted_at`) menor que
+    /// janela de validade (`valid_until - emitted_at`) menor que
     /// o dobro do `t_hit_p75_s` previsto. 100% das recomendações expiram
     /// antes do p75 ⇒ `ExitMiss` forçado sistematicamente.
     ValidityWindowShorterThanPredictedHorizon { valid_for_s: u64, t_hit_p75_s: u32 },
-    /// Fix E18: `p_hit` abaixo do piso configurado de emissão (precision-first).
+    /// `p_hit` abaixo do piso configurado de emissão (precision-first).
     PHitBelowEmissionFloor { p_hit: f32, floor: f32 },
 }
 
-/// Piso mínimo de `p_hit` para aceitar emissão (fix E18).
-///
-/// CLAUDE.md §Critérios "Precision-first": falso positivo é catastrófico.
-/// Emitir `Trade` com `p_hit=0.1` é inconsistente com o espírito do critério.
-/// Configurável via `BaselineConfig::p_hit_emission_floor`; default conservador
-/// 0.50 evita recomendação abaixo de paridade empírica.
-pub const DEFAULT_P_HIT_EMISSION_FLOOR: f32 = 0.50;
+/// Piso mínimo de `p_hit` para aceitar emissão. CLAUDE.md §Critérios
+/// "Precision-first": falso positivo é catastrófico. Default 0.50 evita
+/// recomendação abaixo de paridade empírica.
+const P_HIT_EMISSION_FLOOR: f32 = 0.50;
 
 /// Verifica todas as invariantes estruturais do `TradeSetup`.
-///
-/// Retorna `Err` no primeiro violation detectado. Para diagnóstico
-/// completo (múltiplas violações), usar `verify_tradesetup_all`.
+/// Retorna `Err` no primeiro violation detectado.
 pub fn verify_tradesetup(s: &TradeSetup) -> Result<(), InvariantError> {
-    verify_tradesetup_with_floor(s, DEFAULT_P_HIT_EMISSION_FLOOR)
+    verify_tradesetup_inner(s, P_HIT_EMISSION_FLOOR)
 }
 
-/// Variante com piso de `p_hit` configurável (fix E18).
-pub fn verify_tradesetup_with_floor(
+fn verify_tradesetup_inner(
     s: &TradeSetup,
     p_hit_emission_floor: f32,
 ) -> Result<(), InvariantError> {
@@ -115,12 +109,12 @@ pub fn verify_tradesetup_with_floor(
         }
     }
 
-    // 2. Identidade do output central (fix D1).
+    // 2. Identidade do output central.
     //    CLAUDE.md §Output: `L = enter + exit_q50` (quantil mediano, não target).
     //    Quando `exit_q50` existe, é a identidade autoritativa. Fallback para
     //    `exit_target` mantém compat quando `exit_q50` está ausente (modelo
     //    degradado sem distribuição).
-    //    Fix E1: erro tipado `GrossIdentityMismatch` em vez de reuso impróprio
+    //    erro tipado `GrossIdentityMismatch` em vez de reuso impróprio
     //    de `NonFiniteField`.
     let identity_basis = s.exit_q50.unwrap_or(s.exit_target);
     let identity = s.entry_now + identity_basis;
@@ -295,7 +289,7 @@ pub fn verify_tradesetup_with_floor(
         });
     }
 
-    // 10. Fix D5: censura é primeira ordem (skill §6). Emitir `t_hit_median_s`
+    // 10. censura é primeira ordem (skill §6). Emitir `t_hit_median_s`
     //     sem `p_censor` é epistemologicamente desonesto — esconde que a
     //     distribuição de T pode estar truncada por desaparecimento de rota.
     if (s.t_hit_median_s.is_some() || s.t_hit_p25_s.is_some() || s.t_hit_p75_s.is_some())
@@ -304,7 +298,7 @@ pub fn verify_tradesetup_with_floor(
         return Err(InvariantError::TimeToHitWithoutCensorProbability);
     }
 
-    // 11. Fix D10: `valid_until` deve conter ao menos 2× t_hit_p75_s previsto,
+    // 11. `valid_until` deve conter ao menos 2× t_hit_p75_s previsto,
     //     caso contrário 100% das recomendações expiram antes do p75 e geram
     //     `ExitMiss` forçado em `PendingEconomicTrade::observe` mesmo quando
     //     a saída realizaria dentro da distribuição prevista.
@@ -319,7 +313,7 @@ pub fn verify_tradesetup_with_floor(
         }
     }
 
-    // 12. Fix E18: precision-first requer piso de `p_hit` para emissão.
+    // 12. precision-first requer piso de `p_hit` para emissão.
     //     Abstenção `LowConfidence` é a resposta correta abaixo do piso.
     if let Some(p) = s.p_hit {
         if p < p_hit_emission_floor {
@@ -343,7 +337,7 @@ mod tests {
     use crate::types::{SymbolId, Venue};
 
     fn valid() -> TradeSetup {
-        // Janela de validade deve conter ≥ 2 × t_hit_p75_s (fix D10).
+        // Janela de validade deve conter ≥ 2 × t_hit_p75_s.
         // p75=6000s ⇒ valid_for ≥ 12000s = 12e12 ns.
         let emitted_at = 1_000_000_000_000_000_000u64;
         let valid_for_ns: u64 = 13_000 * 1_000_000_000; // 13 000s folga > 2 × 6000
@@ -524,7 +518,7 @@ mod tests {
         assert!(verify_tradesetup(&s).is_ok());
     }
 
-    // ---- Fix D5: p_censor obrigatório quando t_hit_* presente -----------
+    // ---- p_censor obrigatório quando t_hit_* presente -----------
 
     #[test]
     fn detects_t_hit_without_p_censor() {
@@ -547,7 +541,7 @@ mod tests {
         assert!(verify_tradesetup(&s).is_ok());
     }
 
-    // ---- Fix D10: valid_until ≥ 2 × t_hit_p75_s -------------------------
+    // ---- valid_until ≥ 2 × t_hit_p75_s -------------------------
 
     #[test]
     fn detects_validity_window_shorter_than_2x_p75() {
@@ -568,7 +562,7 @@ mod tests {
         assert!(verify_tradesetup(&s).is_ok());
     }
 
-    // ---- Fix E18: piso de p_hit para emissão ----------------------------
+    // ---- piso de p_hit para emissão ----------------------------
 
     #[test]
     fn detects_p_hit_below_emission_floor() {
@@ -580,11 +574,11 @@ mod tests {
     }
 
     #[test]
-    fn p_hit_at_floor_passes_with_custom_threshold() {
+    fn p_hit_at_floor_passes_at_default_threshold() {
+        // Default floor 0.50 — p_hit=0.55 aceita.
         let mut s = valid();
-        s.p_hit = Some(0.30);
-        s.p_hit_ci = Some((0.25, 0.40));
-        // Piso customizado 0.20 aceita p_hit=0.30.
-        assert!(verify_tradesetup_with_floor(&s, 0.20).is_ok());
+        s.p_hit = Some(0.55);
+        s.p_hit_ci = Some((0.50, 0.60));
+        assert!(verify_tradesetup(&s).is_ok());
     }
 }

@@ -78,27 +78,27 @@ pub struct MlServer {
     // (spread engine) a cada tick. Permite desambiguar snapshots do mesmo
     // timestamp em `AcceptedSample.cycle_seq`.
     cycle_seq: AtomicU64,
-    // ADR-025: stream contínuo pré-trigger. Wave V: decimator em 3 tiers
+    // ADR-025: stream contínuo pré-trigger. decimator em 3 tiers
     // (allowlist / priority / uniform). Seleção em `decide()`.
     raw_decimator: RouteDecimator,
     raw_writer: Option<RawWriterHandle>,
-    // Wave V — rankeador rolling que atualiza `raw_decimator` priority_set.
+    // Rankeador rolling que atualiza `raw_decimator` priority_set.
     // `None` quando desabilitado (tests minimalistas).
     route_ranking: Option<Arc<RouteRanking>>,
-    // Wave V — resolvedor de labels supervisionados (LabeledTrade).
+    // �� resolvedor de labels supervisionados (LabeledTrade).
     // `None` = label disabled (tests legados). Usa `Arc` porque o sweeper
     // task também segura uma cópia.
     label_resolver: Option<Arc<LabelResolver>>,
-    // Wave V — parâmetros de labeling (stride, floor).
+    // �� parâmetros de labeling (stride, floor).
     label_stride_s: u32,
     label_floor_pct: f32,
     label_floors_pct: Vec<f32>,
     label_horizons_s: Vec<u32>,
     last_trade_emit_by_route: Mutex<AHashMap<RouteId, u64>>,
     recommendation_cooldown_ns: u64,
-    // Fix C13: fingerprint da config runtime persistida em cada record.
+    // fingerprint da config runtime persistida em cada record.
     runtime_config_hash: String,
-    // Fix C2: geração do priority_set (incrementado em set_priority_set_and_bump).
+    // geração do priority_set (incrementado em set_priority_set_and_bump).
     priority_set_generation_id: AtomicU64,
     priority_set_updated_at_ns: AtomicU64,
 }
@@ -241,7 +241,7 @@ struct PendingEconomicTrade {
 
 impl PendingEconomicTrade {
     fn new(setup: TradeSetup, initial_exit_pct: f32) -> Self {
-        // Fix D15: `from_model` agora deriva de `setup.source_kind` — enum
+        // `from_model` agora deriva de `setup.source_kind` — enum
         // explícito substitui prefix match frágil `!starts_with("baseline-")`.
         Self {
             last_observed_ns: setup.emitted_at,
@@ -288,7 +288,7 @@ impl PendingEconomicTrade {
                 .saturating_sub(self.setup.emitted_at)
                 .saturating_div(1_000_000)
                 .min(u32::MAX as u64) as u32;
-            // Fix D9: TradeOutcome::Realized não carrega mais `enter_realized_pct`.
+            // TradeOutcome::Realized não carrega mais `enter_realized_pct`.
             return Some(EconomicEvent::new(
                 &self.setup,
                 TradeOutcome::Realized {
@@ -300,7 +300,7 @@ impl PendingEconomicTrade {
         }
 
         if now_ns >= self.setup.valid_until {
-            // Fix D9: TradeOutcome::ExitMiss sem enter_realized.
+            // TradeOutcome::ExitMiss sem enter_realized.
             let outcome = TradeOutcome::ExitMiss {
                 forced_exit_pct: self.last_exit_pct,
             };
@@ -421,7 +421,7 @@ impl EconomicTracker {
 
 impl MlServer {
     pub fn new(baseline: BaselineA3, trigger: SamplingTrigger) -> Self {
-        // Fix C13: fingerprint da config efetiva do dataset. Builders abaixo
+        // fingerprint da config efetiva do dataset. Builders abaixo
         // recomputam depois de aplicar raw/label/cooldown config.
         let raw_decimator = RouteDecimator::new();
         let label_floors_pct = DEFAULT_LABEL_FLOORS_PCT.to_vec();
@@ -473,7 +473,7 @@ impl MlServer {
         );
     }
 
-    /// Fix C2: incrementa geração do priority_set e registra timestamp de update.
+    /// incrementa geração do priority_set e registra timestamp de update.
     /// Deve ser chamado por quem instala novo snapshot em
     /// `raw_decimator.set_priority_set()`.
     pub fn bump_priority_set_generation(&self, now_ns: u64) {
@@ -510,14 +510,14 @@ impl MlServer {
         self
     }
 
-    /// Wave V: conecta ranker rolling (top-N dinâmico por
+    /// conecta ranker rolling (top-N dinâmico por
     /// `accept_count_24h`) para o tier Priority do `RouteDecimator`.
     pub fn with_route_ranking(mut self, ranker: Arc<RouteRanking>) -> Self {
         self.route_ranking = Some(ranker);
         self
     }
 
-    /// Wave V: conecta resolvedor de labels supervisionados.
+    /// conecta resolvedor de labels supervisionados.
     pub fn with_label_resolver(mut self, resolver: Arc<LabelResolver>) -> Self {
         self.label_horizons_s = resolver.horizons().to_vec();
         self.label_resolver = Some(resolver);
@@ -641,14 +641,14 @@ impl MlServer {
         );
         self.bump_sample_metric(sample_dec);
 
-        // Wave V — ranker observa (candidate, accepted).
+        // �� ranker observa (candidate, accepted).
         if let Some(ranker) = self.route_ranking.as_ref() {
             let accepted = matches!(sample_dec, SampleDecision::Accept);
             let vol = buy_vol24_usd.min(sell_vol24_usd);
             ranker.observe(route, now_ns, accepted, vol);
         }
 
-        // Wave V — decimator em tiers.
+        // �� decimator em tiers.
         if let Some(raw_writer) = self.raw_writer.as_ref() {
             let dr = self
                 .raw_decimator
@@ -698,7 +698,7 @@ impl MlServer {
             self.economic
                 .lock()
                 .resolve_route(route, entry_spread, exit_spread, now_ns);
-            // Wave V — resolvedor de LabeledTrade recebe APENAS observações
+            // �� resolvedor de LabeledTrade recebe APENAS observações
             // com liquidez mínima; best_exit supervisionado fica no domínio
             // de spread bruto e não recebe diagnósticos operacionais.
             if let Some(resolver) = self.label_resolver.as_ref() {
@@ -772,7 +772,7 @@ impl MlServer {
         );
         self.bump_sample_metric(sample_dec);
 
-        // Wave V — ranker observa (candidate, accepted).
+        // �� ranker observa (candidate, accepted).
         if let Some(ranker) = self.route_ranking.as_ref() {
             let accepted = matches!(sample_dec, SampleDecision::Accept);
             let vol = buy_vol24_usd.min(sell_vol24_usd);
@@ -856,15 +856,15 @@ impl MlServer {
         let exit_p50_pre_observe = self.baseline.cache().quantile_exit(route, 0.50);
         let exit_p75_pre_observe = self.baseline.cache().quantile_exit(route, 0.75);
         let exit_p95_pre_observe = self.baseline.cache().quantile_exit(route, 0.95);
-        // Fix B1: percentil empírico de entry_now na ECDF 24h (Teste 1 literal).
+        // percentil empírico de entry_now na ECDF 24h (Teste 1 literal).
         let entry_rank_pre_observe = self
             .baseline
             .cache()
             .entry_rank_percentile(route, entry_spread);
-        // Fix B1: magnitude e escala robusta para z-score downstream.
+        // magnitude e escala robusta para z-score downstream.
         let entry_minus_p50_pre = entry_p50_pre_observe.map(|p50| entry_spread - p50);
         let entry_mad_pre = self.baseline.cache().entry_mad_robust(route);
-        // Fix B2: frequência empírica P_hist(exit ≥ floor − entry_now) (Teste 2).
+        // frequência empírica P_hist(exit ≥ floor − entry_now) (Teste 2).
         let exit_threshold_for_primary_floor = self.label_floor_pct - entry_spread;
         let p_exit_ge_floor_pre = self
             .baseline
@@ -884,7 +884,7 @@ impl MlServer {
                 .exit_run_duration_quantiles(route, exit_threshold_for_primary_floor)
                 .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
                 .unwrap_or((None, None, None));
-        // Fix A4: run condicional em exit_p50_24h (sem condicionamento em entry atual).
+        // run condicional em exit_p50_24h (sem condicionamento em entry atual).
         let exit_excess_run_pre = exit_p50_pre_observe.and_then(|threshold| {
             self.baseline
                 .cache()
@@ -892,12 +892,12 @@ impl MlServer {
                 .map(|(_, p50, _)| p50)
         });
         let listing_age_days_pre_observe = self.listing.listing_age_days(route, now_ns);
-        // Fix B9: tail ratio com safeguard para buckets colapsados.
+        // tail ratio com safeguard para buckets colapsados.
         let tail_ratio_pre_observe = self.baseline.cache().tail_ratio_p99_p95(route);
-        // Fix C7: estado PIT do cache em t0 para reconstrutibilidade offline.
+        // estado PIT do cache em t0 para reconstrutibilidade offline.
         let n_cache_obs_pre = self.baseline.cache().n_observations(route) as u32;
         let oldest_cache_ts_pre = self.baseline.cache().oldest_observation_ns(route);
-        // Fix B4: log de volume mínimo e razão — substituem uso de volume absoluto.
+        // log de volume mínimo e razão — substituem uso de volume absoluto.
         let min_vol = buy_vol24_usd.min(sell_vol24_usd).max(1.0);
         let log_min_vol = Some(min_vol.ln() as f32);
         let vol_ratio = {
@@ -912,7 +912,7 @@ impl MlServer {
             self.economic
                 .lock()
                 .process(route, entry_spread, exit_spread, now_ns, &rec);
-            // Wave V — resolvedor supervisionado consome obs limpa.
+            // �� resolvedor supervisionado consome obs limpa.
             if let Some(resolver) = self.label_resolver.as_ref() {
                 resolver.on_clean_observation(route, now_ns, entry_spread, exit_spread);
             }
@@ -938,7 +938,7 @@ impl MlServer {
             None
         };
 
-        // Wave V — enfileira `PendingLabel` para candidates limpos, não
+        // �� enfileira `PendingLabel` para candidates limpos, não
         // apenas Accept. Isso dá negativos supervisionáveis
         // (insufficient_history/below_tail) para abstenção sem contaminar
         // com low-volume operacional.
@@ -995,7 +995,7 @@ impl MlServer {
             // usa stride por rota, então IPW correto depende da taxa observada
             // de candidates/accepts por rota e deve ser estimado offline.
             let label_sampling_probability = f32::NAN;
-            // Fix A6: contadores de RouteRanking para IPW offline.
+            // contadores de RouteRanking para IPW offline.
             let (candidates_24h, accepts_24h) = self
                 .route_ranking
                 .as_ref()
@@ -1039,7 +1039,7 @@ impl MlServer {
                         route.sell_venue,
                     )
                 });
-            // Fix C3/C13/C2: metadados v6 persistidos em cada record.
+            // metadados v6 persistidos em cada record.
             let cluster_id =
                 crate::ml::persistence::label_resolver::derive_cluster_id(route, now_ns);
             let runtime_config_hash = self.runtime_config_hash.clone();
@@ -1102,7 +1102,7 @@ impl MlServer {
                 AbstainReason::InsufficientData => &self.metrics.rec_abstain_insufficient_data,
                 AbstainReason::LowConfidence => &self.metrics.rec_abstain_low_confidence,
                 AbstainReason::LongTail => &self.metrics.rec_abstain_long_tail,
-                // Fix E4: Cooldown reusa bucket de low_confidence para métricas.
+                // Cooldown reusa bucket de low_confidence para métricas.
                 AbstainReason::Cooldown => &self.metrics.rec_abstain_low_confidence,
             },
         };
@@ -1295,7 +1295,7 @@ mod tests {
             model_version: "test-0.1.0".into(),
             source_kind: crate::ml::contract::SourceKind::Baseline,
             emitted_at: 1_700_000_000_000_000_000,
-            // Fix D10: valid_until ≥ 2 × t_hit_p75_s (3120s); usar 7000s para folga.
+            // valid_until ≥ 2 × t_hit_p75_s (3120s); usar 7000s para folga.
             valid_until: 1_700_000_000_000_000_000 + 7000 * 1_000_000_000,
         };
         setup
@@ -1732,8 +1732,6 @@ mod tests {
                 route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
                 max_pending_per_route: 100,
                 sweeper_interval: Duration::from_secs(10),
-                label_stride_base_s: 60,
-                n_events_target_per_horizon: 10,
             },
             handle,
         ));
@@ -1798,8 +1796,6 @@ mod tests {
                 route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
                 max_pending_per_route: 100,
                 sweeper_interval: Duration::from_secs(10),
-                label_stride_base_s: 60,
-                n_events_target_per_horizon: 10,
             },
             handle,
         ));

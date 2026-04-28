@@ -43,7 +43,7 @@ pub struct RawWriterConfig {
 
 impl Default for RawWriterConfig {
     fn default() -> Self {
-        let hostname = hostname_best_effort();
+        let hostname = crate::ml::util::hostname_best_effort();
         let pid = std::process::id();
         Self {
             data_dir: PathBuf::from("data/ml/raw_samples"),
@@ -54,12 +54,6 @@ impl Default for RawWriterConfig {
             parquet: ParquetCompactionConfig::default(),
         }
     }
-}
-
-fn hostname_best_effort() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "scanner".into())
 }
 
 // ---------------------------------------------------------------------------

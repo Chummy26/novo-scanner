@@ -1,4 +1,4 @@
-//! Ranker de rotas com janela rolling real (Wave V — correção PhD A5+A6+Q1).
+//! Ranker de rotas com janela rolling real.
 //!
 //! Mantém **96 buckets de 15 min** (= 24h de histórico). A cada rollover,
 //! o bucket mais antigo é descartado e um novo bucket vazio criado.

@@ -174,7 +174,7 @@ fn source_lacks_any(source: &str, needles: &[&str]) -> bool {
     needles.iter().all(|needle| !source.contains(needle))
 }
 
-/// Fix B5: verifica que o literal `FeaturesT0 { ... }` não contém nenhum dos
+/// verifica que o literal `FeaturesT0 { ... }` não contém nenhum dos
 /// identificadores proibidos dentro da janela de 2000 bytes pós-abertura.
 /// Conservador — não é AST parsing completo, mas cobre o vetor principal
 /// de leakage (cópia errante de campo).

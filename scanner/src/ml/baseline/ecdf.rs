@@ -281,12 +281,12 @@ impl BaselineA3 {
 
         let valid_until = now_ns + (self.cfg.valid_for_s as u64) * 1_000_000_000;
 
-        // Fix D1: gross_profit_target deriva de exit_q50 (mediano), não de
+        // gross_profit_target deriva de exit_q50 (mediano), não de
         // exit_at_min (alvo conservador). Para consistência com CLAUDE.md
         // §Output "L = enter + exit_q50".
         let gross_profit_central = current_entry + p50_x;
 
-        // Fix D17: ReasonDetail estruturado — zero prosa free-form.
+        // ReasonDetail estruturado — zero prosa free-form.
         let percentile = self.cache.entry_rank_percentile(route, current_entry);
         let z = self.cache.entry_mad_robust(route).and_then(|mad| {
             if mad.abs() < 1e-6 {
@@ -312,7 +312,7 @@ impl BaselineA3 {
             // central. Mantém None e guarda a ECDF em diagnostics.
             p_hit: None,
             p_hit_ci: None,
-            // Fix D2: método declarado — Wilson marginal, não conformal.
+            // método declarado — Wilson marginal, não conformal.
             ci_method: "wilson_marginal",
             exit_q25: Some(p25_x),
             exit_q50: Some(p50_x),
@@ -341,7 +341,7 @@ impl BaselineA3 {
             cluster_id: None, // detector vem em M1.3
             cluster_size: 1,
             cluster_rank: 1,
-            // Fix D3: status explícito distingue "não implementado" de
+            // status explícito distingue "não implementado" de
             // "cluster detectado mas tamanho 1".
             cluster_detection_status: "not_implemented",
             // `Degraded` sinaliza que estamos em baseline/safety-net, não no
@@ -353,7 +353,7 @@ impl BaselineA3 {
                 detail: reason_detail,
             },
             model_version: self.cfg.model_version.to_string(),
-            // Fix D15: fonte canônica via enum — baseline A3 é Baseline, não Model.
+            // fonte canônica via enum — baseline A3 é Baseline, não Model.
             source_kind: crate::ml::contract::SourceKind::Baseline,
             emitted_at: now_ns,
             valid_until,
@@ -529,7 +529,7 @@ mod tests {
                 // Sanity checks em campos-chave do ADR-016.
                 assert_eq!(setup.route_id, route);
                 assert_eq!(setup.entry_now, 3.8);
-                // Fix D1: gross_profit_target deriva de entry_now + exit_q50.
+                // gross_profit_target deriva de entry_now + exit_q50.
                 let q50 = setup.exit_q50.expect("q50 presente em baseline trade");
                 assert_eq!(setup.gross_profit_target, setup.entry_now + q50);
                 // Pós-auditoria: min/typical/peak podem coincidir quando

@@ -23,7 +23,7 @@ use crate::ml::dto::RecommendationDto;
 
 /// Capacidade default do canal broadcast.
 ///
-/// Fix pós-auditoria 2026-04-21: o valor anterior de 512 era severamente
+/// o valor anterior de 512 era severamente
 /// subdimensionado — 2600 rotas ativas a 150 ms produz até 17k mensagens/s;
 /// qualquer consumer com latência > 30 ms lotava o canal. `tokio::sync::broadcast`
 /// sobrescreve mensagens antigas silenciosamente quando lotado, e até o
@@ -119,7 +119,7 @@ pub struct BroadcasterMetrics {
     /// Quando `publish` encontrou ≥ 1 consumer no instante do envio.
     /// É proxy de entrega, não confirmação de leitura humana.
     pub was_recommended_publications: AtomicU64,
-    /// Fix pós-auditoria 2026-04-21: número agregado de frames
+    /// número agregado de frames
     /// sobrescritos por consumers lentos (`RecvError::Lagged(n)`).
     /// Incrementado pelo handler WS em `broadcast/server.rs`.
     /// Observabilidade antes ausente — consumers lentos causavam perda
@@ -397,7 +397,7 @@ fn iso8601_from_ns(ns: u64) -> String {
 
 fn iso8601_from_secs(secs: i64, ms: u32) -> String {
     let (date_days, time_secs) = (secs.div_euclid(86400), secs.rem_euclid(86400));
-    let (y, m, d) = civil_from_days(date_days);
+    let (y, m, d) = crate::ml::util::civil_from_days(date_days);
     let h = time_secs / 3600;
     let mi = (time_secs % 3600) / 60;
     let s = time_secs % 60;
@@ -405,18 +405,4 @@ fn iso8601_from_secs(secs: i64, ms: u32) -> String {
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
         y, m, d, h, mi, s, ms
     )
-}
-
-fn civil_from_days(z: i64) -> (i32, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as i64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y as i32, m as u32, d as u32)
 }

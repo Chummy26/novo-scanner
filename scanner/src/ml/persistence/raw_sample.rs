@@ -35,30 +35,8 @@ use crate::ml::contract::RouteId;
 use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::trigger::SampleDecision;
 
-/// Versão atual do schema do `RawSample`. Bump quando adicionar/remover
-/// campos. `AcceptedSample` tem versão independente — decisões de schema
-/// dos dois streams são desacopladas.
-///
-/// # Histórico
-/// - **v1** (ADR-025): schema inicial com `symbol_id` numérico.
-/// - **v2** (ADR-029, 2026-04-21): adiciona `symbol_name` canonical (BASE-QUOTE)
-///   e `scanner_version`. Motivação: `SymbolId` não é estável entre runs;
-///   sem nome canonical, join retrospectivo cross-dia quebra.
-/// - **v3** (Wave V dataset PhD, 2026-04-21): adiciona `sample_id`,
-///   `sampling_tier`, `sampling_probability`. Decimator agora em 3 tiers
-///   (allowlist + priority + uniforme); auditoria de amostragem.
-/// - **v4** (2026-04-21): remove `buy/sell_book_age_ms` e `halt_active`.
-///   Esses campos são diagnósticos operacionais, não dataset ML.
-/// - **v5** (2026-04-22): `sample_id` passa a FNV-1a 128-bit hex32.
-/// - **v6** (2026-04-23 Wave W): bump para alinhar com `LabeledTrade` v6 e
-///   `AcceptedSample` v6 (consolidação pós-auditoria PhD de 70 findings).
-///   `SCANNER_VERSION` agora é importado de `ml/mod.rs` (fix E5). Campos
-///   `cluster_id`, `cluster_size`, `priority_set_generation_id` (C3, C2).
-/// - **v7** (2026-04-23): adiciona `priority_set_generation_id` e
-///   `priority_set_updated_at_ns` no próprio RawSample. Sem esses campos,
-///   o tier `priority` tinha `sampling_probability=1.0` condicional, mas
-///   não carregava a geração que permite estimar a probabilidade marginal
-///   offline.
+/// Versão atual do schema do `RawSample`. Bump em qualquer alteração
+/// de campos persistidos. Histórico em git log.
 pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 7;
 
 use crate::ml::SCANNER_VERSION;
@@ -91,7 +69,7 @@ pub struct RawSample {
     pub route_id: RouteId,
     /// **v2 (ADR-029)** — nome canonical estável entre runs (ex: "BTC-USDT").
     ///
-    /// Fix E15: `route_id.symbol_id` é volátil entre runs; apenas `symbol_name`
+    /// `route_id.symbol_id` é volátil entre runs; apenas `symbol_name`
     /// deve ser usado para joins cross-dia. O JSON ainda serializa
     /// `symbol_id` para debug, mas consumidores offline **devem** chavear
     /// por `symbol_name` (+ `buy_venue`/`sell_venue`) para estabilidade.
@@ -296,7 +274,7 @@ fn escape_json_string(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// SamplingTier — 3 tiers de amostragem (Wave V)
+// SamplingTier — 3 tiers de amostragem
 // ---------------------------------------------------------------------------
 
 /// Tier que aprovou persistência de uma rota no RawSample dataset.
@@ -336,7 +314,7 @@ pub struct DecisionResult {
     pub probability: f32,
 }
 
-/// Decimator por rota com 3 tiers (Wave V, correção PhD B1+A6).
+/// Decimator por rota com 3 tiers.
 ///
 /// Mantém internamente:
 /// - `allowlist`: HashSet de rotas fixas via config (todas as rotas
@@ -389,7 +367,7 @@ impl RouteDecimator {
     /// Substitui a allowlist por snapshot atômico (chamado no startup
     /// após resolver `raw_allowlist_symbols` via `SymbolUniverse`).
     ///
-    /// Fix C5: emite WARN explícito quando a allowlist fica vazia no boot —
+    /// emite WARN explícito quando a allowlist fica vazia no boot —
     /// cenário em que listings novos perdem ~90% dos ticks por 24h por
     /// dependerem apenas do tier `DecimatedUniform` enquanto acumulam
     /// accepts suficientes para entrar em `Priority`.
@@ -397,7 +375,7 @@ impl RouteDecimator {
         if routes.is_empty() {
             tracing::warn!(
                 "raw_decimator allowlist vazia: listings novos dependerão apenas de Priority/Uniform. \
-                 Cobertura longtail cold-start prejudicada (fix C5). \
+                 Cobertura longtail cold-start prejudicada. \
                  Defina `raw_allowlist_symbols` na config para mitigar."
             );
         }
@@ -441,7 +419,7 @@ impl RouteDecimator {
             return DecisionResult {
                 should_persist: true,
                 tier: SamplingTier::Priority,
-                // Fix C4: `1.0` é probabilidade CONDICIONAL à membership do
+                // `1.0` é probabilidade CONDICIONAL à membership do
                 // priority_set — não marginal. Membership oscila entre
                 // generations do ranker; trainer offline deve usar
                 // `priority_set_generation_id` + `priority_set_updated_at_ns`
@@ -722,7 +700,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Tier tests (Wave V — correção PhD B1)
+    // Tier tests
     // ------------------------------------------------------------------
 
     #[test]

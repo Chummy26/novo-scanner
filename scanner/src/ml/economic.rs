@@ -74,12 +74,12 @@ impl TradeOutcome {
 
 /// Evento registrado por emissão (recomendação + outcome resolvido).
 ///
-/// Fix D7: inclui `sampling_probability` para Horvitz-Thompson 1952 correto
+/// inclui `sampling_probability` para Horvitz-Thompson 1952 correto
 /// na agregação `WindowMetrics`. Eventos allowlist (π=1.0) ponderam
 /// diferente de eventos Uniform (π=0.1); agregação ingênua enviesa para
 /// rotas priority sobre-representadas.
 ///
-/// Fix D11: campo renomeado `gross_pnl_usd` → `indicative_gross_at_10k_ref_usd`
+/// campo renomeado `gross_pnl_usd` → `indicative_gross_at_10k_ref_usd`
 /// para eliminar semântica falsa de "ganho operacional real" no dashboard.
 #[derive(Debug, Clone)]
 pub struct EconomicEvent {
@@ -87,7 +87,7 @@ pub struct EconomicEvent {
     pub ts_resolved_ns: u64,
     pub route_id: RouteId,
     pub model_version: String,
-    /// Fix D15: fonte canônica via enum, substituindo prefix match `!starts_with("baseline-")`.
+    /// fonte canônica via enum, substituindo prefix match `!starts_with("baseline-")`.
     pub source_kind: crate::ml::contract::SourceKind,
     /// `entry_now` travado pelo `TradeSetup` em t0 (imutável, skill §3.1).
     pub entry_locked_pct: f32,
@@ -98,7 +98,7 @@ pub struct EconomicEvent {
     /// **NÃO é PnL operacional real** — fees/funding/slippage excluídos
     /// (CLAUDE.md §Fronteira ML). Renomeado em fix D11.
     pub indicative_gross_at_10k_ref_usd: f64,
-    /// Fix D7: probabilidade de amostragem Horvitz-Thompson (IPW).
+    /// probabilidade de amostragem Horvitz-Thompson (IPW).
     /// NaN ⇒ trainer/agregador deve estimar offline.
     pub sampling_probability: f32,
     /// `true` se foi recomendação do modelo real; `false` se baseline/fallback.
@@ -274,7 +274,7 @@ pub struct EconomicMetrics {
 // BaseRateAccumulator (ECE bucket-based)
 // ---------------------------------------------------------------------------
 
-/// Buckets de horizonte para ECE condicional (fix D6).
+/// Buckets de horizonte para ECE condicional.
 ///
 /// Skill §3.2: multiplicidade de pares (t0, t1) significa que calibração deve
 /// ser avaliada por horizonte. Misturar setups de 30s vs 8h num único ECE
@@ -283,7 +283,7 @@ pub struct EconomicMetrics {
 /// Grid log-uniforme: `< 60s | < 5min | < 30min | < 2h | >= 2h`.
 pub const HORIZON_BUCKETS_S: [u32; 5] = [60, 300, 1800, 7200, u32::MAX];
 
-/// Classifica `horizon_observed_ms` em bucket de horizonte (fix D6).
+/// Classifica `horizon_observed_ms` em bucket de horizonte.
 #[inline]
 pub fn horizon_bucket_idx(horizon_observed_ms: u32) -> usize {
     let horizon_s = horizon_observed_ms / 1000;
@@ -293,7 +293,7 @@ pub fn horizon_bucket_idx(horizon_observed_ms: u32) -> usize {
         .unwrap_or(HORIZON_BUCKETS_S.len() - 1)
 }
 
-/// Janela de decay para ECE rolling (fix D8).
+/// Janela de decay para ECE rolling.
 ///
 /// Sem decay, acumulador vitalício atenua drift: em 30 dias, um regime novo
 /// de 6h representa ~0.8% do total e não move ECE. Meta CLAUDE.md "ECE<0.10
@@ -331,7 +331,7 @@ impl Default for CalibrationAccumulator {
 
 impl CalibrationAccumulator {
 
-    /// Registra observação com horizonte e timestamp (fix D6 + D8).
+    /// Registra observação com horizonte e timestamp.
     pub fn record_at(&mut self, p_hit: f32, realized: bool, horizon_observed_ms: u32, now_ns: u64) {
         // Decay exponencial sobre buckets por horizonte.
         if self.last_record_ns > 0 && now_ns > self.last_record_ns {
@@ -367,7 +367,7 @@ impl CalibrationAccumulator {
     }
 
     /// Total decaído (soma sobre todos horizon buckets).
-    pub fn total_soft(&self) -> f64 {
+    fn total_soft(&self) -> f64 {
         self.buckets
             .iter()
             .flat_map(|row| row.iter())
@@ -377,7 +377,7 @@ impl CalibrationAccumulator {
 
     /// ECE global (agregado sobre horizontes) com decay ativo.
     ///
-    /// Fix D8: usa soft counts decaídos; meta "ECE<0.10 em 24h" computável.
+    /// usa soft counts decaídos; meta "ECE<0.10 em 24h" computável.
     pub fn ece(&self) -> f32 {
         let total = self.total_soft();
         if total < 10.0 {
@@ -403,7 +403,7 @@ impl CalibrationAccumulator {
         ece as f32
     }
 
-    /// Fix D6: ECE por bucket de horizonte. Útil para detectar miscalibração
+    /// ECE por bucket de horizonte. Útil para detectar miscalibração
     /// localizada (curto superconfiante + longo subconfiante se compensam no
     /// ECE global).
     pub fn ece_by_horizon_bucket(&self) -> [Option<f32>; 5] {
@@ -428,20 +428,9 @@ impl CalibrationAccumulator {
         out
     }
 
-    /// Reliability diagram data — para dashboard.
-    /// Retorna pontos com IC de Wilson por bucket (correção pós-auditoria
-    /// 2026-04-22: reliability diagram sem IC é estatisticamente inválido;
-    /// Wald é anti-conservativo em amostra pequena conforme Agresti-Coull 1998).
-    /// Buckets com `n < 30` são marcados `unstable = true`.
+    /// Reliability diagram data — pontos com IC de Wilson por bucket.
+    /// Buckets com `n < RELIABILITY_BUCKET_MIN_N` são marcados `unstable`.
     pub fn reliability_points(&self) -> Vec<ReliabilityPoint> {
-        self.reliability_points_with_min_n(RELIABILITY_BUCKET_MIN_N)
-    }
-
-    /// Fix E9: variante com threshold de estabilidade configurável.
-    pub fn reliability_points_with_min_n(&self, min_n: u64) -> Vec<ReliabilityPoint> {
-        // Fix D6: buckets agora são `[[(f64, f64); 10]; 5]` (segregado por
-        // horizon); `flat_buckets` mantém agregação por p_decile para a API
-        // global do reliability diagram.
         let mut pts = Vec::new();
         for (i, (n, k)) in self.flat_buckets.iter().enumerate() {
             if *n == 0 {
@@ -456,7 +445,7 @@ impl CalibrationAccumulator {
                 n: *n,
                 ic_lower,
                 ic_upper,
-                unstable: *n < min_n,
+                unstable: *n < RELIABILITY_BUCKET_MIN_N,
             });
         }
         pts
@@ -464,13 +453,7 @@ impl CalibrationAccumulator {
 }
 
 /// Threshold mínimo de amostras por bucket para considerar estatisticamente
-/// estável. Abaixo disso, a aproximação normal do Wilson IC perde acurácia e
-/// o gate de kill switch não deve disparar por ruído amostral.
-///
-/// Fix E9: Valor default (30) derivado de Student-t rule-of-thumb (CLT
-/// converge razoavelmente a partir desse tamanho). Operador pode sobrescrever
-/// via `reliability_points_with_min_n` para regimes heavy-tail (60+
-/// recomendado quando `tail_ratio_p99_p95 > 2`).
+/// estável. Wilson IC perde acurácia abaixo desse N (Student-t rule-of-thumb).
 pub const RELIABILITY_BUCKET_MIN_N: u64 = 30;
 
 /// Ponto do reliability diagram com IC de Wilson.
@@ -521,7 +504,7 @@ pub fn wilson_ci_95(n: u64, k: u64) -> (f32, f32) {
 
 impl EconomicAccumulator {
     pub fn new() -> Self {
-        // Fix E20: meta CLAUDE.md "ECE<0.10 em 24h" implica janela 24h ~3.7M
+        // meta CLAUDE.md "ECE<0.10 em 24h" implica janela 24h ~3.7M
         // eventos a 1 rec/min × 2600 rotas. 100k anterior truncava em ~40min.
         // Elevamos para 4M para cobrir 24h com folga em regime estacionário.
         Self::with_capacity(4_000_000)
@@ -582,8 +565,8 @@ impl EconomicAccumulator {
                 .fetch_add(pnl_scaled, Ordering::Relaxed);
         }
 
-        // Fix D6: record_at com horizonte observado para ECE segregada.
-        // Fix D8: ts_resolved_ns aciona decay exponencial 24h.
+        // record_at com horizonte observado para ECE segregada.
+        // ts_resolved_ns aciona decay exponencial 24h.
         if let Some(p_hit) = evt.p_hit_forecast {
             if matches!(evt.outcome, TradeOutcome::Censored) {
                 self.events.push_back(evt);
@@ -616,7 +599,7 @@ impl EconomicAccumulator {
 
     /// Snapshot agregado de eventos resolvidos em [now − window, now].
     ///
-    /// Fix D7: aplica Horvitz-Thompson 1952 quando `sampling_probability` é
+    /// aplica Horvitz-Thompson 1952 quando `sampling_probability` é
     /// finito. Eventos allowlist (π=1.0) ponderam 1×, Uniform (π=0.1)
     /// ponderam 10×; reconstrói distribuição populacional sem viés para
     /// rotas priority sobre-representadas.
@@ -794,7 +777,7 @@ mod tests {
             exit_realized_pct: -0.9,
             horizon_observed_ms: 400,
         };
-        // Fix D9: entry_locked é parâmetro externo, não campo interno.
+        // entry_locked é parâmetro externo, não campo interno.
         assert!((out.gross_pnl_pct(2.3) - 1.4).abs() < 1e-5);
         // 1.4% × 10_000 / 100 = 140 USD
         assert!((out.indicative_gross_at_10k_ref_usd(2.3) - 140.0).abs() < 1e-3);
@@ -970,7 +953,7 @@ mod tests {
         assert_eq!(ws[3].window_s, 2_592_000);
     }
 
-    // ---- Fix D6: ECE por horizon bucket --------------------------------
+    // ---- ECE por horizon bucket --------------------------------
 
     #[test]
     fn horizon_bucket_idx_segregates_correctly() {
@@ -1002,7 +985,7 @@ mod tests {
         assert!(per_bucket[3].unwrap() > 0.3);
     }
 
-    // ---- Fix D8: ECE com decay 24h --------------------------------------
+    // ---- ECE com decay 24h --------------------------------------
 
     #[test]
     fn ece_decay_shrinks_old_observations() {

@@ -12,7 +12,7 @@
 //! - O alvo supervisionado principal é `first_exit_ge_label_floor_*` com
 //!   censura; `best_exit_pct`/`best_gross_pct` são auditoria hindsight.
 //!
-//! # Fix C1 — filtragem obrigatória no trainer
+//! # Filtragem obrigatória no trainer
 //!
 //! O resolver cria `PendingLabel` para **todos** os candidates limpos, não
 //! apenas `sample_decision == "accept"`. Isso permite calibrar abstenção e
@@ -50,30 +50,8 @@
 
 use crate::ml::contract::RouteId;
 
-/// Versão atual do schema do LabeledTrade.
-///
-/// v4 (2026-04-22): adiciona `sample_decision` e `label_floor_hits`
-/// multi-threshold. Mantem os campos first-hit primarios por compatibilidade,
-/// mas permite treinar P(exit >= floor | state, floor) sem congelar o modelo
-/// em um unico floor global.
-/// v5 (2026-04-23): `gross_run_*` passa a significar run histórico de
-/// `exit >= label_floor - entry_locked(t0)`; `sampling_probability` do label
-/// serializa null quando a probabilidade efetiva depende do stride por rota.
-/// v6 (2026-04-23 Wave W): auditoria PhD de 70 findings. Novos campos:
-///   - `FeaturesT0`: `entry_rank_percentile_24h`, `entry_minus_p50_24h`,
-///     `entry_mad_robust_24h`, `p_exit_ge_label_floor_minus_entry_24h`,
-///     `n_cache_observations_at_t0`, `oldest_cache_ts_ns`,
-///     `log_min_vol24_usd`, `vol_ratio`, `exit_excess_run_s` (B1, B2, B4,
-///     C7/C15); volumes brutos mantidos por compat porém marcados.
-///   - `LabeledTrade`: `cluster_id`, `cluster_size`, `cluster_rank`,
-///     `runtime_config_hash`, `priority_set_generation_id`,
-///     `priority_set_updated_at_ns` (C2, C3, C13).
-///   - `PolicyMetadata`: `candidates_in_route_last_24h`,
-///     `accepts_in_route_last_24h`, `effective_stride_s`, `ci_method` (A6, C4, D2).
-///   - Renomeação protetora: `best_exit_pct` → `audit_hindsight_best_exit_pct`,
-///     `best_gross_pct` → `audit_hindsight_best_gross_pct`, `t_to_best_s` →
-///     `audit_hindsight_t_to_best_s` (A10). Nomes antigos removidos do JSON.
-///   - `SCANNER_VERSION` consolidado em `ml/mod.rs` (E5).
+/// Versão atual do schema do `LabeledTrade`. Bump em qualquer alteração
+/// de campos persistidos. Histórico em git log.
 pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 6;
 
 #[cfg(test)]
@@ -131,13 +109,13 @@ impl CensorReason {
 /// literalmente aos Testes 1 e 2 da skill §4.
 #[derive(Debug, Clone)]
 pub struct FeaturesT0 {
-    // --- Liquidez (fix B4) -----------------------------------------------
+    // --- Liquidez -----------------------------------------------
     /// Volumes brutos mantidos por compat; preferir `log_min_vol24_usd` +
     /// `vol_ratio` como features; `buy_vol24`/`sell_vol24` expostos apenas
     /// para reconstrução offline de agregações pré-v6.
     pub buy_vol24: f64,
     pub sell_vol24: f64,
-    /// Fix B4: amplitude de participantes (não capacidade operacional).
+    /// amplitude de participantes (não capacidade operacional).
     /// Evita que modelo aprenda atalho "volume alto → atenua slippage" —
     /// CLAUDE.md §Fronteira ML proíbe modelar slippage/execução.
     pub log_min_vol24_usd: Option<f32>,
@@ -150,13 +128,13 @@ pub struct FeaturesT0 {
     pub entry_p50_24h: Option<f32>,
     pub entry_p75_24h: Option<f32>,
     pub entry_p95_24h: Option<f32>,
-    /// Fix B1: percentil empírico de `entry_now` na ECDF 24h da rota.
+    /// percentil empírico de `entry_now` na ECDF 24h da rota.
     /// Teste 1 literal: `P_hist(entry ≤ entry_now)`. Feature primária
     /// que antes exigia reconstrução offline por composição não-linear.
     pub entry_rank_percentile_24h: Option<f32>,
-    /// Fix B1: magnitude do entry atual vs mediana histórica.
+    /// magnitude do entry atual vs mediana histórica.
     pub entry_minus_p50_24h: Option<f32>,
-    /// Fix B1: Median Absolute Deviation robusto — escala para z-score
+    /// Median Absolute Deviation robusto — escala para z-score
     /// resistente a caudas. Permite `z = (entry_now - p50) / MAD`.
     pub entry_mad_robust_24h: Option<f32>,
 
@@ -165,11 +143,11 @@ pub struct FeaturesT0 {
     pub exit_p50_24h: Option<f32>,
     pub exit_p75_24h: Option<f32>,
     pub exit_p95_24h: Option<f32>,
-    /// Fix B2: frequência empírica `P_hist(exit ≥ label_floor − entry_now)`.
+    /// frequência empírica `P_hist(exit ≥ label_floor − entry_now)`.
     /// Teste 2 literal: proxy direto da base rate do hit condicional.
     pub p_exit_ge_label_floor_minus_entry_24h: Option<f32>,
 
-    // --- Runs (fix A4) ---------------------------------------------------
+    // --- Runs ---------------------------------------------------
     /// Duração histórica de janelas em que `entry_locked(t0) + exit_hist`
     /// teria atingido o `label_floor_pct` primário. Computado como run de
     /// `exit_hist >= label_floor_pct - entry_locked(t0)`, não como
@@ -177,11 +155,11 @@ pub struct FeaturesT0 {
     pub gross_run_p05_s: Option<u32>,
     pub gross_run_p50_s: Option<u32>,
     pub gross_run_p95_s: Option<u32>,
-    /// Fix A4: runs de `exit(τ) ≥ exit_p50_24h`, sem condicionamento em
+    /// runs de `exit(τ) ≥ exit_p50_24h`, sem condicionamento em
     /// entry atual. Feature mais estacionária complementar.
     pub exit_excess_run_s: Option<u32>,
 
-    // --- Estado do cache PIT (fix C7) ------------------------------------
+    // --- Estado do cache PIT ------------------------------------
     /// Número de observações no cache rolante 24h da rota no instante t0.
     /// Permite trainer filtrar por "histórico suficiente" de forma idêntica
     /// ao gate do trigger e reconstruir estado PIT.
@@ -207,7 +185,7 @@ pub struct PolicyMetadata {
     pub baseline_derived_exit_at_min: Option<f32>,
     pub baseline_floor_pct: f32,
     pub label_stride_s: u32,
-    /// Fix A13: stride efetivo por horizonte deste record específico.
+    /// stride efetivo por horizonte deste record específico.
     pub effective_stride_s: u32,
     /// Probabilidade efetiva do label quando conhecida.
     ///
@@ -216,13 +194,13 @@ pub struct PolicyMetadata {
     /// observada de candidates por rota/horizonte; quando não for conhecida
     /// online, serializa como `null` e o trainer deve estimar offline.
     pub label_sampling_probability: f32,
-    /// Fix A6: candidates da rota nas últimas 24h (pré-stride). Permite
+    /// candidates da rota nas últimas 24h (pré-stride). Permite
     /// trainer reconstruir `π(x)` offline sem ambiguidade.
     pub candidates_in_route_last_24h: u32,
-    /// Fix A6: accepts da rota nas últimas 24h. `accepts/candidates` é a
+    /// accepts da rota nas últimas 24h. `accepts/candidates` é a
     /// taxa histórica de trigger aceitando na cauda.
     pub accepts_in_route_last_24h: u32,
-    /// Fix D2: método usado para construir `p_hit_ci` do baseline/modelo
+    /// método usado para construir `p_hit_ci` do baseline/modelo
     /// que emitiu este candidate.
     pub ci_method: &'static str,
 }
@@ -244,7 +222,7 @@ pub struct FloorHitLabel {
 
 /// `LabeledTrade` — 1 record por `(sample_id, horizon_s)` conforme Opção B.
 ///
-/// Schema v6 (fix C3, C13, A10, A9, C2):
+/// Schema v6:
 /// - `best_*` → `audit_hindsight_best_*` (namespace protetor contra uso indevido como target);
 /// - `cluster_id`/`cluster_size`/`cluster_rank` (anti-IID pseudoreplicação);
 /// - `runtime_config_hash` (distingue datasets gerados com configs diferentes);
@@ -263,7 +241,7 @@ pub struct LabeledTrade {
     pub route_id: RouteId,
     pub symbol_name: String,
 
-    // Fix C3: cluster de correlação para CPCV correto.
+    // cluster de correlação para CPCV correto.
     /// ID do cluster: hash determinístico `route_id + floor(ts_emit_ns / 15min)`.
     pub cluster_id: String,
     /// Tamanho do cluster no instante de emit (inicializa 1; pode ser atualizado
@@ -272,9 +250,9 @@ pub struct LabeledTrade {
     /// Rank desta rota dentro do cluster (1 = melhor).
     pub cluster_rank: u32,
 
-    // Fix C13: fingerprint da config runtime em hex16.
+    // fingerprint da config runtime em hex16.
     pub runtime_config_hash: String,
-    // Fix C2: auditoria de membership do priority_set.
+    // auditoria de membership do priority_set.
     pub priority_set_generation_id: u32,
     pub priority_set_updated_at_ns: u64,
 
@@ -285,7 +263,7 @@ pub struct LabeledTrade {
     // Features t0
     pub features_t0: FeaturesT0,
 
-    // Fix A10: auditoria oracle/hindsight com prefix protetor — NUNCA usar
+    // auditoria oracle/hindsight com prefix protetor — NUNCA usar
     // como target supervisionado principal. Nomes antigos (`best_exit_pct`
     // etc.) foram removidos do schema v6.
     pub audit_hindsight_best_exit_pct: Option<f32>,
@@ -308,7 +286,7 @@ pub struct LabeledTrade {
     pub observed_until_ns: u64,
     /// Ts em que o slot foi fechado pelo resolver (after close_slack ou sweep).
     pub closed_ts_ns: u64,
-    /// Fix A9: ts em que o writer de fato serializou a linha. Agora distinto
+    /// ts em que o writer de fato serializou a linha. Agora distinto
     /// de `closed_ts_ns`; populado pelo writer task no momento do `writeln!`.
     pub written_ts_ns: u64,
 
@@ -675,7 +653,7 @@ mod tests {
         assert_eq!(v["policy_metadata"]["ci_method"], "wilson_marginal");
         assert_eq!(v["policy_metadata"]["candidates_in_route_last_24h"], 10_000);
         assert_eq!(v["sampling_tier"], "allowlist");
-        // Fix B1/B2/B4 — novas features exportadas.
+        // (removed) novas features exportadas.
         assert_eq!(v["features_t0"]["entry_rank_percentile_24h"], 0.75);
         assert_eq!(v["features_t0"]["entry_minus_p50_24h"], 0.5);
         assert_eq!(
@@ -689,7 +667,7 @@ mod tests {
         assert_eq!(v["features_t0"]["gross_run_p50_s"], 120);
         assert_eq!(v["features_t0"]["exit_excess_run_s"], 90);
         assert_eq!(v["features_t0"]["listing_age_days"], 14.0);
-        // Fix A10 — renomeação protetora ativa.
+        // (removed) renomeação protetora ativa.
         assert!(
             v.get("best_exit_pct").is_none(),
             "nome antigo não deve sair no v6"
@@ -716,7 +694,7 @@ mod tests {
         let line = l.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["outcome"], "censored");
-        // Fix A2: RouteDelisted é variante distinta de RouteVanished.
+        // RouteDelisted é variante distinta de RouteVanished.
         assert_eq!(v["censor_reason"], "route_delisted");
         assert!(v["audit_hindsight_best_exit_pct"].is_null());
         assert!(v["first_exit_ge_label_floor_ts_ns"].is_null());

@@ -32,7 +32,5 @@ pub mod invariants;
 pub mod leakage;
 pub mod lovo;
 
-pub use invariants::{
-    verify_tradesetup, verify_tradesetup_with_floor, InvariantError, DEFAULT_P_HIT_EMISSION_FLOOR,
-};
+pub use invariants::{verify_tradesetup, InvariantError};
 pub use lovo::{LovoReport, VenueFoldMetrics};

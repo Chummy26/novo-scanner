@@ -1,4 +1,4 @@
-//! Writer JSONL para `LabeledTrade` (Wave V — análogo a `JsonlWriter`).
+//! Writer JSONL para `LabeledTrade` — análogo a `JsonlWriter`.
 //!
 //! Mesmo padrão de `persistence/writer.rs`: canal mpsc, rotação horária
 //! Hive-style, flush periódico.
@@ -32,7 +32,7 @@ pub struct LabeledWriterConfig {
 
 impl Default for LabeledWriterConfig {
     fn default() -> Self {
-        let hostname = hostname_best_effort();
+        let hostname = crate::ml::util::hostname_best_effort();
         let pid = std::process::id();
         Self {
             data_dir: PathBuf::from("data/ml/labeled_trades"),
@@ -43,12 +43,6 @@ impl Default for LabeledWriterConfig {
             parquet: ParquetCompactionConfig::default(),
         }
     }
-}
-
-fn hostname_best_effort() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "scanner".into())
 }
 
 #[derive(Clone)]

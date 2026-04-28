@@ -76,7 +76,7 @@ pub struct MlPrometheusMetrics {
     // cedo demais sistematicamente é erro do modelo" — CLAUDE.md).
     premature_recommendation_rate: Gauge,
 
-    // Wave V — labels supervisionados + decimator tiers.
+    // Labels supervisionados + decimator tiers.
     labels_created_total: IntCounter,
     labels_stride_skipped_total: IntCounter,
     labels_written_total: IntCounterVec,
@@ -230,7 +230,7 @@ impl MlPrometheusMetrics {
             "PnL bruto simulado agregado em USD (capital hipotético 10k)",
         ))?;
 
-        // Wave U — Fix pós-auditoria 2026-04-21.
+        // (removed) Fix pós-auditoria 2026-04-21.
         let broadcaster_lagged_frames_total = IntCounter::with_opts(Opts::new(
             "ml_broadcaster_lagged_frames_total",
             "Frames sobrescritos por consumer WS lento (RecvError::Lagged)",
@@ -260,7 +260,7 @@ impl MlPrometheusMetrics {
             "n_window_miss_total / n_emissions_total acumulado — taxa de recomendações que não realizaram o entry dentro da janela (CLAUDE.md: 'recomendar cedo demais sistematicamente é erro do modelo')",
         ))?;
 
-        // Wave V — labels supervisionados + tiers.
+        // (removed) labels supervisionados + tiers.
         let labels_created_total = IntCounter::with_opts(Opts::new(
             "ml_labels_created_total",
             "PendingLabels criados (1 por AcceptedSample elegível após stride)",
@@ -526,7 +526,7 @@ impl MlPrometheusMetrics {
         }
     }
 
-    /// Wave V — atualiza métricas do `LabelResolver`.
+    /// (removed) atualiza métricas do `LabelResolver`.
     pub fn update_from_resolver(&mut self, rm: &ResolverMetrics) {
         let pending = rm.pending_created_total.load(Ordering::Relaxed);
         let stride = rm.stride_skipped_total.load(Ordering::Relaxed);
@@ -601,7 +601,7 @@ impl MlPrometheusMetrics {
         self.broadcaster_no_subscribers_total.inc_by(d_no_subs);
         self.broadcaster_was_recommended_total.inc_by(d_rec);
 
-        // Wave U — lagged frames.
+        // (removed) lagged frames.
         let lagged = bm.lagged_frames_total.load(Ordering::Relaxed);
         let d_lagged = lagged.saturating_sub(self.last_broadcaster.lagged_frames_total);
         self.broadcaster_lagged_frames_total.inc_by(d_lagged);
