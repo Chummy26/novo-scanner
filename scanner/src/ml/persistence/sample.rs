@@ -4,12 +4,13 @@
 //! Vide `mod.rs` para racional de formato.
 
 use crate::ml::contract::RouteId;
+use crate::ml::persistence::raw_sample::sampling_probability_kind_for_tier_label;
 use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::trigger::SampleDecision;
 
 /// Versão atual do schema do `AcceptedSample`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 7;
+pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 8;
 
 use crate::ml::SCANNER_VERSION;
 
@@ -51,6 +52,15 @@ pub struct AcceptedSample {
     /// joins frágeis quando o accepted precisa ser auditado isoladamente.
     pub sampling_tier: &'static str,
     pub sampling_probability: f32,
+    /// **v8** — semântica de `sampling_probability`; evita tratar
+    /// `priority` como probabilidade marginal quando é condicional à
+    /// membership no ranker.
+    pub sampling_probability_kind: &'static str,
+    /// **v8** — snapshot mínimo de lifecycle da rota no instante t0.
+    pub route_first_seen_ns: u64,
+    pub route_last_seen_ns: u64,
+    pub route_active_until_ns: Option<u64>,
+    pub route_n_snapshots: u64,
     /// Flag de emissão do baseline — `true` se o baseline A3 produziu
     /// `Recommendation::Trade` para este snapshot (observe: Abstain =
     /// false). Determinado por `should_mark_sample_recommended` em
@@ -108,8 +118,26 @@ impl AcceptedSample {
             sample_decision,
             sampling_tier,
             sampling_probability,
+            sampling_probability_kind: sampling_probability_kind_for_tier_label(sampling_tier),
+            route_first_seen_ns: 0,
+            route_last_seen_ns: 0,
+            route_active_until_ns: None,
+            route_n_snapshots: 0,
             was_recommended: false,
         }
+    }
+
+    pub fn set_lifecycle(
+        &mut self,
+        first_seen_ns: u64,
+        last_seen_ns: u64,
+        active_until_ns: Option<u64>,
+        n_snapshots: u64,
+    ) {
+        self.route_first_seen_ns = first_seen_ns;
+        self.route_last_seen_ns = last_seen_ns;
+        self.route_active_until_ns = active_until_ns;
+        self.route_n_snapshots = n_snapshots;
     }
 
     pub fn mark_recommended(&mut self) {
@@ -132,6 +160,9 @@ impl AcceptedSample {
                 r#""entry_spread":{},"exit_spread":{},"#,
                 r#""buy_vol24":{},"sell_vol24":{},"#,
                 r#""sample_decision":"{}","sampling_tier":"{}","sampling_probability":{},"#,
+                r#""sampling_probability_kind":"{}","#,
+                r#""route_first_seen_ns":{},"route_last_seen_ns":{},"#,
+                r#""route_active_until_ns":{},"route_n_snapshots":{},"#,
                 r#""was_recommended":{}}}"#,
             ),
             self.ts_ns,
@@ -153,6 +184,11 @@ impl AcceptedSample {
             decision,
             self.sampling_tier,
             format_f32(self.sampling_probability),
+            self.sampling_probability_kind,
+            self.route_first_seen_ns,
+            self.route_last_seen_ns,
+            opt_u64(self.route_active_until_ns),
+            self.route_n_snapshots,
             self.was_recommended,
         )
     }
@@ -176,6 +212,12 @@ fn escape_json_string(s: &str) -> String {
         }
     }
     out
+}
+
+#[inline]
+fn opt_u64(v: Option<u64>) -> String {
+    v.map(|x| x.to_string())
+        .unwrap_or_else(|| "null".to_string())
 }
 
 /// f32 → string JSON-safe: `NaN` e `Inf` viram `null`.
@@ -231,12 +273,13 @@ mod tests {
             1.0,
         );
         assert_eq!(s.schema_version, ACCEPTED_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(s.schema_version, 7);
+        assert_eq!(s.schema_version, 8);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
         assert_eq!(s.runtime_config_hash, "0000000000000001");
         assert_eq!(s.sampling_tier, "priority");
         assert_eq!(s.sampling_probability, 1.0);
+        assert_eq!(s.sampling_probability_kind, "conditional_priority");
         assert_eq!(s.sample_id.len(), 32);
         assert!(!s.was_recommended);
     }
@@ -270,9 +313,12 @@ mod tests {
         assert_eq!(v["runtime_config_hash"], "0000000000000001");
         assert_eq!(v["sampling_tier"], "priority");
         assert_eq!(v["sampling_probability"], 1.0);
+        assert_eq!(v["sampling_probability_kind"], "conditional_priority");
+        assert_eq!(v["route_first_seen_ns"], 0);
+        assert!(v["route_active_until_ns"].is_null());
         assert_eq!(v["was_recommended"], false);
         assert!(v["scanner_version"].is_string());
-        assert_eq!(v["schema_version"], 7);
+        assert_eq!(v["schema_version"], 8);
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert!(
             v.get("buy_book_age_ms").is_none(),

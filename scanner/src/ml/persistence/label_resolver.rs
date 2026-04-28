@@ -32,8 +32,9 @@ use crate::ml::persistence::labeled_trade::{
     CensorReason, FeaturesT0, FloorHitLabel, LabelOutcome, LabeledTrade, PolicyMetadata,
     LABELED_TRADE_SCHEMA_VERSION,
 };
-use crate::ml::SCANNER_VERSION;
 use crate::ml::persistence::labeled_writer::{LabeledWriterHandle, LabeledWriterSendError};
+use crate::ml::persistence::raw_sample::sampling_probability_kind_for_tier_label;
+use crate::ml::SCANNER_VERSION;
 
 /// Padrões de horizonte (s) — fix A7.
 ///
@@ -670,13 +671,13 @@ impl LabelResolver {
             })
             .collect();
 
-        // stride efetivo por horizonte registrado em PolicyMetadata.
+        // Stride persistido deve representar a seleção realmente aplicada.
+        // Hoje o resolver cria o pending por rota usando `label_stride_s`
+        // antes de expandir horizontes; `effective_stride_for_horizon` segue
+        // disponível como recomendação futura, mas não pode ser gravado como
+        // se tivesse controlado a amostragem atual.
         let mut policy = pending.policy_metadata.clone();
-        policy.effective_stride_s = effective_stride_for_horizon(
-            LABEL_STRIDE_BASE_S,
-            slot.horizon_s,
-            N_EVENTS_TARGET_PER_HORIZON,
-        );
+        policy.effective_stride_s = pending.policy_metadata.label_stride_s;
 
         let label = LabeledTrade {
             sample_id: pending.sample_id.clone(),
@@ -719,6 +720,9 @@ impl LabelResolver {
             policy_metadata: policy,
             sampling_tier: pending.sampling_tier,
             sampling_probability: pending.sampling_probability,
+            sampling_probability_kind: sampling_probability_kind_for_tier_label(
+                pending.sampling_tier,
+            ),
         };
 
         match self.writer.try_send(label) {
@@ -849,6 +853,10 @@ mod tests {
             n_cache_observations_at_t0: 0,
             oldest_cache_ts_ns: 0,
             listing_age_days: None,
+            route_first_seen_ns: None,
+            route_last_seen_ns: None,
+            route_active_until_ns: None,
+            route_n_snapshots: None,
         }
     }
 
@@ -856,6 +864,26 @@ mod tests {
         PolicyMetadata {
             baseline_model_version: "baseline-a3-0.2.0".into(),
             baseline_recommended: false,
+            recommendation_kind: "abstain",
+            abstain_reason: Some("NO_OPPORTUNITY"),
+            prediction_source_kind: "baseline",
+            prediction_model_version: "baseline-a3-0.2.0".into(),
+            prediction_emitted_at_ns: None,
+            prediction_valid_until_ns: None,
+            prediction_entry_now: None,
+            prediction_exit_target: None,
+            prediction_gross_profit_target: None,
+            prediction_p_hit: None,
+            prediction_p_hit_ci_lo: None,
+            prediction_p_hit_ci_hi: None,
+            prediction_exit_q25: None,
+            prediction_exit_q50: None,
+            prediction_exit_q75: None,
+            prediction_t_hit_p25_s: None,
+            prediction_t_hit_median_s: None,
+            prediction_t_hit_p75_s: None,
+            prediction_p_censor: None,
+            prediction_calibration_status: "not_applicable",
             baseline_historical_base_rate_24h: None,
             baseline_derived_enter_at_min: None,
             baseline_derived_exit_at_min: None,
@@ -1209,10 +1237,7 @@ mod tests {
         // Sem observações → observed_until == t_emit < qualquer deadline → Censored.
         // DEFAULT_HORIZONS_S agora tem 6 elementos (buraco 2h→8h fechado).
         let closed = resolver.shutdown_flush(t0 + 1_000_000_000);
-        assert_eq!(
-            closed, 6,
-            "6 horizontes default devem ter sido fechados"
-        );
+        assert_eq!(closed, 6, "6 horizontes default devem ter sido fechados");
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert_eq!(

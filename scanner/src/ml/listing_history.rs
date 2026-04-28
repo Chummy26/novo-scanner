@@ -157,10 +157,21 @@ impl ListingHistory {
         guard.get(&route).map(|lc| lc.last_seen_ns)
     }
 
+    pub fn active_until(&self, route: RouteId) -> Option<u64> {
+        let guard = self.routes.read();
+        guard.get(&route).and_then(|lc| lc.active_until_ns)
+    }
+
     /// Total de snapshots observados para a rota.
     pub fn n_snapshots(&self, route: RouteId) -> u64 {
         let guard = self.routes.read();
         guard.get(&route).map(|lc| lc.n_snapshots).unwrap_or(0)
+    }
+
+    /// Snapshot imutável de uma rota específica.
+    pub fn snapshot_for(&self, route: RouteId) -> Option<RouteLifecycle> {
+        let guard = self.routes.read();
+        guard.get(&route).copied()
     }
 
     /// Marca explicitamente uma rota como delisted (ex: aviso manual

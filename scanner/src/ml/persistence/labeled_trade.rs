@@ -52,7 +52,7 @@ use crate::ml::contract::RouteId;
 
 /// Versão atual do schema do `LabeledTrade`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 6;
+pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 7;
 
 #[cfg(test)]
 use crate::ml::SCANNER_VERSION;
@@ -170,6 +170,12 @@ pub struct FeaturesT0 {
     pub oldest_cache_ts_ns: u64,
 
     pub listing_age_days: Option<f32>,
+    /// Snapshot PIT de lifecycle da rota para auditoria anti-survivorship
+    /// sem depender do estado RAM do scanner.
+    pub route_first_seen_ns: Option<u64>,
+    pub route_last_seen_ns: Option<u64>,
+    pub route_active_until_ns: Option<u64>,
+    pub route_n_snapshots: Option<u64>,
 }
 
 /// Metadados de policy (auditoria, não target do modelo — correção A1/P3).
@@ -180,6 +186,29 @@ pub struct FeaturesT0 {
 pub struct PolicyMetadata {
     pub baseline_model_version: String,
     pub baseline_recommended: bool,
+    /// `trade` ou `abstain` para o recomendador vigente no snapshot.
+    pub recommendation_kind: &'static str,
+    /// Motivo canônico quando `recommendation_kind = abstain`.
+    pub abstain_reason: Option<&'static str>,
+    /// Fonte canônica da predição emitida (`baseline`, `model` ou `none`).
+    pub prediction_source_kind: &'static str,
+    pub prediction_model_version: String,
+    pub prediction_emitted_at_ns: Option<u64>,
+    pub prediction_valid_until_ns: Option<u64>,
+    pub prediction_entry_now: Option<f32>,
+    pub prediction_exit_target: Option<f32>,
+    pub prediction_gross_profit_target: Option<f32>,
+    pub prediction_p_hit: Option<f32>,
+    pub prediction_p_hit_ci_lo: Option<f32>,
+    pub prediction_p_hit_ci_hi: Option<f32>,
+    pub prediction_exit_q25: Option<f32>,
+    pub prediction_exit_q50: Option<f32>,
+    pub prediction_exit_q75: Option<f32>,
+    pub prediction_t_hit_p25_s: Option<u32>,
+    pub prediction_t_hit_median_s: Option<u32>,
+    pub prediction_t_hit_p75_s: Option<u32>,
+    pub prediction_p_censor: Option<f32>,
+    pub prediction_calibration_status: &'static str,
     pub baseline_historical_base_rate_24h: Option<f32>,
     pub baseline_derived_enter_at_min: Option<f32>,
     pub baseline_derived_exit_at_min: Option<f32>,
@@ -297,6 +326,7 @@ pub struct LabeledTrade {
     // a probabilidade efetiva do label depende do stride por rota.
     pub sampling_tier: &'static str,
     pub sampling_probability: f32,
+    pub sampling_probability_kind: &'static str,
 }
 
 impl LabeledTrade {
@@ -332,7 +362,8 @@ impl LabeledTrade {
                 r#""gross_run_p05_s":{},"gross_run_p50_s":{},"gross_run_p95_s":{},"#,
                 r#""exit_excess_run_s":{},"#,
                 r#""n_cache_observations_at_t0":{},"oldest_cache_ts_ns":{},"#,
-                r#""listing_age_days":{}}},"#,
+                r#""listing_age_days":{},"route_first_seen_ns":{},"route_last_seen_ns":{},"#,
+                r#""route_active_until_ns":{},"route_n_snapshots":{}}},"#,
                 r#""audit_hindsight_best_exit_pct":{},"audit_hindsight_best_exit_ts_ns":{},"#,
                 r#""audit_hindsight_best_gross_pct":{},"audit_hindsight_t_to_best_s":{},"#,
                 r#""n_clean_future_samples":{},"#,
@@ -342,13 +373,21 @@ impl LabeledTrade {
                 r#""outcome":"{}","censor_reason":{},"#,
                 r#""observed_until_ns":{},"closed_ts_ns":{},"written_ts_ns":{},"#,
                 r#""policy_metadata":{{"baseline_model_version":"{}","#,
-                r#""baseline_recommended":{},"baseline_historical_base_rate_24h":{},"#,
+                r#""baseline_recommended":{},"recommendation_kind":"{}","abstain_reason":{},"#,
+                r#""prediction_source_kind":"{}","prediction_model_version":"{}","#,
+                r#""prediction_emitted_at_ns":{},"prediction_valid_until_ns":{},"#,
+                r#""prediction_entry_now":{},"prediction_exit_target":{},"prediction_gross_profit_target":{},"#,
+                r#""prediction_p_hit":{},"prediction_p_hit_ci_lo":{},"prediction_p_hit_ci_hi":{},"#,
+                r#""prediction_exit_q25":{},"prediction_exit_q50":{},"prediction_exit_q75":{},"#,
+                r#""prediction_t_hit_p25_s":{},"prediction_t_hit_median_s":{},"prediction_t_hit_p75_s":{},"#,
+                r#""prediction_p_censor":{},"prediction_calibration_status":"{}","#,
+                r#""baseline_historical_base_rate_24h":{},"#,
                 r#""baseline_derived_enter_at_min":{},"baseline_derived_exit_at_min":{},"#,
                 r#""baseline_floor_pct":{},"label_stride_s":{},"effective_stride_s":{},"#,
                 r#""label_sampling_probability":{},"#,
                 r#""candidates_in_route_last_24h":{},"accepts_in_route_last_24h":{},"#,
                 r#""ci_method":"{}"}},"#,
-                r#""sampling_tier":"{}","sampling_probability":{}}}"#,
+                r#""sampling_tier":"{}","sampling_probability":{},"sampling_probability_kind":"{}"}}"#,
             ),
             self.sample_id,
             self.sample_decision,
@@ -395,6 +434,10 @@ impl LabeledTrade {
             self.features_t0.n_cache_observations_at_t0,
             self.features_t0.oldest_cache_ts_ns,
             opt_f32(self.features_t0.listing_age_days),
+            opt_u64(self.features_t0.route_first_seen_ns),
+            opt_u64(self.features_t0.route_last_seen_ns),
+            opt_u64(self.features_t0.route_active_until_ns),
+            opt_u64(self.features_t0.route_n_snapshots),
             opt_f32(self.audit_hindsight_best_exit_pct),
             opt_u64(self.audit_hindsight_best_exit_ts_ns),
             opt_f32(self.audit_hindsight_best_gross_pct),
@@ -412,6 +455,26 @@ impl LabeledTrade {
             self.written_ts_ns,
             escape_json(&self.policy_metadata.baseline_model_version),
             self.policy_metadata.baseline_recommended,
+            self.policy_metadata.recommendation_kind,
+            opt_str(self.policy_metadata.abstain_reason),
+            self.policy_metadata.prediction_source_kind,
+            escape_json(&self.policy_metadata.prediction_model_version),
+            opt_u64(self.policy_metadata.prediction_emitted_at_ns),
+            opt_u64(self.policy_metadata.prediction_valid_until_ns),
+            opt_f32(self.policy_metadata.prediction_entry_now),
+            opt_f32(self.policy_metadata.prediction_exit_target),
+            opt_f32(self.policy_metadata.prediction_gross_profit_target),
+            opt_f32(self.policy_metadata.prediction_p_hit),
+            opt_f32(self.policy_metadata.prediction_p_hit_ci_lo),
+            opt_f32(self.policy_metadata.prediction_p_hit_ci_hi),
+            opt_f32(self.policy_metadata.prediction_exit_q25),
+            opt_f32(self.policy_metadata.prediction_exit_q50),
+            opt_f32(self.policy_metadata.prediction_exit_q75),
+            opt_u32(self.policy_metadata.prediction_t_hit_p25_s),
+            opt_u32(self.policy_metadata.prediction_t_hit_median_s),
+            opt_u32(self.policy_metadata.prediction_t_hit_p75_s),
+            opt_f32(self.policy_metadata.prediction_p_censor),
+            self.policy_metadata.prediction_calibration_status,
             opt_f32(self.policy_metadata.baseline_historical_base_rate_24h),
             opt_f32(self.policy_metadata.baseline_derived_enter_at_min),
             opt_f32(self.policy_metadata.baseline_derived_exit_at_min),
@@ -424,6 +487,7 @@ impl LabeledTrade {
             self.policy_metadata.ci_method,
             self.sampling_tier,
             f32_or_null(self.sampling_probability),
+            self.sampling_probability_kind,
         )
     }
 }
@@ -462,6 +526,13 @@ fn opt_u32(o: Option<u32>) -> String {
 fn opt_u64(o: Option<u64>) -> String {
     match o {
         Some(v) => v.to_string(),
+        None => "null".to_string(),
+    }
+}
+#[inline]
+fn opt_str(o: Option<&str>) -> String {
+    match o {
+        Some(v) => format!("\"{}\"", escape_json(v)),
         None => "null".to_string(),
     }
 }
@@ -566,6 +637,12 @@ mod tests {
                 n_cache_observations_at_t0: 850,
                 oldest_cache_ts_ns: 1_700_000_000_000_000_000 - 24 * 3600 * 1_000_000_000,
                 listing_age_days: Some(14.0),
+                route_first_seen_ns: Some(
+                    1_700_000_000_000_000_000 - 14 * 24 * 3600 * 1_000_000_000,
+                ),
+                route_last_seen_ns: Some(1_700_000_000_000_000_000),
+                route_active_until_ns: None,
+                route_n_snapshots: Some(123_456),
             },
             audit_hindsight_best_exit_pct: Some(-0.3),
             audit_hindsight_best_exit_ts_ns: Some(1_700_000_000_000_000_000 + 300 * 1_000_000_000),
@@ -609,6 +686,26 @@ mod tests {
             policy_metadata: PolicyMetadata {
                 baseline_model_version: "baseline-a3-0.2.0".into(),
                 baseline_recommended: true,
+                recommendation_kind: "trade",
+                abstain_reason: None,
+                prediction_source_kind: "baseline",
+                prediction_model_version: "baseline-a3-0.2.0".into(),
+                prediction_emitted_at_ns: Some(1_700_000_000_000_000_000),
+                prediction_valid_until_ns: Some(1_700_000_000_000_000_000 + 60_000_000_000),
+                prediction_entry_now: Some(2.5),
+                prediction_exit_target: Some(-1.7),
+                prediction_gross_profit_target: Some(1.4),
+                prediction_p_hit: None,
+                prediction_p_hit_ci_lo: None,
+                prediction_p_hit_ci_hi: None,
+                prediction_exit_q25: Some(-1.4),
+                prediction_exit_q50: Some(-1.1),
+                prediction_exit_q75: Some(-0.8),
+                prediction_t_hit_p25_s: None,
+                prediction_t_hit_median_s: None,
+                prediction_t_hit_p75_s: None,
+                prediction_p_censor: None,
+                prediction_calibration_status: "degraded",
                 baseline_historical_base_rate_24h: Some(0.77),
                 baseline_derived_enter_at_min: Some(1.9),
                 baseline_derived_exit_at_min: Some(-1.1),
@@ -622,6 +719,7 @@ mod tests {
             },
             sampling_tier: "allowlist",
             sampling_probability: 1.0,
+            sampling_probability_kind: "marginal_full_capture",
         }
     }
 
@@ -634,7 +732,7 @@ mod tests {
         assert_eq!(v["sample_id"], "abcdef0123456789abcdef0123456789");
         assert_eq!(v["sample_decision"], "accept");
         assert_eq!(v["horizon_s"], 900);
-        assert_eq!(v["schema_version"], 6);
+        assert_eq!(v["schema_version"], 7);
         assert_eq!(v["cluster_id"], "deadbeefdeadbeef");
         assert_eq!(v["cluster_size"], 1);
         assert!(v["runtime_config_hash"].is_string());
@@ -650,6 +748,11 @@ mod tests {
             v["policy_metadata"]["baseline_model_version"],
             "baseline-a3-0.2.0"
         );
+        assert_eq!(v["policy_metadata"]["recommendation_kind"], "trade");
+        assert!(v["policy_metadata"]["abstain_reason"].is_null());
+        assert_eq!(v["policy_metadata"]["prediction_source_kind"], "baseline");
+        assert_eq!(v["policy_metadata"]["prediction_entry_now"], 2.5);
+        assert!(v["policy_metadata"]["prediction_p_hit"].is_null());
         assert_eq!(v["policy_metadata"]["ci_method"], "wilson_marginal");
         assert_eq!(v["policy_metadata"]["candidates_in_route_last_24h"], 10_000);
         assert_eq!(v["sampling_tier"], "allowlist");
@@ -667,6 +770,9 @@ mod tests {
         assert_eq!(v["features_t0"]["gross_run_p50_s"], 120);
         assert_eq!(v["features_t0"]["exit_excess_run_s"], 90);
         assert_eq!(v["features_t0"]["listing_age_days"], 14.0);
+        assert_eq!(v["features_t0"]["route_n_snapshots"], 123456);
+        assert!(v["features_t0"]["route_active_until_ns"].is_null());
+        assert_eq!(v["sampling_probability_kind"], "marginal_full_capture");
         // (removed) renomeação protetora ativa.
         assert!(
             v.get("best_exit_pct").is_none(),

@@ -37,7 +37,7 @@ use crate::ml::trigger::SampleDecision;
 
 /// Versão atual do schema do `RawSample`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 8;
+pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 9;
 
 use crate::ml::SCANNER_VERSION;
 
@@ -90,15 +90,28 @@ pub struct RawSample {
     /// **v3** — tier que aprovou persistência. "allowlist" | "priority"
     /// | "decimated_uniform".
     pub sampling_tier: &'static str,
-    /// **v3** — probabilidade de amostragem efetiva (auditoria para treino).
-    /// `allowlist`/`priority` = 1.0; `decimated_uniform` = 1/modulus.
+    /// **v3** — probabilidade de amostragem registrada.
+    ///
+    /// O significado exato vive em `sampling_probability_kind`: `priority`
+    /// usa captura integral condicionada à membership do ranker, não uma
+    /// probabilidade marginal populacional.
     pub sampling_probability: f32,
+    /// **v9** — semântica de `sampling_probability`.
+    /// Valores: `marginal_full_capture`, `conditional_priority`,
+    /// `marginal_uniform`.
+    pub sampling_probability_kind: &'static str,
     /// Geração do priority_set vigente no instante da amostra. `0` significa
     /// que nenhum rerank foi instalado ainda ou que o tier não depende de
     /// priority membership.
     pub priority_set_generation_id: u32,
     /// Timestamp ns do último rerank instalado. `0` quando ainda não houve.
     pub priority_set_updated_at_ns: u64,
+    /// **v9** — snapshot mínimo de lifecycle da rota para auditoria
+    /// anti-survivorship sem depender de RAM.
+    pub route_first_seen_ns: u64,
+    pub route_last_seen_ns: u64,
+    pub route_active_until_ns: Option<u64>,
+    pub route_n_snapshots: u64,
 }
 
 impl RawSample {
@@ -174,8 +187,13 @@ impl RawSample {
             sample_decision,
             sampling_tier: sampling_tier.as_str(),
             sampling_probability,
+            sampling_probability_kind: sampling_tier.probability_kind(),
             priority_set_generation_id: 0,
             priority_set_updated_at_ns: 0,
+            route_first_seen_ns: 0,
+            route_last_seen_ns: 0,
+            route_active_until_ns: None,
+            route_n_snapshots: 0,
         }
     }
 
@@ -223,9 +241,27 @@ impl RawSample {
             sample_decision,
             sampling_tier: sampling_tier.as_str(),
             sampling_probability,
+            sampling_probability_kind: sampling_tier.probability_kind(),
             priority_set_generation_id,
             priority_set_updated_at_ns,
+            route_first_seen_ns: 0,
+            route_last_seen_ns: 0,
+            route_active_until_ns: None,
+            route_n_snapshots: 0,
         }
+    }
+
+    pub fn set_lifecycle(
+        &mut self,
+        first_seen_ns: u64,
+        last_seen_ns: u64,
+        active_until_ns: Option<u64>,
+        n_snapshots: u64,
+    ) {
+        self.route_first_seen_ns = first_seen_ns;
+        self.route_last_seen_ns = last_seen_ns;
+        self.route_active_until_ns = active_until_ns;
+        self.route_n_snapshots = n_snapshots;
     }
 
     /// Serializa para uma linha JSON (sem newline).
@@ -241,8 +277,10 @@ impl RawSample {
                 r#""entry_spread":{},"exit_spread":{},"#,
                 r#""buy_vol24":{},"sell_vol24":{},"#,
                 r#""sample_decision":"{}","#,
-                r#""sampling_tier":"{}","sampling_probability":{},"#,
-                r#""priority_set_generation_id":{},"priority_set_updated_at_ns":{}}}"#,
+                r#""sampling_tier":"{}","sampling_probability":{},"sampling_probability_kind":"{}","#,
+                r#""priority_set_generation_id":{},"priority_set_updated_at_ns":{},"#,
+                r#""route_first_seen_ns":{},"route_last_seen_ns":{},"#,
+                r#""route_active_until_ns":{},"route_n_snapshots":{}}}"#,
             ),
             self.ts_ns,
             self.cycle_seq,
@@ -263,8 +301,13 @@ impl RawSample {
             self.sample_decision.reason_label(),
             self.sampling_tier,
             format_f32(self.sampling_probability),
+            self.sampling_probability_kind,
             self.priority_set_generation_id,
             self.priority_set_updated_at_ns,
+            self.route_first_seen_ns,
+            self.route_last_seen_ns,
+            opt_u64(self.route_active_until_ns),
+            self.route_n_snapshots,
         )
     }
 }
@@ -284,6 +327,12 @@ fn escape_json_string(s: &str) -> String {
         }
     }
     out
+}
+
+#[inline]
+fn opt_u64(v: Option<u64>) -> String {
+    v.map(|x| x.to_string())
+        .unwrap_or_else(|| "null".to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +362,23 @@ impl SamplingTier {
             SamplingTier::Priority => "priority",
             SamplingTier::DecimatedUniform => "decimated_uniform",
         }
+    }
+
+    pub fn probability_kind(self) -> &'static str {
+        match self {
+            SamplingTier::Allowlist => "marginal_full_capture",
+            SamplingTier::Priority => "conditional_priority",
+            SamplingTier::DecimatedUniform => "marginal_uniform",
+        }
+    }
+}
+
+pub fn sampling_probability_kind_for_tier_label(tier: &str) -> &'static str {
+    match tier {
+        "allowlist" | "accepted_full_capture" => "marginal_full_capture",
+        "priority" => "conditional_priority",
+        "decimated_uniform" => "marginal_uniform",
+        _ => "unknown",
     }
 }
 
@@ -536,7 +602,7 @@ mod tests {
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, RAW_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 8);
+        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 9);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
         assert_eq!(s.runtime_config_hash, "test-runtime-config");
@@ -564,14 +630,17 @@ mod tests {
         assert_eq!(v["buy_venue"], "mexc");
         assert_eq!(v["sell_venue"], "bingx");
         assert_eq!(v["sample_decision"], "accept");
-        assert_eq!(v["schema_version"], 8);
+        assert_eq!(v["schema_version"], 9);
         assert!(v["scanner_version"].is_string());
         assert_eq!(v["runtime_config_hash"], "test-runtime-config");
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert_eq!(v["sampling_tier"], "decimated_uniform");
         assert!(v["sampling_probability"].as_f64().is_some());
+        assert_eq!(v["sampling_probability_kind"], "marginal_uniform");
         assert_eq!(v["priority_set_generation_id"], 0);
         assert_eq!(v["priority_set_updated_at_ns"], 0);
+        assert_eq!(v["route_first_seen_ns"], 0);
+        assert!(v["route_active_until_ns"].is_null());
         assert!(v.get("buy_book_age_ms").is_none());
         assert!(v.get("sell_book_age_ms").is_none());
         assert!(v.get("halt_active").is_none());
@@ -830,6 +899,7 @@ mod tests {
         let line = s.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["sampling_tier"], "priority");
+        assert_eq!(v["sampling_probability_kind"], "conditional_priority");
         assert_eq!(v["runtime_config_hash"], "0000000000000001");
         assert_eq!(v["priority_set_generation_id"], 9);
         assert_eq!(

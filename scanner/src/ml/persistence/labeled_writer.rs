@@ -131,8 +131,12 @@ impl LabeledJsonlWriter {
         }
     }
 
-    async fn write_one(&mut self, label: LabeledTrade) {
-        let hour_key = hour_key_for_ns(label.written_ts_ns);
+    async fn write_one(&mut self, mut label: LabeledTrade) {
+        label.written_ts_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(label.closed_ts_ns);
+        let hour_key = hour_key_for_ns(label.closed_ts_ns);
         if self.current_hour_key.as_deref() != Some(hour_key.as_str()) {
             self.close_current_file();
             match self.open_writer_for_hour(&hour_key) {
@@ -233,7 +237,6 @@ impl LabeledJsonlWriter {
         info!(path = %path.display(), "labeled writer: abrindo novo arquivo");
         Ok((BufWriter::with_capacity(64 * 1024, file), path))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +302,10 @@ mod tests {
                 n_cache_observations_at_t0: 0,
                 oldest_cache_ts_ns: 0,
                 listing_age_days: None,
+                route_first_seen_ns: None,
+                route_last_seen_ns: None,
+                route_active_until_ns: None,
+                route_n_snapshots: None,
             },
             audit_hindsight_best_exit_pct: Some(-0.3),
             audit_hindsight_best_exit_ts_ns: Some(
@@ -326,6 +333,26 @@ mod tests {
             policy_metadata: PolicyMetadata {
                 baseline_model_version: "baseline-a3-0.2.0".into(),
                 baseline_recommended: false,
+                recommendation_kind: "abstain",
+                abstain_reason: Some("NO_OPPORTUNITY"),
+                prediction_source_kind: "baseline",
+                prediction_model_version: "baseline-a3-0.2.0".into(),
+                prediction_emitted_at_ns: None,
+                prediction_valid_until_ns: None,
+                prediction_entry_now: None,
+                prediction_exit_target: None,
+                prediction_gross_profit_target: None,
+                prediction_p_hit: None,
+                prediction_p_hit_ci_lo: None,
+                prediction_p_hit_ci_hi: None,
+                prediction_exit_q25: None,
+                prediction_exit_q50: None,
+                prediction_exit_q75: None,
+                prediction_t_hit_p25_s: None,
+                prediction_t_hit_median_s: None,
+                prediction_t_hit_p75_s: None,
+                prediction_p_censor: None,
+                prediction_calibration_status: "not_applicable",
                 baseline_historical_base_rate_24h: None,
                 baseline_derived_enter_at_min: None,
                 baseline_derived_exit_at_min: None,
@@ -339,6 +366,7 @@ mod tests {
             },
             sampling_tier: "decimated_uniform",
             sampling_probability: 0.1,
+            sampling_probability_kind: "marginal_uniform",
         }
     }
 

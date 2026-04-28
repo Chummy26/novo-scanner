@@ -77,9 +77,9 @@ pub fn compact_jsonl_file(
             )
         })?;
         let expected: u16 = match dataset_kind {
-            DatasetKind::AcceptedSamples => 7,
-            DatasetKind::RawSamples => 8,
-            DatasetKind::LabeledTrades => 6,
+            DatasetKind::AcceptedSamples => 8,
+            DatasetKind::RawSamples => 9,
+            DatasetKind::LabeledTrades => 7,
         };
         if let Some(got) = v.get("schema_version").and_then(|x| x.as_u64()) {
             if got != expected as u64 {
@@ -209,6 +209,11 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             utf8_field("sample_decision"),
             utf8_field("sampling_tier"),
             f32_field("sampling_probability"),
+            utf8_field("sampling_probability_kind"),
+            u64_field("route_first_seen_ns"),
+            u64_field("route_last_seen_ns"),
+            u64_field("route_active_until_ns"),
+            u64_field("route_n_snapshots"),
             bool_field("was_recommended"),
         ]),
         DatasetKind::RawSamples => Schema::new(vec![
@@ -231,8 +236,13 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             utf8_field("sample_decision"),
             utf8_field("sampling_tier"),
             f32_field("sampling_probability"),
+            utf8_field("sampling_probability_kind"),
             u32_field("priority_set_generation_id"),
             u64_field("priority_set_updated_at_ns"),
+            u64_field("route_first_seen_ns"),
+            u64_field("route_last_seen_ns"),
+            u64_field("route_active_until_ns"),
+            u64_field("route_n_snapshots"),
         ]),
         DatasetKind::LabeledTrades => Schema::new(vec![
             utf8_field("sample_id"),
@@ -289,6 +299,10 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
                     u32_field("n_cache_observations_at_t0"),
                     u64_field("oldest_cache_ts_ns"),
                     f32_field("listing_age_days"),
+                    u64_field("route_first_seen_ns"),
+                    u64_field("route_last_seen_ns"),
+                    u64_field("route_active_until_ns"),
+                    u64_field("route_n_snapshots"),
                 ],
             ),
             // renomeação protetora.
@@ -321,6 +335,26 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
                 vec![
                     utf8_field("baseline_model_version"),
                     bool_field("baseline_recommended"),
+                    utf8_field("recommendation_kind"),
+                    utf8_field("abstain_reason"),
+                    utf8_field("prediction_source_kind"),
+                    utf8_field("prediction_model_version"),
+                    u64_field("prediction_emitted_at_ns"),
+                    u64_field("prediction_valid_until_ns"),
+                    f32_field("prediction_entry_now"),
+                    f32_field("prediction_exit_target"),
+                    f32_field("prediction_gross_profit_target"),
+                    f32_field("prediction_p_hit"),
+                    f32_field("prediction_p_hit_ci_lo"),
+                    f32_field("prediction_p_hit_ci_hi"),
+                    f32_field("prediction_exit_q25"),
+                    f32_field("prediction_exit_q50"),
+                    f32_field("prediction_exit_q75"),
+                    u32_field("prediction_t_hit_p25_s"),
+                    u32_field("prediction_t_hit_median_s"),
+                    u32_field("prediction_t_hit_p75_s"),
+                    f32_field("prediction_p_censor"),
+                    utf8_field("prediction_calibration_status"),
                     f32_field("baseline_historical_base_rate_24h"),
                     f32_field("baseline_derived_enter_at_min"),
                     f32_field("baseline_derived_exit_at_min"),
@@ -335,6 +369,7 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             ),
             utf8_field("sampling_tier"),
             f32_field("sampling_probability"),
+            utf8_field("sampling_probability_kind"),
         ]),
     })
 }
@@ -411,7 +446,7 @@ mod tests {
         write_lines(
             &jsonl,
             &[
-                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":7,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"was_recommended":true}"#,
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":8,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":true}"#,
             ],
         );
 
@@ -434,7 +469,7 @@ mod tests {
         write_lines(
             &jsonl,
             &[
-                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":8,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"priority_set_generation_id":3,"priority_set_updated_at_ns":2}"#,
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":9,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","priority_set_generation_id":3,"priority_set_updated_at_ns":2,"route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1}"#,
             ],
         );
 
@@ -459,7 +494,7 @@ mod tests {
             &jsonl,
             &[concat!(
                 r#"{"sample_id":"id1","sample_decision":"accept","horizon_s":900,"ts_emit_ns":1,"cycle_seq":1,"#,
-                r#""schema_version":6,"scanner_version":"0.1.0","#,
+                r#""schema_version":7,"scanner_version":"0.1.0","#,
                 r#""cluster_id":"aaaa0000aaaa0000","cluster_size":1,"cluster_rank":1,"#,
                 r#""runtime_config_hash":"0000000000000000","#,
                 r#""priority_set_generation_id":0,"priority_set_updated_at_ns":0,"#,
@@ -476,7 +511,8 @@ mod tests {
                 r#""gross_run_p05_s":30,"gross_run_p50_s":120,"gross_run_p95_s":600,"#,
                 r#""exit_excess_run_s":90,"#,
                 r#""n_cache_observations_at_t0":500,"oldest_cache_ts_ns":0,"#,
-                r#""listing_age_days":14.0},"#,
+                r#""listing_age_days":14.0,"route_first_seen_ns":1,"route_last_seen_ns":1,"#,
+                r#""route_active_until_ns":null,"route_n_snapshots":1},"#,
                 r#""audit_hindsight_best_exit_pct":-0.5,"audit_hindsight_best_exit_ts_ns":2,"#,
                 r#""audit_hindsight_best_gross_pct":1.5,"audit_hindsight_t_to_best_s":120,"#,
                 r#""n_clean_future_samples":10,"label_floor_pct":0.8,"#,
@@ -487,12 +523,20 @@ mod tests {
                 r#""outcome":"realized","censor_reason":null,"#,
                 r#""observed_until_ns":2,"closed_ts_ns":3,"written_ts_ns":4,"#,
                 r#""policy_metadata":{"baseline_model_version":"baseline-a3","baseline_recommended":true,"#,
+                r#""recommendation_kind":"trade","abstain_reason":null,"#,
+                r#""prediction_source_kind":"baseline","prediction_model_version":"baseline-a3","#,
+                r#""prediction_emitted_at_ns":1,"prediction_valid_until_ns":61,"#,
+                r#""prediction_entry_now":2.0,"prediction_exit_target":-1.2,"prediction_gross_profit_target":0.8,"#,
+                r#""prediction_p_hit":null,"prediction_p_hit_ci_lo":null,"prediction_p_hit_ci_hi":null,"#,
+                r#""prediction_exit_q25":-1.5,"prediction_exit_q50":-1.2,"prediction_exit_q75":-0.8,"#,
+                r#""prediction_t_hit_p25_s":null,"prediction_t_hit_median_s":null,"prediction_t_hit_p75_s":null,"#,
+                r#""prediction_p_censor":null,"prediction_calibration_status":"degraded","#,
                 r#""baseline_historical_base_rate_24h":0.7,"baseline_derived_enter_at_min":1.8,"#,
                 r#""baseline_derived_exit_at_min":-1.1,"baseline_floor_pct":0.8,"#,
                 r#""label_stride_s":60,"effective_stride_s":60,"label_sampling_probability":1.0,"#,
                 r#""candidates_in_route_last_24h":100,"accepts_in_route_last_24h":10,"#,
                 r#""ci_method":"wilson_marginal"},"#,
-                r#""sampling_tier":"priority","sampling_probability":1.0}"#,
+                r#""sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority"}"#,
             )],
         );
 
@@ -517,7 +561,7 @@ mod tests {
         write_lines(
             &jsonl,
             &[
-                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":7,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":null,"exit_spread":null,"buy_vol24":null,"sell_vol24":null,"sample_decision":"accept","sampling_tier":"accepted_full_capture","sampling_probability":1.0,"was_recommended":false}"#,
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":8,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":null,"exit_spread":null,"buy_vol24":null,"sell_vol24":null,"sample_decision":"accept","sampling_tier":"accepted_full_capture","sampling_probability":1.0,"sampling_probability_kind":"marginal_full_capture","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":false}"#,
             ],
         );
 
@@ -535,7 +579,7 @@ mod tests {
 
     #[test]
     fn compactor_rejects_schema_version_mismatch() {
-        // arquivo com schema_version != 7 deve falhar loud.
+        // arquivo com schema_version != esperado deve falhar loud.
         let tmp = tempfile::tempdir().expect("tmp");
         let jsonl = tmp.path().join("old.jsonl");
         write_lines(
@@ -551,7 +595,7 @@ mod tests {
         );
         assert!(
             result.is_err(),
-            "schema v5 deveria ser rejeitado pelo compactor v7"
+            "schema v5 deveria ser rejeitado pelo compactor vigente"
         );
     }
 }

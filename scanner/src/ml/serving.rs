@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::ml::baseline::BaselineA3;
-use crate::ml::contract::{AbstainDiagnostic, AbstainReason, Recommendation, RouteId, TradeSetup};
+use crate::ml::contract::{
+    AbstainDiagnostic, AbstainReason, CalibStatus, Recommendation, RouteId, TradeSetup,
+};
 use crate::ml::economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome};
 use crate::ml::eval::verify_tradesetup;
 use crate::ml::listing_history::ListingHistory;
@@ -52,6 +54,115 @@ use parking_lot::Mutex;
 /// Identidade §2 da skill: soma intra-tick sempre negativa; trade só realiza
 /// em tick posterior ao da emissão. Default: 1 ciclo do scanner = 150 ms.
 const MIN_HORIZON_NS: u64 = 150_000_000;
+
+struct RecommendationPersistence {
+    baseline_recommended: bool,
+    baseline_base_rate: Option<f32>,
+    baseline_enter_at_min: Option<f32>,
+    baseline_exit_at_min: Option<f32>,
+    recommendation_kind: &'static str,
+    abstain_reason: Option<&'static str>,
+    prediction_source_kind: &'static str,
+    prediction_model_version: String,
+    prediction_emitted_at_ns: Option<u64>,
+    prediction_valid_until_ns: Option<u64>,
+    prediction_entry_now: Option<f32>,
+    prediction_exit_target: Option<f32>,
+    prediction_gross_profit_target: Option<f32>,
+    prediction_p_hit: Option<f32>,
+    prediction_p_hit_ci_lo: Option<f32>,
+    prediction_p_hit_ci_hi: Option<f32>,
+    prediction_exit_q25: Option<f32>,
+    prediction_exit_q50: Option<f32>,
+    prediction_exit_q75: Option<f32>,
+    prediction_t_hit_p25_s: Option<u32>,
+    prediction_t_hit_median_s: Option<u32>,
+    prediction_t_hit_p75_s: Option<u32>,
+    prediction_p_censor: Option<f32>,
+    prediction_calibration_status: &'static str,
+}
+
+fn recommendation_persistence(rec: &Recommendation) -> RecommendationPersistence {
+    match rec {
+        Recommendation::Trade(ts) => {
+            let d = ts.baseline_diagnostics.as_ref();
+            let (ci_lo, ci_hi) = ts
+                .p_hit_ci
+                .map(|(lo, hi)| (Some(lo), Some(hi)))
+                .unwrap_or((None, None));
+            RecommendationPersistence {
+                baseline_recommended: true,
+                baseline_base_rate: d.map(|d| d.historical_base_rate_24h),
+                baseline_enter_at_min: d.map(|d| d.enter_at_min),
+                baseline_exit_at_min: d.map(|d| d.exit_at_min),
+                recommendation_kind: "trade",
+                abstain_reason: None,
+                prediction_source_kind: ts.source_kind.as_str(),
+                prediction_model_version: ts.model_version.clone(),
+                prediction_emitted_at_ns: Some(ts.emitted_at),
+                prediction_valid_until_ns: Some(ts.valid_until),
+                prediction_entry_now: Some(ts.entry_now),
+                prediction_exit_target: Some(ts.exit_target),
+                prediction_gross_profit_target: Some(ts.gross_profit_target),
+                prediction_p_hit: ts.p_hit,
+                prediction_p_hit_ci_lo: ci_lo,
+                prediction_p_hit_ci_hi: ci_hi,
+                prediction_exit_q25: ts.exit_q25,
+                prediction_exit_q50: ts.exit_q50,
+                prediction_exit_q75: ts.exit_q75,
+                prediction_t_hit_p25_s: ts.t_hit_p25_s,
+                prediction_t_hit_median_s: ts.t_hit_median_s,
+                prediction_t_hit_p75_s: ts.t_hit_p75_s,
+                prediction_p_censor: ts.p_censor,
+                prediction_calibration_status: calib_status_label(ts.calibration_status),
+            }
+        }
+        Recommendation::Abstain { reason, diagnostic } => RecommendationPersistence {
+            baseline_recommended: false,
+            baseline_base_rate: None,
+            baseline_enter_at_min: None,
+            baseline_exit_at_min: None,
+            recommendation_kind: "abstain",
+            abstain_reason: Some(abstain_reason_label(*reason)),
+            prediction_source_kind: "baseline",
+            prediction_model_version: diagnostic.model_version.clone(),
+            prediction_emitted_at_ns: None,
+            prediction_valid_until_ns: None,
+            prediction_entry_now: None,
+            prediction_exit_target: None,
+            prediction_gross_profit_target: None,
+            prediction_p_hit: None,
+            prediction_p_hit_ci_lo: None,
+            prediction_p_hit_ci_hi: None,
+            prediction_exit_q25: None,
+            prediction_exit_q50: None,
+            prediction_exit_q75: None,
+            prediction_t_hit_p25_s: None,
+            prediction_t_hit_median_s: None,
+            prediction_t_hit_p75_s: None,
+            prediction_p_censor: None,
+            prediction_calibration_status: "not_applicable",
+        },
+    }
+}
+
+fn abstain_reason_label(reason: AbstainReason) -> &'static str {
+    match reason {
+        AbstainReason::NoOpportunity => "NO_OPPORTUNITY",
+        AbstainReason::InsufficientData => "INSUFFICIENT_DATA",
+        AbstainReason::LowConfidence => "LOW_CONFIDENCE",
+        AbstainReason::LongTail => "LONG_TAIL",
+        AbstainReason::Cooldown => "COOLDOWN",
+    }
+}
+
+fn calib_status_label(status: CalibStatus) -> &'static str {
+    match status {
+        CalibStatus::Ok => "ok",
+        CalibStatus::Degraded => "degraded",
+        CalibStatus::Suspended => "suspended",
+    }
+}
 
 /// Largura máxima de IC 95% antes de abstenção por `LowConfidence`.
 const IC_WIDTH_LIMIT: f32 = 0.20;
@@ -631,6 +742,7 @@ impl MlServer {
         now_ns: u64,
     ) -> SampleDecision {
         self.listing.record_seen(route, now_ns);
+        let lifecycle = self.listing.snapshot_for(route);
         let clean = self.trigger.is_clean_data(buy_vol24_usd, sell_vol24_usd);
         let sample_dec = self.trigger.evaluate(
             route,
@@ -655,7 +767,7 @@ impl MlServer {
                 .decide_for_sample(route, now_ns, cycle_seq);
             if dr.should_persist {
                 let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
-                let raw = RawSample::with_tier_and_priority_metadata(
+                let mut raw = RawSample::with_tier_and_priority_metadata(
                     now_ns,
                     cycle_seq,
                     route,
@@ -671,6 +783,14 @@ impl MlServer {
                     priority_updated_ns,
                     self.runtime_config_hash.clone(),
                 );
+                if let Some(lc) = lifecycle {
+                    raw.set_lifecycle(
+                        lc.first_seen_ns,
+                        lc.last_seen_ns,
+                        lc.active_until_ns,
+                        lc.n_snapshots,
+                    );
+                }
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
                         self.metrics
@@ -755,6 +875,7 @@ impl MlServer {
         // 0. **C5** — registra lifecycle da rota (first_seen / last_seen).
         //    Anti-survivorship; alimenta feature `listing_age_days`.
         self.listing.record_seen(route, now_ns);
+        let lifecycle = self.listing.snapshot_for(route);
 
         // 1. **C2 fix** — só alimenta histograma se dado é LIMPO.
         //    Snapshots low-vol NÃO devem poluir o P95 que o
@@ -789,7 +910,7 @@ impl MlServer {
                 .decide_for_sample(route, now_ns, cycle_seq);
             if dr.should_persist {
                 let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
-                let raw = RawSample::with_tier_and_priority_metadata(
+                let mut raw = RawSample::with_tier_and_priority_metadata(
                     now_ns,
                     cycle_seq,
                     route,
@@ -805,6 +926,14 @@ impl MlServer {
                     priority_updated_ns,
                     self.runtime_config_hash.clone(),
                 );
+                if let Some(lc) = lifecycle {
+                    raw.set_lifecycle(
+                        lc.first_seen_ns,
+                        lc.last_seen_ns,
+                        lc.active_until_ns,
+                        lc.n_snapshots,
+                    );
+                }
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
                         self.metrics
@@ -926,7 +1055,7 @@ impl MlServer {
         let accepted = if sample_dec == SampleDecision::Accept {
             let (accepted_sampling_tier, accepted_sampling_probability) =
                 tier_snapshot.unwrap_or((SamplingTier::DecimatedUniform, 1.0));
-            Some(AcceptedSample::new(
+            let mut sample = AcceptedSample::new(
                 now_ns,
                 cycle_seq,
                 route,
@@ -939,7 +1068,16 @@ impl MlServer {
                 self.runtime_config_hash.clone(),
                 accepted_sampling_tier.as_str(),
                 accepted_sampling_probability,
-            ))
+            );
+            if let Some(lc) = lifecycle {
+                sample.set_lifecycle(
+                    lc.first_seen_ns,
+                    lc.last_seen_ns,
+                    lc.active_until_ns,
+                    lc.n_snapshots,
+                );
+            }
+            Some(sample)
         } else {
             None
         };
@@ -954,23 +1092,7 @@ impl MlServer {
             if !clean {
                 return (rec, sample_dec, accepted);
             }
-            let (
-                baseline_recommended,
-                baseline_base_rate,
-                baseline_enter_at_min,
-                baseline_exit_at_min,
-            ) = match &rec {
-                Recommendation::Trade(ts) => {
-                    let d = ts.baseline_diagnostics.as_ref();
-                    (
-                        true,
-                        d.map(|d| d.historical_base_rate_24h),
-                        d.map(|d| d.enter_at_min),
-                        d.map(|d| d.exit_at_min),
-                    )
-                }
-                Recommendation::Abstain { .. } => (false, None, None, None),
-            };
+            let rec_meta = recommendation_persistence(&rec);
             let features_t0 = FeaturesT0 {
                 buy_vol24: buy_vol24_usd,
                 sell_vol24: sell_vol24_usd,
@@ -996,6 +1118,10 @@ impl MlServer {
                 n_cache_observations_at_t0: n_cache_obs_pre,
                 oldest_cache_ts_ns: oldest_cache_ts_pre,
                 listing_age_days: listing_age_days_pre_observe,
+                route_first_seen_ns: lifecycle.map(|lc| lc.first_seen_ns),
+                route_last_seen_ns: lifecycle.map(|lc| lc.last_seen_ns),
+                route_active_until_ns: lifecycle.and_then(|lc| lc.active_until_ns),
+                route_n_snapshots: lifecycle.map(|lc| lc.n_snapshots),
             };
             // Probabilidade efetiva do label é desconhecida online: o labeler
             // usa stride por rota, então IPW correto depende da taxa observada
@@ -1021,10 +1147,30 @@ impl MlServer {
                 .unwrap_or((0, 0));
             let policy = PolicyMetadata {
                 baseline_model_version: self.baseline.config().model_version.to_string(),
-                baseline_recommended,
-                baseline_historical_base_rate_24h: baseline_base_rate,
-                baseline_derived_enter_at_min: baseline_enter_at_min,
-                baseline_derived_exit_at_min: baseline_exit_at_min,
+                baseline_recommended: rec_meta.baseline_recommended,
+                recommendation_kind: rec_meta.recommendation_kind,
+                abstain_reason: rec_meta.abstain_reason,
+                prediction_source_kind: rec_meta.prediction_source_kind,
+                prediction_model_version: rec_meta.prediction_model_version,
+                prediction_emitted_at_ns: rec_meta.prediction_emitted_at_ns,
+                prediction_valid_until_ns: rec_meta.prediction_valid_until_ns,
+                prediction_entry_now: rec_meta.prediction_entry_now,
+                prediction_exit_target: rec_meta.prediction_exit_target,
+                prediction_gross_profit_target: rec_meta.prediction_gross_profit_target,
+                prediction_p_hit: rec_meta.prediction_p_hit,
+                prediction_p_hit_ci_lo: rec_meta.prediction_p_hit_ci_lo,
+                prediction_p_hit_ci_hi: rec_meta.prediction_p_hit_ci_hi,
+                prediction_exit_q25: rec_meta.prediction_exit_q25,
+                prediction_exit_q50: rec_meta.prediction_exit_q50,
+                prediction_exit_q75: rec_meta.prediction_exit_q75,
+                prediction_t_hit_p25_s: rec_meta.prediction_t_hit_p25_s,
+                prediction_t_hit_median_s: rec_meta.prediction_t_hit_median_s,
+                prediction_t_hit_p75_s: rec_meta.prediction_t_hit_p75_s,
+                prediction_p_censor: rec_meta.prediction_p_censor,
+                prediction_calibration_status: rec_meta.prediction_calibration_status,
+                baseline_historical_base_rate_24h: rec_meta.baseline_base_rate,
+                baseline_derived_enter_at_min: rec_meta.baseline_enter_at_min,
+                baseline_derived_exit_at_min: rec_meta.baseline_exit_at_min,
                 baseline_floor_pct: self.baseline.config().floor_pct,
                 label_stride_s: self.label_stride_s,
                 effective_stride_s: self.label_stride_s,
