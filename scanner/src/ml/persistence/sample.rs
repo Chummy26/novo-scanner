@@ -9,7 +9,7 @@ use crate::ml::trigger::SampleDecision;
 
 /// Versão atual do schema do `AcceptedSample`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 6;
+pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 7;
 
 use crate::ml::SCANNER_VERSION;
 
@@ -31,6 +31,10 @@ pub struct AcceptedSample {
     /// **v2** — versão do scanner que gerou a amostra. Útil para excluir
     /// dados gerados por versões bugadas retrospectivamente.
     pub scanner_version: &'static str,
+    /// **v7** — fingerprint determinístico da configuração runtime que
+    /// produziu a candidatura. Necessário para auditar política e comparar
+    /// amostras geradas com horizontes/floors/gates diferentes.
+    pub runtime_config_hash: String,
     /// **v3** — hash determinístico da tupla canonical (ts_ns+cycle_seq+
     /// symbol+venues+markets). Chave de join cross-schema com RawSample
     /// e LabeledTrade. Computado via `sample_id_of()` — função única.
@@ -40,6 +44,13 @@ pub struct AcceptedSample {
     pub buy_vol24: f64,
     pub sell_vol24: f64,
     pub sample_decision: SampleDecision,
+    /// **v7** — contexto do decimator bruto no mesmo `t0`.
+    ///
+    /// O writer de `AcceptedSample` captura todo trigger `Accept`; estes
+    /// campos espelham a política de amostragem do stream bruto para evitar
+    /// joins frágeis quando o accepted precisa ser auditado isoladamente.
+    pub sampling_tier: &'static str,
+    pub sampling_probability: f32,
     /// Flag de emissão do baseline — `true` se o baseline A3 produziu
     /// `Recommendation::Trade` para este snapshot (observe: Abstain =
     /// false). Determinado por `should_mark_sample_recommended` em
@@ -68,8 +79,12 @@ impl AcceptedSample {
         buy_vol24: f64,
         sell_vol24: f64,
         sample_decision: SampleDecision,
+        runtime_config_hash: impl Into<String>,
+        sampling_tier: &'static str,
+        sampling_probability: f32,
     ) -> Self {
         let symbol_name = symbol_name.into();
+        let runtime_config_hash = runtime_config_hash.into();
         let sample_id = sample_id_of(
             ts_ns,
             cycle_seq,
@@ -84,12 +99,15 @@ impl AcceptedSample {
             route_id,
             symbol_name,
             scanner_version: SCANNER_VERSION,
+            runtime_config_hash,
             sample_id,
             entry_spread,
             exit_spread,
             buy_vol24,
             sell_vol24,
             sample_decision,
+            sampling_tier,
+            sampling_probability,
             was_recommended: false,
         }
     }
@@ -107,18 +125,21 @@ impl AcceptedSample {
             concat!(
                 r#"{{"ts_ns":{},"cycle_seq":{},"schema_version":{},"#,
                 r#""scanner_version":"{}","sample_id":"{}","#,
+                r#""runtime_config_hash":"{}","#,
                 r#""symbol_id":{},"symbol_name":"{}","#,
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
                 r#""entry_spread":{},"exit_spread":{},"#,
                 r#""buy_vol24":{},"sell_vol24":{},"#,
-                r#""sample_decision":"{}","was_recommended":{}}}"#,
+                r#""sample_decision":"{}","sampling_tier":"{}","sampling_probability":{},"#,
+                r#""was_recommended":{}}}"#,
             ),
             self.ts_ns,
             self.cycle_seq,
             self.schema_version,
             self.scanner_version,
             self.sample_id,
+            escape_json_string(&self.runtime_config_hash),
             self.route_id.symbol_id.0,
             escape_json_string(&self.symbol_name),
             self.route_id.buy_venue.as_str(),
@@ -130,6 +151,8 @@ impl AcceptedSample {
             format_f64(self.buy_vol24),
             format_f64(self.sell_vol24),
             decision,
+            self.sampling_tier,
+            format_f32(self.sampling_probability),
             self.was_recommended,
         )
     }
@@ -203,11 +226,17 @@ mod tests {
             1e6,
             2e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "priority",
+            1.0,
         );
         assert_eq!(s.schema_version, ACCEPTED_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(s.schema_version, 6);
+        assert_eq!(s.schema_version, 7);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
+        assert_eq!(s.runtime_config_hash, "0000000000000001");
+        assert_eq!(s.sampling_tier, "priority");
+        assert_eq!(s.sampling_probability, 1.0);
         assert_eq!(s.sample_id.len(), 32);
         assert!(!s.was_recommended);
     }
@@ -224,6 +253,9 @@ mod tests {
             1e6,
             2e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "priority",
+            1.0,
         );
         let line = s.to_json_line();
         assert!(!line.contains('\n'));
@@ -235,9 +267,12 @@ mod tests {
         assert_eq!(v["sell_venue"], "bingx");
         assert_eq!(v["buy_market"], "FUTURES");
         assert_eq!(v["sample_decision"], "accept");
+        assert_eq!(v["runtime_config_hash"], "0000000000000001");
+        assert_eq!(v["sampling_tier"], "priority");
+        assert_eq!(v["sampling_probability"], 1.0);
         assert_eq!(v["was_recommended"], false);
         assert!(v["scanner_version"].is_string());
-        assert_eq!(v["schema_version"], 6);
+        assert_eq!(v["schema_version"], 7);
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert!(
             v.get("buy_book_age_ms").is_none(),
@@ -261,6 +296,9 @@ mod tests {
             f64::NEG_INFINITY,
             1e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "decimated_uniform",
+            f32::NAN,
         );
         s.mark_recommended();
         let line = s.to_json_line();
@@ -268,6 +306,7 @@ mod tests {
         assert!(v["entry_spread"].is_null());
         assert!(v["exit_spread"].is_null());
         assert!(v["buy_vol24"].is_null());
+        assert!(v["sampling_probability"].is_null());
         assert_eq!(v["was_recommended"], true);
     }
 
@@ -283,6 +322,9 @@ mod tests {
             1e6,
             1e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "allowlist",
+            1.0,
         );
         let line = s.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -306,6 +348,9 @@ mod tests {
             1e6,
             1e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "allowlist",
+            1.0,
         );
         let line = s.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).expect("still valid json");
@@ -325,6 +370,9 @@ mod tests {
             1e6,
             1e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "allowlist",
+            1.0,
         );
         let line = s.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).expect("json valido mesmo vazio");

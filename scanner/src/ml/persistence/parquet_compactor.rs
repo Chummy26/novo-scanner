@@ -77,8 +77,8 @@ pub fn compact_jsonl_file(
             )
         })?;
         let expected: u16 = match dataset_kind {
-            DatasetKind::AcceptedSamples => 6,
-            DatasetKind::RawSamples => 7,
+            DatasetKind::AcceptedSamples => 7,
+            DatasetKind::RawSamples => 8,
             DatasetKind::LabeledTrades => 6,
         };
         if let Some(got) = v.get("schema_version").and_then(|x| x.as_u64()) {
@@ -195,6 +195,7 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             u16_field("schema_version"),
             utf8_field("scanner_version"),
             utf8_field("sample_id"),
+            utf8_field("runtime_config_hash"),
             u32_field("symbol_id"),
             utf8_field("symbol_name"),
             utf8_field("buy_venue"),
@@ -206,6 +207,8 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             f64_field("buy_vol24"),
             f64_field("sell_vol24"),
             utf8_field("sample_decision"),
+            utf8_field("sampling_tier"),
+            f32_field("sampling_probability"),
             bool_field("was_recommended"),
         ]),
         DatasetKind::RawSamples => Schema::new(vec![
@@ -214,6 +217,7 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             u16_field("schema_version"),
             utf8_field("scanner_version"),
             utf8_field("sample_id"),
+            utf8_field("runtime_config_hash"),
             u32_field("symbol_id"),
             utf8_field("symbol_name"),
             utf8_field("buy_venue"),
@@ -407,7 +411,7 @@ mod tests {
         write_lines(
             &jsonl,
             &[
-                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":6,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","was_recommended":true}"#,
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":7,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"was_recommended":true}"#,
             ],
         );
 
@@ -430,7 +434,7 @@ mod tests {
         write_lines(
             &jsonl,
             &[
-                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":7,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"priority_set_generation_id":3,"priority_set_updated_at_ns":2}"#,
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":8,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"priority_set_generation_id":3,"priority_set_updated_at_ns":2}"#,
             ],
         );
 
@@ -513,7 +517,7 @@ mod tests {
         write_lines(
             &jsonl,
             &[
-                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":6,"scanner_version":"0.1.0","sample_id":"id1","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":null,"exit_spread":null,"buy_vol24":null,"sell_vol24":null,"sample_decision":"accept","was_recommended":false}"#,
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":7,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":null,"exit_spread":null,"buy_vol24":null,"sell_vol24":null,"sample_decision":"accept","sampling_tier":"accepted_full_capture","sampling_probability":1.0,"was_recommended":false}"#,
             ],
         );
 
@@ -531,7 +535,7 @@ mod tests {
 
     #[test]
     fn compactor_rejects_schema_version_mismatch() {
-        // arquivo com schema_version != 6 deve falhar loud.
+        // arquivo com schema_version != 7 deve falhar loud.
         let tmp = tempfile::tempdir().expect("tmp");
         let jsonl = tmp.path().join("old.jsonl");
         write_lines(
@@ -547,7 +551,7 @@ mod tests {
         );
         assert!(
             result.is_err(),
-            "schema v5 deveria ser rejeitado pelo compactor v6"
+            "schema v5 deveria ser rejeitado pelo compactor v7"
         );
     }
 }

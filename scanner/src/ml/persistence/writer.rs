@@ -290,7 +290,6 @@ impl JsonlWriter {
         info!(path = %path.display(), "ML writer: abrindo novo arquivo");
         Ok((BufWriter::with_capacity(64 * 1024, file), path))
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +387,9 @@ mod tests {
             1e6,
             1e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "accepted_full_capture",
+            1.0,
         );
         // Hora 15 (15:00).
         let s2 = AcceptedSample::new(
@@ -400,6 +402,9 @@ mod tests {
             1e6,
             1e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "accepted_full_capture",
+            1.0,
         );
         // Hora 15 ainda (15:01).
         let s3 = AcceptedSample::new(
@@ -412,6 +417,9 @@ mod tests {
             1e6,
             1e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "accepted_full_capture",
+            1.0,
         );
         handle.try_send(s1).expect("send s1");
         handle.try_send(s2).expect("send s2");
@@ -464,6 +472,9 @@ mod tests {
             1e6,
             1e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "accepted_full_capture",
+            1.0,
         );
         handle.try_send(s).expect("send sample");
 
@@ -521,6 +532,9 @@ mod tests {
             1e6,
             1e6,
             SampleDecision::Accept,
+            "0000000000000001",
+            "accepted_full_capture",
+            1.0,
         );
         // Primeiro envio OK.
         assert!(handle.try_send(s.clone()).is_ok());

@@ -669,6 +669,7 @@ impl MlServer {
                     dr.probability,
                     priority_gen,
                     priority_updated_ns,
+                    self.runtime_config_hash.clone(),
                 );
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
@@ -802,6 +803,7 @@ impl MlServer {
                     dr.probability,
                     priority_gen,
                     priority_updated_ns,
+                    self.runtime_config_hash.clone(),
                 );
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
@@ -919,10 +921,11 @@ impl MlServer {
         }
 
         // 4. **C4** — emite `AcceptedSample` se o trigger aceitou.
-        //    `was_recommended` inicializa `false`; broadcast layer flipa
-        //    para `true` apenas quando ao menos 1 consumer recebeu o frame
-        //    (proxy de entrega, não de leitura humana).
+        //    `was_recommended` inicializa `false`; o caller marca `true`
+        //    quando a recomendação gerada para o snapshot foi `Trade`.
         let accepted = if sample_dec == SampleDecision::Accept {
+            let (accepted_sampling_tier, accepted_sampling_probability) =
+                tier_snapshot.unwrap_or((SamplingTier::DecimatedUniform, 1.0));
             Some(AcceptedSample::new(
                 now_ns,
                 cycle_seq,
@@ -933,6 +936,9 @@ impl MlServer {
                 buy_vol24_usd,
                 sell_vol24_usd,
                 sample_dec,
+                self.runtime_config_hash.clone(),
+                accepted_sampling_tier.as_str(),
+                accepted_sampling_probability,
             ))
         } else {
             None
@@ -942,7 +948,7 @@ impl MlServer {
         // apenas Accept. Isso dá negativos supervisionáveis
         // (insufficient_history/below_tail) para abstenção sem contaminar
         // com low-volume operacional.
-        if let (Some(resolver), Some((tier, _raw_sampling_probability))) =
+        if let (Some(resolver), Some((tier, raw_sampling_probability))) =
             (self.label_resolver.as_ref(), tier_snapshot)
         {
             if !clean {
@@ -1058,7 +1064,7 @@ impl MlServer {
                 self.label_floors_pct.clone(),
                 policy,
                 tier.as_str(),
-                label_sampling_probability,
+                raw_sampling_probability,
                 self.label_stride_s,
                 cluster_id,
                 1, // cluster_size — detector correlacional atualiza offline.
@@ -1843,9 +1849,9 @@ mod tests {
             "gross_run_* deve ser derivado do run histórico de exit >= floor-entry(t0), não ficar nulo por usar gross simultâneo"
         );
         assert!(
-            v["sampling_probability"].is_null()
+            v["sampling_probability"].as_f64().is_some()
                 && v["policy_metadata"]["label_sampling_probability"].is_null(),
-            "probabilidade efetiva do label depende do stride por rota e deve ser estimada offline, não herdada do raw decimator"
+            "sampling_probability top-level carrega contexto do raw decimator; probabilidade efetiva do label depende do stride por rota e fica em policy_metadata.label_sampling_probability"
         );
     }
 }

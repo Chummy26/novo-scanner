@@ -37,7 +37,7 @@ use crate::ml::trigger::SampleDecision;
 
 /// Versão atual do schema do `RawSample`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 7;
+pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 8;
 
 use crate::ml::SCANNER_VERSION;
 
@@ -76,6 +76,10 @@ pub struct RawSample {
     pub symbol_name: String,
     /// **v2 (ADR-029)** — scanner que gerou.
     pub scanner_version: &'static str,
+    /// **v8** — fingerprint determinístico da configuração runtime vigente
+    /// no instante da observação. Permite auditar a política de candidatura
+    /// e "observação limpa" no stream bruto, não apenas nos labels.
+    pub runtime_config_hash: String,
     /// **v3** — hash determinístico cross-schema (join com AcceptedSample/LabeledTrade).
     pub sample_id: String,
     pub entry_spread: f32,
@@ -124,6 +128,7 @@ impl RawSample {
             sample_decision,
             SamplingTier::DecimatedUniform,
             1.0,
+            "test-runtime-config",
         )
     }
 
@@ -142,8 +147,10 @@ impl RawSample {
         sample_decision: SampleDecision,
         sampling_tier: SamplingTier,
         sampling_probability: f32,
+        runtime_config_hash: impl Into<String>,
     ) -> Self {
         let symbol_name = symbol_name.into();
+        let runtime_config_hash = runtime_config_hash.into();
         let sample_id = sample_id_of(
             ts_ns,
             cycle_seq,
@@ -158,6 +165,7 @@ impl RawSample {
             route_id,
             symbol_name,
             scanner_version: SCANNER_VERSION,
+            runtime_config_hash,
             sample_id,
             entry_spread,
             exit_spread,
@@ -188,8 +196,10 @@ impl RawSample {
         sampling_probability: f32,
         priority_set_generation_id: u32,
         priority_set_updated_at_ns: u64,
+        runtime_config_hash: impl Into<String>,
     ) -> Self {
         let symbol_name = symbol_name.into();
+        let runtime_config_hash = runtime_config_hash.into();
         let sample_id = sample_id_of(
             ts_ns,
             cycle_seq,
@@ -204,6 +214,7 @@ impl RawSample {
             route_id,
             symbol_name,
             scanner_version: SCANNER_VERSION,
+            runtime_config_hash,
             sample_id,
             entry_spread,
             exit_spread,
@@ -223,6 +234,7 @@ impl RawSample {
             concat!(
                 r#"{{"ts_ns":{},"cycle_seq":{},"schema_version":{},"#,
                 r#""scanner_version":"{}","sample_id":"{}","#,
+                r#""runtime_config_hash":"{}","#,
                 r#""symbol_id":{},"symbol_name":"{}","#,
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
@@ -237,6 +249,7 @@ impl RawSample {
             self.schema_version,
             self.scanner_version,
             self.sample_id,
+            escape_json_string(&self.runtime_config_hash),
             self.route_id.symbol_id.0,
             escape_json_string(&self.symbol_name),
             self.route_id.buy_venue.as_str(),
@@ -523,9 +536,10 @@ mod tests {
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, RAW_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 7);
+        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 8);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
+        assert_eq!(s.runtime_config_hash, "test-runtime-config");
         assert_eq!(s.sample_id.len(), 32);
     }
 
@@ -550,8 +564,9 @@ mod tests {
         assert_eq!(v["buy_venue"], "mexc");
         assert_eq!(v["sell_venue"], "bingx");
         assert_eq!(v["sample_decision"], "accept");
-        assert_eq!(v["schema_version"], 7);
+        assert_eq!(v["schema_version"], 8);
         assert!(v["scanner_version"].is_string());
+        assert_eq!(v["runtime_config_hash"], "test-runtime-config");
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert_eq!(v["sampling_tier"], "decimated_uniform");
         assert!(v["sampling_probability"].as_f64().is_some());
@@ -781,8 +796,10 @@ mod tests {
             SampleDecision::Accept,
             SamplingTier::Allowlist,
             1.0,
+            "0000000000000001",
         );
         assert_eq!(s.sampling_tier, "allowlist");
+        assert_eq!(s.runtime_config_hash, "0000000000000001");
         assert!((s.sampling_probability - 1.0).abs() < f32::EPSILON);
         // Serialização respeita o tier e o sample_id é hex32.
         let line = s.to_json_line();
@@ -808,10 +825,12 @@ mod tests {
             1.0,
             9,
             1_700_000_000_000_000_100,
+            "0000000000000001",
         );
         let line = s.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["sampling_tier"], "priority");
+        assert_eq!(v["runtime_config_hash"], "0000000000000001");
         assert_eq!(v["priority_set_generation_id"], 9);
         assert_eq!(
             v["priority_set_updated_at_ns"],
