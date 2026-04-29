@@ -12,27 +12,31 @@
 //! - O alvo supervisionado principal é `first_exit_ge_label_floor_*` com
 //!   censura; `best_exit_pct`/`best_gross_pct` são auditoria hindsight.
 //!
-//! # Filtragem obrigatória no trainer
+//! # Separação obrigatória no trainer
 //!
 //! O resolver cria `PendingLabel` para **todos** os candidates limpos, não
 //! apenas `sample_decision == "accept"`. Isso permite calibrar abstenção e
-//! treinar classificador de `NoOpportunity`/`InsufficientData`. Porém o
-//! objetivo canônico do modelo (CLAUDE.md §Objetivo) é aprender sobre a
-//! cauda superior (Teste 1 da skill §4). Trainer **deve** filtrar:
+//! treinar classificador de `NoOpportunity`/`InsufficientData`. O trainer não
+//! deve descartar cegamente `sample_decision != "accept"`: recomendações em
+//! shadow mode precisam ser auditáveis mesmo quando a política de candidatura
+//! mudar. Separe conjuntos explicitamente:
 //!
 //! ```python
-//! df_canonical = df[df["sample_decision"] == "accept"]
-//! df_abstention = df[df["sample_decision"] != "accept"]
+//! df_tail = df[df["sample_decision"] == "accept"]
+//! df_background = df[df["sample_decision"] != "accept"]
+//! df_recommended = df[df["policy_metadata"].map(lambda p: p["recommendation_kind"]) == "trade"]
 //! ```
 //!
-//! Sem este filtro, mistura de regimes contamina o target e calibração
-//! fica ambígua.
+//! Treino precision-first pode priorizar `df_tail`, mas calibração de
+//! recomendação e análise de abstenção precisam de `df_recommended` e
+//! `df_background`. `label_sampling_probability = null` não equivale a 1.0:
+//! o trainer deve estimar/reconstruir pesos de seleção antes de IPW.
 //!
 //! # Opção B: 1 record por (sample_id, horizon_s)
 //!
-//! Cada horizonte (15 min, 30 min, 2 h) escreve seu próprio record quando
-//! fecha. JSONL é append-only; sem update in-place. Smoke test vê h15m em
-//! 15 min sem esperar 2 h.
+//! Cada horizonte configurado escreve seu próprio record quando fecha.
+//! JSONL é append-only; sem update in-place. Smoke test vê h15m em 15 min
+//! sem esperar o maior horizonte.
 //!
 //! # Alvos contínuos vs first-hit
 //!
@@ -271,7 +275,9 @@ pub struct LabeledTrade {
     pub symbol_name: String,
 
     // cluster de correlação para CPCV correto.
-    /// ID do cluster: hash determinístico `route_id + floor(ts_emit_ns / 15min)`.
+    /// ID do cluster temporal: hash determinístico de `route_id` + bucket
+    /// baseado no maior horizonte configurado. Detector correlacional offline
+    /// pode substituir por cluster cross-rota real antes de CPCV.
     pub cluster_id: String,
     /// Tamanho do cluster no instante de emit (inicializa 1; pode ser atualizado
     /// offline por detector correlacional).

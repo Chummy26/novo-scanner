@@ -57,9 +57,9 @@ impl TradeOutcome {
     /// PnL bruto percentual dado `entry_now` travado em t0.
     pub fn gross_pnl_pct(&self, entry_locked_pct: f32) -> f32 {
         match *self {
-            TradeOutcome::Realized { exit_realized_pct, .. } => {
-                entry_locked_pct + exit_realized_pct
-            }
+            TradeOutcome::Realized {
+                exit_realized_pct, ..
+            } => entry_locked_pct + exit_realized_pct,
             TradeOutcome::ExitMiss { forced_exit_pct } => entry_locked_pct + forced_exit_pct,
             TradeOutcome::Censored => f32::NAN,
         }
@@ -330,7 +330,6 @@ impl Default for CalibrationAccumulator {
 }
 
 impl CalibrationAccumulator {
-
     /// Registra observação com horizonte e timestamp.
     pub fn record_at(&mut self, p_hit: f32, realized: bool, horizon_observed_ms: u32, now_ns: u64) {
         // Decay exponencial sobre buckets por horizonte.
@@ -576,7 +575,10 @@ impl EconomicAccumulator {
                 return;
             }
             let horizon_ms = match evt.outcome {
-                TradeOutcome::Realized { horizon_observed_ms, .. } => horizon_observed_ms,
+                TradeOutcome::Realized {
+                    horizon_observed_ms,
+                    ..
+                } => horizon_observed_ms,
                 TradeOutcome::ExitMiss { .. } => u32::MAX, // longest bucket
                 TradeOutcome::Censored => unreachable!("censored returned before calibration"),
             };
@@ -826,7 +828,9 @@ mod tests {
         let setup2 = mk_setup(now_ns - 400_000_000);
         acc.push(EconomicEvent::new(
             &setup2,
-            TradeOutcome::ExitMiss { forced_exit_pct: -3.0 },
+            TradeOutcome::ExitMiss {
+                forced_exit_pct: -3.0,
+            },
             now_ns,
         ));
         let m = acc.snapshot_window(3600, now_ns);

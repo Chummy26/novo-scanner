@@ -96,15 +96,17 @@ impl BaselineA3 {
     /// **Fluxo pós-auditoria 2026-04-21**:
     /// 1. Checa `n_observations ≥ n_min` (senão `InsufficientData`).
     /// 2. Checa tail_ratio p99/p95 > threshold → `Abstain(LongTail)`.
-    /// 3. Gate tático: `current_entry ≥ p50(entry)` senão `NoOpportunity`.
-    /// 4. Threshold diagnóstico `enter_at_min` derivado sobre LUCRO BRUTO COTADO:
+    /// 3. Gate acionável: `current_entry ≥ 0`, senão `NoOpportunity`.
+    /// 4. Gate tático alinhado ao trigger: `current_entry ≥ p95(entry)`,
+    ///    senão `NoOpportunity`.
+    /// 5. Threshold diagnóstico `enter_at_min` derivado sobre LUCRO BRUTO COTADO:
     ///    `max(floor_pct − exit_typical, p50_entry)`.
-    /// 5. Gate econômico degradado: `current_entry + exit_typical ≥ floor`.
-    /// 6. Quantis de gross são proxy marginal:
+    /// 6. Gate econômico degradado: `current_entry + exit_typical ≥ floor`.
+    /// 7. Quantis de gross são proxy marginal:
     ///    `enter_typical + quantile(exit)`, não `entry(t)+exit(t)`.
-    /// 7. `historical_base_rate_24h` é a taxa empírica marginal
+    /// 8. `historical_base_rate_24h` é a taxa empírica marginal
     ///    `P_hist(exit ≥ floor − enter_typical)` na janela do cache.
-    /// 8. Emite `TradeSetup` com `entry_now=current_entry` e
+    /// 9. Emite `TradeSetup` com `entry_now=current_entry` e
     ///    `calibration_status: Degraded`; o modelo A2
     ///    deve substituir isso por labels forward-looking reais.
     pub fn recommend(
@@ -124,6 +126,22 @@ impl BaselineA3 {
             return Recommendation::Abstain {
                 reason: AbstainReason::InsufficientData,
                 diagnostic: diagnostic_insufficient(n, self.cfg.model_version),
+            };
+        }
+
+        // Observações com entry negativo continuam válidas para histórico e
+        // calibração de abstenção, mas não são recomendação acionável.
+        if current_entry < 0.0 {
+            return Recommendation::Abstain {
+                reason: AbstainReason::NoOpportunity,
+                diagnostic: AbstainDiagnostic {
+                    n_observations: n.min(u32::MAX as u64) as u32,
+                    ci_width_if_emitted: None,
+                    nearest_feasible_utility: Some(current_entry),
+                    tail_ratio_p99_p95: None,
+                    model_version: self.cfg.model_version.to_string(),
+                    regime_posterior: [1.0, 0.0, 0.0],
+                },
             };
         }
 
@@ -151,9 +169,9 @@ impl BaselineA3 {
             }
         }
 
-        // Gate 2: spread atual deve estar na cauda superior — caso
-        // contrário não há oportunidade *tática agora*.
-        let p50_entry = match self.cache.quantile_entry(route, 0.50) {
+        // Gate 2: spread atual deve estar na mesma cauda superior usada pelo
+        // SamplingTrigger; caso contrário não há oportunidade *tática agora*.
+        let p95_entry_gate = match self.cache.quantile_entry(route, 0.95) {
             Some(v) => v,
             None => {
                 return Recommendation::Abstain {
@@ -162,7 +180,7 @@ impl BaselineA3 {
                 }
             }
         };
-        if current_entry + quantile_tolerance < p50_entry {
+        if current_entry + quantile_tolerance < p95_entry_gate {
             return Recommendation::Abstain {
                 reason: AbstainReason::NoOpportunity,
                 diagnostic: AbstainDiagnostic {
@@ -176,7 +194,8 @@ impl BaselineA3 {
             };
         }
 
-        // Lookup de quantis marginais.
+        // Lookup de quantis marginais. Neste ponto a cauda superior já foi
+        // validada contra p95.
         let (_p10_e, _p25_e, p50_e, _p75_e, _p90_e, p95_e) =
             match all_quantiles_entry(&self.cache, route) {
                 Some(qs) => qs,
@@ -493,19 +512,36 @@ mod tests {
     }
 
     #[test]
-    fn abstain_when_current_entry_below_median() {
+    fn abstain_when_current_entry_below_p95() {
         let cache = mk_cache();
         let a3 = BaselineA3::with_defaults(cache.clone());
         let route = mk_route();
         populate(&cache, route, 1000);
 
-        // current_entry = 0.6% está abaixo do p50 esperado (~1.7%).
+        // current_entry = 0.6% está abaixo do p95 esperado (~3.9%).
         let rec = a3.recommend(route, 0.6, -1.0, 1);
         match rec {
             Recommendation::Abstain { reason, .. } => {
                 assert_eq!(reason, AbstainReason::NoOpportunity);
             }
             Recommendation::Trade(_) => panic!("should abstain with low entry"),
+        }
+    }
+
+    #[test]
+    fn abstain_when_current_entry_is_negative_even_with_history() {
+        let cache = mk_cache();
+        let a3 = BaselineA3::with_defaults(cache.clone());
+        let route = mk_route();
+        populate(&cache, route, 1000);
+
+        let rec = a3.recommend(route, -0.01, 1.0, 1);
+        match rec {
+            Recommendation::Abstain { reason, diagnostic } => {
+                assert_eq!(reason, AbstainReason::NoOpportunity);
+                assert_eq!(diagnostic.nearest_feasible_utility, Some(-0.01));
+            }
+            Recommendation::Trade(_) => panic!("negative entry must not be actionable"),
         }
     }
 
@@ -522,13 +558,13 @@ mod tests {
         let route = mk_route();
         populate(&cache, route, 500);
 
-        // current_entry 3.8% > p50 (~3.0%) → passa gate 2.
-        let rec = a3.recommend(route, 3.8, 0.2, 1_700_000_000_000_000_000);
+        // current_entry 4.0% > p95 (~3.9%) → passa gate 2.
+        let rec = a3.recommend(route, 4.0, 0.2, 1_700_000_000_000_000_000);
         match rec {
             Recommendation::Trade(setup) => {
                 // Sanity checks em campos-chave do ADR-016.
                 assert_eq!(setup.route_id, route);
-                assert_eq!(setup.entry_now, 3.8);
+                assert_eq!(setup.entry_now, 4.0);
                 // gross_profit_target deriva de entry_now + exit_q50.
                 let q50 = setup.exit_q50.expect("q50 presente em baseline trade");
                 assert_eq!(setup.gross_profit_target, setup.entry_now + q50);
@@ -569,7 +605,7 @@ mod tests {
         let route = mk_route();
         populate(&cache, route, 500);
 
-        let rec = a3.recommend(route, 3.8, 0.2, 1);
+        let rec = a3.recommend(route, 4.0, 0.2, 1);
         match rec {
             Recommendation::Abstain { reason, .. } => {
                 assert_eq!(reason, AbstainReason::NoOpportunity);
@@ -678,7 +714,7 @@ mod tests {
         }
         observe_samples(&cache, route, &samples);
 
-        let rec = a3.recommend(route, 2.0, -1.5, 1_700_000_000_000_000_000);
+        let rec = a3.recommend(route, 2.1, -1.5, 1_700_000_000_000_000_000);
         match rec {
             Recommendation::Trade(setup) => {
                 let diag = setup

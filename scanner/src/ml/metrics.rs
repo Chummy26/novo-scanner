@@ -116,6 +116,7 @@ struct ServerMetricsSnapshot {
     rec_abstain_insufficient_data: u64,
     rec_abstain_low_confidence: u64,
     rec_abstain_long_tail: u64,
+    rec_abstain_cooldown: u64,
     raw_samples_emitted: u64,
     raw_samples_emitted_allowlist: u64,
     raw_samples_emitted_priority: u64,
@@ -263,11 +264,11 @@ impl MlPrometheusMetrics {
         // (removed) labels supervisionados + tiers.
         let labels_created_total = IntCounter::with_opts(Opts::new(
             "ml_labels_created_total",
-            "PendingLabels criados (1 por AcceptedSample elegível após stride)",
+            "PendingLabels criados (1 por candidate limpo com ao menos um horizonte elegível após stride)",
         ))?;
         let labels_stride_skipped_total = IntCounter::with_opts(Opts::new(
             "ml_labels_stride_skipped_total",
-            "AcceptedSamples pulados por label_stride dentro da janela",
+            "Candidates limpos pulados porque nenhum horizonte passou no stride",
         ))?;
         let labels_written_total = IntCounterVec::new(
             Opts::new(
@@ -335,6 +336,7 @@ impl MlPrometheusMetrics {
             "abstain_insufficient_data",
             "abstain_low_confidence",
             "abstain_long_tail",
+            "abstain_cooldown",
         ] {
             recommendations_total.with_label_values(&[kind]).inc_by(0);
         }
@@ -463,6 +465,9 @@ impl MlPrometheusMetrics {
         self.recommendations_total
             .with_label_values(&["abstain_long_tail"])
             .inc_by(diff!(rec_abstain_long_tail));
+        self.recommendations_total
+            .with_label_values(&["abstain_cooldown"])
+            .inc_by(diff!(rec_abstain_cooldown));
 
         self.cache_routes_tracked
             .set(server.baseline().cache().routes_tracked() as i64);
@@ -678,6 +683,7 @@ fn snapshot(m: &Arc<ServerMetrics>) -> ServerMetricsSnapshot {
         rec_abstain_insufficient_data: m.rec_abstain_insufficient_data.load(Ordering::Relaxed),
         rec_abstain_low_confidence: m.rec_abstain_low_confidence.load(Ordering::Relaxed),
         rec_abstain_long_tail: m.rec_abstain_long_tail.load(Ordering::Relaxed),
+        rec_abstain_cooldown: m.rec_abstain_cooldown.load(Ordering::Relaxed),
         raw_samples_emitted: m.raw_samples_emitted.load(Ordering::Relaxed),
         raw_samples_emitted_allowlist: m.raw_samples_emitted_allowlist.load(Ordering::Relaxed),
         raw_samples_emitted_priority: m.raw_samples_emitted_priority.load(Ordering::Relaxed),
@@ -744,6 +750,15 @@ mod tests {
         assert!(names.contains(&"ml_recommendations_total".to_string()));
         assert!(names.contains(&"ml_cache_routes_tracked".to_string()));
         assert!(names.contains(&"ml_raw_samples_emitted_by_tier_total".to_string()));
+        let rec_family = families
+            .iter()
+            .find(|f| f.get_name() == "ml_recommendations_total")
+            .expect("recommendations family");
+        assert!(rec_family.get_metric().iter().any(|m| {
+            m.get_label()
+                .iter()
+                .any(|l| l.get_name() == "kind" && l.get_value() == "abstain_cooldown")
+        }));
         // F2-R4
         assert!(names.contains(&"ml_premature_recommendation_rate".to_string()));
     }
@@ -826,7 +841,9 @@ mod tests {
         for i in 0..7u64 {
             acc.push(EconomicEvent::new(
                 &mk_setup(10_000_000_000 + i * 1_000_000_000),
-                TradeOutcome::ExitMiss { forced_exit_pct: -2.0 },
+                TradeOutcome::ExitMiss {
+                    forced_exit_pct: -2.0,
+                },
                 11_000_000_000 + i * 1_000_000_000,
             ));
         }

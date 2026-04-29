@@ -60,6 +60,9 @@ pub enum InvariantError {
     ValidityWindowShorterThanPredictedHorizon { valid_for_s: u64, t_hit_p75_s: u32 },
     /// `p_hit` abaixo do piso configurado de emissão (precision-first).
     PHitBelowEmissionFloor { p_hit: f32, floor: f32 },
+    /// `entry_now < 0` em `TradeSetup` ativo. Observações negativas podem
+    /// existir no dataset bruto/abstenção, mas não são entrada acionável.
+    NegativeEntryForActiveTrade { entry_now: f32 },
 }
 
 /// Piso mínimo de `p_hit` para aceitar emissão. CLAUDE.md §Critérios
@@ -91,6 +94,11 @@ fn verify_tradesetup_inner(
     check_finite!(entry_now);
     check_finite!(exit_target);
     check_finite!(gross_profit_target);
+    if s.entry_now < 0.0 {
+        return Err(InvariantError::NegativeEntryForActiveTrade {
+            entry_now: s.entry_now,
+        });
+    }
 
     if let Some(p) = s.p_hit {
         if !p.is_finite() {
@@ -437,6 +445,18 @@ mod tests {
         s.entry_now = f32::NAN;
         let err = verify_tradesetup(&s).unwrap_err();
         assert!(matches!(err, InvariantError::NonFiniteField { .. }));
+    }
+
+    #[test]
+    fn rejects_negative_entry_for_active_trade() {
+        let mut s = valid();
+        s.entry_now = -0.01;
+        s.gross_profit_target = s.entry_now + s.exit_q50.unwrap();
+        let err = verify_tradesetup(&s).unwrap_err();
+        assert!(matches!(
+            err,
+            InvariantError::NegativeEntryForActiveTrade { .. }
+        ));
     }
 
     #[test]

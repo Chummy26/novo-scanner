@@ -215,9 +215,10 @@ pub fn effective_stride_for_horizon(base_s: u32, horizon_s: u32, n_events_target
 /// Métricas agregadas (sem cardinalidade por rota — correção P6).
 #[derive(Debug, Default)]
 pub struct ResolverMetrics {
-    /// Labels enfileirados (um por AcceptedSample elegível após stride).
+    /// Labels enfileirados (um por candidate limpo com ao menos um horizonte
+    /// elegível após stride).
     pub pending_created_total: AtomicU64,
-    /// Skips por stride — label não gerado.
+    /// Skips por stride — nenhum horizonte elegível no candidate.
     pub stride_skipped_total: AtomicU64,
     /// Records escritos (1 por horizonte fechado).
     pub labels_written_total: AtomicU64,
@@ -244,8 +245,9 @@ struct ResolverInner {
     /// Pending labels por rota. Em overflow, labels antigos podem ser
     /// descartados para preservar representatividade do regime atual.
     pending_by_route: AHashMap<RouteId, VecDeque<PendingLabel>>,
-    /// Último `ts_ns` em que um label foi criado por rota (para stride).
-    last_label_ts: AHashMap<RouteId, u64>,
+    /// Último `ts_ns` em que um label foi criado por `(rota, horizonte)`.
+    /// Stride por horizonte evita sobreposição extrema em horizontes longos.
+    last_label_ts_by_horizon: AHashMap<(RouteId, u32), u64>,
 }
 
 impl LabelResolver {
@@ -254,7 +256,7 @@ impl LabelResolver {
             cfg,
             inner: Mutex::new(ResolverInner {
                 pending_by_route: AHashMap::with_capacity(4096),
-                last_label_ts: AHashMap::with_capacity(4096),
+                last_label_ts_by_horizon: AHashMap::with_capacity(4096),
             }),
             metrics: Arc::new(ResolverMetrics::default()),
             writer,
@@ -343,26 +345,33 @@ impl LabelResolver {
     ) -> bool {
         let floors = normalized_floors(label_floor_pct, label_floors_pct);
         let mut inner = self.inner.lock();
-        // Stride por rota.
-        if label_stride_s > 0 {
-            if let Some(prev) = inner.last_label_ts.get(&route_id) {
-                let stride_ns = (label_stride_s as u64) * 1_000_000_000;
-                if ts_emit_ns < prev.saturating_add(stride_ns) {
-                    self.metrics
-                        .stride_skipped_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-            }
-        }
-        inner.last_label_ts.insert(route_id, ts_emit_ns);
 
-        let horizons: Vec<PendingHorizon> = self
-            .cfg
-            .horizons_s
-            .iter()
-            .map(|&h| PendingHorizon::new(h, ts_emit_ns, &floors))
-            .collect();
+        let mut horizons = Vec::with_capacity(self.cfg.horizons_s.len());
+        for &horizon_s in &self.cfg.horizons_s {
+            if label_stride_s > 0 {
+                let effective_stride_s = effective_stride_for_horizon(
+                    label_stride_s,
+                    horizon_s,
+                    N_EVENTS_TARGET_PER_HORIZON,
+                );
+                let stride_ns = (effective_stride_s as u64) * 1_000_000_000;
+                let key = (route_id, horizon_s);
+                if let Some(prev) = inner.last_label_ts_by_horizon.get(&key) {
+                    if ts_emit_ns < prev.saturating_add(stride_ns) {
+                        continue;
+                    }
+                }
+                inner.last_label_ts_by_horizon.insert(key, ts_emit_ns);
+            }
+            horizons.push(PendingHorizon::new(horizon_s, ts_emit_ns, &floors));
+        }
+
+        if horizons.is_empty() {
+            self.metrics
+                .stride_skipped_total
+                .fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
 
         let pending = PendingLabel {
             sample_id,
@@ -619,7 +628,7 @@ impl LabelResolver {
                 }
             }
             inner.pending_by_route.clear();
-            inner.last_label_ts.clear();
+            inner.last_label_ts_by_horizon.clear();
         }
         let n = to_write.len() as u64;
         for (pending, idx, outcome, reason) in to_write {
@@ -671,13 +680,12 @@ impl LabelResolver {
             })
             .collect();
 
-        // Stride persistido deve representar a seleção realmente aplicada.
-        // Hoje o resolver cria o pending por rota usando `label_stride_s`
-        // antes de expandir horizontes; `effective_stride_for_horizon` segue
-        // disponível como recomendação futura, mas não pode ser gravado como
-        // se tivesse controlado a amostragem atual.
         let mut policy = pending.policy_metadata.clone();
-        policy.effective_stride_s = pending.policy_metadata.label_stride_s;
+        policy.effective_stride_s = effective_stride_for_horizon(
+            pending.policy_metadata.label_stride_s,
+            slot.horizon_s,
+            N_EVENTS_TARGET_PER_HORIZON,
+        );
 
         let label = LabeledTrade {
             sample_id: pending.sample_id.clone(),
@@ -791,12 +799,26 @@ fn normalized_floors(primary_floor: f32, mut floors: Vec<f32>) -> Vec<f32> {
     floors
 }
 
-/// Deriva `cluster_id` determinístico a partir de `route_id` e
-/// janela de 15 min do `ts_emit_ns`. Offline, detector correlacional
-/// pode substituir pelo cluster real.
+/// Deriva `cluster_id` determinístico a partir de `route_id` e da janela
+/// default do maior horizonte. Offline, detector correlacional pode
+/// substituir pelo cluster real.
 pub fn derive_cluster_id(route: RouteId, ts_emit_ns: u64) -> String {
+    let max_horizon_s = DEFAULT_HORIZONS_S.iter().copied().max().unwrap_or(900);
+    derive_cluster_id_for_horizon_window(route, ts_emit_ns, max_horizon_s)
+}
+
+/// Deriva `cluster_id` com janela temporal compatível com o maior horizonte
+/// configurado. Isso evita separar em clusters distintos amostras da mesma
+/// rota cujas janelas de label ainda se sobrepõem.
+pub fn derive_cluster_id_for_horizon_window(
+    route: RouteId,
+    ts_emit_ns: u64,
+    max_horizon_s: u32,
+) -> String {
     use crate::ml::util::fnv1a_64;
-    let window_ns = 15 * 60 * 1_000_000_000u64;
+    let min_window_ns = 15 * 60 * 1_000_000_000u64;
+    let horizon_window_ns = (max_horizon_s as u64).saturating_mul(1_000_000_000);
+    let window_ns = min_window_ns.max(horizon_window_ns);
     let bucket = ts_emit_ns / window_ns;
     let mut payload = Vec::with_capacity(32);
     payload.extend_from_slice(&bucket.to_le_bytes());
@@ -1154,10 +1176,10 @@ mod tests {
         assert!(!created_b);
         let m = resolver.metrics();
         assert_eq!(m.stride_skipped_total.load(Ordering::Relaxed), 1);
-        // 61s depois — stride expirado → cria.
+        // 91s depois — menor horizonte default tem stride efetivo 90s.
         let created_c = resolver.on_accepted(
             "sid3".into(),
-            t0 + 61_000_000_000,
+            t0 + 91_000_000_000,
             3,
             mk_route(),
             "BTC-USDT".into(),
@@ -1171,6 +1193,62 @@ mod tests {
             60,
         );
         assert!(created_c);
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn stride_filters_horizons_independently() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![60, 600],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t0 = 1_000_000_000u64;
+        assert!(resolver.on_accepted(
+            "sid1".into(),
+            t0,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            10,
+        ));
+
+        // 20s depois: h=60 tem stride efetivo 10s; h=600 tem 60s.
+        assert!(resolver.on_accepted(
+            "sid2".into(),
+            t0 + 20_000_000_000,
+            2,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.6,
+            -1.1,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            10,
+        ));
+
+        let inner = resolver.inner.lock();
+        let queue = inner.pending_by_route.get(&mk_route()).unwrap();
+        assert_eq!(queue.len(), 2);
+        let second = queue.back().unwrap();
+        assert_eq!(second.horizons.len(), 1);
+        assert_eq!(second.horizons[0].horizon_s, 60);
+        drop(inner);
         drop(resolver);
         drop(tmp);
     }
@@ -1420,7 +1498,7 @@ mod tests {
     #[test]
     fn effective_stride_scales_with_horizon() {
         // stride por horizonte evita overlap massivo em h longo.
-        // h=900 com N=10: 90s < base 60 ⇒ 60s.
+        // h=900 com N=10: 90s > base 60 ⇒ 90s.
         assert_eq!(effective_stride_for_horizon(60, 900, 10), 90);
         // h=28800 com N=10: 2880s.
         assert_eq!(effective_stride_for_horizon(60, 28800, 10), 2880);
@@ -1440,18 +1518,18 @@ mod tests {
             buy_venue: Venue::MexcFut,
             sell_venue: Venue::BingxFut,
         };
-        let t = 1_700_000_000_000_000_000u64;
+        let t = 0u64;
         assert_eq!(derive_cluster_id(r1, t), derive_cluster_id(r1, t));
         assert_ne!(derive_cluster_id(r1, t), derive_cluster_id(r2, t));
-        // Mesma janela de 15 min → mesmo cluster.
+        // Mesma janela do horizonte máximo default (8h) → mesmo cluster.
         assert_eq!(
             derive_cluster_id(r1, t),
-            derive_cluster_id(r1, t + 60_000_000_000)
+            derive_cluster_id(r1, t + 16 * 60 * 1_000_000_000)
         );
-        // Janela seguinte → cluster distinto.
+        // Janela seguinte ao horizonte máximo → cluster distinto.
         assert_ne!(
             derive_cluster_id(r1, t),
-            derive_cluster_id(r1, t + 16 * 60 * 1_000_000_000)
+            derive_cluster_id(r1, t + 8 * 60 * 60 * 1_000_000_000)
         );
     }
 }

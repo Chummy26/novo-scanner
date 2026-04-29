@@ -254,7 +254,6 @@ impl RawSampleWriter {
         info!(path = %path.display(), "ML raw writer: abrindo novo arquivo");
         Ok((BufWriter::with_capacity(64 * 1024, file), path))
     }
-
 }
 
 // ---------------------------------------------------------------------------

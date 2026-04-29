@@ -295,7 +295,6 @@ impl ReasonDetail {
     }
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasonKind {
     /// Entry na cauda superior 24h + derivada positiva.
@@ -567,5 +566,4 @@ mod tests {
             assert!(v.is_finite(), "field {} is not finite: {}", i, v);
         }
     }
-
 }

@@ -159,5 +159,4 @@ mod tests {
             r.precision_at_10_worst_drop
         );
     }
-
 }

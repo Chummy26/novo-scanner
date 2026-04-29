@@ -324,6 +324,7 @@ pub struct ServerMetrics {
     pub rec_abstain_insufficient_data: AtomicU64,
     pub rec_abstain_low_confidence: AtomicU64,
     pub rec_abstain_long_tail: AtomicU64,
+    pub rec_abstain_cooldown: AtomicU64,
     /// Fix pós-auditoria: `enforce_recommendation_invariants` bloqueou
     /// um `TradeSetup` inválido (violação de monotonicidade ou IC). Separar
     /// dos LowConfidence naturais dá visibilidade sobre bugs do baseline.
@@ -1192,8 +1193,13 @@ impl MlServer {
                     )
                 });
             // metadados v6 persistidos em cada record.
+            let max_horizon_s = self.label_horizons_s.iter().copied().max().unwrap_or(900);
             let cluster_id =
-                crate::ml::persistence::label_resolver::derive_cluster_id(route, now_ns);
+                crate::ml::persistence::label_resolver::derive_cluster_id_for_horizon_window(
+                    route,
+                    now_ns,
+                    max_horizon_s,
+                );
             let runtime_config_hash = self.runtime_config_hash.clone();
             let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
             resolver.on_candidate(
@@ -1254,8 +1260,7 @@ impl MlServer {
                 AbstainReason::InsufficientData => &self.metrics.rec_abstain_insufficient_data,
                 AbstainReason::LowConfidence => &self.metrics.rec_abstain_low_confidence,
                 AbstainReason::LongTail => &self.metrics.rec_abstain_long_tail,
-                // Cooldown reusa bucket de low_confidence para métricas.
-                AbstainReason::Cooldown => &self.metrics.rec_abstain_low_confidence,
+                AbstainReason::Cooldown => &self.metrics.rec_abstain_cooldown,
             },
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -1528,7 +1533,7 @@ mod tests {
             );
         }
         // Agora tenta emitir com current_entry alto.
-        let (rec, _, _) = server.on_opportunity(201, route, "BTC-USDT", 3.8, 0.2, 1e6, 1e6, 201);
+        let (rec, _, _) = server.on_opportunity(201, route, "BTC-USDT", 4.0, 0.2, 1e6, 1e6, 201);
         match rec {
             Recommendation::Trade(setup) => {
                 assert_eq!(setup.route_id, route);
