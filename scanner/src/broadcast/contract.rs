@@ -82,8 +82,9 @@ impl From<&Opportunity> for OpportunityDto {
 }
 
 pub struct VolStore {
-    /// `[venue_idx * n_symbols + symbol_id.0]` — base-asset 24h volume in
-    /// base currency (or quote currency — whichever the venue emits first).
+    /// `[venue_idx * n_symbols + symbol_id.0]` — 24h USD/USDT-equivalent
+    /// quote volume. Do not store base-asset quantity here; scanner gates and
+    /// ML features interpret this value as notional liquidity.
     pub base: Box<[std::sync::atomic::AtomicU64]>,
     pub n_symbols: u32,
 }
@@ -104,9 +105,18 @@ impl VolStore {
         venue.idx() * (self.n_symbols as usize) + sym.0 as usize
     }
     #[inline]
-    pub fn set(&self, venue: crate::types::Venue, sym: crate::types::SymbolId, vol_usd: f64) {
+    pub fn set_quote_volume_usd(
+        &self,
+        venue: crate::types::Venue,
+        sym: crate::types::SymbolId,
+        vol_usd: f64,
+    ) {
         let bits = vol_usd.to_bits();
         self.base[self.idx(venue, sym)].store(bits, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn set(&self, venue: crate::types::Venue, sym: crate::types::SymbolId, vol_usd: f64) {
+        self.set_quote_volume_usd(venue, sym, vol_usd);
     }
     #[inline]
     pub fn get(&self, venue: crate::types::Venue, sym: crate::types::SymbolId) -> f64 {

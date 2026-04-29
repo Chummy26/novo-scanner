@@ -15,6 +15,9 @@
 //!   dentro da janela de 24h.
 //! - `decimation_counter` — contador sequencial; só guarda no ring
 //!   quando `counter % DECIMATION == 0`.
+//! - `n_observations` — contagem efetiva de observações limpas na janela,
+//!   compensada pela decimação. O histograma continua usando apenas o ring
+//!   decimado.
 //! - `last_rebuild_ns` — timestamp do último rebuild completo do
 //!   histograma a partir do ring.
 //!
@@ -160,8 +163,8 @@ struct PerRouteCache {
     ring: VecDeque<SampleTick>,
     /// Wrap seguro por ~34×10⁹ anos em 17k RPS.
     decimation_counter: u64,
-    /// Contador de samples no ring (não total desde boot). Usado para
-    /// `n_min` gate pelo trigger/baseline.
+    /// Contagem efetiva de samples limpos na janela, compensada pela
+    /// decimação. Usado para `n_min` gate pelo trigger/baseline.
     n_observations: u64,
     last_update_ns: u64,
     last_rebuild_ns: u64,
@@ -232,13 +235,21 @@ impl PerRouteCache {
             let _ = self.exit_hist.record(xb);
         }
 
-        self.n_observations = self.ring.len() as u64;
+        self.n_observations =
+            self.ring
+                .len()
+                .saturating_mul(self.cfg.decimation.max(1) as usize) as u64;
         self.last_update_ns = ts_ns;
     }
 
     #[inline]
+    fn sampled_observations(&self) -> u64 {
+        self.ring.len() as u64
+    }
+
+    #[inline]
     fn quantile_entry(&self, q: f64) -> Option<f32> {
-        if self.n_observations == 0 {
+        if self.sampled_observations() == 0 {
             return None;
         }
         let v = self.entry_hist.value_at_quantile(q);
@@ -248,7 +259,7 @@ impl PerRouteCache {
 
     #[inline]
     fn quantile_exit(&self, q: f64) -> Option<f32> {
-        if self.n_observations == 0 {
+        if self.sampled_observations() == 0 {
             return None;
         }
         let v = self.exit_hist.value_at_quantile(q);
@@ -258,12 +269,12 @@ impl PerRouteCache {
 
     #[inline]
     fn probability_entry_ge(&self, threshold: f32) -> Option<(f32, u64, u64)> {
-        if self.n_observations == 0 {
+        let total = self.sampled_observations();
+        if total == 0 {
             return None;
         }
         let low = to_bucket(threshold);
         let successes = self.entry_hist.count_between(low, BUCKET_MAX);
-        let total = self.n_observations;
         let p = successes as f32 / total as f32;
         Some((p, successes, total))
     }
@@ -272,20 +283,21 @@ impl PerRouteCache {
     /// Retorna fração em `[0, 1]` — Teste 1 da skill §4 literal.
     #[inline]
     fn entry_rank_percentile(&self, spread_pct: f32) -> Option<f32> {
-        if self.n_observations == 0 {
+        let total = self.sampled_observations();
+        if total == 0 {
             return None;
         }
         let bucket = to_bucket(spread_pct);
         // Count de amostras com entry_bucket <= bucket (inclui o próprio).
         let below = self.entry_hist.count_between(1, bucket);
-        Some(below as f32 / self.n_observations as f32)
+        Some(below as f32 / total as f32)
     }
 
     /// MAD (Median Absolute Deviation) robusto de entry.
     /// Computa passo-único: mediana + MAD estimado via quantis do hist.
     #[inline]
     fn entry_mad_robust(&self) -> Option<f32> {
-        if self.n_observations < 30 {
+        if self.sampled_observations() < 30 {
             return None; // MAD instável com amostra pequena.
         }
         // Aproximação via quantis do próprio histograma de entry: desvio
@@ -304,7 +316,7 @@ impl PerRouteCache {
     /// caem no mesmo bucket do HDR histogram (indistinção cauda).
     #[inline]
     fn tail_ratio_p99_p95(&self) -> Option<f32> {
-        if self.n_observations < 30 {
+        if self.sampled_observations() < 30 {
             return None;
         }
         let p99_bucket = self.entry_hist.value_at_quantile(0.99);
@@ -324,19 +336,19 @@ impl PerRouteCache {
 
     #[inline]
     fn probability_exit_ge(&self, threshold: f32) -> Option<(f32, u64, u64)> {
-        if self.n_observations == 0 {
+        let total = self.sampled_observations();
+        if total == 0 {
             return None;
         }
         let low = to_bucket(threshold);
         let successes = self.exit_hist.count_between(low, BUCKET_MAX);
-        let total = self.n_observations;
         let p = successes as f32 / total as f32;
         Some((p, successes, total))
     }
 
     #[inline]
     fn exit_run_duration_quantiles(&self, exit_threshold: f32) -> Option<(u32, u32, u32)> {
-        if self.n_observations == 0 {
+        if self.sampled_observations() == 0 {
             return None;
         }
 
@@ -403,8 +415,9 @@ impl HotQueryCache {
     /// Registra nova observação `(entry_spread, exit_spread)` para `route` em `ts_ns`.
     ///
     /// Lembre: em produção (decimation=10) apenas 1-em-10 samples chegam ao
-    /// ring/histograma. Isso reduz warm-up-visível de `n_min=500` para
-    /// ~14 min a 6 RPS (500 × 10 / 6 ≈ 833s).
+    /// ring/histograma. `n_observations()` compensa a decimação para que o
+    /// gate `n_min=500` represente ~500 observações limpas brutas, enquanto os
+    /// percentis seguem calculados sobre a amostra decimada.
     pub fn observe(&self, route: RouteId, entry_spread: f32, exit_spread: f32, ts_ns: u64) {
         let mut guard = self.routes.write();
         let cache = guard
@@ -426,6 +439,14 @@ impl HotQueryCache {
     pub fn n_observations(&self, route: RouteId) -> u64 {
         let guard = self.routes.read();
         guard.get(&route).map(|c| c.n_observations).unwrap_or(0)
+    }
+
+    pub fn sampled_observations(&self, route: RouteId) -> u64 {
+        let guard = self.routes.read();
+        guard
+            .get(&route)
+            .map(|c| c.sampled_observations())
+            .unwrap_or(0)
     }
 
     pub fn probability_entry_ge(&self, route: RouteId, threshold: f32) -> Option<(f32, u64, u64)> {
@@ -631,12 +652,20 @@ mod tests {
         };
         let cache = HotQueryCache::with_config(cfg);
         let route = mk_route(1);
-        // 100 observações brutas → 10 no ring.
+        // 100 observações brutas → 10 no ring, mas n_min enxerga o n efetivo.
         for i in 0..100 {
             cache.observe(route, 2.0, -1.0, i);
         }
         let n = cache.n_observations(route);
-        assert_eq!(n, 10, "decimação 10 em 100 samples → 10 no ring, got {n}");
+        assert_eq!(
+            n, 100,
+            "decimação 10 em 100 samples deve preservar n efetivo para o gate, got {n}"
+        );
+        assert_eq!(
+            cache.sampled_observations(route),
+            10,
+            "histograma continua armazenando 10 samples decimados"
+        );
     }
 
     #[test]

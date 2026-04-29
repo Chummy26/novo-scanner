@@ -254,17 +254,17 @@ pub fn scan_once_with_observer<F>(
                     continue;
                 }
 
-                // Volume gate: both legs must have at least `min_vol_usd` of
-                // 24h volume. Tolerates 0 on either side only during a
-                // cold-start window (first 60s, before vol_poller runs) — by
-                // checking > 0 AND < min; a genuine 0 (not yet populated) passes.
+                // Volume gate: both legs must have a finite, positive
+                // USD-equivalent 24h volume before reaching UI or ML. A zero
+                // means "unknown/not populated" or a transient venue glitch;
+                // letting it through pollutes raw/background sampling.
                 let buy_vol = vol.get(buy_v, sym_id);
                 let sell_vol = vol.get(sell_v, sym_id);
-                if buy_vol > 0.0 && buy_vol < min_vol_usd {
+                if !buy_vol.is_finite() || buy_vol <= 0.0 || buy_vol < min_vol_usd {
                     counters.dropped_low_vol.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                if sell_vol > 0.0 && sell_vol < min_vol_usd {
+                if !sell_vol.is_finite() || sell_vol <= 0.0 || sell_vol < min_vol_usd {
                     counters.dropped_low_vol.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
@@ -351,7 +351,13 @@ mod tests {
     }
 
     fn make_vol(u: &SymbolUniverse) -> VolStore {
-        VolStore::with_capacity(u.len() as u32)
+        let vol = VolStore::with_capacity(u.len() as u32);
+        for sym in 0..u.len() {
+            for venue in Venue::ALL {
+                vol.set_quote_volume_usd(venue, SymbolId(sym as u32), 1_000_000.0);
+            }
+        }
+        vol
     }
 
     #[test]
@@ -662,6 +668,71 @@ mod tests {
             .find(|o| o.buy_type == "SPOT" && o.sell_type == "FUTURES")
             .expect("ML observer must still see valid SPOT/FUT route");
         assert!(op.entry_spread > 0.0 && op.entry_spread < 0.3);
+    }
+
+    #[test]
+    fn zero_volume_route_does_not_reach_observer() {
+        let mut per_venue: Vec<Vec<crate::discovery::VenueSymbol>> =
+            (0..VENUE_COUNT).map(|_| Vec::new()).collect();
+        let btc = CanonicalPair::of("BTC", "USDT");
+        per_venue[Venue::BinanceSpot.idx()].push(crate::discovery::VenueSymbol {
+            venue: Venue::BinanceSpot,
+            raw: "BTCUSDT".into(),
+            canonical: btc.clone(),
+        });
+        per_venue[Venue::MexcFut.idx()].push(crate::discovery::VenueSymbol {
+            venue: Venue::MexcFut,
+            raw: "BTC_USDT".into(),
+            canonical: btc,
+        });
+        let u = SymbolUniverse::from_venue_symbols(per_venue);
+        let store = BookStore::with_capacity(u.len() as u32);
+        let stale = StaleTable::with_capacity(u.len() as u32);
+        let vol = VolStore::with_capacity(u.len() as u32);
+
+        let now = now_ns();
+        store.slot(Venue::BinanceSpot, SymbolId(0)).commit(
+            Price::from_f64(99.9),
+            Qty::from_f64(1.0),
+            Price::from_f64(100.0),
+            Qty::from_f64(1.0),
+            now,
+        );
+        stale.cell(Venue::BinanceSpot, SymbolId(0)).update(now);
+        store.slot(Venue::MexcFut, SymbolId(0)).commit(
+            Price::from_f64(101.0),
+            Qty::from_f64(1.0),
+            Price::from_f64(101.1),
+            Qty::from_f64(1.0),
+            now,
+        );
+        stale.cell(Venue::MexcFut, SymbolId(0)).update(now);
+
+        let mut out = Vec::new();
+        let mut observed = Vec::new();
+        let c = ScanCounters::default();
+        scan_once_with_observer(
+            &u,
+            &store,
+            &stale,
+            &vol,
+            0.3,
+            100.0,
+            0.0,
+            &c,
+            &mut out,
+            |opp| observed.push(opp.clone()),
+        );
+
+        assert!(out.is_empty());
+        assert!(
+            observed.is_empty(),
+            "zero volume must not feed ML raw/cache"
+        );
+        assert!(
+            c.dropped_low_vol.load(Ordering::Relaxed) > 0,
+            "zero/unknown volume should be counted as low-volume"
+        );
     }
 
     #[test]

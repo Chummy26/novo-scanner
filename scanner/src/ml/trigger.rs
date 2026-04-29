@@ -18,8 +18,8 @@
 //!
 //! # Três gates (ordenados por custo ascendente)
 //!
-//! 1. **Min volume** (`min(vol24) ≥ $50k USD`) — rota ilíquida não é
-//!    operacionalmente interessante (T11 execution feasibility).
+//! 1. **Min volume** (`min(vol24_usd) > 0 && ≥ $50k USD`) — rota ilíquida
+//!    ou sem notional normalizado não é operacionalmente interessante.
 //! 2. **Historical sufficiency** (`n_observations ≥ 500` por rota) —
 //!    sem histórico, percentil p95 é mal estimado.
 //! 3. **Tail quality** (`entry_spread ≥ P95(rota, 24h)`) — apenas cauda
@@ -76,7 +76,7 @@ impl Default for SamplingConfig {
 pub enum SampleDecision {
     /// Snapshot passou todos os gates — entra no dataset.
     Accept,
-    /// `min(buy_vol24, sell_vol24) < min_vol24_usd`.
+    /// `min(buy_vol24, sell_vol24) <= 0` ou `< min_vol24_usd`.
     RejectLowVolume,
     /// `n_observations < n_min` — sem p95 confiável.
     RejectInsufficientHistory,
@@ -128,10 +128,17 @@ impl SamplingTrigger {
     /// Gate mínimo para alimentar o `HotQueryCache`.
     ///
     /// `book_age` e `halt` ficam fora do ML/dataset. Aqui filtramos apenas
-    /// liquidez mínima para evitar rotas economicamente irrelevantes no
-    /// histórico usado para quantis de spread.
+    /// liquidez mínima em USD-equivalente para evitar rotas economicamente
+    /// irrelevantes ou snapshots sem volume normalizado no histórico usado
+    /// para quantis de spread.
     #[inline]
     pub fn is_clean_data(&self, buy_vol24_usd: f64, sell_vol24_usd: f64) -> bool {
+        if !buy_vol24_usd.is_finite() || !sell_vol24_usd.is_finite() {
+            return false;
+        }
+        if buy_vol24_usd <= 0.0 || sell_vol24_usd <= 0.0 {
+            return false;
+        }
         if buy_vol24_usd < self.cfg.min_vol24_usd || sell_vol24_usd < self.cfg.min_vol24_usd {
             return false;
         }
@@ -151,8 +158,15 @@ impl SamplingTrigger {
         cache: &HotQueryCache,
     ) -> SampleDecision {
         // Gate 1 — volume mínimo (evita rotas ilíquidas cedo).
-        if buy_vol24_usd < self.cfg.min_vol24_usd || sell_vol24_usd < self.cfg.min_vol24_usd {
+        if !self.is_clean_data(buy_vol24_usd, sell_vol24_usd) {
             return SampleDecision::RejectLowVolume;
+        }
+
+        // Candidato ativo de entrada precisa começar com spread favorável.
+        // Observações background com entry <= 0 continuam úteis como
+        // abstention/no-opportunity, mas não podem passar como Trade candidate.
+        if !entry_spread.is_finite() || entry_spread <= 0.0 {
+            return SampleDecision::RejectBelowTail;
         }
 
         // Gate 2 — histórico suficiente no cache.
@@ -209,6 +223,8 @@ mod tests {
         let trig = SamplingTrigger::with_defaults();
         assert!(trig.is_clean_data(1e6, 1e6));
         assert!(!trig.is_clean_data(10_000.0, 1e6));
+        assert!(!trig.is_clean_data(0.0, 1e6));
+        assert!(!trig.is_clean_data(f64::NAN, 1e6));
     }
 
     #[test]
@@ -239,6 +255,23 @@ mod tests {
         populate(&cache, route, 1000);
         // p95 ≈ 2.9; current 1.5 bem abaixo.
         let d = trig.evaluate(route, 1.5, 1e6, 1e6, &cache);
+        assert_eq!(d, SampleDecision::RejectBelowTail);
+    }
+
+    #[test]
+    fn reject_non_positive_entry_as_active_candidate() {
+        let cache = mk_cache();
+        let trig = SamplingTrigger::new(SamplingConfig {
+            n_min: 10,
+            ..SamplingConfig::default()
+        });
+        let route = mk_route();
+        populate(&cache, route, 100);
+
+        let d = trig.evaluate(route, -0.1, 1e6, 1e6, &cache);
+        assert_eq!(d, SampleDecision::RejectBelowTail);
+
+        let d = trig.evaluate(route, f32::NAN, 1e6, 1e6, &cache);
         assert_eq!(d, SampleDecision::RejectBelowTail);
     }
 

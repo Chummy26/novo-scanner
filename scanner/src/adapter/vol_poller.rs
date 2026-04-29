@@ -40,6 +40,7 @@ pub async fn run(universe: Arc<SymbolUniverse>, vol: Arc<VolStore>) {
                 poll_kucoin_spot(&h, &u, &v),
                 poll_kucoin_fut(&h, &u, &v),
                 poll_mexc_spot(&h, &u, &v),
+                poll_mexc_fut(&h, &u, &v),
                 poll_xt_spot(&h, &u, &v),
                 poll_xt_fut(&h, &u, &v),
             );
@@ -79,7 +80,7 @@ async fn poll_binance_spot(http: &reqwest::Client, u: &SymbolUniverse, v: &VolSt
         if let Some(id) = u.lookup(Venue::BinanceSpot, &t.symbol) {
             if let Ok(qv) = t.quote_vol.parse::<f64>() {
                 if qv > 0.0 {
-                    v.set(Venue::BinanceSpot, id, qv);
+                    v.set_quote_volume_usd(Venue::BinanceSpot, id, qv);
                     n += 1;
                 }
             }
@@ -112,7 +113,7 @@ async fn poll_binance_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolSto
         if let Some(id) = u.lookup(Venue::BinanceFut, &t.symbol) {
             if let Ok(qv) = t.quote_vol.parse::<f64>() {
                 if qv > 0.0 {
-                    v.set(Venue::BinanceFut, id, qv);
+                    v.set_quote_volume_usd(Venue::BinanceFut, id, qv);
                     n += 1;
                 }
             }
@@ -173,7 +174,7 @@ async fn poll_bingx_spot(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStor
         if let Some(id) = u.lookup(Venue::BingxSpot, &t.symbol) {
             let qv = bingx_qvol(&t.quote_vol);
             if qv > 0.0 {
-                v.set(Venue::BingxSpot, id, qv);
+                v.set_quote_volume_usd(Venue::BingxSpot, id, qv);
                 n += 1;
             }
         }
@@ -205,7 +206,7 @@ async fn poll_bingx_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore
         if let Some(id) = u.lookup(Venue::BingxFut, &t.symbol) {
             let qv = bingx_qvol(&t.quote_vol);
             if qv > 0.0 {
-                v.set(Venue::BingxFut, id, qv);
+                v.set_quote_volume_usd(Venue::BingxFut, id, qv);
                 n += 1;
             }
         }
@@ -256,7 +257,7 @@ async fn poll_bitget_spot(http: &reqwest::Client, u: &SymbolUniverse, v: &VolSto
                 .or_else(|| t.quote_vol.parse::<f64>().ok())
                 .unwrap_or(0.0);
             if qv > 0.0 {
-                v.set(Venue::BitgetSpot, id, qv);
+                v.set_quote_volume_usd(Venue::BitgetSpot, id, qv);
                 n += 1;
             }
         }
@@ -293,7 +294,7 @@ async fn poll_bitget_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStor
                 .or_else(|| t.quote_vol.parse::<f64>().ok())
                 .unwrap_or(0.0);
             if qv > 0.0 {
-                v.set(Venue::BitgetFut, id, qv);
+                v.set_quote_volume_usd(Venue::BitgetFut, id, qv);
                 n += 1;
             }
         }
@@ -342,7 +343,7 @@ async fn poll_kucoin_spot(http: &reqwest::Client, u: &SymbolUniverse, v: &VolSto
         if let Some(id) = u.lookup(Venue::KucoinSpot, &t.symbol) {
             if let Ok(qv) = t.vol_value.parse::<f64>() {
                 if qv > 0.0 {
-                    v.set(Venue::KucoinSpot, id, qv);
+                    v.set_quote_volume_usd(Venue::KucoinSpot, id, qv);
                     n += 1;
                 }
             }
@@ -403,7 +404,7 @@ async fn poll_kucoin_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStor
                 }
             };
             if qv > 0.0 {
-                v.set(Venue::KucoinFut, id, qv);
+                v.set_quote_volume_usd(Venue::KucoinFut, id, qv);
                 n += 1;
             }
         }
@@ -442,13 +443,68 @@ async fn poll_mexc_spot(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore
         if let Some(id) = u.lookup(Venue::MexcSpot, &t.symbol) {
             if let Ok(qv) = t.qv.parse::<f64>() {
                 if qv > 0.0 {
-                    v.set(Venue::MexcSpot, id, qv);
+                    v.set_quote_volume_usd(Venue::MexcSpot, id, qv);
                     n += 1;
                 }
             }
         }
     }
     debug!(updated = n, "mexc-spot vol ok");
+}
+
+#[derive(Debug, Deserialize)]
+struct MexcFutTickerResp {
+    data: serde_json::Value,
+}
+
+fn mexc_fut_amount24(t: &serde_json::Value) -> Option<(&str, f64)> {
+    let obj = t.as_object()?;
+    let symbol = obj.get("symbol")?.as_str()?;
+    let amount24 = match obj.get("amount24") {
+        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+        Some(serde_json::Value::String(s)) => s.parse::<f64>().unwrap_or(0.0),
+        _ => 0.0,
+    };
+    // MEXC contract docs: `amount24` is 24h transaction amount/notional;
+    // `volume24` is statistical volume/count and must not feed USD gates.
+    (amount24.is_finite() && amount24 > 0.0).then_some((symbol, amount24))
+}
+
+async fn poll_mexc_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore) {
+    let r = http
+        .get("https://contract.mexc.com/api/v1/contract/ticker")
+        .send()
+        .await;
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("mexc-fut vol: {}", e);
+            return;
+        }
+    };
+    let wrap: MexcFutTickerResp = match r.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("mexc-fut parse: {}", e);
+            return;
+        }
+    };
+    let entries: Vec<&serde_json::Value> = match &wrap.data {
+        serde_json::Value::Array(xs) => xs.iter().collect(),
+        serde_json::Value::Object(_) => vec![&wrap.data],
+        _ => Vec::new(),
+    };
+    let mut n = 0u32;
+    for t in entries {
+        let Some((symbol, amount24)) = mexc_fut_amount24(t) else {
+            continue;
+        };
+        if let Some(id) = u.lookup(Venue::MexcFut, symbol) {
+            v.set_quote_volume_usd(Venue::MexcFut, id, amount24);
+            n += 1;
+        }
+    }
+    debug!(updated = n, "mexc-fut vol ok");
 }
 
 // ---- Gate futures ----
@@ -490,7 +546,7 @@ async fn poll_gate_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore)
                 .or_else(|| t.volume_24h_quote.parse::<f64>().ok())
                 .unwrap_or(0.0);
             if qv > 0.0 {
-                v.set(Venue::GateFut, id, qv);
+                v.set_quote_volume_usd(Venue::GateFut, id, qv);
                 n += 1;
             }
         }
@@ -536,7 +592,7 @@ async fn poll_xt_spot(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore) 
         if let Some(id) = u.lookup(Venue::XtSpot, &t.s) {
             if let Ok(qv) = t.v.parse::<f64>() {
                 if qv > 0.0 {
-                    v.set(Venue::XtSpot, id, qv);
+                    v.set_quote_volume_usd(Venue::XtSpot, id, qv);
                     n += 1;
                 }
             }
@@ -584,11 +640,40 @@ async fn poll_xt_fut(http: &reqwest::Client, u: &SymbolUniverse, v: &VolStore) {
         if let Some(id) = u.lookup(Venue::XtFut, &t.s) {
             if let Ok(qv) = t.v.parse::<f64>() {
                 if qv > 0.0 {
-                    v.set(Venue::XtFut, id, qv);
+                    v.set_quote_volume_usd(Venue::XtFut, id, qv);
                     n += 1;
                 }
             }
         }
     }
     debug!(updated = n, "xt-fut vol ok");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mexc_fut_uses_amount24_not_volume24() {
+        let v: serde_json::Value = serde_json::json!({
+            "symbol": "TAO_USDT",
+            "amount24": "975750224.5",
+            "volume24": "3250000"
+        });
+        let (symbol, amount24) = mexc_fut_amount24(&v).expect("amount24 should parse");
+        assert_eq!(symbol, "TAO_USDT");
+        assert_eq!(amount24, 975750224.5);
+    }
+
+    #[test]
+    fn mexc_fut_does_not_fallback_to_volume24_count() {
+        let v: serde_json::Value = serde_json::json!({
+            "symbol": "TAO_USDT",
+            "volume24": "3250000"
+        });
+        assert!(
+            mexc_fut_amount24(&v).is_none(),
+            "volume24 is not USD notional and must not feed VolStore"
+        );
+    }
 }

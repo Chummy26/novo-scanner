@@ -163,7 +163,7 @@ impl GateSpotAdapter {
                             );
                             self.stale.cell(Venue::GateSpot, sym_id).update(ts);
                             if quote_vol > 0.0 {
-                                self.vol.set(Venue::GateSpot, sym_id, quote_vol);
+                                self.vol.set_quote_volume_usd(Venue::GateSpot, sym_id, quote_vol);
                             }
                             Metrics::init().record_ingest(Venue::GateSpot, t0.elapsed().as_nanos() as u64);
                         } else {

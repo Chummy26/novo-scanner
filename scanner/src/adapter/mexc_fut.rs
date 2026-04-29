@@ -154,7 +154,9 @@ impl MexcFutAdapter {
                                 bid_px, Qty::from_f64(1.0), ask_px, Qty::from_f64(1.0), ts
                             );
                             self.stale.cell(Venue::MexcFut, sym_id).update(ts);
-                            if vol24 > 0.0 { self.vol.set(Venue::MexcFut, sym_id, vol24); }
+                            if vol24 > 0.0 {
+                                self.vol.set_quote_volume_usd(Venue::MexcFut, sym_id, vol24);
+                            }
                             Metrics::init().record_ingest(Venue::MexcFut, t0.elapsed().as_nanos() as u64);
                         } else {
                             debug!(symbol, "mexc-fut: not in universe");
