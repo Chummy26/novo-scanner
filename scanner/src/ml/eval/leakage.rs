@@ -111,6 +111,10 @@ pub fn run_full_audit() -> LeakageAuditReport {
         "t_to_first_hit_s",
         "censor_reason",
         "pnl",
+        "buy_vol24",
+        "sell_vol24",
+        "log_min_vol24_usd",
+        "vol_ratio",
     ];
     // O scan em serving.rs procura apenas ocorrências DENTRO do literal
     // `FeaturesT0 { ... }`; o match atual é conservador (substring simples

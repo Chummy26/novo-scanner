@@ -502,7 +502,7 @@ impl RouteDecimator {
                 // priority_set — não marginal. Membership oscila entre
                 // generations do ranker; trainer offline deve usar
                 // `priority_set_generation_id` + `priority_set_updated_at_ns`
-                // (persistidos em cada LabeledTrade v6) para estimar π marginal.
+                // (persistidos em cada LabeledTrade atual) para estimar π marginal.
                 // NaN não é usado aqui porque quebraria consumidores Python
                 // legados; documentamos o caveat no docstring da struct.
                 probability: 1.0,

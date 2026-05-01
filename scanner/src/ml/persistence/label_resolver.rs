@@ -720,6 +720,9 @@ impl LabelResolver {
             outcome,
             censor_reason,
             observed_until_ns: slot.observed_until_ns,
+            label_window_closed_at_ns: pending
+                .ts_emit_ns
+                .saturating_add((slot.horizon_s as u64).saturating_mul(1_000_000_000)),
             closed_ts_ns: now_ns,
             // writer task faz override para o ts real de write.
             // Aqui preenchemos com now_ns (close time) como fallback; writer
@@ -851,10 +854,8 @@ mod tests {
 
     fn mk_features() -> FeaturesT0 {
         FeaturesT0 {
-            buy_vol24: 1e6,
-            sell_vol24: 2e6,
-            log_min_vol24_usd: None,
-            vol_ratio: None,
+            half_spread_buy_now: None,
+            half_spread_sell_now: None,
             tail_ratio_p99_p95: None,
             entry_p25_24h: None,
             entry_p50_24h: None,
@@ -868,12 +869,19 @@ mod tests {
             exit_p75_24h: None,
             exit_p95_24h: None,
             p_exit_ge_label_floor_minus_entry_24h: None,
+            entry_p50_1h: None,
+            entry_rank_percentile_1h: None,
+            p_exit_ge_label_floor_minus_entry_1h: None,
+            entry_p50_7d: None,
+            entry_p95_7d: None,
+            p_exit_ge_label_floor_minus_entry_7d: None,
             gross_run_p05_s: None,
             gross_run_p50_s: None,
             gross_run_p95_s: None,
             exit_excess_run_s: None,
             n_cache_observations_at_t0: 0,
             oldest_cache_ts_ns: 0,
+            time_alive_at_t0_s: None,
             listing_age_days: None,
             route_first_seen_ns: None,
             route_last_seen_ns: None,

@@ -31,5 +31,6 @@ Lineage crítico:
 - `priority_set_generation_id` e `priority_set_updated_at_ns` permitem auditar
   membership do tier `priority`.
 
-Fora do objetivo do modelo: book age, halt, taker/maker fees, funding, slippage,
-position sizing, stop-loss, margem, execução parcial e PnL líquido.
+Fora do dataset supervisionado e do objetivo do modelo: diagnósticos
+operacionais do book, halt, taker/maker fees, funding, slippage, position
+sizing, stop-loss, margem, execução parcial e PnL líquido.

@@ -1,0 +1,59 @@
+bind = "127.0.0.1:8000"
+broadcast_ms = 150
+entry_threshold_pct = 0.30
+kucoin_mode = "disabled"
+bitget_mode = "v2"
+
+[venues]
+binance_spot = true
+binance_fut  = true
+mexc_spot    = true
+mexc_fut     = true
+bingx_spot   = true
+bingx_fut    = true
+gate_spot    = true
+gate_fut     = true
+kucoin       = false
+xt_spot      = true
+xt_fut       = true
+bitget       = true
+
+[limits]
+max_symbols = 4000
+max_levels = 20
+history_len = 512
+
+[core_pinning]
+enabled = false
+
+[ml]
+raw_allowlist_symbols = ["BTC-USDT", "ETH-USDT"]
+raw_sampling_target_coverage = 0.95
+raw_decimation_mod = 10
+raw_rerank_interval_s = 300
+label_stride_s = 60
+label_horizons_s = [900, 1800, 3600, 7200, 14400, 28800]
+label_sweeper_interval_s = 10
+label_floor_pct = 0.8
+label_floors_pct = [0.3, 0.5, 0.8, 1.2, 2.0, 3.0]
+recommendation_cooldown_s = 60
+
+[ml.retention]
+enabled = false
+sweep_interval_s = 3600
+keep_recent_hours = 12
+raw_retention_days = 30
+accepted_retention_days = 30
+labeled_retention_days = 365
+dry_run = true
+
+[ml.parquet]
+enabled = true
+delete_jsonl_after_success = true
+batch_size = 4096
+zstd_level = 3
+
+[ml.windows]
+train_window_days = 90
+calibration_window_days = 21
+archive_reference_days = 365

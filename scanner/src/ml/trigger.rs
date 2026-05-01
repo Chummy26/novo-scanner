@@ -10,7 +10,7 @@
 //! brutos**. Treinar em dados brutos é:
 //! - Caro (dataset gigante).
 //! - Ruidoso (maioria é "não-oportunidade" trivial; modelo aprende o óbvio).
-//! - Contaminado por rotas ilíquidas.
+//! - Contaminado por rotas sem volume 24h mínimo normalizado.
 //!
 //! O trigger filtra para manter apenas snapshots **operacionalmente
 //! relevantes** — aqueles que passam critérios mínimos de qualidade e
@@ -18,8 +18,8 @@
 //!
 //! # Três gates (ordenados por custo ascendente)
 //!
-//! 1. **Min volume** (`min(vol24_usd) > 0 && ≥ $50k USD`) — rota ilíquida
-//!    ou sem notional normalizado não é operacionalmente interessante.
+//! 1. **Min volume** (`min(vol24_usd) > 0 && ≥ $50k USD`) — rota sem
+//!    notional normalizado mínimo não é candidata confiável.
 //! 2. **Historical sufficiency** (`n_observations ≥ 500` por rota) —
 //!    sem histórico, percentil p95 é mal estimado.
 //! 3. **Tail quality** (`entry_spread ≥ P95(rota, 24h)`) — apenas cauda
@@ -31,7 +31,7 @@
 //!
 //! `book_age`, `halt_active` e `toxicity_level` são diagnósticos operacionais,
 //! não features ou filtros do ML/dataset. O trigger conserva apenas filtros
-//! diretamente ligados à oportunidade bruta: liquidez, histórico e cauda.
+//! diretamente ligados à oportunidade bruta: volume 24h mínimo, histórico e cauda.
 
 use crate::ml::contract::RouteId;
 use crate::ml::feature_store::HotQueryCache;
@@ -128,9 +128,8 @@ impl SamplingTrigger {
     /// Gate mínimo para alimentar o `HotQueryCache`.
     ///
     /// `book_age` e `halt` ficam fora do ML/dataset. Aqui filtramos apenas
-    /// liquidez mínima em USD-equivalente para evitar rotas economicamente
-    /// irrelevantes ou snapshots sem volume normalizado no histórico usado
-    /// para quantis de spread.
+    /// volume 24h mínimo em USD-equivalente para evitar snapshots sem
+    /// notional normalizado no histórico usado para quantis de spread.
     #[inline]
     pub fn is_clean_data(&self, buy_vol24_usd: f64, sell_vol24_usd: f64) -> bool {
         if !buy_vol24_usd.is_finite() || !sell_vol24_usd.is_finite() {
@@ -157,7 +156,7 @@ impl SamplingTrigger {
         sell_vol24_usd: f64,
         cache: &HotQueryCache,
     ) -> SampleDecision {
-        // Gate 1 — volume mínimo (evita rotas ilíquidas cedo).
+        // Gate 1 — volume 24h mínimo.
         if !self.is_clean_data(buy_vol24_usd, sell_vol24_usd) {
             return SampleDecision::RejectLowVolume;
         }
@@ -219,7 +218,7 @@ mod tests {
     }
 
     #[test]
-    fn is_clean_data_checks_only_liquidity_for_ml() {
+    fn is_clean_data_checks_only_volume_for_ml() {
         let trig = SamplingTrigger::with_defaults();
         assert!(trig.is_clean_data(1e6, 1e6));
         assert!(!trig.is_clean_data(10_000.0, 1e6));

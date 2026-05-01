@@ -275,7 +275,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 cfg.ml.label_floor_pct,
                 cfg.ml.label_floors_pct.clone(),
             )
-            .with_recommendation_cooldown_s(cfg.ml.recommendation_cooldown_s),
+            .with_recommendation_cooldown_s(cfg.ml.recommendation_cooldown_s)
+            .with_opportunity_alive_threshold_pct(cfg.entry_threshold_pct as f32),
     );
 
     // --- Allowlist Wave V: resolver símbolos em rotas engine-elegíveis ---
@@ -820,7 +821,7 @@ async fn run_spread_engine(
             // Sem isso, SymbolId muda entre runs e dados ficam inúteis
             // retrospectivamente.
             let symbol_name = universe.canonical_name_of(opp.symbol_id);
-            let (rec, _dec, accepted) = ml_server.on_opportunity(
+            let (rec, _dec, accepted) = ml_server.on_opportunity_with_books(
                 cycle_seq,
                 route,
                 &symbol_name,
@@ -828,6 +829,10 @@ async fn run_spread_engine(
                 opp.exit_spread as f32,
                 opp.buy_vol24,
                 opp.sell_vol24,
+                opp.buy_bid_price,
+                opp.buy_price,
+                opp.sell_price,
+                opp.sell_ask_price,
                 now,
             );
             // Publica recomendação no canal broadcast para consumers WS /

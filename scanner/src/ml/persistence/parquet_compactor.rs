@@ -79,7 +79,7 @@ pub fn compact_jsonl_file(
         let expected: u16 = match dataset_kind {
             DatasetKind::AcceptedSamples => 8,
             DatasetKind::RawSamples => 9,
-            DatasetKind::LabeledTrades => 7,
+            DatasetKind::LabeledTrades => 9,
         };
         if let Some(got) = v.get("schema_version").and_then(|x| x.as_u64()) {
             if got != expected as u64 {
@@ -270,11 +270,8 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             struct_field(
                 "features_t0",
                 vec![
-                    f64_field("buy_vol24"),
-                    f64_field("sell_vol24"),
-                    // Fix B4
-                    f32_field("log_min_vol24_usd"),
-                    f32_field("vol_ratio"),
+                    f32_field("half_spread_buy_now"),
+                    f32_field("half_spread_sell_now"),
                     f32_field("tail_ratio_p99_p95"),
                     f32_field("entry_p25_24h"),
                     f32_field("entry_p50_24h"),
@@ -290,6 +287,12 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
                     f32_field("exit_p95_24h"),
                     // Fix B2
                     f32_field("p_exit_ge_label_floor_minus_entry_24h"),
+                    f32_field("entry_p50_1h"),
+                    f32_field("entry_rank_percentile_1h"),
+                    f32_field("p_exit_ge_label_floor_minus_entry_1h"),
+                    f32_field("entry_p50_7d"),
+                    f32_field("entry_p95_7d"),
+                    f32_field("p_exit_ge_label_floor_minus_entry_7d"),
                     u32_field("gross_run_p05_s"),
                     u32_field("gross_run_p50_s"),
                     u32_field("gross_run_p95_s"),
@@ -298,6 +301,7 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
                     // Fix C7
                     u32_field("n_cache_observations_at_t0"),
                     u64_field("oldest_cache_ts_ns"),
+                    u32_field("time_alive_at_t0_s"),
                     f32_field("listing_age_days"),
                     u64_field("route_first_seen_ns"),
                     u64_field("route_last_seen_ns"),
@@ -328,6 +332,7 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             utf8_field("outcome"),
             utf8_field("censor_reason"),
             u64_field("observed_until_ns"),
+            u64_field("label_window_closed_at_ns"),
             u64_field("closed_ts_ns"),
             u64_field("written_ts_ns"),
             struct_field(
@@ -489,28 +494,31 @@ mod tests {
     fn compacts_labeled_jsonl_to_parquet() {
         let tmp = tempfile::tempdir().expect("tmp");
         let jsonl = tmp.path().join("labeled.jsonl");
-        // Schema v6 com todos os novos campos (C3, C13, C2, A10, B1, B2, B4, B8, C7, A4, A6, A13, D2).
+        // Schema atual com campos de spread bruto e sem volume em features_t0.
         write_lines(
             &jsonl,
             &[concat!(
                 r#"{"sample_id":"id1","sample_decision":"accept","horizon_s":900,"ts_emit_ns":1,"cycle_seq":1,"#,
-                r#""schema_version":7,"scanner_version":"0.1.0","#,
+                r#""schema_version":9,"scanner_version":"0.1.0","#,
                 r#""cluster_id":"aaaa0000aaaa0000","cluster_size":1,"cluster_rank":1,"#,
                 r#""runtime_config_hash":"0000000000000000","#,
                 r#""priority_set_generation_id":0,"priority_set_updated_at_ns":0,"#,
                 r#""symbol_id":7,"symbol_name":"BTC-USDT","#,
                 r#""buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","#,
                 r#""entry_locked_pct":2.0,"exit_start_pct":-1.0,"#,
-                r#""features_t0":{"buy_vol24":1000000.0,"sell_vol24":1000000.0,"#,
-                r#""log_min_vol24_usd":13.8,"vol_ratio":1.0,"#,
+                r#""features_t0":{"#,
+                r#""half_spread_buy_now":0.02,"half_spread_sell_now":0.03,"#,
                 r#""tail_ratio_p99_p95":1.8,"entry_p25_24h":1.0,"entry_p50_24h":1.5,"#,
                 r#""entry_p75_24h":2.0,"entry_p95_24h":2.5,"#,
                 r#""entry_rank_percentile_24h":0.8,"entry_minus_p50_24h":0.5,"entry_mad_robust_24h":0.3,"#,
                 r#""exit_p25_24h":-1.5,"exit_p50_24h":-1.2,"exit_p75_24h":-0.8,"exit_p95_24h":-0.3,"#,
                 r#""p_exit_ge_label_floor_minus_entry_24h":0.4,"#,
+                r#""entry_p50_1h":1.7,"entry_rank_percentile_1h":0.75,"p_exit_ge_label_floor_minus_entry_1h":0.35,"#,
+                r#""entry_p50_7d":1.4,"entry_p95_7d":2.8,"p_exit_ge_label_floor_minus_entry_7d":0.45,"#,
                 r#""gross_run_p05_s":30,"gross_run_p50_s":120,"gross_run_p95_s":600,"#,
                 r#""exit_excess_run_s":90,"#,
                 r#""n_cache_observations_at_t0":500,"oldest_cache_ts_ns":0,"#,
+                r#""time_alive_at_t0_s":42,"#,
                 r#""listing_age_days":14.0,"route_first_seen_ns":1,"route_last_seen_ns":1,"#,
                 r#""route_active_until_ns":null,"route_n_snapshots":1},"#,
                 r#""audit_hindsight_best_exit_pct":-0.5,"audit_hindsight_best_exit_ts_ns":2,"#,
@@ -521,7 +529,7 @@ mod tests {
                 r#""label_floor_hits":[{"floor_pct":0.8,"first_exit_ge_floor_ts_ns":2,"#,
                 r#""first_exit_ge_floor_pct":-1.2,"t_to_first_hit_s":120,"realized":true}],"#,
                 r#""outcome":"realized","censor_reason":null,"#,
-                r#""observed_until_ns":2,"closed_ts_ns":3,"written_ts_ns":4,"#,
+                r#""observed_until_ns":2,"label_window_closed_at_ns":900000000001,"closed_ts_ns":3,"written_ts_ns":4,"#,
                 r#""policy_metadata":{"baseline_model_version":"baseline-a3","baseline_recommended":true,"#,
                 r#""recommendation_kind":"trade","abstain_reason":null,"#,
                 r#""prediction_source_kind":"baseline","prediction_model_version":"baseline-a3","#,

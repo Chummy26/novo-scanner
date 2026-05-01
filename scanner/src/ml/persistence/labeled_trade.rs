@@ -56,7 +56,7 @@ use crate::ml::contract::RouteId;
 
 /// Versão atual do schema do `LabeledTrade`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 7;
+pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 9;
 
 #[cfg(test)]
 use crate::ml::SCANNER_VERSION;
@@ -82,13 +82,13 @@ impl LabelOutcome {
     }
 }
 
-/// CensorReason tipado distinguindo ilíquidez transitória vs delisting
+/// CensorReason tipado distinguindo silêncio transitório vs delisting
 /// estrutural. Skill §6: censura é primeira ordem; Kaplan-Meier exige
 /// independência entre mecanismo de censura e evento.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CensorReason {
     /// Rota silenciosa entre `ROUTE_VANISH_IDLE_NS` e `ROUTE_DELISTED_IDLE_NS` —
-    /// padrão típico de baixa liquidez intradiária.
+    /// padrão típico de baixa atividade intradiária.
     RouteDormant,
     /// Rota silenciosa além de `ROUTE_DELISTED_IDLE_NS` — evento estrutural
     /// (delisting, halt, ticker rename). Censura informativa.
@@ -113,18 +113,14 @@ impl CensorReason {
 /// literalmente aos Testes 1 e 2 da skill §4.
 #[derive(Debug, Clone)]
 pub struct FeaturesT0 {
-    // --- Liquidez -----------------------------------------------
-    /// Volumes brutos mantidos por compat; preferir `log_min_vol24_usd` +
-    /// `vol_ratio` como features; `buy_vol24`/`sell_vol24` expostos apenas
-    /// para reconstrução offline de agregações pré-v6.
-    pub buy_vol24: f64,
-    pub sell_vol24: f64,
-    /// amplitude de participantes (não capacidade operacional).
-    /// Evita que modelo aprenda atalho "volume alto → atenua slippage" —
-    /// CLAUDE.md §Fronteira ML proíbe modelar slippage/execução.
-    pub log_min_vol24_usd: Option<f32>,
-    /// Razão `max(buy,sell) / min(buy,sell)` — assimetria de liquidez.
-    pub vol_ratio: Option<f32>,
+    // --- Baseline estrutural instantâneo (skill mãe §2) -------------------
+    /// Meio-spread da perna de compra, normalizado pelo ask de compra em t0.
+    /// A identidade `entry + exit = -2*(half_spread_buy + half_spread_sell)`
+    /// deve fechar salvo arredondamento/degenerescência de book.
+    pub half_spread_buy_now: Option<f32>,
+    /// Meio-spread da perna de venda, também normalizado pelo ask de compra
+    /// em t0 para manter a mesma base de `entry_spread` e `exit_spread`.
+    pub half_spread_sell_now: Option<f32>,
 
     // --- Cauda (skill §4 Teste 1) ----------------------------------------
     pub tail_ratio_p99_p95: Option<f32>,
@@ -151,6 +147,16 @@ pub struct FeaturesT0 {
     /// Teste 2 literal: proxy direto da base rate do hit condicional.
     pub p_exit_ge_label_floor_minus_entry_24h: Option<f32>,
 
+    // --- Multi-escala temporal -------------------------------------------
+    /// Janela curta para o modelo distinguir spike recente de regime de 24h.
+    pub entry_p50_1h: Option<f32>,
+    pub entry_rank_percentile_1h: Option<f32>,
+    pub p_exit_ge_label_floor_minus_entry_1h: Option<f32>,
+    /// Janela longa para não impor 24h como única escala de cauda.
+    pub entry_p50_7d: Option<f32>,
+    pub entry_p95_7d: Option<f32>,
+    pub p_exit_ge_label_floor_minus_entry_7d: Option<f32>,
+
     // --- Runs ---------------------------------------------------
     /// Duração histórica de janelas em que `entry_locked(t0) + exit_hist`
     /// teria atingido o `label_floor_pct` primário. Computado como run de
@@ -172,6 +178,10 @@ pub struct FeaturesT0 {
     /// Distância até `ts_emit_ns` revela cobertura temporal efetiva da
     /// janela 24h (rotas baixo-volume têm cobertura parcial).
     pub oldest_cache_ts_ns: u64,
+
+    /// Segundos contínuos em que a rota já estava acima do threshold de
+    /// oportunidade antes de t0. Proxy PIT de crowding/peer-effect.
+    pub time_alive_at_t0_s: Option<u32>,
 
     pub listing_age_days: Option<f32>,
     /// Snapshot PIT de lifecycle da rota para auditoria anti-survivorship
@@ -319,6 +329,10 @@ pub struct LabeledTrade {
     pub censor_reason: Option<CensorReason>,
     /// Ts do último update do slot (limita best_exit/first_hit).
     pub observed_until_ns: u64,
+    /// Timestamp canônico em que a janela de label termina:
+    /// `ts_emit_ns + horizon_s * 1e9`. Materializado para checks de
+    /// cutoff/embargo sem depender de recomputação externa.
+    pub label_window_closed_at_ns: u64,
     /// Ts em que o slot foi fechado pelo resolver (after close_slack ou sweep).
     pub closed_ts_ns: u64,
     /// ts em que o writer de fato serializou a linha. Agora distinto
@@ -358,16 +372,19 @@ impl LabeledTrade {
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
                 r#""entry_locked_pct":{},"exit_start_pct":{},"#,
-                r#""features_t0":{{"buy_vol24":{},"sell_vol24":{},"#,
-                r#""log_min_vol24_usd":{},"vol_ratio":{},"#,
+                r#""features_t0":{{"#,
+                r#""half_spread_buy_now":{},"half_spread_sell_now":{},"#,
                 r#""tail_ratio_p99_p95":{},"entry_p25_24h":{},"entry_p50_24h":{},"#,
                 r#""entry_p75_24h":{},"entry_p95_24h":{},"#,
                 r#""entry_rank_percentile_24h":{},"entry_minus_p50_24h":{},"entry_mad_robust_24h":{},"#,
                 r#""exit_p25_24h":{},"exit_p50_24h":{},"exit_p75_24h":{},"exit_p95_24h":{},"#,
                 r#""p_exit_ge_label_floor_minus_entry_24h":{},"#,
+                r#""entry_p50_1h":{},"entry_rank_percentile_1h":{},"p_exit_ge_label_floor_minus_entry_1h":{},"#,
+                r#""entry_p50_7d":{},"entry_p95_7d":{},"p_exit_ge_label_floor_minus_entry_7d":{},"#,
                 r#""gross_run_p05_s":{},"gross_run_p50_s":{},"gross_run_p95_s":{},"#,
                 r#""exit_excess_run_s":{},"#,
                 r#""n_cache_observations_at_t0":{},"oldest_cache_ts_ns":{},"#,
+                r#""time_alive_at_t0_s":{},"#,
                 r#""listing_age_days":{},"route_first_seen_ns":{},"route_last_seen_ns":{},"#,
                 r#""route_active_until_ns":{},"route_n_snapshots":{}}},"#,
                 r#""audit_hindsight_best_exit_pct":{},"audit_hindsight_best_exit_ts_ns":{},"#,
@@ -377,7 +394,7 @@ impl LabeledTrade {
                 r#""first_exit_ge_label_floor_pct":{},"t_to_first_hit_s":{},"#,
                 r#""label_floor_hits":{},"#,
                 r#""outcome":"{}","censor_reason":{},"#,
-                r#""observed_until_ns":{},"closed_ts_ns":{},"written_ts_ns":{},"#,
+                r#""observed_until_ns":{},"label_window_closed_at_ns":{},"closed_ts_ns":{},"written_ts_ns":{},"#,
                 r#""policy_metadata":{{"baseline_model_version":"{}","#,
                 r#""baseline_recommended":{},"recommendation_kind":"{}","abstain_reason":{},"#,
                 r#""prediction_source_kind":"{}","prediction_model_version":"{}","#,
@@ -416,10 +433,8 @@ impl LabeledTrade {
             self.route_id.sell_venue.market().as_str(),
             f32_or_null(self.entry_locked_pct),
             f32_or_null(self.exit_start_pct),
-            f64_or_null(self.features_t0.buy_vol24),
-            f64_or_null(self.features_t0.sell_vol24),
-            opt_f32(self.features_t0.log_min_vol24_usd),
-            opt_f32(self.features_t0.vol_ratio),
+            opt_f32(self.features_t0.half_spread_buy_now),
+            opt_f32(self.features_t0.half_spread_sell_now),
             opt_f32(self.features_t0.tail_ratio_p99_p95),
             opt_f32(self.features_t0.entry_p25_24h),
             opt_f32(self.features_t0.entry_p50_24h),
@@ -433,12 +448,19 @@ impl LabeledTrade {
             opt_f32(self.features_t0.exit_p75_24h),
             opt_f32(self.features_t0.exit_p95_24h),
             opt_f32(self.features_t0.p_exit_ge_label_floor_minus_entry_24h),
+            opt_f32(self.features_t0.entry_p50_1h),
+            opt_f32(self.features_t0.entry_rank_percentile_1h),
+            opt_f32(self.features_t0.p_exit_ge_label_floor_minus_entry_1h),
+            opt_f32(self.features_t0.entry_p50_7d),
+            opt_f32(self.features_t0.entry_p95_7d),
+            opt_f32(self.features_t0.p_exit_ge_label_floor_minus_entry_7d),
             opt_u32(self.features_t0.gross_run_p05_s),
             opt_u32(self.features_t0.gross_run_p50_s),
             opt_u32(self.features_t0.gross_run_p95_s),
             opt_u32(self.features_t0.exit_excess_run_s),
             self.features_t0.n_cache_observations_at_t0,
             self.features_t0.oldest_cache_ts_ns,
+            opt_u32(self.features_t0.time_alive_at_t0_s),
             opt_f32(self.features_t0.listing_age_days),
             opt_u64(self.features_t0.route_first_seen_ns),
             opt_u64(self.features_t0.route_last_seen_ns),
@@ -457,6 +479,7 @@ impl LabeledTrade {
             self.outcome.as_str(),
             censor_str,
             self.observed_until_ns,
+            self.label_window_closed_at_ns,
             self.closed_ts_ns,
             self.written_ts_ns,
             escape_json(&self.policy_metadata.baseline_model_version),
@@ -500,14 +523,6 @@ impl LabeledTrade {
 
 #[inline]
 fn f32_or_null(v: f32) -> String {
-    if v.is_finite() {
-        format!("{}", v)
-    } else {
-        "null".to_string()
-    }
-}
-#[inline]
-fn f64_or_null(v: f64) -> String {
     if v.is_finite() {
         format!("{}", v)
     } else {
@@ -619,10 +634,8 @@ mod tests {
             entry_locked_pct: 2.5,
             exit_start_pct: -1.2,
             features_t0: FeaturesT0 {
-                buy_vol24: 1e6,
-                sell_vol24: 2e6,
-                log_min_vol24_usd: Some(13.8),
-                vol_ratio: Some(2.0),
+                half_spread_buy_now: Some(0.025),
+                half_spread_sell_now: Some(0.030),
                 tail_ratio_p99_p95: Some(1.8),
                 entry_p25_24h: Some(1.4),
                 entry_p50_24h: Some(2.0),
@@ -636,12 +649,19 @@ mod tests {
                 exit_p75_24h: Some(-0.8),
                 exit_p95_24h: Some(-0.5),
                 p_exit_ge_label_floor_minus_entry_24h: Some(0.33),
+                entry_p50_1h: Some(2.1),
+                entry_rank_percentile_1h: Some(0.70),
+                p_exit_ge_label_floor_minus_entry_1h: Some(0.25),
+                entry_p50_7d: Some(1.7),
+                entry_p95_7d: Some(3.4),
+                p_exit_ge_label_floor_minus_entry_7d: Some(0.41),
                 gross_run_p05_s: Some(30),
                 gross_run_p50_s: Some(120),
                 gross_run_p95_s: Some(600),
                 exit_excess_run_s: Some(90),
                 n_cache_observations_at_t0: 850,
                 oldest_cache_ts_ns: 1_700_000_000_000_000_000 - 24 * 3600 * 1_000_000_000,
+                time_alive_at_t0_s: Some(42),
                 listing_age_days: Some(14.0),
                 route_first_seen_ns: Some(
                     1_700_000_000_000_000_000 - 14 * 24 * 3600 * 1_000_000_000,
@@ -687,6 +707,7 @@ mod tests {
             outcome: LabelOutcome::Realized,
             censor_reason: None,
             observed_until_ns: 1_700_000_000_000_000_000 + 900 * 1_000_000_000,
+            label_window_closed_at_ns: 1_700_000_000_000_000_000 + 900 * 1_000_000_000,
             closed_ts_ns: 1_700_000_000_000_000_000 + 900 * 1_000_000_000 + 1_000_000_000,
             written_ts_ns: 1_700_000_000_000_000_000 + 900 * 1_000_000_000 + 2_000_000_000,
             policy_metadata: PolicyMetadata {
@@ -738,7 +759,7 @@ mod tests {
         assert_eq!(v["sample_id"], "abcdef0123456789abcdef0123456789");
         assert_eq!(v["sample_decision"], "accept");
         assert_eq!(v["horizon_s"], 900);
-        assert_eq!(v["schema_version"], 7);
+        assert_eq!(v["schema_version"], LABELED_TRADE_SCHEMA_VERSION);
         assert_eq!(v["cluster_id"], "deadbeefdeadbeef");
         assert_eq!(v["cluster_size"], 1);
         assert!(v["runtime_config_hash"].is_string());
@@ -769,12 +790,21 @@ mod tests {
             v["features_t0"]["p_exit_ge_label_floor_minus_entry_24h"],
             0.33
         );
-        assert_eq!(v["features_t0"]["vol_ratio"], 2.0);
+        assert_eq!(v["features_t0"]["half_spread_buy_now"], 0.025);
+        assert_eq!(v["features_t0"]["half_spread_sell_now"], 0.03);
         assert_eq!(v["features_t0"]["n_cache_observations_at_t0"], 850);
         assert_eq!(v["features_t0"]["entry_p95_24h"], 3.0);
+        assert_eq!(v["features_t0"]["entry_p50_1h"], 2.1);
+        assert_eq!(v["features_t0"]["entry_rank_percentile_1h"], 0.7);
+        assert_eq!(v["features_t0"]["entry_p95_7d"], 3.4);
+        assert_eq!(
+            v["features_t0"]["p_exit_ge_label_floor_minus_entry_7d"],
+            0.41
+        );
         assert_eq!(v["features_t0"]["exit_p25_24h"], -1.4);
         assert_eq!(v["features_t0"]["gross_run_p50_s"], 120);
         assert_eq!(v["features_t0"]["exit_excess_run_s"], 90);
+        assert_eq!(v["features_t0"]["time_alive_at_t0_s"], 42);
         assert_eq!(v["features_t0"]["listing_age_days"], 14.0);
         assert_eq!(v["features_t0"]["route_n_snapshots"], 123456);
         assert!(v["features_t0"]["route_active_until_ns"].is_null());
@@ -789,6 +819,10 @@ mod tests {
         assert!(v["features_t0"].get("sell_book_age_ms").is_none());
         assert!(v["features_t0"].get("halt_active").is_none());
         assert!(v["features_t0"].get("toxicity_level").is_none());
+        assert!(v["features_t0"].get("buy_vol24").is_none());
+        assert!(v["features_t0"].get("sell_vol24").is_none());
+        assert!(v["features_t0"].get("log_min_vol24_usd").is_none());
+        assert!(v["features_t0"].get("vol_ratio").is_none());
     }
 
     #[test]
@@ -832,6 +866,10 @@ mod tests {
     fn three_timestamps_are_distinct() {
         let l = mk_label();
         assert!(l.observed_until_ns <= l.closed_ts_ns);
+        assert_eq!(
+            l.label_window_closed_at_ns,
+            l.ts_emit_ns + (l.horizon_s as u64) * 1_000_000_000
+        );
         assert!(l.closed_ts_ns <= l.written_ts_ns);
     }
 }

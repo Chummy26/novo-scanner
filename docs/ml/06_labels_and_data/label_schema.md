@@ -23,10 +23,14 @@ Streams:
 - `accepted_samples` (`AcceptedSample` v8): candidatos aceitos pelo trigger.
   `was_recommended` indica se o baseline/modelo emitiu `TradeSetup`; também
   carrega config hash, tier/probabilidade de amostragem e lifecycle.
-- `labeled_trades` (`LabeledTrade` v7): um registro por
+- `labeled_trades` (`LabeledTrade` v9): um registro por
   `(sample_id, horizon_s)`, com `outcome in {realized, miss, censored}`.
   O resolver cria labels para candidates limpos, inclusive `sample_decision !=
   "accept"`, para auditoria de abstenção/background.
+
+`features_t0` não inclui diagnósticos operacionais do book. Volume 24h pode
+existir nos streams bruto/aceito como metadado de amostragem/filtro de
+qualidade, mas não como feature supervisionada do label.
 
 Horizontes default: `900, 1800, 3600, 7200, 14400, 28800` segundos.
 

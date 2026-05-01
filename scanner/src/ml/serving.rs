@@ -39,6 +39,7 @@ use crate::ml::contract::{
 };
 use crate::ml::economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome};
 use crate::ml::eval::verify_tradesetup;
+use crate::ml::feature_store::{CacheConfig, HotQueryCache};
 use crate::ml::listing_history::ListingHistory;
 use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
 use crate::ml::persistence::sample_id::sample_id_of;
@@ -54,6 +55,8 @@ use parking_lot::Mutex;
 /// Identidade §2 da skill: soma intra-tick sempre negativa; trade só realiza
 /// em tick posterior ao da emissão. Default: 1 ciclo do scanner = 150 ms.
 const MIN_HORIZON_NS: u64 = 150_000_000;
+const FEATURE_WINDOW_1H_NS: u64 = 60 * 60 * 1_000_000_000;
+const FEATURE_WINDOW_7D_NS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
 
 struct RecommendationPersistence {
     baseline_recommended: bool,
@@ -180,6 +183,8 @@ const IC_WIDTH_LIMIT: f32 = 0.20;
 /// serializadas pelo write lock interno.
 pub struct MlServer {
     baseline: BaselineA3,
+    feature_cache_1h: HotQueryCache,
+    feature_cache_7d: HotQueryCache,
     trigger: SamplingTrigger,
     listing: ListingHistory,
     economic: Mutex<EconomicTracker>,
@@ -206,6 +211,8 @@ pub struct MlServer {
     label_floors_pct: Vec<f32>,
     label_horizons_s: Vec<u32>,
     last_trade_emit_by_route: Mutex<AHashMap<RouteId, u64>>,
+    alive_since_by_route: Mutex<AHashMap<RouteId, u64>>,
+    opportunity_alive_threshold_pct: f32,
     recommendation_cooldown_ns: u64,
     // fingerprint da config runtime persistida em cada record.
     runtime_config_hash: String,
@@ -223,6 +230,7 @@ fn compute_runtime_config_hash(
     label_horizons_s: &[u32],
     raw_decimation_mod: u64,
     recommendation_cooldown_ns: u64,
+    opportunity_alive_threshold_pct: f32,
 ) -> String {
     let floors = label_floors_pct
         .iter()
@@ -239,7 +247,8 @@ fn compute_runtime_config_hash(
             "scanner_version={}|trigger_n_min={}|tail_q={:.6}|min_vol_usd={:.6}|",
             "baseline_floor_pct={:.6}|baseline_n_min={}|baseline_valid_for_s={}|",
             "label_stride_s={}|label_floor_pct={:.6}|label_floors_pct=[{}]|",
-            "label_horizons_s=[{}]|raw_decimation_mod={}|recommendation_cooldown_ns={}"
+            "label_horizons_s=[{}]|raw_decimation_mod={}|recommendation_cooldown_ns={}|",
+            "feature_windows_s=[3600,86400,604800]|opportunity_alive_threshold_pct={:.6}"
         ),
         crate::ml::SCANNER_VERSION,
         trigger.n_min,
@@ -254,6 +263,7 @@ fn compute_runtime_config_hash(
         horizons,
         raw_decimation_mod,
         recommendation_cooldown_ns,
+        opportunity_alive_threshold_pct,
     );
     format!("{:016x}", crate::ml::util::fnv1a_64(config_blob.as_bytes()))
 }
@@ -548,9 +558,21 @@ impl MlServer {
             &label_horizons_s,
             raw_decimator.modulus(),
             recommendation_cooldown_ns,
+            0.0,
         );
+        let cache_24h_cfg = baseline.cache().config();
+        let feature_cache_1h = HotQueryCache::with_config(CacheConfig {
+            window_ns: FEATURE_WINDOW_1H_NS,
+            ..cache_24h_cfg
+        });
+        let feature_cache_7d = HotQueryCache::with_config(CacheConfig {
+            window_ns: FEATURE_WINDOW_7D_NS,
+            ..cache_24h_cfg
+        });
         Self {
             baseline,
+            feature_cache_1h,
+            feature_cache_7d,
             trigger,
             listing: ListingHistory::new(),
             economic: Mutex::new(EconomicTracker::new()),
@@ -565,6 +587,8 @@ impl MlServer {
             label_floors_pct,
             label_horizons_s,
             last_trade_emit_by_route: Mutex::new(AHashMap::with_capacity(4096)),
+            alive_since_by_route: Mutex::new(AHashMap::with_capacity(4096)),
+            opportunity_alive_threshold_pct: 0.0,
             recommendation_cooldown_ns,
             runtime_config_hash,
             priority_set_generation_id: AtomicU64::new(0),
@@ -582,6 +606,7 @@ impl MlServer {
             &self.label_horizons_s,
             self.raw_decimator.modulus(),
             self.recommendation_cooldown_ns,
+            self.opportunity_alive_threshold_pct,
         );
     }
 
@@ -656,6 +681,12 @@ impl MlServer {
         self
     }
 
+    pub fn with_opportunity_alive_threshold_pct(mut self, threshold_pct: f32) -> Self {
+        self.opportunity_alive_threshold_pct = threshold_pct;
+        self.refresh_runtime_config_hash();
+        self
+    }
+
     pub fn raw_decimator(&self) -> &RouteDecimator {
         &self.raw_decimator
     }
@@ -722,6 +753,38 @@ impl MlServer {
         (self.cycle_seq.fetch_add(1, Ordering::Relaxed) & 0xFFFF_FFFF) as u32
     }
 
+    fn observe_clean_spread(
+        &self,
+        route: RouteId,
+        entry_spread: f32,
+        exit_spread: f32,
+        now_ns: u64,
+    ) {
+        self.baseline
+            .cache()
+            .observe(route, entry_spread, exit_spread, now_ns);
+        self.feature_cache_1h
+            .observe(route, entry_spread, exit_spread, now_ns);
+        self.feature_cache_7d
+            .observe(route, entry_spread, exit_spread, now_ns);
+    }
+
+    fn time_alive_snapshot(&self, route: RouteId, entry_spread: f32, now_ns: u64) -> Option<u32> {
+        if entry_spread < self.opportunity_alive_threshold_pct {
+            self.alive_since_by_route.lock().remove(&route);
+            return None;
+        }
+        let mut alive = self.alive_since_by_route.lock();
+        let since = *alive.entry(route).or_insert(now_ns);
+        Some(((now_ns.saturating_sub(since)) / 1_000_000_000).min(u32::MAX as u64) as u32)
+    }
+
+    fn clear_alive_if_below_threshold(&self, route: RouteId, entry_spread: f32) {
+        if entry_spread < self.opportunity_alive_threshold_pct {
+            self.alive_since_by_route.lock().remove(&route);
+        }
+    }
+
     /// Observa uma rota válida que não necessariamente é uma oportunidade
     /// acima do threshold do scanner.
     ///
@@ -753,6 +816,7 @@ impl MlServer {
             self.baseline.cache(),
         );
         self.bump_sample_metric(sample_dec);
+        self.clear_alive_if_below_threshold(route, entry_spread);
 
         // �� ranker observa (candidate, accepted).
         if let Some(ranker) = self.route_ranking.as_ref() {
@@ -814,14 +878,12 @@ impl MlServer {
         }
 
         if clean {
-            self.baseline
-                .cache()
-                .observe(route, entry_spread, exit_spread, now_ns);
+            self.observe_clean_spread(route, entry_spread, exit_spread, now_ns);
             self.economic
                 .lock()
                 .resolve_route(route, entry_spread, exit_spread, now_ns);
-            // �� resolvedor de LabeledTrade recebe APENAS observações
-            // com liquidez mínima; best_exit supervisionado fica no domínio
+            // O resolvedor de LabeledTrade recebe APENAS observações
+            // com volume 24h mínimo; best_exit supervisionado fica no domínio
             // de spread bruto e não recebe diagnósticos operacionais.
             if let Some(resolver) = self.label_resolver.as_ref() {
                 resolver.on_clean_observation(route, now_ns, entry_spread, exit_spread);
@@ -869,6 +931,70 @@ impl MlServer {
         sell_vol24_usd: f64,
         now_ns: u64,
     ) -> (Recommendation, SampleDecision, Option<AcceptedSample>) {
+        self.on_opportunity_inner(
+            cycle_seq,
+            route,
+            symbol_name,
+            entry_spread,
+            exit_spread,
+            buy_vol24_usd,
+            sell_vol24_usd,
+            None,
+            None,
+            None,
+            None,
+            now_ns,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn on_opportunity_with_books(
+        &self,
+        cycle_seq: u32,
+        route: RouteId,
+        symbol_name: &str,
+        entry_spread: f32,
+        exit_spread: f32,
+        buy_vol24_usd: f64,
+        sell_vol24_usd: f64,
+        buy_bid_price: f64,
+        buy_ask_price: f64,
+        sell_bid_price: f64,
+        sell_ask_price: f64,
+        now_ns: u64,
+    ) -> (Recommendation, SampleDecision, Option<AcceptedSample>) {
+        self.on_opportunity_inner(
+            cycle_seq,
+            route,
+            symbol_name,
+            entry_spread,
+            exit_spread,
+            buy_vol24_usd,
+            sell_vol24_usd,
+            Some(buy_bid_price),
+            Some(buy_ask_price),
+            Some(sell_bid_price),
+            Some(sell_ask_price),
+            now_ns,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_opportunity_inner(
+        &self,
+        cycle_seq: u32,
+        route: RouteId,
+        symbol_name: &str,
+        entry_spread: f32,
+        exit_spread: f32,
+        buy_vol24_usd: f64,
+        sell_vol24_usd: f64,
+        buy_bid_price: Option<f64>,
+        buy_ask_price: Option<f64>,
+        sell_bid_price: Option<f64>,
+        sell_ask_price: Option<f64>,
+        now_ns: u64,
+    ) -> (Recommendation, SampleDecision, Option<AcceptedSample>) {
         self.metrics
             .opportunities_seen
             .fetch_add(1, Ordering::Relaxed);
@@ -877,6 +1003,27 @@ impl MlServer {
         //    Anti-survivorship; alimenta feature `listing_age_days`.
         self.listing.record_seen(route, now_ns);
         let lifecycle = self.listing.snapshot_for(route);
+        let time_alive_at_t0_s = self.time_alive_snapshot(route, entry_spread, now_ns);
+        let half_spread_buy_now = match (buy_bid_price, buy_ask_price) {
+            (Some(bid), Some(ask))
+                if bid.is_finite() && ask.is_finite() && ask > 0.0 && ask >= bid =>
+            {
+                Some((((ask - bid) / ask) * 50.0) as f32)
+            }
+            _ => None,
+        };
+        let half_spread_sell_now = match (sell_bid_price, sell_ask_price, buy_ask_price) {
+            (Some(bid), Some(ask), Some(base))
+                if bid.is_finite()
+                    && ask.is_finite()
+                    && base.is_finite()
+                    && base > 0.0
+                    && ask >= bid =>
+            {
+                Some((((ask - bid) / base) * 50.0) as f32)
+            }
+            _ => None,
+        };
 
         // 1. **C2 fix** — só alimenta histograma se dado é LIMPO.
         //    Snapshots low-vol NÃO devem poluir o P95 que o
@@ -1003,6 +1150,20 @@ impl MlServer {
             .cache()
             .probability_exit_ge(route, exit_threshold_for_primary_floor)
             .map(|(p, _, _)| p);
+        let entry_p50_1h_pre_observe = self.feature_cache_1h.quantile_entry(route, 0.50);
+        let entry_rank_1h_pre_observe = self
+            .feature_cache_1h
+            .entry_rank_percentile(route, entry_spread);
+        let p_exit_ge_floor_1h_pre = self
+            .feature_cache_1h
+            .probability_exit_ge(route, exit_threshold_for_primary_floor)
+            .map(|(p, _, _)| p);
+        let entry_p50_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.50);
+        let entry_p95_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.95);
+        let p_exit_ge_floor_7d_pre = self
+            .feature_cache_7d
+            .probability_exit_ge(route, exit_threshold_for_primary_floor)
+            .map(|(p, _, _)| p);
         // PIT: duração histórica dos runs em que a saída teria satisfeito
         // o floor primário dado o entry travado AGORA.
         //
@@ -1029,18 +1190,8 @@ impl MlServer {
         // estado PIT do cache em t0 para reconstrutibilidade offline.
         let n_cache_obs_pre = self.baseline.cache().n_observations(route) as u32;
         let oldest_cache_ts_pre = self.baseline.cache().oldest_observation_ns(route);
-        // log de volume mínimo e razão — substituem uso de volume absoluto.
-        let min_vol = buy_vol24_usd.min(sell_vol24_usd).max(1.0);
-        let log_min_vol = Some(min_vol.ln() as f32);
-        let vol_ratio = {
-            let max_v = buy_vol24_usd.max(sell_vol24_usd).max(1.0);
-            Some((max_v / min_vol) as f32)
-        };
-
         if clean {
-            self.baseline
-                .cache()
-                .observe(route, entry_spread, exit_spread, now_ns);
+            self.observe_clean_spread(route, entry_spread, exit_spread, now_ns);
             self.economic
                 .lock()
                 .process(route, entry_spread, exit_spread, now_ns, &rec);
@@ -1095,10 +1246,8 @@ impl MlServer {
             }
             let rec_meta = recommendation_persistence(&rec);
             let features_t0 = FeaturesT0 {
-                buy_vol24: buy_vol24_usd,
-                sell_vol24: sell_vol24_usd,
-                log_min_vol24_usd: log_min_vol,
-                vol_ratio,
+                half_spread_buy_now,
+                half_spread_sell_now,
                 tail_ratio_p99_p95: tail_ratio_pre_observe,
                 entry_p25_24h: entry_p25_pre_observe,
                 entry_p50_24h: entry_p50_pre_observe,
@@ -1112,12 +1261,19 @@ impl MlServer {
                 exit_p75_24h: exit_p75_pre_observe,
                 exit_p95_24h: exit_p95_pre_observe,
                 p_exit_ge_label_floor_minus_entry_24h: p_exit_ge_floor_pre,
+                entry_p50_1h: entry_p50_1h_pre_observe,
+                entry_rank_percentile_1h: entry_rank_1h_pre_observe,
+                p_exit_ge_label_floor_minus_entry_1h: p_exit_ge_floor_1h_pre,
+                entry_p50_7d: entry_p50_7d_pre_observe,
+                entry_p95_7d: entry_p95_7d_pre_observe,
+                p_exit_ge_label_floor_minus_entry_7d: p_exit_ge_floor_7d_pre,
                 gross_run_p05_s: gross_run_p05_pre_observe,
                 gross_run_p50_s: gross_run_p50_pre_observe,
                 gross_run_p95_s: gross_run_p95_pre_observe,
                 exit_excess_run_s: exit_excess_run_pre,
                 n_cache_observations_at_t0: n_cache_obs_pre,
                 oldest_cache_ts_ns: oldest_cache_ts_pre,
+                time_alive_at_t0_s,
                 listing_age_days: listing_age_days_pre_observe,
                 route_first_seen_ns: lifecycle.map(|lc| lc.first_seen_ns),
                 route_last_seen_ns: lifecycle.map(|lc| lc.last_seen_ns),
@@ -1968,8 +2124,20 @@ mod tests {
             .with_label_resolver(Arc::clone(&resolver))
             .with_label_config(0, 0.8, DEFAULT_LABEL_FLOORS_PCT.to_vec())
             .with_raw_decimator(RouteDecimator::with_modulus(1));
-        let (_rec, dec, accepted) =
-            server.on_opportunity(2, route, "BTC-USDT", 9.0, 2.5, 1e6, 1e6, t0 + 2_000_000_000);
+        let (_rec, dec, accepted) = server.on_opportunity_with_books(
+            2,
+            route,
+            "BTC-USDT",
+            9.0,
+            2.5,
+            1e6,
+            1e6,
+            99.0,
+            100.0,
+            109.0,
+            110.0,
+            t0 + 2_000_000_000,
+        );
         assert_eq!(dec, SampleDecision::Accept);
         assert!(accepted.is_some());
         resolver.on_clean_observation(route, t0 + 3_000_000_000, 8.0, 2.6);
@@ -1994,6 +2162,21 @@ mod tests {
         assert!(
             (label_entry_p50 - pre_entry_p50).abs() < 0.05,
             "features_t0 must use pre-observe p50; got {label_entry_p50}, pre was {pre_entry_p50}"
+        );
+        assert!(
+            v["features_t0"]["entry_p50_1h"].as_f64().is_some()
+                && v["features_t0"]["entry_p50_7d"].as_f64().is_some()
+                && v["features_t0"]["p_exit_ge_label_floor_minus_entry_7d"]
+                    .as_f64()
+                    .is_some(),
+            "features_t0 deve carregar janela curta e longa além de 24h"
+        );
+        assert_eq!(v["features_t0"]["half_spread_buy_now"], 0.5);
+        assert_eq!(v["features_t0"]["half_spread_sell_now"], 0.5);
+        assert_eq!(v["features_t0"]["time_alive_at_t0_s"], 2);
+        assert_eq!(
+            v["label_window_closed_at_ns"],
+            v["ts_emit_ns"].as_u64().unwrap() + v["horizon_s"].as_u64().unwrap() * 1_000_000_000
         );
         assert!(
             v["features_t0"]["gross_run_p50_s"].as_u64().is_some(),
