@@ -3549,7 +3549,7 @@ ${f}`;
                 d.current.readyState !== WebSocket.CLOSING &&
                 F(),
               t("connecting"));
-            const B = new WebSocket("ws://localhost:8000/ws/ml/recommendations");
+            const B = new WebSocket("ws://127.0.0.1:8000/ws");
             ((d.current = B),
               (B.onopen = () => {
                 (t("open"), l());

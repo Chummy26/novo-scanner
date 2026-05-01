@@ -50,8 +50,8 @@ const OPPORTUNITY_TYPE_OPTIONS = [
   },
 ];
 
-const WS_SCANNER_URL = "ws://localhost:8000/ws";
-const WS_BASE_URL = "ws://localhost:8000";
+const WS_SCANNER_URL = "ws://127.0.0.1:8000/ws";
+const WS_BASE_URL = "ws://127.0.0.1:8000";
 const PINS_STORAGE_KEY = "teamop.scanner.pins";
 const WATCHDOG_TIMEOUT_SECONDS = 120;
 
