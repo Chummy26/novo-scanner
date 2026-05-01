@@ -1034,6 +1034,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn future_entry_improvement_does_not_realize_locked_label() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![2],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t_emit = 1_000_000_000u64;
+        resolver.on_accepted(
+            "sid_locked_entry".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            1.0,
+            -2.0,
+            mk_features(),
+            3.0,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
+        );
+
+        // Se o label usasse entry(t>t0), este tick realizaria: 99 + 0 >= 3.
+        // Correto: entry_locked=1, então 1 + 0 < 3 e o horizonte vira Miss.
+        resolver.on_clean_observation(mk_route(), t_emit + 2_000_000_000, 99.0, 0.0);
+        resolver.sweep(t_emit + 4_000_000_000);
+        sleep(Duration::from_millis(150)).await;
+
+        let m = resolver.metrics();
+        assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.labels_written_miss_total.load(Ordering::Relaxed), 1);
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
     async fn post_deadline_hit_does_not_realize_horizon() {
         let cfg = ResolverConfig {
             horizons_s: vec![2],
