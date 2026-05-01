@@ -54,6 +54,4 @@ secrets/
 Thumbs.db
 desktop.ini
 
-# Claude / agentes
-.claude/
-.agents/
+
