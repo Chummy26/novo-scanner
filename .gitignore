@@ -29,6 +29,12 @@ env/
 **/logs/
 logs/
 
+# Local runtime artifacts
+.tmp/*.json
+.tmp/*.jsonl
+.tmp/*.pid
+.tmp/*.txt
+
 # ML data outputs
 **/data/ml/
 !**/data/ml/README.md
@@ -53,5 +59,4 @@ secrets/
 .DS_Store
 Thumbs.db
 desktop.ini
-
 

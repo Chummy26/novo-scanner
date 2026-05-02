@@ -1,9 +1,0 @@
-{
-  "pid": 37944,
-  "started_at": "2026-05-01T22:14:02.2623926-03:00",
-  "intended_duration_minutes": 60,
-  "stdout": "C:\\Users\\nicoolas\\Pictures\\novo sc anner\\.tmp\\scanner_collect_20260501-221402.out.log",
-  "stderr": "C:\\Users\\nicoolas\\Pictures\\novo sc anner\\.tmp\\scanner_collect_20260501-221402.err.log",
-  "cwd": "C:\\Users\\nicoolas\\Pictures\\novo sc anner\\scanner",
-  "exe": "C:\\Users\\nicoolas\\Pictures\\novo sc anner\\scanner\\target\\release\\scanner.exe"
-}
