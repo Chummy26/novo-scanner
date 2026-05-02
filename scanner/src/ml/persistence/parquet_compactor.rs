@@ -10,6 +10,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 
+use crate::ml::persistence::labeled_trade::LABELED_TRADE_SCHEMA_VERSION;
+use crate::ml::persistence::raw_sample::RAW_SAMPLE_SCHEMA_VERSION;
+use crate::ml::persistence::sample::ACCEPTED_SAMPLE_SCHEMA_VERSION;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatasetKind {
     AcceptedSamples,
@@ -77,9 +81,9 @@ pub fn compact_jsonl_file(
             )
         })?;
         let expected: u16 = match dataset_kind {
-            DatasetKind::AcceptedSamples => 8,
-            DatasetKind::RawSamples => 9,
-            DatasetKind::LabeledTrades => 9,
+            DatasetKind::AcceptedSamples => ACCEPTED_SAMPLE_SCHEMA_VERSION,
+            DatasetKind::RawSamples => RAW_SAMPLE_SCHEMA_VERSION,
+            DatasetKind::LabeledTrades => LABELED_TRADE_SCHEMA_VERSION,
         };
         if let Some(got) = v.get("schema_version").and_then(|x| x.as_u64()) {
             if got != expected as u64 {
@@ -198,6 +202,8 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             utf8_field("runtime_config_hash"),
             u32_field("symbol_id"),
             utf8_field("symbol_name"),
+            utf8_field("canonical_symbol"),
+            utf8_field("route_id"),
             utf8_field("buy_venue"),
             utf8_field("sell_venue"),
             utf8_field("buy_market"),
@@ -225,6 +231,8 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             utf8_field("runtime_config_hash"),
             u32_field("symbol_id"),
             utf8_field("symbol_name"),
+            utf8_field("canonical_symbol"),
+            utf8_field("route_id"),
             utf8_field("buy_venue"),
             utf8_field("sell_venue"),
             utf8_field("buy_market"),
@@ -261,6 +269,8 @@ fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
             u64_field("priority_set_updated_at_ns"),
             u32_field("symbol_id"),
             utf8_field("symbol_name"),
+            utf8_field("canonical_symbol"),
+            utf8_field("route_id"),
             utf8_field("buy_venue"),
             utf8_field("sell_venue"),
             utf8_field("buy_market"),
@@ -451,7 +461,7 @@ mod tests {
         write_lines(
             &jsonl,
             &[
-                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":8,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":true}"#,
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":10,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":true}"#,
             ],
         );
 
@@ -474,7 +484,7 @@ mod tests {
         write_lines(
             &jsonl,
             &[
-                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":9,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","priority_set_generation_id":3,"priority_set_updated_at_ns":2,"route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1}"#,
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":11,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","priority_set_generation_id":3,"priority_set_updated_at_ns":2,"route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1}"#,
             ],
         );
 
@@ -499,11 +509,11 @@ mod tests {
             &jsonl,
             &[concat!(
                 r#"{"sample_id":"id1","sample_decision":"accept","horizon_s":900,"ts_emit_ns":1,"cycle_seq":1,"#,
-                r#""schema_version":9,"scanner_version":"0.1.0","#,
+                r#""schema_version":11,"scanner_version":"0.1.0","#,
                 r#""cluster_id":"aaaa0000aaaa0000","cluster_size":1,"cluster_rank":1,"#,
                 r#""runtime_config_hash":"0000000000000000","#,
                 r#""priority_set_generation_id":0,"priority_set_updated_at_ns":0,"#,
-                r#""symbol_id":7,"symbol_name":"BTC-USDT","#,
+                r#""symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","#,
                 r#""buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","#,
                 r#""entry_locked_pct":2.0,"exit_start_pct":-1.0,"#,
                 r#""features_t0":{"#,
@@ -569,7 +579,7 @@ mod tests {
         write_lines(
             &jsonl,
             &[
-                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":8,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":null,"exit_spread":null,"buy_vol24":null,"sell_vol24":null,"sample_decision":"accept","sampling_tier":"accepted_full_capture","sampling_probability":1.0,"sampling_probability_kind":"marginal_full_capture","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":false}"#,
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":10,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":null,"exit_spread":null,"buy_vol24":null,"sell_vol24":null,"sample_decision":"accept","sampling_tier":"accepted_full_capture","sampling_probability":1.0,"sampling_probability_kind":"marginal_full_capture","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":false}"#,
             ],
         );
 

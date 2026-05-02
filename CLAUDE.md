@@ -3,7 +3,7 @@
 Norte do projeto. Leitura obrigatória antes de qualquer tarefa.
 
 
-## Pré-requisito obrigatório: skill da estratégia
+## Pré-requisito obrigatório: skills canônicas
 
 Antes de qualquer tarefa envolvendo scanner, dataset, ML, labels, baseline, recomendação, entrada, saída, spread, oportunidade, rota ou arbitragem, é **obrigatório** ler e aplicar a skill:
 
@@ -12,7 +12,12 @@ Antes de qualquer tarefa envolvendo scanner, dataset, ML, labels, baseline, reco
 
 Essa skill é o conhecimento crítico canônico da estratégia. Ela define a matemática correta de `S_entrada(t)`, `S_saída(t)`, `PnL_bruto = S_entrada(t0) + S_saída(t1)`, a diferença entre entrada/saída variáveis, a discricionariedade do operador e a separação entre estratégia, scanner e ML.
 
-Nenhum agente deve propor schema, feature, label, baseline, métrica, filtro, gate ou alteração de código relacionado ao ML sem antes checar se a proposta respeita essa skill. Se houver conflito entre uma interpretação genérica de ML/trading e a skill, a skill vence.
+Para tarefas envolvendo dataset, schema, labels, coleta, features, sampling ou treino, também é obrigatório ler e aplicar:
+
+1. `.claude/skills/spread-arbitrage-dataset/SKILL.md`
+2. Se a primeira não estiver disponível: `.agents/skills/spread-arbitrage-dataset/SKILL.md`
+
+Nenhum agente deve propor schema, feature, label, baseline, métrica, filtro, gate ou alteração de código relacionado ao ML sem antes checar se a proposta respeita essas skills. Se houver conflito entre uma interpretação genérica de ML/trading, este arquivo e uma skill canônica, a skill vence.
 
 Importante: a skill também descreve riscos operacionais da estratégia, mas isso **não** autoriza colocar taker fees, slippage, funding, posição, margem, stop, execução parcial ou PnL líquido no objetivo, label, função de perda ou gate do ML. Para este projeto, a skill deve ser usada para preservar o objetivo bruto: `enter`, `exit`, `lucro bruto`, `P`, `T` e `IC`.
 

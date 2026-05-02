@@ -145,6 +145,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // Canal `tokio::sync::broadcast` cap 512; não bloqueia em backpressure.
     // Resolve lacuna "Recommendation descartada em lib.rs" (Wave T).
     let ml_broadcaster = RecommendationBroadcaster::new();
+    let (admin_shutdown_tx, mut admin_shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
     // --- Broadcast state + server ---
     let bstate = BroadcastState::new()
@@ -155,7 +156,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             Arc::clone(&counters),
             Arc::clone(&vol),
         )
-        .with_ml_broadcaster(ml_broadcaster.clone());
+        .with_ml_broadcaster(ml_broadcaster.clone())
+        .with_admin_shutdown(admin_shutdown_tx.clone());
     let addr: std::net::SocketAddr = cfg
         .bind
         .parse()
@@ -550,25 +552,43 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         )
         .await;
     });
-    tokio::select! {
+    let shutdown_reason = tokio::select! {
         result = &mut engine_task => {
             if let Err(e) = result {
                 warn!(error = %e, "spread engine task terminou com erro");
             }
+            None
         }
         signal = tokio::signal::ctrl_c() => {
             match signal {
                 Ok(()) => {
-                    let n = label_resolver_shutdown.shutdown_flush(now_ns());
-                    info!(n_closed = n, "shutdown: labels pendentes censurados");
-                    tokio::time::sleep(label_flush_interval + Duration::from_millis(250)).await;
+                    info!("shutdown solicitado via ctrl_c");
                 }
                 Err(e) => {
                     warn!(error = %e, "falha aguardando sinal de shutdown");
                 }
             }
-            engine_task.abort();
+            Some("ctrl_c")
         }
+        signal = admin_shutdown_rx.recv() => {
+            match signal {
+                Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    info!("shutdown solicitado via endpoint admin");
+                    Some("admin_endpoint")
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+            }
+        }
+    };
+    if let Some(reason) = shutdown_reason {
+        let n = label_resolver_shutdown.shutdown_flush(now_ns());
+        info!(
+            reason,
+            n_closed = n,
+            "shutdown: labels pendentes censurados"
+        );
+        tokio::time::sleep(label_flush_interval + Duration::from_millis(250)).await;
+        engine_task.abort();
     }
     Ok(())
 }

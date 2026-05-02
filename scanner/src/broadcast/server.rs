@@ -10,7 +10,7 @@ use axum::{
         State,
     },
     response::{IntoResponse, Json},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use parking_lot::RwLock;
@@ -53,6 +53,9 @@ pub struct BroadcastState {
     /// Broadcaster de `Recommendation` (ADR-026, Wave T). `None` em testes
     /// ou quando scanner roda sem pipeline ML. Injetado por `with_ml_broadcaster`.
     pub ml_broadcaster: Option<RecommendationBroadcaster>,
+    /// Sinal de shutdown administrativo. Usado por coletas supervisionadas
+    /// para acionar o mesmo flush limpo do `Ctrl+C`.
+    pub admin_shutdown_tx: Option<broadcast::Sender<()>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -87,6 +90,7 @@ impl BroadcastState {
             counters: None,
             vol: None,
             ml_broadcaster: None,
+            admin_shutdown_tx: None,
         }
     }
 
@@ -112,6 +116,11 @@ impl BroadcastState {
     /// responde 503 Service Unavailable.
     pub fn with_ml_broadcaster(mut self, b: RecommendationBroadcaster) -> Self {
         self.ml_broadcaster = Some(b);
+        self
+    }
+
+    pub fn with_admin_shutdown(mut self, tx: broadcast::Sender<()>) -> Self {
+        self.admin_shutdown_tx = Some(tx);
         self
     }
 
@@ -152,6 +161,7 @@ pub async fn serve(
         .route("/api/spread/status", get(rest_status))
         .route("/api/spread/history/:symbol", get(rest_history))
         .route("/api/spread/debug", get(rest_debug))
+        .route("/api/admin/shutdown", post(admin_shutdown))
         .route("/metrics", get(rest_metrics))
         .route("/healthz", get(healthz))
         // Dev auth bypass: frontend's login screen calls these; we return
@@ -589,6 +599,26 @@ async fn rest_debug(State(state): State<BroadcastState>) -> impl IntoResponse {
             "bingx_bbo_driven":"BingX spot/fut subscribe {sym}@bookTicker which is BBO-driven (no heartbeat on illiquid pairs). The fix is a different channel — not a tighter threshold.",
         }
     }))
+}
+
+async fn admin_shutdown(State(state): State<BroadcastState>) -> impl IntoResponse {
+    let Some(tx) = state.admin_shutdown_tx else {
+        return (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "accepted": false,
+                "reason": "admin_shutdown_not_configured"
+            })),
+        )
+            .into_response();
+    };
+
+    let _ = tx.send(());
+    Json(serde_json::json!({
+        "accepted": true,
+        "reason": "shutdown_requested"
+    }))
+    .into_response()
 }
 
 async fn healthz() -> &'static str {

@@ -53,10 +53,11 @@
 //! PnL líquido, position sizing. Label só mede **lucro bruto cotado**.
 
 use crate::ml::contract::RouteId;
+use crate::ml::persistence::sample_id::route_id_key;
 
 /// Versão atual do schema do `LabeledTrade`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 9;
+pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 11;
 
 #[cfg(test)]
 use crate::ml::SCANNER_VERSION;
@@ -282,17 +283,18 @@ pub struct LabeledTrade {
     pub schema_version: u16,
     pub scanner_version: &'static str,
     pub route_id: RouteId,
+    /// Nome canônico estável entre runs. O JSON materializa também
+    /// `canonical_symbol` como alias explícito para auditoria/trainer.
     pub symbol_name: String,
 
     // cluster de correlação para CPCV correto.
-    /// ID do cluster temporal: hash determinístico de `route_id` + bucket
-    /// baseado no maior horizonte configurado. Detector correlacional offline
-    /// pode substituir por cluster cross-rota real antes de CPCV.
+    /// ID do cluster temporal por símbolo canônico + bucket baseado no maior
+    /// horizonte configurado. Agrupa rotas irmãs do mesmo ativo antes do
+    /// detector correlacional offline mais rico.
     pub cluster_id: String,
-    /// Tamanho do cluster no instante de emit (inicializa 1; pode ser atualizado
-    /// offline por detector correlacional).
+    /// Tamanho do cluster estrutural PIT no instante de emit.
     pub cluster_size: u32,
-    /// Rank desta rota dentro do cluster (1 = melhor).
+    /// Rank determinístico desta rota dentro do cluster estrutural PIT.
     pub cluster_rank: u32,
 
     // fingerprint da config runtime em hex16.
@@ -368,7 +370,7 @@ impl LabeledTrade {
                 r#""cluster_id":"{}","cluster_size":{},"cluster_rank":{},"#,
                 r#""runtime_config_hash":"{}","#,
                 r#""priority_set_generation_id":{},"priority_set_updated_at_ns":{},"#,
-                r#""symbol_id":{},"symbol_name":"{}","#,
+                r#""symbol_id":{},"symbol_name":"{}","canonical_symbol":"{}","route_id":"{}","#,
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
                 r#""entry_locked_pct":{},"exit_start_pct":{},"#,
@@ -427,6 +429,8 @@ impl LabeledTrade {
             self.priority_set_updated_at_ns,
             self.route_id.symbol_id.0,
             escape_json(&self.symbol_name),
+            escape_json(&self.symbol_name),
+            escape_json(&route_id_key(&self.symbol_name, self.route_id)),
             self.route_id.buy_venue.as_str(),
             self.route_id.sell_venue.as_str(),
             self.route_id.buy_venue.market().as_str(),
@@ -764,6 +768,8 @@ mod tests {
         assert_eq!(v["cluster_size"], 1);
         assert!(v["runtime_config_hash"].is_string());
         assert_eq!(v["symbol_name"], "BTC-USDT");
+        assert_eq!(v["canonical_symbol"], "BTC-USDT");
+        assert_eq!(v["route_id"], "BTC-USDT|mexc:FUTURES->bingx:FUTURES");
         assert_eq!(v["entry_locked_pct"], 2.5);
         assert_eq!(v["outcome"], "realized");
         assert!(v["censor_reason"].is_null());

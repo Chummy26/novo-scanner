@@ -1,0 +1,152 @@
+# HELP ml_accepted_samples_dropped_total AcceptedSamples descartadas por backpressure do writer JSONL
+# TYPE ml_accepted_samples_dropped_total counter
+ml_accepted_samples_dropped_total{reason="channel_closed"} 0
+ml_accepted_samples_dropped_total{reason="channel_full"} 0
+# HELP ml_broadcaster_lagged_frames_total Frames sobrescritos por consumer WS lento (RecvError::Lagged)
+# TYPE ml_broadcaster_lagged_frames_total counter
+ml_broadcaster_lagged_frames_total 0
+# HELP ml_broadcaster_no_subscribers_total Publicações sem consumers ativos (ADR-026)
+# TYPE ml_broadcaster_no_subscribers_total counter
+ml_broadcaster_no_subscribers_total 311377
+# HELP ml_broadcaster_published_total Recommendations publicadas ao canal broadcast (ADR-026)
+# TYPE ml_broadcaster_published_total counter
+ml_broadcaster_published_total{kind="abstain"} 311355
+ml_broadcaster_published_total{kind="trade"} 22
+# HELP ml_broadcaster_was_recommended_total Publicações que encontraram ≥1 consumer no envio — proxy de entrega
+# TYPE ml_broadcaster_was_recommended_total counter
+ml_broadcaster_was_recommended_total 0
+# HELP ml_cache_routes_tracked Rotas distintas no HotQueryCache (n_obs ≥ 1)
+# TYPE ml_cache_routes_tracked gauge
+ml_cache_routes_tracked 21100
+# HELP ml_calibration_observations Total de pares (P_hit, realized) registrados no tracker de calibração
+# TYPE ml_calibration_observations gauge
+ml_calibration_observations 0
+# HELP ml_economic_emissions_total Eventos econômicos acumulados (ADR-019)
+# TYPE ml_economic_emissions_total counter
+ml_economic_emissions_total 22
+# HELP ml_economic_outcomes_total Outcomes resolvidos de recomendações (ADR-019)
+# TYPE ml_economic_outcomes_total counter
+ml_economic_outcomes_total{outcome="censored"} 2
+ml_economic_outcomes_total{outcome="exit_miss"} 2
+ml_economic_outcomes_total{outcome="realized"} 18
+ml_economic_outcomes_total{outcome="window_miss"} 0
+# HELP ml_economic_pnl_aggregated_usd PnL bruto simulado agregado em USD (capital hipotético 10k)
+# TYPE ml_economic_pnl_aggregated_usd gauge
+ml_economic_pnl_aggregated_usd 2056.0945
+# HELP ml_labels_created_total PendingLabels criados (1 por candidate limpo com ao menos um horizonte elegível após stride)
+# TYPE ml_labels_created_total counter
+ml_labels_created_total 51530
+# HELP ml_labels_dropped_capacity_total PendingLabels descartados por overflow do cap por rota
+# TYPE ml_labels_dropped_capacity_total counter
+ml_labels_dropped_capacity_total 0
+# HELP ml_labels_dropped_writer_total LabeledTrades descartados por writer indisponível
+# TYPE ml_labels_dropped_writer_total counter
+ml_labels_dropped_writer_total{reason="channel_closed"} 0
+ml_labels_dropped_writer_total{reason="channel_full"} 0
+# HELP ml_labels_stride_skipped_total Candidates limpos pulados porque nenhum horizonte passou no stride
+# TYPE ml_labels_stride_skipped_total counter
+ml_labels_stride_skipped_total 259847
+# HELP ml_labels_written_total LabeledTrades persistidos (1 por horizonte fechado) — labeled por outcome
+# TYPE ml_labels_written_total counter
+ml_labels_written_total{outcome="censored"} 213
+ml_labels_written_total{outcome="miss"} 34475
+ml_labels_written_total{outcome="realized"} 2264
+# HELP ml_opportunities_seen_total Total de oportunidades processadas pelo MlServer
+# TYPE ml_opportunities_seen_total counter
+ml_opportunities_seen_total 311378
+# HELP ml_p_hit_calibration_ece Expected Calibration Error de P_hit em [0,1] — baseline A3 degradado não alimenta esta métrica
+# TYPE ml_p_hit_calibration_ece gauge
+ml_p_hit_calibration_ece 0
+# HELP ml_premature_recommendation_rate n_window_miss_total / n_emissions_total acumulado — taxa de recomendações que não realizaram o entry dentro da janela (CLAUDE.md: 'recomendar cedo demais sistematicamente é erro do modelo')
+# TYPE ml_premature_recommendation_rate gauge
+ml_premature_recommendation_rate 0.1
+# HELP ml_raw_samples_dropped_total RawSamples descartados por backpressure (ADR-025)
+# TYPE ml_raw_samples_dropped_total counter
+ml_raw_samples_dropped_total{reason="channel_closed"} 0
+ml_raw_samples_dropped_total{reason="channel_full"} 0
+# HELP ml_raw_samples_emitted_by_tier_total RawSamples pré-trigger emitidos por tier de decimação
+# TYPE ml_raw_samples_emitted_by_tier_total counter
+ml_raw_samples_emitted_by_tier_total{tier="allowlist"} 0
+ml_raw_samples_emitted_by_tier_total{tier="decimated_uniform"} 1172510
+ml_raw_samples_emitted_by_tier_total{tier="priority"} 0
+# HELP ml_raw_samples_emitted_total RawSamples pré-trigger emitidos ao writer JSONL (ADR-025)
+# TYPE ml_raw_samples_emitted_total counter
+ml_raw_samples_emitted_total 1172510
+# HELP ml_rec_invariant_blocked_total TradeSetup bloqueado pelo verificador de invariantes (downgrade para Abstain)
+# TYPE ml_rec_invariant_blocked_total counter
+ml_rec_invariant_blocked_total 0
+# HELP ml_recommendations_total Recomendações emitidas por categoria
+# TYPE ml_recommendations_total counter
+ml_recommendations_total{kind="abstain_cooldown"} 34
+ml_recommendations_total{kind="abstain_insufficient_data"} 272999
+ml_recommendations_total{kind="abstain_long_tail"} 766
+ml_recommendations_total{kind="abstain_low_confidence"} 0
+ml_recommendations_total{kind="abstain_no_opportunity"} 37557
+ml_recommendations_total{kind="trade"} 22
+# HELP ml_sample_decisions_total Decisões do sampling trigger por razão
+# TYPE ml_sample_decisions_total counter
+ml_sample_decisions_total{reason="accept"} 45422
+ml_sample_decisions_total{reason="below_tail"} 10235259
+ml_sample_decisions_total{reason="insufficient_history"} 1432093
+ml_sample_decisions_total{reason="low_volume"} 0
+# HELP ml_shutdown_lost_pending_total PendingLabels forçados censored{shutdown} ao encerrar
+# TYPE ml_shutdown_lost_pending_total counter
+ml_shutdown_lost_pending_total 0
+# HELP scanner_opportunities_total Opportunities emitted to clients
+# TYPE scanner_opportunities_total counter
+scanner_opportunities_total 311467
+# HELP scanner_ws_frames_total WebSocket frames ingested
+# TYPE scanner_ws_frames_total counter
+scanner_ws_frames_total{venue="binance"} 5175281
+scanner_ws_frames_total{venue="bingx"} 6021283
+scanner_ws_frames_total{venue="bitget"} 12634073
+scanner_ws_frames_total{venue="gate"} 3437938
+scanner_ws_frames_total{venue="kucoin"} 9334466
+scanner_ws_frames_total{venue="mexc"} 1126545
+scanner_ws_frames_total{venue="xt"} 5270186
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="binance"} 3301
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="binance"} 4203
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="mexc"} 27787263
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="mexc"} 6903
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="bingx"} 3701
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="bingx"} 3701
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="gate"} 3401
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="gate"} 4903
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="kucoin"} 2301
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="kucoin"} 3701
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="xt"} 4703
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="xt"} 2801
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="bitget"} 4303
+# HELP scanner_ingest_latency_ns_p99 Per-venue ingest p99 latency ns
+# TYPE scanner_ingest_latency_ns_p99 gauge
+scanner_ingest_latency_ns_p99{venue="bitget"} 4803
+# HELP scanner_spread_cycle_ns_p99 Spread-engine cycle p99 latency ns
+# TYPE scanner_spread_cycle_ns_p99 gauge
+scanner_spread_cycle_ns_p99 6365183
+

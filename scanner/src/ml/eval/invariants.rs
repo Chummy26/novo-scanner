@@ -342,34 +342,22 @@ fn verify_tradesetup_inner(
     //     deve ser confundido com recomendação calibrada completa.
     if s.source_kind == SourceKind::Model {
         if s.p_hit.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput {
-                field: "p_hit",
-            });
+            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "p_hit" });
         }
         if s.p_hit_ci.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput {
-                field: "p_hit_ci",
-            });
+            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "p_hit_ci" });
         }
         if matches!(s.ci_method, "none" | "") {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput {
-                field: "ci_method",
-            });
+            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "ci_method" });
         }
         if s.exit_q25.is_none() || s.exit_q50.is_none() || s.exit_q75.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput {
-                field: "exit_q*",
-            });
+            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "exit_q*" });
         }
         if s.t_hit_p25_s.is_none() || s.t_hit_median_s.is_none() || s.t_hit_p75_s.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput {
-                field: "t_hit_*",
-            });
+            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "t_hit_*" });
         }
         if s.p_censor.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput {
-                field: "p_censor",
-            });
+            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "p_censor" });
         }
     }
 

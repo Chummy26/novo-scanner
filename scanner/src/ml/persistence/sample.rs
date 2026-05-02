@@ -5,12 +5,12 @@
 
 use crate::ml::contract::RouteId;
 use crate::ml::persistence::raw_sample::sampling_probability_kind_for_tier_label;
-use crate::ml::persistence::sample_id::sample_id_of;
+use crate::ml::persistence::sample_id::{route_id_key, sample_id_of};
 use crate::ml::trigger::SampleDecision;
 
 /// Versão atual do schema do `AcceptedSample`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 8;
+pub const ACCEPTED_SAMPLE_SCHEMA_VERSION: u16 = 10;
 
 use crate::ml::SCANNER_VERSION;
 
@@ -26,8 +26,8 @@ pub struct AcceptedSample {
     pub schema_version: u16,
     pub route_id: RouteId,
     /// **v2** — nome canonical estável entre runs (ex: "BTC-USDT"). Único
-    /// join key confiável para análise cross-dia. `symbol_id` é incluído
-    /// como auxiliar mas não deve ser usado entre runs.
+    /// join key confiável para análise cross-dia. O JSON também materializa
+    /// `canonical_symbol` como alias explícito exigido pela skill.
     pub symbol_name: String,
     /// **v2** — versão do scanner que gerou a amostra. Útil para excluir
     /// dados gerados por versões bugadas retrospectivamente.
@@ -45,11 +45,12 @@ pub struct AcceptedSample {
     pub buy_vol24: f64,
     pub sell_vol24: f64,
     pub sample_decision: SampleDecision,
-    /// **v7** — contexto do decimator bruto no mesmo `t0`.
+    /// **v7** — probabilidade de inclusão no papel `AcceptedSample`.
     ///
-    /// O writer de `AcceptedSample` captura todo trigger `Accept`; estes
-    /// campos espelham a política de amostragem do stream bruto para evitar
-    /// joins frágeis quando o accepted precisa ser auditado isoladamente.
+    /// Em produção o writer captura todo trigger `Accept`, portanto o valor
+    /// esperado é `sampling_tier = accepted_full_capture`,
+    /// `sampling_probability = 1.0` e kind `marginal_full_capture`. Contexto
+    /// do decimator bruto fica no `RawSample` e no `LabeledTrade`.
     pub sampling_tier: &'static str,
     pub sampling_probability: f32,
     /// **v8** — semântica de `sampling_probability`; evita tratar
@@ -154,7 +155,7 @@ impl AcceptedSample {
                 r#"{{"ts_ns":{},"cycle_seq":{},"schema_version":{},"#,
                 r#""scanner_version":"{}","sample_id":"{}","#,
                 r#""runtime_config_hash":"{}","#,
-                r#""symbol_id":{},"symbol_name":"{}","#,
+                r#""symbol_id":{},"symbol_name":"{}","canonical_symbol":"{}","route_id":"{}","#,
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
                 r#""entry_spread":{},"exit_spread":{},"#,
@@ -173,6 +174,8 @@ impl AcceptedSample {
             escape_json_string(&self.runtime_config_hash),
             self.route_id.symbol_id.0,
             escape_json_string(&self.symbol_name),
+            escape_json_string(&self.symbol_name),
+            escape_json_string(&route_id_key(&self.symbol_name, self.route_id)),
             self.route_id.buy_venue.as_str(),
             self.route_id.sell_venue.as_str(),
             self.route_id.buy_venue.market().as_str(),
@@ -273,7 +276,7 @@ mod tests {
             1.0,
         );
         assert_eq!(s.schema_version, ACCEPTED_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(s.schema_version, 8);
+        assert_eq!(s.schema_version, 10);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
         assert_eq!(s.runtime_config_hash, "0000000000000001");
@@ -306,6 +309,8 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         assert_eq!(v["symbol_id"], 42);
         assert_eq!(v["symbol_name"], "BTC-USDT");
+        assert_eq!(v["canonical_symbol"], "BTC-USDT");
+        assert_eq!(v["route_id"], "BTC-USDT|mexc:FUTURES->bingx:FUTURES");
         assert_eq!(v["buy_venue"], "mexc");
         assert_eq!(v["sell_venue"], "bingx");
         assert_eq!(v["buy_market"], "FUTURES");
@@ -318,7 +323,7 @@ mod tests {
         assert!(v["route_active_until_ns"].is_null());
         assert_eq!(v["was_recommended"], false);
         assert!(v["scanner_version"].is_string());
-        assert_eq!(v["schema_version"], 8);
+        assert_eq!(v["schema_version"], 10);
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);
         assert!(
             v.get("buy_book_age_ms").is_none(),
@@ -401,6 +406,7 @@ mod tests {
         let line = s.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).expect("still valid json");
         assert_eq!(v["symbol_name"], "XYZ\"EVIL");
+        assert_eq!(v["canonical_symbol"], "XYZ\"EVIL");
     }
 
     #[test]
@@ -423,5 +429,6 @@ mod tests {
         let line = s.to_json_line();
         let v: serde_json::Value = serde_json::from_str(&line).expect("json valido mesmo vazio");
         assert_eq!(v["symbol_name"], "");
+        assert_eq!(v["canonical_symbol"], "");
     }
 }

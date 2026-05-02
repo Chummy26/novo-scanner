@@ -57,6 +57,7 @@ use parking_lot::Mutex;
 const MIN_HORIZON_NS: u64 = 150_000_000;
 const FEATURE_WINDOW_1H_NS: u64 = 60 * 60 * 1_000_000_000;
 const FEATURE_WINDOW_7D_NS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
+const FEATURE_WINDOW_7D_DECIMATION_MULTIPLIER: u32 = 12;
 
 struct RecommendationPersistence {
     baseline_recommended: bool,
@@ -565,8 +566,17 @@ impl MlServer {
             window_ns: FEATURE_WINDOW_1H_NS,
             ..cache_24h_cfg
         });
+        let seven_day_decimation = if cache_24h_cfg.decimation <= 1 {
+            cache_24h_cfg.decimation
+        } else {
+            cache_24h_cfg
+                .decimation
+                .saturating_mul(FEATURE_WINDOW_7D_DECIMATION_MULTIPLIER)
+                .max(cache_24h_cfg.decimation)
+        };
         let feature_cache_7d = HotQueryCache::with_config(CacheConfig {
             window_ns: FEATURE_WINDOW_7D_NS,
+            decimation: seven_day_decimation,
             ..cache_24h_cfg
         });
         Self {
@@ -1202,11 +1212,11 @@ impl MlServer {
         }
 
         // 4. **C4** — emite `AcceptedSample` se o trigger aceitou.
+        //    O stream accepted é full-capture dos Accepts; a probabilidade
+        //    aqui descreve inclusão no papel accepted, não o decimator raw.
         //    `was_recommended` inicializa `false`; o caller marca `true`
         //    quando a recomendação gerada para o snapshot foi `Trade`.
         let accepted = if sample_dec == SampleDecision::Accept {
-            let (accepted_sampling_tier, accepted_sampling_probability) =
-                tier_snapshot.unwrap_or((SamplingTier::DecimatedUniform, 1.0));
             let mut sample = AcceptedSample::new(
                 now_ns,
                 cycle_seq,
@@ -1218,8 +1228,8 @@ impl MlServer {
                 sell_vol24_usd,
                 sample_dec,
                 self.runtime_config_hash.clone(),
-                accepted_sampling_tier.as_str(),
-                accepted_sampling_probability,
+                "accepted_full_capture",
+                1.0,
             );
             if let Some(lc) = lifecycle {
                 sample.set_lifecycle(
@@ -1356,6 +1366,14 @@ impl MlServer {
                     now_ns,
                     max_horizon_s,
                 );
+            let cluster_routes = self.listing.active_routes_for_symbol(route.symbol_id);
+            let cluster_size = cluster_routes.len().max(1).min(u32::MAX as usize) as u32;
+            let cluster_rank = cluster_routes
+                .iter()
+                .position(|candidate| *candidate == route)
+                .map(|idx| idx + 1)
+                .unwrap_or(cluster_routes.len().max(1))
+                .min(u32::MAX as usize) as u32;
             let runtime_config_hash = self.runtime_config_hash.clone();
             let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
             resolver.on_candidate(
@@ -1375,8 +1393,8 @@ impl MlServer {
                 raw_sampling_probability,
                 self.label_stride_s,
                 cluster_id,
-                1, // cluster_size — detector correlacional atualiza offline.
-                1, // cluster_rank — idem.
+                cluster_size,
+                cluster_rank,
                 runtime_config_hash,
                 priority_gen,
                 priority_updated_ns,
@@ -1478,6 +1496,19 @@ mod tests {
             ..SamplingConfig::default()
         });
         MlServer::new(baseline, trigger)
+    }
+
+    #[test]
+    fn seven_day_feature_cache_uses_coarser_decimation() {
+        use crate::ml::feature_store::hot_cache::CacheConfig;
+        let cache = HotQueryCache::with_config(CacheConfig::default());
+        let baseline = BaselineA3::new(cache, BaselineConfig::default());
+        let server = MlServer::new(baseline, SamplingTrigger::with_defaults());
+        let base_decimation = CacheConfig::default().decimation;
+        assert_eq!(
+            server.feature_cache_7d.config().decimation,
+            base_decimation * FEATURE_WINDOW_7D_DECIMATION_MULTIPLIER
+        );
     }
 
     #[test]
@@ -1689,7 +1720,13 @@ mod tests {
             );
         }
         // Agora tenta emitir com current_entry alto.
-        let (rec, _, _) = server.on_opportunity(201, route, "BTC-USDT", 4.0, 0.2, 1e6, 1e6, 201);
+        let (rec, dec, accepted) =
+            server.on_opportunity(201, route, "BTC-USDT", 4.0, 0.2, 1e6, 1e6, 201);
+        assert_eq!(dec, SampleDecision::Accept);
+        let accepted = accepted.expect("accepted sample");
+        assert_eq!(accepted.sampling_tier, "accepted_full_capture");
+        assert_eq!(accepted.sampling_probability, 1.0);
+        assert_eq!(accepted.sampling_probability_kind, "marginal_full_capture");
         match rec {
             Recommendation::Trade(setup) => {
                 assert_eq!(setup.route_id, route);

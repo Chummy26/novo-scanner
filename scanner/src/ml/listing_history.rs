@@ -43,6 +43,7 @@ use ahash::AHashMap;
 use parking_lot::RwLock;
 
 use crate::ml::contract::RouteId;
+use crate::types::SymbolId;
 
 // ---------------------------------------------------------------------------
 // Config
@@ -212,6 +213,21 @@ impl ListingHistory {
         guard.values().filter(|lc| lc.is_active()).count()
     }
 
+    /// Rotas ativas do mesmo símbolo canônico, ordenadas de forma estável
+    /// por venue. Usado para materializar cluster estrutural PIT em labels
+    /// sem depender de detector offline.
+    pub fn active_routes_for_symbol(&self, symbol_id: SymbolId) -> Vec<RouteId> {
+        let guard = self.routes.read();
+        let mut routes: Vec<RouteId> = guard
+            .iter()
+            .filter_map(|(route, lc)| {
+                (route.symbol_id == symbol_id && lc.is_active()).then_some(*route)
+            })
+            .collect();
+        routes.sort_by_key(|route| (route.buy_venue.idx(), route.sell_venue.idx()));
+        routes
+    }
+
     /// Número de rotas delisted.
     pub fn delisted_routes(&self) -> usize {
         let guard = self.routes.read();
@@ -288,6 +304,28 @@ mod tests {
         assert_eq!(lh.first_seen(r), Some(t0)); // inalterado
         assert_eq!(lh.last_seen(r), Some(t0 + 5_000_000_000));
         assert_eq!(lh.n_snapshots(r), 3);
+    }
+
+    #[test]
+    fn active_routes_for_symbol_returns_only_active_siblings() {
+        let lh = ListingHistory::new();
+        let r1 = RouteId {
+            symbol_id: SymbolId(1),
+            buy_venue: Venue::MexcFut,
+            sell_venue: Venue::BingxFut,
+        };
+        let r2 = RouteId {
+            symbol_id: SymbolId(1),
+            buy_venue: Venue::BinanceFut,
+            sell_venue: Venue::MexcFut,
+        };
+        let other_symbol = mk_route(2);
+        lh.record_seen(r1, 10);
+        lh.record_seen(r2, 10);
+        lh.record_seen(other_symbol, 10);
+        lh.mark_delisted(r2, 20);
+
+        assert_eq!(lh.active_routes_for_symbol(SymbolId(1)), vec![r1]);
     }
 
     #[test]

@@ -32,12 +32,12 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::ml::contract::RouteId;
-use crate::ml::persistence::sample_id::sample_id_of;
+use crate::ml::persistence::sample_id::{route_id_key, sample_id_of};
 use crate::ml::trigger::SampleDecision;
 
 /// Versão atual do schema do `RawSample`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 9;
+pub const RAW_SAMPLE_SCHEMA_VERSION: u16 = 11;
 
 use crate::ml::SCANNER_VERSION;
 
@@ -69,10 +69,9 @@ pub struct RawSample {
     pub route_id: RouteId,
     /// **v2 (ADR-029)** — nome canonical estável entre runs (ex: "BTC-USDT").
     ///
-    /// `route_id.symbol_id` é volátil entre runs; apenas `symbol_name`
-    /// deve ser usado para joins cross-dia. O JSON ainda serializa
-    /// `symbol_id` para debug, mas consumidores offline **devem** chavear
-    /// por `symbol_name` (+ `buy_venue`/`sell_venue`) para estabilidade.
+    /// `route_id.symbol_id` é volátil entre runs; `symbol_name` e o alias
+    /// JSON `canonical_symbol` devem ser usados para joins cross-dia. O JSON
+    /// ainda serializa `symbol_id` para debug.
     pub symbol_name: String,
     /// **v2 (ADR-029)** — scanner que gerou.
     pub scanner_version: &'static str,
@@ -271,7 +270,7 @@ impl RawSample {
                 r#"{{"ts_ns":{},"cycle_seq":{},"schema_version":{},"#,
                 r#""scanner_version":"{}","sample_id":"{}","#,
                 r#""runtime_config_hash":"{}","#,
-                r#""symbol_id":{},"symbol_name":"{}","#,
+                r#""symbol_id":{},"symbol_name":"{}","canonical_symbol":"{}","route_id":"{}","#,
                 r#""buy_venue":"{}","sell_venue":"{}","#,
                 r#""buy_market":"{}","sell_market":"{}","#,
                 r#""entry_spread":{},"exit_spread":{},"#,
@@ -290,6 +289,8 @@ impl RawSample {
             escape_json_string(&self.runtime_config_hash),
             self.route_id.symbol_id.0,
             escape_json_string(&self.symbol_name),
+            escape_json_string(&self.symbol_name),
+            escape_json_string(&route_id_key(&self.symbol_name, self.route_id)),
             self.route_id.buy_venue.as_str(),
             self.route_id.sell_venue.as_str(),
             self.route_id.buy_venue.market().as_str(),
@@ -602,7 +603,7 @@ mod tests {
             SampleDecision::Accept,
         );
         assert_eq!(s.schema_version, RAW_SAMPLE_SCHEMA_VERSION);
-        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 9);
+        assert_eq!(RAW_SAMPLE_SCHEMA_VERSION, 11);
         assert_eq!(s.symbol_name, "BTC-USDT");
         assert!(!s.scanner_version.is_empty());
         assert_eq!(s.runtime_config_hash, "test-runtime-config");
@@ -627,10 +628,12 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&line).expect("valid json");
         assert_eq!(v["symbol_id"], 42);
         assert_eq!(v["symbol_name"], "BTC-USDT");
+        assert_eq!(v["canonical_symbol"], "BTC-USDT");
+        assert_eq!(v["route_id"], "BTC-USDT|mexc:FUTURES->bingx:FUTURES");
         assert_eq!(v["buy_venue"], "mexc");
         assert_eq!(v["sell_venue"], "bingx");
         assert_eq!(v["sample_decision"], "accept");
-        assert_eq!(v["schema_version"], 9);
+        assert_eq!(v["schema_version"], 11);
         assert!(v["scanner_version"].is_string());
         assert_eq!(v["runtime_config_hash"], "test-runtime-config");
         assert_eq!(v["sample_id"].as_str().unwrap().len(), 32);

@@ -25,6 +25,7 @@
 //! - `xxhash-rust`: determinístico e mais rápido, mas adicionaria nova dep.
 //!   FNV-1a 128 puro-Rust ≈ 20 linhas, suficiente para 1 hash por sample.
 
+use crate::ml::contract::RouteId;
 use crate::types::{Market, Venue};
 
 const FNV_OFFSET_128: u128 = 0x6c62272e07bb014262b821756295c58d;
@@ -64,6 +65,23 @@ pub fn sample_id_of(
     fnv1a_update(&mut h, b":");
     fnv1a_update(&mut h, market_str(sell_venue.market()).as_bytes());
     format!("{:032x}", h)
+}
+
+/// ID estável de rota para auditoria e splits.
+///
+/// Diferente do `Debug` de [`RouteId`], este valor não inclui `symbol_id`,
+/// que é volátil entre execuções. O formato é textual e deliberadamente
+/// redundante com os campos componentes materializados no schema.
+#[inline]
+pub fn route_id_key(symbol_name: &str, route_id: RouteId) -> String {
+    format!(
+        "{}|{}:{}->{}:{}",
+        symbol_name,
+        route_id.buy_venue.as_str(),
+        market_str(route_id.buy_venue.market()),
+        route_id.sell_venue.as_str(),
+        market_str(route_id.sell_venue.market())
+    )
 }
 
 #[inline]
@@ -129,5 +147,27 @@ mod tests {
         let a = sample_id_of(100, 1, "BTC-USDT", Venue::MexcSpot, Venue::BingxFut);
         let b = sample_id_of(100, 1, "BTC-USDT", Venue::MexcFut, Venue::BingxFut);
         assert_ne!(a, b, "spot e fut da mesma venue devem gerar ids distintos");
+    }
+
+    #[test]
+    fn route_id_key_is_stable_and_excludes_symbol_id() {
+        let a = route_id_key(
+            "BTC-USDT",
+            RouteId {
+                symbol_id: crate::types::SymbolId(1),
+                buy_venue: Venue::MexcSpot,
+                sell_venue: Venue::BingxFut,
+            },
+        );
+        let b = route_id_key(
+            "BTC-USDT",
+            RouteId {
+                symbol_id: crate::types::SymbolId(999),
+                buy_venue: Venue::MexcSpot,
+                sell_venue: Venue::BingxFut,
+            },
+        );
+        assert_eq!(a, b);
+        assert_eq!(a, "BTC-USDT|mexc:SPOT->bingx:FUTURES");
     }
 }

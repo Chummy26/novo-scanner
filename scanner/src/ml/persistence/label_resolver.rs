@@ -802,17 +802,17 @@ fn normalized_floors(primary_floor: f32, mut floors: Vec<f32>) -> Vec<f32> {
     floors
 }
 
-/// Deriva `cluster_id` determinístico a partir de `route_id` e da janela
-/// default do maior horizonte. Offline, detector correlacional pode
-/// substituir pelo cluster real.
+/// Deriva `cluster_id` determinístico a partir do símbolo e da janela default
+/// do maior horizonte. Rotas irmãs do mesmo ativo compartilham o cluster
+/// temporal para purge/CPCV conservador.
 pub fn derive_cluster_id(route: RouteId, ts_emit_ns: u64) -> String {
     let max_horizon_s = DEFAULT_HORIZONS_S.iter().copied().max().unwrap_or(900);
     derive_cluster_id_for_horizon_window(route, ts_emit_ns, max_horizon_s)
 }
 
 /// Deriva `cluster_id` com janela temporal compatível com o maior horizonte
-/// configurado. Isso evita separar em clusters distintos amostras da mesma
-/// rota cujas janelas de label ainda se sobrepõem.
+/// configurado. Isso evita separar em clusters distintos amostras do mesmo
+/// símbolo cujas janelas de label ainda se sobrepõem.
 pub fn derive_cluster_id_for_horizon_window(
     route: RouteId,
     ts_emit_ns: u64,
@@ -823,10 +823,8 @@ pub fn derive_cluster_id_for_horizon_window(
     let horizon_window_ns = (max_horizon_s as u64).saturating_mul(1_000_000_000);
     let window_ns = min_window_ns.max(horizon_window_ns);
     let bucket = ts_emit_ns / window_ns;
-    let mut payload = Vec::with_capacity(32);
+    let mut payload = Vec::with_capacity(16);
     payload.extend_from_slice(&bucket.to_le_bytes());
-    payload.extend_from_slice(route.buy_venue.as_str().as_bytes());
-    payload.extend_from_slice(route.sell_venue.as_str().as_bytes());
     payload.extend_from_slice(&route.symbol_id.0.to_le_bytes());
     format!("{:016x}", fnv1a_64(&payload))
 }
@@ -1554,13 +1552,18 @@ mod tests {
     }
 
     #[test]
-    fn cluster_id_deterministic_and_route_sensitive() {
+    fn cluster_id_deterministic_and_symbol_window_sensitive() {
         // cluster_id derivável deterministicamente.
         use crate::types::{SymbolId, Venue};
         let r1 = RouteId {
             symbol_id: SymbolId(1),
             buy_venue: Venue::MexcFut,
             sell_venue: Venue::BingxFut,
+        };
+        let r_same_symbol = RouteId {
+            symbol_id: SymbolId(1),
+            buy_venue: Venue::BinanceFut,
+            sell_venue: Venue::MexcFut,
         };
         let r2 = RouteId {
             symbol_id: SymbolId(2),
@@ -1569,6 +1572,10 @@ mod tests {
         };
         let t = 0u64;
         assert_eq!(derive_cluster_id(r1, t), derive_cluster_id(r1, t));
+        assert_eq!(
+            derive_cluster_id(r1, t),
+            derive_cluster_id(r_same_symbol, t)
+        );
         assert_ne!(derive_cluster_id(r1, t), derive_cluster_id(r2, t));
         // Mesma janela do horizonte máximo default (8h) → mesmo cluster.
         assert_eq!(
