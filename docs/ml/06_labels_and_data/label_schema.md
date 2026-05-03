@@ -16,14 +16,14 @@ fora do label.
 
 Streams:
 
-- `raw_samples` (`RawSample` v9): observações pré-trigger amostradas por tier.
+- `raw_samples` (`RawSample` v11): observações pré-trigger amostradas por tier.
   Inclui `sampling_tier`, `sampling_probability`,
   `sampling_probability_kind`, `priority_set_generation_id`,
   `priority_set_updated_at_ns` e lifecycle mínimo da rota.
-- `accepted_samples` (`AcceptedSample` v8): candidatos aceitos pelo trigger.
+- `accepted_samples` (`AcceptedSample` v10): candidatos aceitos pelo trigger.
   `was_recommended` indica se o baseline/modelo emitiu `TradeSetup`; também
   carrega config hash, tier/probabilidade de amostragem e lifecycle.
-- `labeled_trades` (`LabeledTrade` v9): um registro por
+- `labeled_trades` (`LabeledTrade` v11): um registro por
   `(sample_id, horizon_s)`, com `outcome in {realized, miss, censored}`.
   O resolver cria labels para candidates limpos, inclusive `sample_decision !=
   "accept"`, para auditoria de abstenção/background.
