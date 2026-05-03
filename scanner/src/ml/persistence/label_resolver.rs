@@ -559,13 +559,12 @@ impl LabelResolver {
                     }
                     if !closed_this_sweep.is_empty() {
                         let snap = pending.clone();
-                        for (idx, outcome_hint, reason) in closed_this_sweep {
-                            // Recalcula outcome real para `expired` (pode ter virado Realized).
-                            let final_outcome = if matches!(outcome_hint, LabelOutcome::Censored) {
-                                LabelOutcome::Censored
-                            } else {
-                                LabelOutcome::from_pending(&snap, idx)
-                            };
+                        for (idx, _outcome_hint, reason) in closed_this_sweep {
+                            // Hit dentro da janela vence qualquer fechamento
+                            // posterior por sweep. Forcar Censored aqui
+                            // sobrescrevia realizacoes ja observadas quando
+                            // a rota ficava dormente antes do deadline.
+                            let final_outcome = LabelOutcome::from_pending(&snap, idx);
                             // `IncompleteWindow` removido. Se outcome é
                             // Censored sem reason específico (caminho
                             // teoricamente inalcançável dado o gate acima),
@@ -573,7 +572,7 @@ impl LabelResolver {
                             let final_reason = if matches!(final_outcome, LabelOutcome::Censored) {
                                 reason.or(Some(CensorReason::RouteDormant))
                             } else {
-                                reason
+                                None
                             };
                             to_write.push((snap.clone(), idx, final_outcome, final_reason));
                         }
@@ -1179,6 +1178,47 @@ mod tests {
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert!(m.labels_written_censored_total.load(Ordering::Relaxed) >= 3);
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn dormant_sweep_preserves_realized_when_hit_already_seen() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![60],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 5 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t_emit = 1_000_000_000u64;
+        resolver.on_accepted(
+            "sid_dormant_realized".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            0.5,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
+        );
+        // t+2s: gross = 2.0 + (-0.5) = 1.5 >= floor 0.5.
+        resolver.on_clean_observation(mk_route(), t_emit + 2_000_000_000, 1.8, -0.5);
+        // t+8s: rota ja esta dormente pelo threshold de 5s, mas o hit foi
+        // observado antes do silencio; outcome correto e Realized.
+        resolver.sweep(t_emit + 8_000_000_000);
+        sleep(Duration::from_millis(150)).await;
+
+        let m = resolver.metrics();
+        assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 0);
         drop(resolver);
         drop(tmp);
     }

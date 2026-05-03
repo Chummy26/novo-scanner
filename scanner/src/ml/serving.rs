@@ -40,7 +40,7 @@ use crate::ml::contract::{
 use crate::ml::economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome};
 use crate::ml::eval::verify_tradesetup;
 use crate::ml::feature_store::{CacheConfig, HotQueryCache};
-use crate::ml::listing_history::ListingHistory;
+use crate::ml::listing_history::{ListingHistory, RouteLifecycle};
 use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
 use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::persistence::{
@@ -148,6 +148,62 @@ fn recommendation_persistence(rec: &Recommendation) -> RecommendationPersistence
             prediction_calibration_status: "not_applicable",
         },
     }
+}
+
+fn background_recommendation_persistence(model_version: &str) -> RecommendationPersistence {
+    RecommendationPersistence {
+        baseline_recommended: false,
+        baseline_base_rate: None,
+        baseline_enter_at_min: None,
+        baseline_exit_at_min: None,
+        recommendation_kind: "abstain",
+        abstain_reason: Some("NO_OPPORTUNITY"),
+        prediction_source_kind: "none",
+        prediction_model_version: model_version.to_string(),
+        prediction_emitted_at_ns: None,
+        prediction_valid_until_ns: None,
+        prediction_entry_now: None,
+        prediction_exit_target: None,
+        prediction_gross_profit_target: None,
+        prediction_p_hit: None,
+        prediction_p_hit_ci_lo: None,
+        prediction_p_hit_ci_hi: None,
+        prediction_exit_q25: None,
+        prediction_exit_q50: None,
+        prediction_exit_q75: None,
+        prediction_t_hit_p25_s: None,
+        prediction_t_hit_median_s: None,
+        prediction_t_hit_p75_s: None,
+        prediction_p_censor: None,
+        prediction_calibration_status: "not_applicable",
+    }
+}
+
+fn half_spreads_from_books(
+    buy_bid_price: Option<f64>,
+    buy_ask_price: Option<f64>,
+    sell_bid_price: Option<f64>,
+    sell_ask_price: Option<f64>,
+) -> (Option<f32>, Option<f32>) {
+    let half_spread_buy_now = match (buy_bid_price, buy_ask_price) {
+        (Some(bid), Some(ask)) if bid.is_finite() && ask.is_finite() && ask > 0.0 && ask >= bid => {
+            Some((((ask - bid) / ask) * 50.0) as f32)
+        }
+        _ => None,
+    };
+    let half_spread_sell_now = match (sell_bid_price, sell_ask_price, buy_ask_price) {
+        (Some(bid), Some(ask), Some(base))
+            if bid.is_finite()
+                && ask.is_finite()
+                && base.is_finite()
+                && base > 0.0
+                && ask >= bid =>
+        {
+            Some((((ask - bid) / base) * 50.0) as f32)
+        }
+        _ => None,
+    };
+    (half_spread_buy_now, half_spread_sell_now)
 }
 
 fn abstain_reason_label(reason: AbstainReason) -> &'static str {
@@ -789,10 +845,254 @@ impl MlServer {
         Some(((now_ns.saturating_sub(since)) / 1_000_000_000).min(u32::MAX as u64) as u32)
     }
 
-    fn clear_alive_if_below_threshold(&self, route: RouteId, entry_spread: f32) {
-        if entry_spread < self.opportunity_alive_threshold_pct {
-            self.alive_since_by_route.lock().remove(&route);
+    fn build_accepted_sample(
+        &self,
+        sample_dec: SampleDecision,
+        now_ns: u64,
+        cycle_seq: u32,
+        route: RouteId,
+        symbol_name: &str,
+        entry_spread: f32,
+        exit_spread: f32,
+        buy_vol24_usd: f64,
+        sell_vol24_usd: f64,
+        lifecycle: Option<RouteLifecycle>,
+    ) -> Option<AcceptedSample> {
+        if sample_dec != SampleDecision::Accept {
+            return None;
         }
+        let mut sample = AcceptedSample::new(
+            now_ns,
+            cycle_seq,
+            route,
+            symbol_name,
+            entry_spread,
+            exit_spread,
+            buy_vol24_usd,
+            sell_vol24_usd,
+            sample_dec,
+            self.runtime_config_hash.clone(),
+            "accepted_full_capture",
+            1.0,
+        );
+        if let Some(lc) = lifecycle {
+            sample.set_lifecycle(
+                lc.first_seen_ns,
+                lc.last_seen_ns,
+                lc.active_until_ns,
+                lc.n_snapshots,
+            );
+        }
+        Some(sample)
+    }
+
+    fn build_features_t0(
+        &self,
+        route: RouteId,
+        entry_spread: f32,
+        now_ns: u64,
+        lifecycle: Option<RouteLifecycle>,
+        half_spread_buy_now: Option<f32>,
+        half_spread_sell_now: Option<f32>,
+    ) -> FeaturesT0 {
+        let entry_p25_pre_observe = self.baseline.cache().quantile_entry(route, 0.25);
+        let entry_p50_pre_observe = self.baseline.cache().quantile_entry(route, 0.50);
+        let entry_p75_pre_observe = self.baseline.cache().quantile_entry(route, 0.75);
+        let entry_p95_pre_observe = self.baseline.cache().quantile_entry(route, 0.95);
+        let exit_p25_pre_observe = self.baseline.cache().quantile_exit(route, 0.25);
+        let exit_p50_pre_observe = self.baseline.cache().quantile_exit(route, 0.50);
+        let exit_p75_pre_observe = self.baseline.cache().quantile_exit(route, 0.75);
+        let exit_p95_pre_observe = self.baseline.cache().quantile_exit(route, 0.95);
+        let entry_rank_pre_observe = self
+            .baseline
+            .cache()
+            .entry_rank_percentile(route, entry_spread);
+        let entry_minus_p50_pre = entry_p50_pre_observe.map(|p50| entry_spread - p50);
+        let entry_mad_pre = self.baseline.cache().entry_mad_robust(route);
+        let exit_threshold_for_primary_floor = self.label_floor_pct - entry_spread;
+        let p_exit_ge_floor_pre = self
+            .baseline
+            .cache()
+            .probability_exit_ge(route, exit_threshold_for_primary_floor)
+            .map(|(p, _, _)| p);
+        let entry_p50_1h_pre_observe = self.feature_cache_1h.quantile_entry(route, 0.50);
+        let entry_rank_1h_pre_observe = self
+            .feature_cache_1h
+            .entry_rank_percentile(route, entry_spread);
+        let p_exit_ge_floor_1h_pre = self
+            .feature_cache_1h
+            .probability_exit_ge(route, exit_threshold_for_primary_floor)
+            .map(|(p, _, _)| p);
+        let entry_p50_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.50);
+        let entry_p95_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.95);
+        let p_exit_ge_floor_7d_pre = self
+            .feature_cache_7d
+            .probability_exit_ge(route, exit_threshold_for_primary_floor)
+            .map(|(p, _, _)| p);
+        let (gross_run_p05_pre_observe, gross_run_p50_pre_observe, gross_run_p95_pre_observe) =
+            self.baseline
+                .cache()
+                .exit_run_duration_quantiles(route, exit_threshold_for_primary_floor)
+                .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
+                .unwrap_or((None, None, None));
+        let exit_excess_run_pre = exit_p50_pre_observe.and_then(|threshold| {
+            self.baseline
+                .cache()
+                .exit_run_duration_quantiles(route, threshold)
+                .map(|(_, p50, _)| p50)
+        });
+        let tail_ratio_pre_observe = self.baseline.cache().tail_ratio_p99_p95(route);
+        let n_cache_obs_pre = self.baseline.cache().n_observations(route) as u32;
+        let oldest_cache_ts_pre = self.baseline.cache().oldest_observation_ns(route);
+        let time_alive_at_t0_s = self.time_alive_snapshot(route, entry_spread, now_ns);
+        let listing_age_days_pre_observe = self.listing.listing_age_days(route, now_ns);
+
+        FeaturesT0 {
+            half_spread_buy_now,
+            half_spread_sell_now,
+            tail_ratio_p99_p95: tail_ratio_pre_observe,
+            entry_p25_24h: entry_p25_pre_observe,
+            entry_p50_24h: entry_p50_pre_observe,
+            entry_p75_24h: entry_p75_pre_observe,
+            entry_p95_24h: entry_p95_pre_observe,
+            entry_rank_percentile_24h: entry_rank_pre_observe,
+            entry_minus_p50_24h: entry_minus_p50_pre,
+            entry_mad_robust_24h: entry_mad_pre,
+            exit_p25_24h: exit_p25_pre_observe,
+            exit_p50_24h: exit_p50_pre_observe,
+            exit_p75_24h: exit_p75_pre_observe,
+            exit_p95_24h: exit_p95_pre_observe,
+            p_exit_ge_label_floor_minus_entry_24h: p_exit_ge_floor_pre,
+            entry_p50_1h: entry_p50_1h_pre_observe,
+            entry_rank_percentile_1h: entry_rank_1h_pre_observe,
+            p_exit_ge_label_floor_minus_entry_1h: p_exit_ge_floor_1h_pre,
+            entry_p50_7d: entry_p50_7d_pre_observe,
+            entry_p95_7d: entry_p95_7d_pre_observe,
+            p_exit_ge_label_floor_minus_entry_7d: p_exit_ge_floor_7d_pre,
+            gross_run_p05_s: gross_run_p05_pre_observe,
+            gross_run_p50_s: gross_run_p50_pre_observe,
+            gross_run_p95_s: gross_run_p95_pre_observe,
+            exit_excess_run_s: exit_excess_run_pre,
+            n_cache_observations_at_t0: n_cache_obs_pre,
+            oldest_cache_ts_ns: oldest_cache_ts_pre,
+            time_alive_at_t0_s,
+            listing_age_days: listing_age_days_pre_observe,
+            route_first_seen_ns: lifecycle.map(|lc| lc.first_seen_ns),
+            route_last_seen_ns: lifecycle.map(|lc| lc.last_seen_ns),
+            route_active_until_ns: lifecycle.and_then(|lc| lc.active_until_ns),
+            route_n_snapshots: lifecycle.map(|lc| lc.n_snapshots),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_label_candidate(
+        &self,
+        resolver: &Arc<LabelResolver>,
+        sample_id: String,
+        sample_dec: SampleDecision,
+        now_ns: u64,
+        cycle_seq: u32,
+        route: RouteId,
+        symbol_name: &str,
+        entry_spread: f32,
+        exit_spread: f32,
+        features_t0: FeaturesT0,
+        tier: SamplingTier,
+        raw_sampling_probability: f32,
+        rec_meta: &RecommendationPersistence,
+    ) {
+        let label_sampling_probability = f32::NAN;
+        let (candidates_24h, accepts_24h) = self
+            .route_ranking
+            .as_ref()
+            .and_then(|r| {
+                let top = r.top_k(usize::MAX);
+                top.into_iter().find_map(|(rid, score)| {
+                    if rid == route {
+                        Some((
+                            score.candidate_count_24h.min(u32::MAX as u64) as u32,
+                            score.accept_count_24h.min(u32::MAX as u64) as u32,
+                        ))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or((0, 0));
+        let policy = PolicyMetadata {
+            baseline_model_version: self.baseline.config().model_version.to_string(),
+            baseline_recommended: rec_meta.baseline_recommended,
+            recommendation_kind: rec_meta.recommendation_kind,
+            abstain_reason: rec_meta.abstain_reason,
+            prediction_source_kind: rec_meta.prediction_source_kind,
+            prediction_model_version: rec_meta.prediction_model_version.clone(),
+            prediction_emitted_at_ns: rec_meta.prediction_emitted_at_ns,
+            prediction_valid_until_ns: rec_meta.prediction_valid_until_ns,
+            prediction_entry_now: rec_meta.prediction_entry_now,
+            prediction_exit_target: rec_meta.prediction_exit_target,
+            prediction_gross_profit_target: rec_meta.prediction_gross_profit_target,
+            prediction_p_hit: rec_meta.prediction_p_hit,
+            prediction_p_hit_ci_lo: rec_meta.prediction_p_hit_ci_lo,
+            prediction_p_hit_ci_hi: rec_meta.prediction_p_hit_ci_hi,
+            prediction_exit_q25: rec_meta.prediction_exit_q25,
+            prediction_exit_q50: rec_meta.prediction_exit_q50,
+            prediction_exit_q75: rec_meta.prediction_exit_q75,
+            prediction_t_hit_p25_s: rec_meta.prediction_t_hit_p25_s,
+            prediction_t_hit_median_s: rec_meta.prediction_t_hit_median_s,
+            prediction_t_hit_p75_s: rec_meta.prediction_t_hit_p75_s,
+            prediction_p_censor: rec_meta.prediction_p_censor,
+            prediction_calibration_status: rec_meta.prediction_calibration_status,
+            baseline_historical_base_rate_24h: rec_meta.baseline_base_rate,
+            baseline_derived_enter_at_min: rec_meta.baseline_enter_at_min,
+            baseline_derived_exit_at_min: rec_meta.baseline_exit_at_min,
+            baseline_floor_pct: self.baseline.config().floor_pct,
+            label_stride_s: self.label_stride_s,
+            effective_stride_s: self.label_stride_s,
+            label_sampling_probability,
+            candidates_in_route_last_24h: candidates_24h,
+            accepts_in_route_last_24h: accepts_24h,
+            ci_method: "wilson_marginal",
+        };
+        let max_horizon_s = self.label_horizons_s.iter().copied().max().unwrap_or(900);
+        let cluster_id =
+            crate::ml::persistence::label_resolver::derive_cluster_id_for_horizon_window(
+                route,
+                now_ns,
+                max_horizon_s,
+            );
+        let cluster_routes = self.listing.active_routes_for_symbol(route.symbol_id);
+        let cluster_size = cluster_routes.len().max(1).min(u32::MAX as usize) as u32;
+        let cluster_rank = cluster_routes
+            .iter()
+            .position(|candidate| *candidate == route)
+            .map(|idx| idx + 1)
+            .unwrap_or(cluster_routes.len().max(1))
+            .min(u32::MAX as usize) as u32;
+        let runtime_config_hash = self.runtime_config_hash.clone();
+        let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
+        resolver.on_candidate(
+            sample_id,
+            sample_dec.reason_label(),
+            now_ns,
+            cycle_seq,
+            route,
+            symbol_name.to_string(),
+            entry_spread,
+            exit_spread,
+            features_t0,
+            self.label_floor_pct,
+            self.label_floors_pct.clone(),
+            policy,
+            tier.as_str(),
+            raw_sampling_probability,
+            self.label_stride_s,
+            cluster_id,
+            cluster_size,
+            cluster_rank,
+            runtime_config_hash,
+            priority_gen,
+            priority_updated_ns,
+        );
     }
 
     /// Observa uma rota válida que não necessariamente é uma oportunidade
@@ -814,9 +1114,75 @@ impl MlServer {
         buy_vol24_usd: f64,
         sell_vol24_usd: f64,
         now_ns: u64,
-    ) -> SampleDecision {
+    ) -> (SampleDecision, Option<AcceptedSample>) {
+        self.observe_background_inner(
+            cycle_seq,
+            route,
+            symbol_name,
+            entry_spread,
+            exit_spread,
+            buy_vol24_usd,
+            sell_vol24_usd,
+            None,
+            None,
+            None,
+            None,
+            now_ns,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_background_with_books(
+        &self,
+        cycle_seq: u32,
+        route: RouteId,
+        symbol_name: &str,
+        entry_spread: f32,
+        exit_spread: f32,
+        buy_vol24_usd: f64,
+        sell_vol24_usd: f64,
+        buy_bid_price: f64,
+        buy_ask_price: f64,
+        sell_bid_price: f64,
+        sell_ask_price: f64,
+        now_ns: u64,
+    ) -> (SampleDecision, Option<AcceptedSample>) {
+        self.observe_background_inner(
+            cycle_seq,
+            route,
+            symbol_name,
+            entry_spread,
+            exit_spread,
+            buy_vol24_usd,
+            sell_vol24_usd,
+            Some(buy_bid_price),
+            Some(buy_ask_price),
+            Some(sell_bid_price),
+            Some(sell_ask_price),
+            now_ns,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_background_inner(
+        &self,
+        cycle_seq: u32,
+        route: RouteId,
+        symbol_name: &str,
+        entry_spread: f32,
+        exit_spread: f32,
+        buy_vol24_usd: f64,
+        sell_vol24_usd: f64,
+        buy_bid_price: Option<f64>,
+        buy_ask_price: Option<f64>,
+        sell_bid_price: Option<f64>,
+        sell_ask_price: Option<f64>,
+        now_ns: u64,
+    ) -> (SampleDecision, Option<AcceptedSample>) {
         self.listing.record_seen(route, now_ns);
         let lifecycle = self.listing.snapshot_for(route);
+        let (half_spread_buy_now, half_spread_sell_now) =
+            half_spreads_from_books(buy_bid_price, buy_ask_price, sell_bid_price, sell_ask_price);
         let clean = self.trigger.is_clean_data(buy_vol24_usd, sell_vol24_usd);
         let sample_dec = self.trigger.evaluate(
             route,
@@ -826,7 +1192,14 @@ impl MlServer {
             self.baseline.cache(),
         );
         self.bump_sample_metric(sample_dec);
-        self.clear_alive_if_below_threshold(route, entry_spread);
+        let features_t0 = self.build_features_t0(
+            route,
+            entry_spread,
+            now_ns,
+            lifecycle,
+            half_spread_buy_now,
+            half_spread_sell_now,
+        );
 
         // �� ranker observa (candidate, accepted).
         if let Some(ranker) = self.route_ranking.as_ref() {
@@ -836,7 +1209,7 @@ impl MlServer {
         }
 
         // �� decimator em tiers.
-        if let Some(raw_writer) = self.raw_writer.as_ref() {
+        let tier_snapshot = if let Some(raw_writer) = self.raw_writer.as_ref() {
             let dr = self
                 .raw_decimator
                 .decide_for_sample(route, now_ns, cycle_seq);
@@ -885,7 +1258,26 @@ impl MlServer {
                     }
                 }
             }
-        }
+            Some((dr.tier, dr.probability))
+        } else {
+            let dr = self
+                .raw_decimator
+                .decide_for_sample(route, now_ns, cycle_seq);
+            Some((dr.tier, dr.probability))
+        };
+
+        let accepted = self.build_accepted_sample(
+            sample_dec,
+            now_ns,
+            cycle_seq,
+            route,
+            symbol_name,
+            entry_spread,
+            exit_spread,
+            buy_vol24_usd,
+            sell_vol24_usd,
+            lifecycle,
+        );
 
         if clean {
             self.observe_clean_spread(route, entry_spread, exit_spread, now_ns);
@@ -900,7 +1292,43 @@ impl MlServer {
             }
         }
 
-        sample_dec
+        if clean {
+            if let (Some(resolver), Some((tier, raw_sampling_probability))) =
+                (self.label_resolver.as_ref(), tier_snapshot)
+            {
+                let label_sample_id = accepted
+                    .as_ref()
+                    .map(|s| s.sample_id.clone())
+                    .unwrap_or_else(|| {
+                        sample_id_of(
+                            now_ns,
+                            cycle_seq,
+                            symbol_name,
+                            route.buy_venue,
+                            route.sell_venue,
+                        )
+                    });
+                let rec_meta =
+                    background_recommendation_persistence(self.baseline.config().model_version);
+                self.enqueue_label_candidate(
+                    resolver,
+                    label_sample_id,
+                    sample_dec,
+                    now_ns,
+                    cycle_seq,
+                    route,
+                    symbol_name,
+                    entry_spread,
+                    exit_spread,
+                    features_t0,
+                    tier,
+                    raw_sampling_probability,
+                    &rec_meta,
+                );
+            }
+        }
+
+        (sample_dec, accepted)
     }
 
     /// Processa uma oportunidade do scanner.
@@ -1534,7 +1962,7 @@ mod tests {
         assert_eq!(server.baseline.cache().n_observations(route), 0);
 
         for i in 0..10 {
-            let dec = server.observe_background(
+            let (dec, accepted) = server.observe_background(
                 i,
                 route,
                 "BTC-USDT",
@@ -1545,6 +1973,7 @@ mod tests {
                 1_000_000_000 + i as u64,
             );
             assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
+            assert!(accepted.is_none());
         }
 
         assert_eq!(server.baseline.cache().n_observations(route), 10);
@@ -1554,6 +1983,36 @@ mod tests {
             "background observations are data collection, not UI opportunities"
         );
         assert_eq!(server.metrics.rec_trade_total.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn background_accept_returns_accepted_sample_without_recommendation() {
+        let server = mk_server_with_min_history(3);
+        let route = mk_route();
+
+        for i in 0..3 {
+            let (dec, accepted) = server.observe_background(
+                i,
+                route,
+                "BTC-USDT",
+                1.0 + i as f32 * 0.1,
+                -1.0,
+                1e6,
+                1e6,
+                1_000_000_000 + i as u64,
+            );
+            assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
+            assert!(accepted.is_none());
+        }
+
+        let (dec, accepted) =
+            server.observe_background(4, route, "BTC-USDT", 5.0, -1.0, 1e6, 1e6, 2_000_000_000);
+        assert_eq!(dec, SampleDecision::Accept);
+        let accepted = accepted.expect("background trigger Accept must be persisted");
+        assert_eq!(accepted.sample_decision, SampleDecision::Accept);
+        assert_eq!(accepted.sampling_tier, "accepted_full_capture");
+        assert_eq!(accepted.sampling_probability, 1.0);
+        assert!(!accepted.was_recommended);
     }
 
     #[test]
@@ -2109,6 +2568,70 @@ mod tests {
                 .load(Ordering::Relaxed),
             1,
             "snapshot limpo rejeitado deve gerar label negativo supervisionavel"
+        );
+        drop(server);
+        drop(resolver);
+        drop(tmp);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn clean_background_snapshots_create_supervised_negative_labels() {
+        use crate::ml::persistence::{
+            LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, ResolverConfig,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
+        let (writer, handle) = LabeledJsonlWriter::create(LabeledWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 1024,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(50),
+            file_prefix: "bg-label".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
+        });
+        let task = tokio::spawn(writer.run());
+        let resolver = Arc::new(LabelResolver::new(
+            ResolverConfig {
+                horizons_s: vec![1],
+                close_slack_ns: 1_000_000_000,
+                route_vanish_idle_ns: 60 * 1_000_000_000,
+                route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+                max_pending_per_route: 100,
+                sweeper_interval: Duration::from_secs(10),
+            },
+            handle,
+        ));
+
+        let server = mk_server()
+            .with_label_resolver(Arc::clone(&resolver))
+            .with_raw_decimator(RouteDecimator::with_modulus(1));
+        let route = mk_route();
+        let (dec, accepted) = server.observe_background(
+            0,
+            route,
+            "BTC-USDT",
+            -0.1,
+            -0.8,
+            1e6,
+            1e6,
+            1_745_159_400u64 * 1_000_000_000,
+        );
+        assert_eq!(dec, SampleDecision::RejectBelowTail);
+        assert!(accepted.is_none());
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_created_total
+                .load(Ordering::Relaxed),
+            1,
+            "background limpo rejeitado deve gerar label para abstencao/no-opportunity"
         );
         drop(server);
         drop(resolver);

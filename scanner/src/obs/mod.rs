@@ -22,8 +22,15 @@ pub struct Metrics {
     pub opportunities_total: IntCounter,
     /// Per-venue ingest-latency histograms (frame decode + book write), ns.
     pub ingest_hist: [Mutex<Histogram<u64>>; VENUE_COUNT],
-    /// Spread-engine cycle latency histogram, ns.
+    /// Spread-engine scan latency histogram, ns. Nome Prometheus legado:
+    /// `scanner_spread_cycle_ns_p99`.
     pub cycle_hist: Mutex<Histogram<u64>>,
+    /// Full spread loop processing latency, excluding scheduler sleep, ns.
+    pub full_cycle_hist: Mutex<Histogram<u64>>,
+    /// Foreground ML pass over UI opportunities, ns.
+    pub ml_foreground_hist: Mutex<Histogram<u64>>,
+    /// Background ML/cache pass over below-threshold observations, ns.
+    pub ml_background_hist: Mutex<Histogram<u64>>,
 }
 
 static METRICS: OnceCell<Metrics> = OnceCell::new();
@@ -71,6 +78,9 @@ impl Metrics {
             let ingest_hist: [Mutex<Histogram<u64>>; VENUE_COUNT] =
                 std::array::from_fn(|_| Mutex::new(new_hist()));
             let cycle_hist = Mutex::new(new_hist());
+            let full_cycle_hist = Mutex::new(new_hist());
+            let ml_foreground_hist = Mutex::new(new_hist());
+            let ml_background_hist = Mutex::new(new_hist());
 
             Metrics {
                 registry,
@@ -80,6 +90,9 @@ impl Metrics {
                 opportunities_total,
                 ingest_hist,
                 cycle_hist,
+                full_cycle_hist,
+                ml_foreground_hist,
+                ml_background_hist,
             }
         })
     }
@@ -98,10 +111,30 @@ impl Metrics {
 
     #[inline]
     pub fn record_cycle(&self, ns: u64) {
-        if let Some(mut h) = self.cycle_hist.try_lock() {
-            let v = ns.min(10_000_000_000);
-            let _ = h.record(v.max(1));
-        }
+        record_hist(&self.cycle_hist, ns);
+    }
+
+    #[inline]
+    pub fn record_full_cycle(&self, ns: u64) {
+        record_hist(&self.full_cycle_hist, ns);
+    }
+
+    #[inline]
+    pub fn record_ml_foreground(&self, ns: u64) {
+        record_hist(&self.ml_foreground_hist, ns);
+    }
+
+    #[inline]
+    pub fn record_ml_background(&self, ns: u64) {
+        record_hist(&self.ml_background_hist, ns);
+    }
+}
+
+#[inline]
+fn record_hist(hist: &Mutex<Histogram<u64>>, ns: u64) {
+    if let Some(mut h) = hist.try_lock() {
+        let v = ns.min(10_000_000_000);
+        let _ = h.record(v.max(1));
     }
 }
 

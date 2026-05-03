@@ -50,6 +50,32 @@ fn should_mark_sample_recommended(rec: &crate::ml::contract::Recommendation) -> 
     matches!(rec, crate::ml::contract::Recommendation::Trade(_))
 }
 
+fn enqueue_accepted_sample(
+    ml_server: &MlServer,
+    ml_writer: &WriterHandle,
+    mut sample: crate::ml::persistence::AcceptedSample,
+    was_recommended: bool,
+) {
+    if was_recommended {
+        sample.mark_recommended();
+    }
+    if let Err(e) = ml_writer.try_send(sample) {
+        let metrics = ml_server.metrics();
+        match e {
+            WriterSendError::ChannelFull => {
+                metrics
+                    .accepted_samples_dropped_channel_full
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            WriterSendError::ChannelClosed => {
+                metrics
+                    .accepted_samples_dropped_channel_closed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 fn route_decimator_from_ml_config(ml: &config::MlConfig) -> RouteDecimator {
     RouteDecimator::with_modulus(ml.raw_decimation_mod.max(1))
 }
@@ -795,6 +821,8 @@ async fn run_spread_engine(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        let cycle_t0 = std::time::Instant::now();
+        let metrics = obs::Metrics::init();
         let t0 = std::time::Instant::now();
         buf.clear();
         ml_observations.clear();
@@ -811,13 +839,11 @@ async fn run_spread_engine(
             |opp| ml_observations.push(opp.clone()),
         );
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
-        obs::Metrics::init().record_cycle(elapsed_ns);
+        metrics.record_cycle(elapsed_ns);
 
         let count = buf.len();
         if count > 0 {
-            obs::Metrics::init()
-                .opportunities_total
-                .inc_by(count as u64);
+            metrics.opportunities_total.inc_by(count as u64);
         }
 
         // --- ML pass (M1.7 shadow mode inline) ---
@@ -831,6 +857,7 @@ async fn run_spread_engine(
         // total <1 ms em budget de 150 ms.
         let now = now_ns();
         let cycle_seq = ml_server.begin_cycle();
+        let ml_foreground_t0 = std::time::Instant::now();
         for opp in &buf {
             let route = RouteId {
                 symbol_id: opp.symbol_id,
@@ -870,32 +897,22 @@ async fn run_spread_engine(
             // `accepted_samples_dropped_channel_full/closed`. Antes eram
             // silenciosos (`let _ = ...`), causando perdas invisíveis
             // durante bursts ou writer travado.
-            if let Some(mut sample) = accepted {
-                if should_mark_sample_recommended(&rec) {
-                    sample.mark_recommended();
-                }
-                if let Err(e) = ml_writer.try_send(sample) {
-                    let metrics = ml_server.metrics();
-                    match e {
-                        WriterSendError::ChannelFull => {
-                            metrics
-                                .accepted_samples_dropped_channel_full
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                        WriterSendError::ChannelClosed => {
-                            metrics
-                                .accepted_samples_dropped_channel_closed
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                }
+            if let Some(sample) = accepted {
+                enqueue_accepted_sample(
+                    &ml_server,
+                    &ml_writer,
+                    sample,
+                    should_mark_sample_recommended(&rec),
+                );
             }
         }
+        metrics.record_ml_foreground(ml_foreground_t0.elapsed().as_nanos() as u64);
 
         // Feed ML/cache with valid route observations that were below the UI
         // opportunity threshold. This runs after the thresholded
         // `on_opportunity` pass to preserve point-in-time behavior for
         // recommendations emitted this cycle.
+        let ml_background_t0 = std::time::Instant::now();
         for opp in &ml_observations {
             if opp.entry_spread >= threshold_pct {
                 continue;
@@ -906,7 +923,7 @@ async fn run_spread_engine(
                 sell_venue: opp.sell_venue,
             };
             let symbol_name = universe.canonical_name_of(opp.symbol_id);
-            ml_server.observe_background(
+            let (_dec, accepted) = ml_server.observe_background_with_books(
                 cycle_seq,
                 route,
                 &symbol_name,
@@ -914,14 +931,23 @@ async fn run_spread_engine(
                 opp.exit_spread as f32,
                 opp.buy_vol24,
                 opp.sell_vol24,
+                opp.buy_bid_price,
+                opp.buy_price,
+                opp.sell_price,
+                opp.sell_ask_price,
                 now,
             );
+            if let Some(sample) = accepted {
+                enqueue_accepted_sample(&ml_server, &ml_writer, sample, false);
+            }
         }
+        metrics.record_ml_background(ml_background_t0.elapsed().as_nanos() as u64);
 
         // Move buf contents into DTOs; reuse allocation on next cycle.
         let snapshot: Vec<Opportunity> = std::mem::take(&mut buf);
         buf = Vec::with_capacity(count.max(1024));
         bstate.publish(snapshot);
+        metrics.record_full_cycle(cycle_t0.elapsed().as_nanos() as u64);
     }
 }
 

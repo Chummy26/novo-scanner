@@ -49,4 +49,8 @@ Invariantes do trainer:
   `policy_metadata.recommendation_kind == "trade"`.
 - Usar `label_floor_hits[]` quando o objetivo for estimar
   `P(realize | floor)`. O campo primário `first_exit_ge_label_floor_*` cobre
-  apenas o `label_floor_pct` principal.
+  apenas o `label_floor_pct` principal. Para treino multi-floor, a ingestão
+  deve explodir cada registro para a unidade
+  `(sample_id, horizon_s, floor_pct)`, derivando `floor_outcome` por floor.
+  Helper canônico:
+  `python scanner/scripts/explode_label_floor_hits.py data/ml/labeled_trades -o labeled_floors.jsonl`.

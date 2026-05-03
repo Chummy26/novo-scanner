@@ -814,9 +814,39 @@ async fn rest_metrics() -> impl IntoResponse {
     if let Some(h) = metrics.cycle_hist.try_lock() {
         if h.len() > 0 {
             extra.push_str(&format!(
-                "# HELP scanner_spread_cycle_ns_p99 Spread-engine cycle p99 latency ns\n\
+                "# HELP scanner_spread_cycle_ns_p99 Spread-engine scan p99 latency ns (legacy name)\n\
                  # TYPE scanner_spread_cycle_ns_p99 gauge\n\
                  scanner_spread_cycle_ns_p99 {}\n",
+                h.value_at_quantile(0.99)
+            ));
+        }
+    }
+    if let Some(h) = metrics.full_cycle_hist.try_lock() {
+        if h.len() > 0 {
+            extra.push_str(&format!(
+                "# HELP scanner_spread_full_cycle_ns_p99 Full spread loop p99 latency ns excluding scheduler sleep\n\
+                 # TYPE scanner_spread_full_cycle_ns_p99 gauge\n\
+                 scanner_spread_full_cycle_ns_p99 {}\n",
+                h.value_at_quantile(0.99)
+            ));
+        }
+    }
+    if let Some(h) = metrics.ml_foreground_hist.try_lock() {
+        if h.len() > 0 {
+            extra.push_str(&format!(
+                "# HELP scanner_ml_foreground_ns_p99 Foreground ML pass p99 latency ns\n\
+                 # TYPE scanner_ml_foreground_ns_p99 gauge\n\
+                 scanner_ml_foreground_ns_p99 {}\n",
+                h.value_at_quantile(0.99)
+            ));
+        }
+    }
+    if let Some(h) = metrics.ml_background_hist.try_lock() {
+        if h.len() > 0 {
+            extra.push_str(&format!(
+                "# HELP scanner_ml_background_ns_p99 Background ML pass p99 latency ns\n\
+                 # TYPE scanner_ml_background_ns_p99 gauge\n\
+                 scanner_ml_background_ns_p99 {}\n",
                 h.value_at_quantile(0.99)
             ));
         }
