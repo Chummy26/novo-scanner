@@ -33,7 +33,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::ml::persistence::parquet_compactor::{
@@ -87,18 +87,40 @@ impl Default for WriterConfig {
 /// (compartilha o `Sender` via tokio).
 #[derive(Clone)]
 pub struct WriterHandle {
-    tx: mpsc::Sender<AcceptedSample>,
+    tx: mpsc::Sender<WriterCommand>,
 }
 
 impl WriterHandle {
     /// Envia uma amostra sem bloquear. Retorna `Err` se o canal está
     /// cheio (backpressure) — caller deve incrementar counter e continuar.
     pub fn try_send(&self, sample: AcceptedSample) -> Result<(), WriterSendError> {
-        self.tx.try_send(sample).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => WriterSendError::ChannelFull,
-            mpsc::error::TrySendError::Closed(_) => WriterSendError::ChannelClosed,
-        })
+        self.tx
+            .try_send(WriterCommand::Write(sample))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => WriterSendError::ChannelFull,
+                mpsc::error::TrySendError::Closed(_) => WriterSendError::ChannelClosed,
+            })
     }
+
+    pub async fn seal_current_file(&self) -> Result<WriterStats, WriterSendError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(WriterCommand::Seal { reply: reply_tx })
+            .await
+            .map_err(|_| WriterSendError::ChannelClosed)?;
+        reply_rx.await.map_err(|_| WriterSendError::ChannelClosed)
+    }
+}
+
+enum WriterCommand {
+    Write(AcceptedSample),
+    Seal { reply: oneshot::Sender<WriterStats> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterStats {
+    pub total_written: u64,
+    pub total_dropped: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,7 +140,7 @@ pub enum WriterSendError {
 /// arquivos JSONL com rotação horária.
 pub struct JsonlWriter {
     cfg: WriterConfig,
-    rx: mpsc::Receiver<AcceptedSample>,
+    rx: mpsc::Receiver<WriterCommand>,
     current_hour_key: Option<String>,
     writer: Option<BufWriter<std::fs::File>>,
     current_path: Option<PathBuf>,
@@ -167,7 +189,12 @@ impl JsonlWriter {
                 }
                 maybe_sample = self.rx.recv() => {
                     match maybe_sample {
-                        Some(sample) => self.write_one(sample).await,
+                        Some(WriterCommand::Write(sample)) => self.write_one(sample).await,
+                        Some(WriterCommand::Seal { reply }) => {
+                            self.close_current_file();
+                            self.await_pending_compactions().await;
+                            let _ = reply.send(self.stats());
+                        }
                         None => {
                             info!(
                                 total_written = self.total_written,
@@ -271,6 +298,13 @@ impl JsonlWriter {
             if let Err(e) = handle.await {
                 warn!(error = %e, "ML accepted writer compaction task join falhou");
             }
+        }
+    }
+
+    fn stats(&self) -> WriterStats {
+        WriterStats {
+            total_written: self.total_written,
+            total_dropped: self.total_dropped,
         }
     }
 

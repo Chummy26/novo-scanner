@@ -251,6 +251,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     )
     .await;
     let (ml_raw_writer, ml_raw_writer_handle) = RawSampleWriter::create(raw_writer_cfg);
+    let raw_shutdown_handle = ml_raw_writer_handle.clone();
     tokio::spawn(async move {
         ml_raw_writer.run().await;
     });
@@ -273,8 +274,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         "labeled_trades",
     )
     .await;
-    let label_flush_interval = labeled_writer_cfg.flush_interval;
     let (labeled_writer, labeled_handle) = LabeledJsonlWriter::create(labeled_writer_cfg);
+    let labeled_shutdown_handle = labeled_handle.clone();
     tokio::spawn(async move {
         labeled_writer.run().await;
     });
@@ -376,7 +377,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     // Task sweeper do label resolver.
-    {
+    let label_sweeper_task = {
         let resolver_clone = Arc::clone(&label_resolver);
         let sweeper_interval = Duration::from_secs(cfg.ml.label_sweeper_interval_s.max(1));
         tokio::spawn(async move {
@@ -389,8 +390,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     tracing::debug!(n_closed = n, "label_resolver sweep");
                 }
             }
-        });
-    }
+        })
+    };
 
     // Fix C2 — Sweeper econômico: fecha pendings cujo `valid_until` expirou
     // mesmo sem nova observação da rota (rotas que silenciam). Mesma cadência
@@ -469,6 +470,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     )
     .await;
     let (ml_writer, ml_writer_handle) = JsonlWriter::create(writer_cfg);
+    let accepted_shutdown_handle = ml_writer_handle.clone();
     tokio::spawn(async move {
         ml_writer.run().await;
     });
@@ -607,14 +609,52 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }
     };
     if let Some(reason) = shutdown_reason {
-        let n = label_resolver_shutdown.shutdown_flush(now_ns());
+        engine_task.abort();
+        if let Err(e) = engine_task.await {
+            if !e.is_cancelled() {
+                warn!(error = %e, "spread engine task terminou com erro durante shutdown");
+            }
+        }
+        label_sweeper_task.abort();
+        if let Err(e) = label_sweeper_task.await {
+            if !e.is_cancelled() {
+                warn!(error = %e, "label sweeper task terminou com erro durante shutdown");
+            }
+        }
+
+        let label_stats = label_resolver_shutdown.shutdown_flush(now_ns()).await;
         info!(
             reason,
-            n_closed = n,
-            "shutdown: labels pendentes censurados"
+            n_closed = label_stats.closed_total,
+            n_sent = label_stats.sent_total,
+            n_censored = label_stats.censored_total,
+            n_dropped_channel_closed = label_stats.dropped_channel_closed_total,
+            "shutdown: labels pendentes fechados"
         );
-        tokio::time::sleep(label_flush_interval + Duration::from_millis(250)).await;
-        engine_task.abort();
+        match labeled_shutdown_handle.seal_current_file().await {
+            Ok(stats) => info!(
+                total_written = stats.total_written,
+                total_dropped = stats.total_dropped,
+                "shutdown: labeled writer selado"
+            ),
+            Err(e) => warn!(error = ?e, "shutdown: falha selando labeled writer"),
+        }
+        match raw_shutdown_handle.seal_current_file().await {
+            Ok(stats) => info!(
+                total_written = stats.total_written,
+                total_dropped = stats.total_dropped,
+                "shutdown: raw writer selado"
+            ),
+            Err(e) => warn!(error = ?e, "shutdown: falha selando raw writer"),
+        }
+        match accepted_shutdown_handle.seal_current_file().await {
+            Ok(stats) => info!(
+                total_written = stats.total_written,
+                total_dropped = stats.total_dropped,
+                "shutdown: accepted writer selado"
+            ),
+            Err(e) => warn!(error = ?e, "shutdown: falha selando accepted writer"),
+        }
     }
     Ok(())
 }

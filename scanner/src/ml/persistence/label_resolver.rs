@@ -233,6 +233,14 @@ pub struct ResolverMetrics {
     pub shutdown_lost_pending_total: AtomicU64,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownFlushStats {
+    pub closed_total: u64,
+    pub sent_total: u64,
+    pub censored_total: u64,
+    pub dropped_channel_closed_total: u64,
+}
+
 /// Resolver compartilhado. Thread-safe via interior mutability.
 pub struct LabelResolver {
     cfg: ResolverConfig,
@@ -599,7 +607,7 @@ impl LabelResolver {
     /// no dataset supervisionado. A lógica correta é a mesma do `sweep`:
     /// chamar `LabelOutcome::from_pending()` e só atribuir `Shutdown` quando
     /// o outcome for de fato `Censored` (incomplete window).
-    pub fn shutdown_flush(&self, now_ns: u64) -> u64 {
+    pub async fn shutdown_flush(&self, now_ns: u64) -> ShutdownFlushStats {
         let mut to_write: Vec<(PendingLabel, usize, LabelOutcome, Option<CensorReason>)> =
             Vec::new();
         {
@@ -629,18 +637,42 @@ impl LabelResolver {
             inner.pending_by_route.clear();
             inner.last_label_ts_by_horizon.clear();
         }
-        let n = to_write.len() as u64;
+        let mut stats = ShutdownFlushStats {
+            closed_total: to_write.len() as u64,
+            ..ShutdownFlushStats::default()
+        };
         for (pending, idx, outcome, reason) in to_write {
             // Métrica conta apenas labels realmente "perdidos" — Realized e
             // Miss são outcomes válidos, não perdas.
             if matches!(outcome, LabelOutcome::Censored) {
+                stats.censored_total = stats.censored_total.saturating_add(1);
                 self.metrics
                     .shutdown_lost_pending_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            self.write_closed_horizon_with_reason(pending, idx, now_ns, outcome, reason);
+            let label = self.build_closed_horizon_label(pending, idx, now_ns, outcome, reason);
+            match self.writer.send(label).await {
+                Ok(()) => {
+                    stats.sent_total = stats.sent_total.saturating_add(1);
+                    self.bump_written_metrics(outcome);
+                }
+                Err(LabeledWriterSendError::ChannelClosed) => {
+                    stats.dropped_channel_closed_total =
+                        stats.dropped_channel_closed_total.saturating_add(1);
+                    self.metrics
+                        .labels_dropped_channel_closed_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(LabeledWriterSendError::ChannelFull) => {
+                    // `send().await` nunca retorna Full; mantenha o braço
+                    // defensivo caso o handle mude no futuro.
+                    self.metrics
+                        .labels_dropped_channel_full_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
-        n
+        stats
     }
 
     fn write_closed_horizon_with_reason(
@@ -651,6 +683,32 @@ impl LabelResolver {
         outcome: LabelOutcome,
         censor_reason: Option<CensorReason>,
     ) {
+        let label = self.build_closed_horizon_label(pending, idx, now_ns, outcome, censor_reason);
+        match self.writer.try_send(label) {
+            Ok(()) => {
+                self.bump_written_metrics(outcome);
+            }
+            Err(LabeledWriterSendError::ChannelFull) => {
+                self.metrics
+                    .labels_dropped_channel_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(LabeledWriterSendError::ChannelClosed) => {
+                self.metrics
+                    .labels_dropped_channel_closed_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn build_closed_horizon_label(
+        &self,
+        pending: PendingLabel,
+        idx: usize,
+        now_ns: u64,
+        outcome: LabelOutcome,
+        censor_reason: Option<CensorReason>,
+    ) -> LabeledTrade {
         let slot = &pending.horizons[idx];
         let best_gross = slot
             .best_exit_pct_so_far
@@ -686,7 +744,7 @@ impl LabelResolver {
             N_EVENTS_TARGET_PER_HORIZON,
         );
 
-        let label = LabeledTrade {
+        LabeledTrade {
             sample_id: pending.sample_id.clone(),
             sample_decision: pending.sample_decision,
             horizon_s: slot.horizon_s,
@@ -733,39 +791,27 @@ impl LabelResolver {
             sampling_probability_kind: sampling_probability_kind_for_tier_label(
                 pending.sampling_tier,
             ),
-        };
-
-        match self.writer.try_send(label) {
-            Ok(()) => {
-                self.metrics
-                    .labels_written_total
-                    .fetch_add(1, Ordering::Relaxed);
-                match outcome {
-                    LabelOutcome::Realized => self
-                        .metrics
-                        .labels_written_realized_total
-                        .fetch_add(1, Ordering::Relaxed),
-                    LabelOutcome::Miss => self
-                        .metrics
-                        .labels_written_miss_total
-                        .fetch_add(1, Ordering::Relaxed),
-                    LabelOutcome::Censored => self
-                        .metrics
-                        .labels_written_censored_total
-                        .fetch_add(1, Ordering::Relaxed),
-                };
-            }
-            Err(LabeledWriterSendError::ChannelFull) => {
-                self.metrics
-                    .labels_dropped_channel_full_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            Err(LabeledWriterSendError::ChannelClosed) => {
-                self.metrics
-                    .labels_dropped_channel_closed_total
-                    .fetch_add(1, Ordering::Relaxed);
-            }
         }
+    }
+
+    fn bump_written_metrics(&self, outcome: LabelOutcome) {
+        self.metrics
+            .labels_written_total
+            .fetch_add(1, Ordering::Relaxed);
+        match outcome {
+            LabelOutcome::Realized => self
+                .metrics
+                .labels_written_realized_total
+                .fetch_add(1, Ordering::Relaxed),
+            LabelOutcome::Miss => self
+                .metrics
+                .labels_written_miss_total
+                .fetch_add(1, Ordering::Relaxed),
+            LabelOutcome::Censored => self
+                .metrics
+                .labels_written_censored_total
+                .fetch_add(1, Ordering::Relaxed),
+        };
     }
 }
 
@@ -1401,8 +1447,12 @@ mod tests {
         );
         // Sem observações → observed_until == t_emit < qualquer deadline → Censored.
         // DEFAULT_HORIZONS_S agora tem 6 elementos (buraco 2h→8h fechado).
-        let closed = resolver.shutdown_flush(t0 + 1_000_000_000);
-        assert_eq!(closed, 6, "6 horizontes default devem ter sido fechados");
+        let closed = resolver.shutdown_flush(t0 + 1_000_000_000).await;
+        assert_eq!(
+            closed.closed_total, 6,
+            "6 horizontes default devem ter sido fechados"
+        );
+        assert_eq!(closed.sent_total, 6);
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert_eq!(
@@ -1414,6 +1464,79 @@ mod tests {
         assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 0);
         drop(resolver);
         drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn shutdown_flush_drains_more_than_writer_channel_capacity() {
+        fn count_jsonl_lines(root: &std::path::Path) -> usize {
+            let mut total = 0usize;
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(dir).expect("read_dir") {
+                    let entry = entry.expect("dir entry");
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                        let content = std::fs::read_to_string(&path).expect("jsonl content");
+                        total += content.lines().count();
+                    }
+                }
+            }
+            total
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wcfg = LabeledWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 1,
+            flush_after_n: 512,
+            flush_interval: Duration::from_secs(60),
+            file_prefix: "lr-shutdown-drain".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
+        };
+        let (writer, handle) = LabeledJsonlWriter::create(wcfg);
+        let task = tokio::spawn(writer.run());
+        let resolver = Arc::new(LabelResolver::new(
+            ResolverConfig::default(),
+            handle.clone(),
+        ));
+        let t0 = 1_000_000_000u64;
+        for i in 0..25u32 {
+            resolver.on_accepted(
+                format!("sid_{i}"),
+                t0 + i as u64,
+                i,
+                mk_route(),
+                "BTC-USDT".into(),
+                2.0,
+                -1.0,
+                mk_features(),
+                0.8,
+                mk_policy(),
+                "allowlist",
+                1.0,
+                0,
+            );
+        }
+
+        let closed = resolver.shutdown_flush(t0 + 1_000_000_000).await;
+        assert_eq!(closed.closed_total, 25 * DEFAULT_HORIZONS_S.len() as u64);
+        assert_eq!(
+            closed.sent_total, closed.closed_total,
+            "shutdown must not drop when pending burst exceeds channel capacity"
+        );
+        assert_eq!(closed.dropped_channel_closed_total, 0);
+        let writer_stats = handle.seal_current_file().await.expect("seal writer");
+        assert_eq!(writer_stats.total_written, closed.closed_total);
+        assert_eq!(count_jsonl_lines(tmp.path()), closed.closed_total as usize);
+
+        drop(resolver);
+        drop(handle);
+        task.abort();
     }
 
     #[tokio::test]
@@ -1449,8 +1572,9 @@ mod tests {
         // Observação dentro de 2s: gross = 2.0 + (-0.5) = 1.5 > floor 0.5 → hit.
         resolver.on_clean_observation(mk_route(), t0 + 2_000_000_000, 1.8, -0.5);
         // Shutdown em t0+5s (antes de qualquer horizonte expirar).
-        let closed = resolver.shutdown_flush(t0 + 5_000_000_000);
-        assert_eq!(closed, 3, "3 horizontes fechados no shutdown");
+        let closed = resolver.shutdown_flush(t0 + 5_000_000_000).await;
+        assert_eq!(closed.closed_total, 3, "3 horizontes fechados no shutdown");
+        assert_eq!(closed.sent_total, 3);
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert_eq!(
@@ -1509,7 +1633,7 @@ mod tests {
         }
         // Shutdown em t0+7s — slot 900s/1800s/2h (no config test: 2/4/6s)
         // todos têm observed_until >= deadline → Miss, não Censored.
-        resolver.shutdown_flush(t0 + 7_000_000_000);
+        resolver.shutdown_flush(t0 + 7_000_000_000).await;
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert_eq!(

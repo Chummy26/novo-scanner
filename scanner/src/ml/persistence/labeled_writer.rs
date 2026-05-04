@@ -11,7 +11,7 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::ml::persistence::labeled_trade::LabeledTrade;
@@ -47,16 +47,49 @@ impl Default for LabeledWriterConfig {
 
 #[derive(Clone)]
 pub struct LabeledWriterHandle {
-    tx: mpsc::Sender<LabeledTrade>,
+    tx: mpsc::Sender<LabeledWriterCommand>,
 }
 
 impl LabeledWriterHandle {
     pub fn try_send(&self, sample: LabeledTrade) -> Result<(), LabeledWriterSendError> {
-        self.tx.try_send(sample).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => LabeledWriterSendError::ChannelFull,
-            mpsc::error::TrySendError::Closed(_) => LabeledWriterSendError::ChannelClosed,
-        })
+        self.tx
+            .try_send(LabeledWriterCommand::Write(sample))
+            .map_err(|e| match e {
+                mpsc::error::TrySendError::Full(_) => LabeledWriterSendError::ChannelFull,
+                mpsc::error::TrySendError::Closed(_) => LabeledWriterSendError::ChannelClosed,
+            })
     }
+
+    pub async fn send(&self, sample: LabeledTrade) -> Result<(), LabeledWriterSendError> {
+        self.tx
+            .send(LabeledWriterCommand::Write(sample))
+            .await
+            .map_err(|_| LabeledWriterSendError::ChannelClosed)
+    }
+
+    pub async fn seal_current_file(&self) -> Result<LabeledWriterStats, LabeledWriterSendError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(LabeledWriterCommand::Seal { reply: reply_tx })
+            .await
+            .map_err(|_| LabeledWriterSendError::ChannelClosed)?;
+        reply_rx
+            .await
+            .map_err(|_| LabeledWriterSendError::ChannelClosed)
+    }
+}
+
+enum LabeledWriterCommand {
+    Write(LabeledTrade),
+    Seal {
+        reply: oneshot::Sender<LabeledWriterStats>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LabeledWriterStats {
+    pub total_written: u64,
+    pub total_dropped: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +100,7 @@ pub enum LabeledWriterSendError {
 
 pub struct LabeledJsonlWriter {
     cfg: LabeledWriterConfig,
-    rx: mpsc::Receiver<LabeledTrade>,
+    rx: mpsc::Receiver<LabeledWriterCommand>,
     current_hour_key: Option<String>,
     writer: Option<BufWriter<std::fs::File>>,
     current_path: Option<PathBuf>,
@@ -114,7 +147,12 @@ impl LabeledJsonlWriter {
                 }
                 maybe = self.rx.recv() => {
                     match maybe {
-                        Some(l) => self.write_one(l).await,
+                        Some(LabeledWriterCommand::Write(l)) => self.write_one(l).await,
+                        Some(LabeledWriterCommand::Seal { reply }) => {
+                            self.close_current_file();
+                            self.await_pending_compactions().await;
+                            let _ = reply.send(self.stats());
+                        }
                         None => {
                             info!(
                                 total_written = self.total_written,
@@ -218,6 +256,13 @@ impl LabeledJsonlWriter {
             if let Err(e) = handle.await {
                 warn!(error = %e, "ML labeled writer compaction task join falhou");
             }
+        }
+    }
+
+    fn stats(&self) -> LabeledWriterStats {
+        LabeledWriterStats {
+            total_written: self.total_written,
+            total_dropped: self.total_dropped,
         }
     }
 
