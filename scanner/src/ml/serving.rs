@@ -845,6 +845,12 @@ impl MlServer {
         Some(((now_ns.saturating_sub(since)) / 1_000_000_000).min(u32::MAX as u64) as u32)
     }
 
+    fn clear_alive_if_below_threshold(&self, route: RouteId, entry_spread: f32) {
+        if entry_spread < self.opportunity_alive_threshold_pct {
+            self.alive_since_by_route.lock().remove(&route);
+        }
+    }
+
     fn build_accepted_sample(
         &self,
         sample_dec: SampleDecision,
@@ -1006,16 +1012,11 @@ impl MlServer {
             .route_ranking
             .as_ref()
             .and_then(|r| {
-                let top = r.top_k(usize::MAX);
-                top.into_iter().find_map(|(rid, score)| {
-                    if rid == route {
-                        Some((
-                            score.candidate_count_24h.min(u32::MAX as u64) as u32,
-                            score.accept_count_24h.min(u32::MAX as u64) as u32,
-                        ))
-                    } else {
-                        None
-                    }
+                r.score_for_route(route).map(|score| {
+                    (
+                        score.candidate_count_24h.min(u32::MAX as u64) as u32,
+                        score.accept_count_24h.min(u32::MAX as u64) as u32,
+                    )
                 })
             })
             .unwrap_or((0, 0));
@@ -1192,14 +1193,7 @@ impl MlServer {
             self.baseline.cache(),
         );
         self.bump_sample_metric(sample_dec);
-        let features_t0 = self.build_features_t0(
-            route,
-            entry_spread,
-            now_ns,
-            lifecycle,
-            half_spread_buy_now,
-            half_spread_sell_now,
-        );
+        self.clear_alive_if_below_threshold(route, entry_spread);
 
         // �� ranker observa (candidate, accepted).
         if let Some(ranker) = self.route_ranking.as_ref() {
@@ -1279,6 +1273,23 @@ impl MlServer {
             lifecycle,
         );
 
+        // Background abaixo do threshold visual alimenta historico PIT e
+        // resolve labels existentes, mas nao pode criar um PendingLabel para
+        // todo tick limpo: isso explode cardinalidade e trava o ciclo. So
+        // materializa candidato novo aqui se o proprio trigger aceitou.
+        let features_t0 = if clean && sample_dec == SampleDecision::Accept {
+            Some(self.build_features_t0(
+                route,
+                entry_spread,
+                now_ns,
+                lifecycle,
+                half_spread_buy_now,
+                half_spread_sell_now,
+            ))
+        } else {
+            None
+        };
+
         if clean {
             self.observe_clean_spread(route, entry_spread, exit_spread, now_ns);
             self.economic
@@ -1296,6 +1307,9 @@ impl MlServer {
             if let (Some(resolver), Some((tier, raw_sampling_probability))) =
                 (self.label_resolver.as_ref(), tier_snapshot)
             {
+                let Some(features_t0) = features_t0 else {
+                    return (sample_dec, accepted);
+                };
                 let label_sample_id = accepted
                     .as_ref()
                     .map(|s| s.sample_id.clone())
@@ -1727,16 +1741,11 @@ impl MlServer {
                 .route_ranking
                 .as_ref()
                 .and_then(|r| {
-                    let top = r.top_k(usize::MAX);
-                    top.into_iter().find_map(|(rid, score)| {
-                        if rid == route {
-                            Some((
-                                score.candidate_count_24h.min(u32::MAX as u64) as u32,
-                                score.accept_count_24h.min(u32::MAX as u64) as u32,
-                            ))
-                        } else {
-                            None
-                        }
+                    r.score_for_route(route).map(|score| {
+                        (
+                            score.candidate_count_24h.min(u32::MAX as u64) as u32,
+                            score.accept_count_24h.min(u32::MAX as u64) as u32,
+                        )
                     })
                 })
                 .unwrap_or((0, 0));
@@ -2576,7 +2585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_background_snapshots_create_supervised_negative_labels() {
+    async fn clean_background_below_tail_does_not_create_new_label_candidate() {
         use crate::ml::persistence::{
             LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, ResolverConfig,
         };
@@ -2630,8 +2639,76 @@ mod tests {
                 .metrics()
                 .pending_created_total
                 .load(Ordering::Relaxed),
+            0,
+            "background below-tail alimenta cache/raw e resolve labels existentes, mas nao cria pending por tick"
+        );
+        drop(server);
+        drop(resolver);
+        drop(tmp);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn clean_background_accept_creates_label_candidate() {
+        use crate::ml::persistence::{
+            LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, ResolverConfig,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
+        let (writer, handle) = LabeledJsonlWriter::create(LabeledWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 1024,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(50),
+            file_prefix: "bg-accept-label".into(),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
+        });
+        let task = tokio::spawn(writer.run());
+        let resolver = Arc::new(LabelResolver::new(
+            ResolverConfig {
+                horizons_s: vec![1],
+                close_slack_ns: 1_000_000_000,
+                route_vanish_idle_ns: 60 * 1_000_000_000,
+                route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+                max_pending_per_route: 100,
+                sweeper_interval: Duration::from_secs(10),
+            },
+            handle,
+        ));
+
+        let server = mk_server_with_min_history(3)
+            .with_label_resolver(Arc::clone(&resolver))
+            .with_raw_decimator(RouteDecimator::with_modulus(1));
+        let route = mk_route();
+        for i in 0..3 {
+            let _ = server.observe_background(
+                i,
+                route,
+                "BTC-USDT",
+                0.10 + i as f32 * 0.01,
+                -0.8,
+                1e6,
+                1e6,
+                1_000_000_000 + i as u64,
+            );
+        }
+        let (dec, accepted) =
+            server.observe_background(4, route, "BTC-USDT", 1.0, -0.8, 1e6, 1e6, 2_000_000_000);
+        assert_eq!(dec, SampleDecision::Accept);
+        assert!(accepted.is_some());
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_created_total
+                .load(Ordering::Relaxed),
             1,
-            "background limpo rejeitado deve gerar label para abstencao/no-opportunity"
+            "background Accept ainda deve virar candidato supervisionado"
         );
         drop(server);
         drop(resolver);

@@ -153,6 +153,42 @@ impl RouteRanking {
         agg
     }
 
+    /// Retorna o score 24h de uma rota sem agregar/ordenar o universo todo.
+    ///
+    /// Usado no hot path de criação de labels. `top_k(usize::MAX)` é correto
+    /// para dashboards, mas é O(N rotas × buckets) + sort; chamar isso para
+    /// cada candidato degrada o ciclo de coleta.
+    pub fn score_for_route(&self, route: RouteId) -> Option<RouteScore> {
+        let inner = self.inner.lock();
+        let mut score = RouteScore::default();
+        let mut non_empty_buckets = 0u64;
+        for bucket in inner.buckets.iter() {
+            let Some(stats) = bucket.get(&route) else {
+                continue;
+            };
+            score.accept_count_24h = score
+                .accept_count_24h
+                .saturating_add(stats.accept_count as u64);
+            score.candidate_count_24h = score
+                .candidate_count_24h
+                .saturating_add(stats.candidate_count as u64);
+            if stats.n > 0 {
+                score.vol24_mean += stats.vol24_sum / stats.n as f64;
+                non_empty_buckets = non_empty_buckets.saturating_add(1);
+            }
+        }
+        if score.accept_count_24h == 0
+            && score.candidate_count_24h == 0
+            && non_empty_buckets == 0
+        {
+            return None;
+        }
+        if non_empty_buckets > 0 {
+            score.vol24_mean /= non_empty_buckets as f64;
+        }
+        Some(score)
+    }
+
     /// Seleciona priority_set via `target_coverage`. Clamp `[20, 200]`.
     ///
     /// Estratégia:
@@ -265,6 +301,11 @@ mod tests {
         assert_eq!(top.len(), 1);
         assert_eq!(top[0].0, route);
         assert_eq!(top[0].1.accept_count_24h, 50);
+        assert_eq!(r.score_for_route(route), Some(top[0].1));
+        assert_eq!(
+            r.score_for_route(mk_route(99, Venue::GateFut, Venue::BinanceFut)),
+            None
+        );
     }
 
     #[test]

@@ -111,6 +111,7 @@ impl RouteLifecycle {
 /// Tracker thread-safe do histórico de listagem de todas as rotas.
 pub struct ListingHistory {
     routes: Arc<RwLock<AHashMap<RouteId, RouteLifecycle>>>,
+    active_by_symbol: Arc<RwLock<AHashMap<SymbolId, Vec<RouteId>>>>,
     delisting_window_ns: u64,
 }
 
@@ -122,18 +123,51 @@ impl ListingHistory {
     pub fn with_delisting_window(delisting_window_ns: u64) -> Self {
         Self {
             routes: Arc::new(RwLock::new(AHashMap::with_capacity(4096))),
+            active_by_symbol: Arc::new(RwLock::new(AHashMap::with_capacity(1024))),
             delisting_window_ns,
+        }
+    }
+
+    fn add_active_route_to_index(&self, route: RouteId) {
+        let mut guard = self.active_by_symbol.write();
+        let routes = guard.entry(route.symbol_id).or_default();
+        if !routes.contains(&route) {
+            routes.push(route);
+            routes.sort_by_key(|route| (route.buy_venue.idx(), route.sell_venue.idx()));
+        }
+    }
+
+    fn remove_active_route_from_index(&self, route: RouteId) {
+        let mut guard = self.active_by_symbol.write();
+        if let Some(routes) = guard.get_mut(&route.symbol_id) {
+            routes.retain(|candidate| *candidate != route);
+            if routes.is_empty() {
+                guard.remove(&route.symbol_id);
+            }
         }
     }
 
     /// Registra que a rota foi observada no ciclo atual. Cria entrada
     /// se nova; atualiza `last_seen` caso contrário.
     pub fn record_seen(&self, route: RouteId, ts_ns: u64) {
-        let mut guard = self.routes.write();
-        guard
-            .entry(route)
-            .and_modify(|lc| lc.record_seen(ts_ns))
-            .or_insert_with(|| RouteLifecycle::new(ts_ns));
+        let should_add_active_index;
+        {
+            let mut guard = self.routes.write();
+            match guard.get_mut(&route) {
+                Some(lc) => {
+                    let was_active = lc.is_active();
+                    lc.record_seen(ts_ns);
+                    should_add_active_index = !was_active;
+                }
+                None => {
+                    guard.insert(route, RouteLifecycle::new(ts_ns));
+                    should_add_active_index = true;
+                }
+            }
+        }
+        if should_add_active_index {
+            self.add_active_route_to_index(route);
+        }
     }
 
     /// Idade da rota em dias desde `first_seen`. `None` se rota
@@ -178,9 +212,16 @@ impl ListingHistory {
     /// Marca explicitamente uma rota como delisted (ex: aviso manual
     /// do operador ou anúncio da venue). Idempotente.
     pub fn mark_delisted(&self, route: RouteId, ts_ns: u64) {
-        let mut guard = self.routes.write();
-        if let Some(lc) = guard.get_mut(&route) {
-            lc.active_until_ns = Some(ts_ns);
+        let mut should_remove_active_index = false;
+        {
+            let mut guard = self.routes.write();
+            if let Some(lc) = guard.get_mut(&route) {
+                should_remove_active_index = lc.is_active();
+                lc.active_until_ns = Some(ts_ns);
+            }
+        }
+        if should_remove_active_index {
+            self.remove_active_route_from_index(route);
         }
     }
 
@@ -191,18 +232,24 @@ impl ListingHistory {
     /// Retorna `(n_active, n_newly_delisted)` para métricas.
     pub fn sweep_inactive(&self, now_ns: u64) -> (usize, usize) {
         let cutoff = now_ns.saturating_sub(self.delisting_window_ns);
+        let mut newly_delisted_routes = Vec::new();
         let mut guard = self.routes.write();
         let mut newly = 0;
         let mut active = 0;
-        for lc in guard.values_mut() {
+        for (route, lc) in guard.iter_mut() {
             if lc.is_active() {
                 if lc.last_seen_ns < cutoff {
                     lc.active_until_ns = Some(lc.last_seen_ns);
                     newly += 1;
+                    newly_delisted_routes.push(*route);
                 } else {
                     active += 1;
                 }
             }
+        }
+        drop(guard);
+        for route in newly_delisted_routes {
+            self.remove_active_route_from_index(route);
         }
         (active, newly)
     }
@@ -217,15 +264,11 @@ impl ListingHistory {
     /// por venue. Usado para materializar cluster estrutural PIT em labels
     /// sem depender de detector offline.
     pub fn active_routes_for_symbol(&self, symbol_id: SymbolId) -> Vec<RouteId> {
-        let guard = self.routes.read();
-        let mut routes: Vec<RouteId> = guard
-            .iter()
-            .filter_map(|(route, lc)| {
-                (route.symbol_id == symbol_id && lc.is_active()).then_some(*route)
-            })
-            .collect();
-        routes.sort_by_key(|route| (route.buy_venue.idx(), route.sell_venue.idx()));
-        routes
+        self.active_by_symbol
+            .read()
+            .get(&symbol_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Número de rotas delisted.
@@ -251,6 +294,7 @@ impl Clone for ListingHistory {
     fn clone(&self) -> Self {
         Self {
             routes: Arc::clone(&self.routes),
+            active_by_symbol: Arc::clone(&self.active_by_symbol),
             delisting_window_ns: self.delisting_window_ns,
         }
     }
@@ -304,6 +348,11 @@ mod tests {
         assert_eq!(lh.first_seen(r), Some(t0)); // inalterado
         assert_eq!(lh.last_seen(r), Some(t0 + 5_000_000_000));
         assert_eq!(lh.n_snapshots(r), 3);
+        assert_eq!(
+            lh.active_routes_for_symbol(SymbolId(1)),
+            vec![r],
+            "indice ativo por simbolo nao deve duplicar rota repetida"
+        );
     }
 
     #[test]
