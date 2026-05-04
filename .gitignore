@@ -32,8 +32,11 @@ logs/
 # Local runtime artifacts
 .tmp/collect-*.toml
 .tmp/*.json
+.tmp/**/*.json
 .tmp/*.jsonl
+.tmp/**/*.jsonl
 .tmp/*.parquet
+.tmp/**/*.parquet
 .tmp/*.pid
 .tmp/*.txt
 
