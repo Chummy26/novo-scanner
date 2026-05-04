@@ -4,6 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use arrow_array::{
+    Array, ArrayRef, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+};
 use arrow_json::reader::ReaderBuilder;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
@@ -63,42 +66,6 @@ pub fn compact_jsonl_file(
         return Ok(None);
     }
 
-    // valida `schema_version` na primeira linha antes de compactar.
-    // Divergência → fail-loud em vez de perda silenciosa.
-    let first_line_reader = File::open(jsonl_path)
-        .with_context(|| format!("open for schema-check {}", jsonl_path.display()))?;
-    let mut first_line = String::new();
-    {
-        use std::io::BufRead;
-        let mut buf = BufReader::new(first_line_reader);
-        buf.read_line(&mut first_line)
-            .with_context(|| format!("read first line {}", jsonl_path.display()))?;
-    }
-    if !first_line.trim().is_empty() {
-        let v: serde_json::Value = serde_json::from_str(first_line.trim()).with_context(|| {
-            format!(
-                "parse first line for schema_version {}",
-                jsonl_path.display()
-            )
-        })?;
-        let expected: u16 = match dataset_kind {
-            DatasetKind::AcceptedSamples => ACCEPTED_SAMPLE_SCHEMA_VERSION,
-            DatasetKind::RawSamples => RAW_SAMPLE_SCHEMA_VERSION,
-            DatasetKind::LabeledTrades => LABELED_TRADE_SCHEMA_VERSION,
-        };
-        if let Some(got) = v.get("schema_version").and_then(|x| x.as_u64()) {
-            if got != expected as u64 {
-                anyhow::bail!(
-                    "schema_version mismatch em {}: arquivo={}, compactor espera={}. \
-                     Migração em voo — atualize o compactor antes de processar este arquivo.",
-                    jsonl_path.display(),
-                    got,
-                    expected
-                );
-            }
-        }
-    }
-
     let parquet_path = jsonl_path.with_extension("parquet");
     let temp_parquet_path = jsonl_path.with_extension("parquet.tmp");
     let schema = schema_for(dataset_kind);
@@ -121,21 +88,44 @@ pub fn compact_jsonl_file(
         .build();
     let output = File::create(&temp_parquet_path)
         .with_context(|| format!("create output {}", temp_parquet_path.display()))?;
-    let mut writer = ArrowWriter::try_new(output, schema, Some(props))
-        .with_context(|| format!("create parquet writer for {}", temp_parquet_path.display()))?;
+    let mut writer = match ArrowWriter::try_new(output, schema, Some(props)) {
+        Ok(writer) => writer,
+        Err(e) => {
+            let _ = fs::remove_file(&temp_parquet_path);
+            return Err(e).with_context(|| {
+                format!("create parquet writer for {}", temp_parquet_path.display())
+            });
+        }
+    };
 
     let mut rows_written = 0usize;
-    for maybe_batch in &mut json_reader {
-        let batch = maybe_batch
-            .with_context(|| format!("read record batch from {}", jsonl_path.display()))?;
-        rows_written += batch.num_rows();
+    let mut source_validation = ValidationDigest::new(dataset_kind);
+    let write_result = (|| -> Result<()> {
+        for maybe_batch in &mut json_reader {
+            let batch = maybe_batch
+                .with_context(|| format!("read record batch from {}", jsonl_path.display()))?;
+            validate_required_batch(dataset_kind, &batch, &mut source_validation).with_context(
+                || {
+                    format!(
+                        "validate required fields from source {}",
+                        jsonl_path.display()
+                    )
+                },
+            )?;
+            rows_written += batch.num_rows();
+            writer.write(&batch).with_context(|| {
+                format!("write parquet batch for {}", temp_parquet_path.display())
+            })?;
+        }
         writer
-            .write(&batch)
-            .with_context(|| format!("write parquet batch for {}", temp_parquet_path.display()))?;
+            .close()
+            .with_context(|| format!("close parquet writer for {}", temp_parquet_path.display()))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&temp_parquet_path);
+        return Err(e);
     }
-    writer
-        .close()
-        .with_context(|| format!("close parquet writer for {}", temp_parquet_path.display()))?;
 
     if rows_written == 0 {
         let _ = fs::remove_file(&temp_parquet_path);
@@ -146,16 +136,48 @@ pub fn compact_jsonl_file(
         return Ok(None);
     }
 
-    let parquet_rows = parquet_row_count(&temp_parquet_path)
-        .with_context(|| format!("validate parquet row count {}", temp_parquet_path.display()))?;
+    let parquet_rows = match parquet_row_count(&temp_parquet_path) {
+        Ok(rows) => rows,
+        Err(e) => {
+            let _ = fs::remove_file(&temp_parquet_path);
+            return Err(e).with_context(|| {
+                format!("validate parquet row count {}", temp_parquet_path.display())
+            });
+        }
+    };
     if parquet_rows != rows_written as u64 {
         let _ = fs::remove_file(&temp_parquet_path);
         anyhow::bail!(
             "parquet row-count mismatch em {}: writer_rows={}, parquet_rows={}. \
-             JSONL fonte preservado; nao removendo apos compactacao inconsistente.",
+            JSONL fonte preservado; nao removendo apos compactacao inconsistente.",
             jsonl_path.display(),
             rows_written,
             parquet_rows
+        );
+    }
+
+    let parquet_validation = match parquet_validation_digest(&temp_parquet_path, dataset_kind) {
+        Ok(validation) => validation,
+        Err(e) => {
+            let _ = fs::remove_file(&temp_parquet_path);
+            return Err(e).with_context(|| {
+                format!(
+                    "validate parquet required-field digest {}",
+                    temp_parquet_path.display()
+                )
+            });
+        }
+    };
+    if parquet_validation != source_validation {
+        let _ = fs::remove_file(&temp_parquet_path);
+        anyhow::bail!(
+            "parquet required-field digest mismatch em {}: source_rows={}, parquet_rows={}, \
+             source_hash={:016x}, parquet_hash={:016x}. JSONL fonte preservado.",
+            jsonl_path.display(),
+            source_validation.rows,
+            parquet_validation.rows,
+            source_validation.hash,
+            parquet_validation.hash
         );
     }
 
@@ -180,6 +202,307 @@ fn parquet_row_count(path: &Path) -> Result<u64> {
     let reader = SerializedFileReader::new(file)
         .with_context(|| format!("read parquet metadata {}", path.display()))?;
     Ok(reader.metadata().file_metadata().num_rows().max(0) as u64)
+}
+
+fn parquet_validation_digest(path: &Path, dataset_kind: DatasetKind) -> Result<ValidationDigest> {
+    let file = File::open(path).with_context(|| format!("open parquet {}", path.display()))?;
+    let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("build parquet reader {}", path.display()))?;
+    let mut reader = builder
+        .build()
+        .with_context(|| format!("read parquet {}", path.display()))?;
+    let mut digest = ValidationDigest::new(dataset_kind);
+    for maybe_batch in &mut reader {
+        let batch =
+            maybe_batch.with_context(|| format!("read parquet batch {}", path.display()))?;
+        validate_required_batch(dataset_kind, &batch, &mut digest)?;
+    }
+    Ok(digest)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequiredColumnKind {
+    Utf8NonEmpty,
+    U16Eq(u16),
+    U32,
+    U64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequiredColumn {
+    name: &'static str,
+    kind: RequiredColumnKind,
+}
+
+const ACCEPTED_REQUIRED_COLUMNS: &[RequiredColumn] = &[
+    RequiredColumn {
+        name: "schema_version",
+        kind: RequiredColumnKind::U16Eq(ACCEPTED_SAMPLE_SCHEMA_VERSION),
+    },
+    RequiredColumn {
+        name: "sample_id",
+        kind: RequiredColumnKind::Utf8NonEmpty,
+    },
+    RequiredColumn {
+        name: "route_id",
+        kind: RequiredColumnKind::Utf8NonEmpty,
+    },
+    RequiredColumn {
+        name: "ts_ns",
+        kind: RequiredColumnKind::U64,
+    },
+    RequiredColumn {
+        name: "cycle_seq",
+        kind: RequiredColumnKind::U32,
+    },
+];
+
+const RAW_REQUIRED_COLUMNS: &[RequiredColumn] = &[
+    RequiredColumn {
+        name: "schema_version",
+        kind: RequiredColumnKind::U16Eq(RAW_SAMPLE_SCHEMA_VERSION),
+    },
+    RequiredColumn {
+        name: "sample_id",
+        kind: RequiredColumnKind::Utf8NonEmpty,
+    },
+    RequiredColumn {
+        name: "route_id",
+        kind: RequiredColumnKind::Utf8NonEmpty,
+    },
+    RequiredColumn {
+        name: "ts_ns",
+        kind: RequiredColumnKind::U64,
+    },
+    RequiredColumn {
+        name: "cycle_seq",
+        kind: RequiredColumnKind::U32,
+    },
+];
+
+const LABELED_REQUIRED_COLUMNS: &[RequiredColumn] = &[
+    RequiredColumn {
+        name: "schema_version",
+        kind: RequiredColumnKind::U16Eq(LABELED_TRADE_SCHEMA_VERSION),
+    },
+    RequiredColumn {
+        name: "sample_id",
+        kind: RequiredColumnKind::Utf8NonEmpty,
+    },
+    RequiredColumn {
+        name: "route_id",
+        kind: RequiredColumnKind::Utf8NonEmpty,
+    },
+    RequiredColumn {
+        name: "horizon_s",
+        kind: RequiredColumnKind::U32,
+    },
+    RequiredColumn {
+        name: "ts_emit_ns",
+        kind: RequiredColumnKind::U64,
+    },
+    RequiredColumn {
+        name: "cycle_seq",
+        kind: RequiredColumnKind::U32,
+    },
+    RequiredColumn {
+        name: "label_window_closed_at_ns",
+        kind: RequiredColumnKind::U64,
+    },
+    RequiredColumn {
+        name: "closed_ts_ns",
+        kind: RequiredColumnKind::U64,
+    },
+    RequiredColumn {
+        name: "outcome",
+        kind: RequiredColumnKind::Utf8NonEmpty,
+    },
+];
+
+fn required_columns(dataset_kind: DatasetKind) -> &'static [RequiredColumn] {
+    match dataset_kind {
+        DatasetKind::AcceptedSamples => ACCEPTED_REQUIRED_COLUMNS,
+        DatasetKind::RawSamples => RAW_REQUIRED_COLUMNS,
+        DatasetKind::LabeledTrades => LABELED_REQUIRED_COLUMNS,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValidationDigest {
+    rows: u64,
+    hash: u64,
+}
+
+impl ValidationDigest {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    fn new(dataset_kind: DatasetKind) -> Self {
+        let mut digest = Self {
+            rows: 0,
+            hash: Self::FNV_OFFSET,
+        };
+        digest.update_bytes(b"dataset");
+        digest.update_bytes(format!("{dataset_kind:?}").as_bytes());
+        digest
+    }
+
+    fn begin_row(&mut self, row: u64) {
+        self.update_bytes(b"\x1erow");
+        self.update_bytes(&row.to_le_bytes());
+    }
+
+    fn update_field_name(&mut self, name: &str) {
+        self.update_bytes(b"\x1ffield");
+        self.update_bytes(&(name.len() as u64).to_le_bytes());
+        self.update_bytes(name.as_bytes());
+    }
+
+    fn update_u16(&mut self, value: u16) {
+        self.update_bytes(b"u16");
+        self.update_bytes(&value.to_le_bytes());
+    }
+
+    fn update_u32(&mut self, value: u32) {
+        self.update_bytes(b"u32");
+        self.update_bytes(&value.to_le_bytes());
+    }
+
+    fn update_u64(&mut self, value: u64) {
+        self.update_bytes(b"u64");
+        self.update_bytes(&value.to_le_bytes());
+    }
+
+    fn update_str(&mut self, value: &str) {
+        self.update_bytes(b"str");
+        self.update_bytes(&(value.len() as u64).to_le_bytes());
+        self.update_bytes(value.as_bytes());
+    }
+
+    fn update_bytes(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.hash ^= *byte as u64;
+            self.hash = self.hash.wrapping_mul(Self::FNV_PRIME);
+        }
+    }
+}
+
+fn validate_required_batch(
+    dataset_kind: DatasetKind,
+    batch: &RecordBatch,
+    digest: &mut ValidationDigest,
+) -> Result<()> {
+    let mut columns = Vec::with_capacity(required_columns(dataset_kind).len());
+    for required in required_columns(dataset_kind) {
+        let idx = batch
+            .schema()
+            .index_of(required.name)
+            .with_context(|| format!("required column '{}' not found", required.name))?;
+        columns.push((*required, batch.column(idx).clone()));
+    }
+
+    for row_idx in 0..batch.num_rows() {
+        let global_row = digest.rows + row_idx as u64 + 1;
+        digest.begin_row(global_row);
+        for (required, array) in &columns {
+            digest.update_field_name(required.name);
+            validate_required_value(dataset_kind, *required, array, row_idx, global_row, digest)?;
+        }
+    }
+    digest.rows = digest.rows.saturating_add(batch.num_rows() as u64);
+    Ok(())
+}
+
+fn validate_required_value(
+    dataset_kind: DatasetKind,
+    required: RequiredColumn,
+    array: &ArrayRef,
+    row_idx: usize,
+    global_row: u64,
+    digest: &mut ValidationDigest,
+) -> Result<()> {
+    if array.is_null(row_idx) {
+        anyhow::bail!(
+            "{dataset_kind:?} required field '{}' is null at row {}",
+            required.name,
+            global_row
+        );
+    }
+
+    match required.kind {
+        RequiredColumnKind::Utf8NonEmpty => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .with_context(|| {
+                    format!(
+                        "{dataset_kind:?} required field '{}' has non-Utf8 type {:?}",
+                        required.name,
+                        array.data_type()
+                    )
+                })?;
+            let value = values.value(row_idx);
+            if value.is_empty() {
+                anyhow::bail!(
+                    "{dataset_kind:?} required field '{}' is empty at row {}",
+                    required.name,
+                    global_row
+                );
+            }
+            digest.update_str(value);
+        }
+        RequiredColumnKind::U16Eq(expected) => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .with_context(|| {
+                    format!(
+                        "{dataset_kind:?} required field '{}' has non-UInt16 type {:?}",
+                        required.name,
+                        array.data_type()
+                    )
+                })?;
+            let value = values.value(row_idx);
+            if value != expected {
+                anyhow::bail!(
+                    "schema_version mismatch em {dataset_kind:?} row {}: arquivo={}, compactor espera={}. \
+                     Migração em voo — atualize o compactor antes de processar este arquivo.",
+                    global_row,
+                    value,
+                    expected
+                );
+            }
+            digest.update_u16(value);
+        }
+        RequiredColumnKind::U32 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .with_context(|| {
+                    format!(
+                        "{dataset_kind:?} required field '{}' has non-UInt32 type {:?}",
+                        required.name,
+                        array.data_type()
+                    )
+                })?;
+            digest.update_u32(values.value(row_idx));
+        }
+        RequiredColumnKind::U64 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .with_context(|| {
+                    format!(
+                        "{dataset_kind:?} required field '{}' has non-UInt64 type {:?}",
+                        required.name,
+                        array.data_type()
+                    )
+                })?;
+            digest.update_u64(values.value(row_idx));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn compact_existing_jsonl_in_tree(
@@ -637,5 +960,64 @@ mod tests {
             result.is_err(),
             "schema v5 deveria ser rejeitado pelo compactor vigente"
         );
+        assert!(
+            jsonl.exists(),
+            "JSONL fonte deve ser preservado quando a validacao falha"
+        );
+        assert!(!jsonl.with_extension("parquet").exists());
+    }
+
+    #[test]
+    fn compactor_rejects_missing_required_identity_and_keeps_jsonl() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("missing_identity.jsonl");
+        write_lines(
+            &jsonl,
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":10,"sample_id":"id1","route_id":"route-a"}"#,
+                r#"{"ts_ns":2,"cycle_seq":2,"schema_version":10,"route_id":"route-a"}"#,
+            ],
+        );
+
+        let result = compact_jsonl_file(
+            &jsonl,
+            DatasetKind::AcceptedSamples,
+            &ParquetCompactionConfig::default(),
+        );
+
+        assert!(
+            result.is_err(),
+            "sample_id ausente em linha posterior deve ser rejeitado"
+        );
+        assert!(jsonl.exists());
+        assert!(!jsonl.with_extension("parquet").exists());
+        assert!(!jsonl.with_extension("parquet.tmp").exists());
+    }
+
+    #[test]
+    fn compactor_rejects_later_schema_version_mismatch_and_keeps_jsonl() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("later_schema_mismatch.jsonl");
+        write_lines(
+            &jsonl,
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":10,"sample_id":"id1","route_id":"route-a"}"#,
+                r#"{"ts_ns":2,"cycle_seq":2,"schema_version":11,"sample_id":"id2","route_id":"route-a"}"#,
+            ],
+        );
+
+        let result = compact_jsonl_file(
+            &jsonl,
+            DatasetKind::AcceptedSamples,
+            &ParquetCompactionConfig::default(),
+        );
+
+        assert!(
+            result.is_err(),
+            "schema_version divergente em linha posterior deve ser rejeitado"
+        );
+        assert!(jsonl.exists());
+        assert!(!jsonl.with_extension("parquet").exists());
+        assert!(!jsonl.with_extension("parquet.tmp").exists());
     }
 }

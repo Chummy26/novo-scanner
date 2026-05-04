@@ -92,6 +92,8 @@ enum LabeledWriterCommand {
 pub struct LabeledWriterStats {
     pub total_written: u64,
     pub total_dropped: u64,
+    pub compaction_succeeded: u64,
+    pub compaction_failed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,7 +111,9 @@ pub struct LabeledJsonlWriter {
     lines_since_flush: usize,
     total_written: u64,
     total_dropped: u64,
-    compaction_tasks: Vec<tokio::task::JoinHandle<()>>,
+    compaction_tasks: Vec<tokio::task::JoinHandle<anyhow::Result<Option<PathBuf>>>>,
+    compaction_succeeded: u64,
+    compaction_failed: u64,
 }
 
 impl LabeledJsonlWriter {
@@ -126,6 +130,8 @@ impl LabeledJsonlWriter {
                 total_written: 0,
                 total_dropped: 0,
                 compaction_tasks: Vec::new(),
+                compaction_succeeded: 0,
+                compaction_failed: 0,
             },
             LabeledWriterHandle { tx },
         )
@@ -236,7 +242,8 @@ impl LabeledJsonlWriter {
 
         let parquet_cfg = self.cfg.parquet.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            match compact_jsonl_file(&path, DatasetKind::LabeledTrades, &parquet_cfg) {
+            let result = compact_jsonl_file(&path, DatasetKind::LabeledTrades, &parquet_cfg);
+            match &result {
                 Ok(Some(parquet_path)) => {
                     info!(
                         source = %path.display(),
@@ -253,14 +260,25 @@ impl LabeledJsonlWriter {
                     );
                 }
             }
+            result
         });
         self.compaction_tasks.push(handle);
     }
 
     async fn await_pending_compactions(&mut self) {
         while let Some(handle) = self.compaction_tasks.pop() {
-            if let Err(e) = handle.await {
-                warn!(error = %e, "ML labeled writer compaction task join falhou");
+            match handle.await {
+                Ok(Ok(Some(_))) => {
+                    self.compaction_succeeded = self.compaction_succeeded.saturating_add(1);
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(_)) => {
+                    self.compaction_failed = self.compaction_failed.saturating_add(1);
+                }
+                Err(e) => {
+                    self.compaction_failed = self.compaction_failed.saturating_add(1);
+                    warn!(error = %e, "ML labeled writer compaction task join falhou");
+                }
             }
         }
     }
@@ -269,6 +287,8 @@ impl LabeledJsonlWriter {
         LabeledWriterStats {
             total_written: self.total_written,
             total_dropped: self.total_dropped,
+            compaction_succeeded: self.compaction_succeeded,
+            compaction_failed: self.compaction_failed,
         }
     }
 

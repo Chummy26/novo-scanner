@@ -649,25 +649,52 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             "shutdown: labels pendentes fechados"
         );
         match labeled_shutdown_handle.seal_current_file().await {
+            Ok(stats) if stats.compaction_failed > 0 => warn!(
+                total_written = stats.total_written,
+                total_dropped = stats.total_dropped,
+                compaction_succeeded = stats.compaction_succeeded,
+                compaction_failed = stats.compaction_failed,
+                "shutdown: labeled writer selado com falha de compactacao"
+            ),
             Ok(stats) => info!(
                 total_written = stats.total_written,
                 total_dropped = stats.total_dropped,
+                compaction_succeeded = stats.compaction_succeeded,
+                compaction_failed = stats.compaction_failed,
                 "shutdown: labeled writer selado"
             ),
             Err(e) => warn!(error = ?e, "shutdown: falha selando labeled writer"),
         }
         match raw_shutdown_handle.seal_current_file().await {
+            Ok(stats) if stats.compaction_failed > 0 => warn!(
+                total_written = stats.total_written,
+                total_dropped = stats.total_dropped,
+                compaction_succeeded = stats.compaction_succeeded,
+                compaction_failed = stats.compaction_failed,
+                "shutdown: raw writer selado com falha de compactacao"
+            ),
             Ok(stats) => info!(
                 total_written = stats.total_written,
                 total_dropped = stats.total_dropped,
+                compaction_succeeded = stats.compaction_succeeded,
+                compaction_failed = stats.compaction_failed,
                 "shutdown: raw writer selado"
             ),
             Err(e) => warn!(error = ?e, "shutdown: falha selando raw writer"),
         }
         match accepted_shutdown_handle.seal_current_file().await {
+            Ok(stats) if stats.compaction_failed > 0 => warn!(
+                total_written = stats.total_written,
+                total_dropped = stats.total_dropped,
+                compaction_succeeded = stats.compaction_succeeded,
+                compaction_failed = stats.compaction_failed,
+                "shutdown: accepted writer selado com falha de compactacao"
+            ),
             Ok(stats) => info!(
                 total_written = stats.total_written,
                 total_dropped = stats.total_dropped,
+                compaction_succeeded = stats.compaction_succeeded,
+                compaction_failed = stats.compaction_failed,
                 "shutdown: accepted writer selado"
             ),
             Err(e) => warn!(error = ?e, "shutdown: falha selando accepted writer"),

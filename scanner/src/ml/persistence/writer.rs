@@ -127,6 +127,8 @@ enum WriterCommand {
 pub struct WriterStats {
     pub total_written: u64,
     pub total_dropped: u64,
+    pub compaction_succeeded: u64,
+    pub compaction_failed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,7 +155,9 @@ pub struct JsonlWriter {
     lines_since_flush: usize,
     total_written: u64,
     total_dropped: u64,
-    compaction_tasks: Vec<tokio::task::JoinHandle<()>>,
+    compaction_tasks: Vec<tokio::task::JoinHandle<anyhow::Result<Option<PathBuf>>>>,
+    compaction_succeeded: u64,
+    compaction_failed: u64,
 }
 
 impl JsonlWriter {
@@ -171,6 +175,8 @@ impl JsonlWriter {
             total_written: 0,
             total_dropped: 0,
             compaction_tasks: Vec::new(),
+            compaction_succeeded: 0,
+            compaction_failed: 0,
         };
         (writer, WriterHandle { tx })
     }
@@ -281,7 +287,8 @@ impl JsonlWriter {
 
         let parquet_cfg = self.cfg.parquet.clone();
         let handle = tokio::task::spawn_blocking(move || {
-            match compact_jsonl_file(&path, DatasetKind::AcceptedSamples, &parquet_cfg) {
+            let result = compact_jsonl_file(&path, DatasetKind::AcceptedSamples, &parquet_cfg);
+            match &result {
                 Ok(Some(parquet_path)) => {
                     info!(
                         source = %path.display(),
@@ -298,14 +305,25 @@ impl JsonlWriter {
                     );
                 }
             }
+            result
         });
         self.compaction_tasks.push(handle);
     }
 
     async fn await_pending_compactions(&mut self) {
         while let Some(handle) = self.compaction_tasks.pop() {
-            if let Err(e) = handle.await {
-                warn!(error = %e, "ML accepted writer compaction task join falhou");
+            match handle.await {
+                Ok(Ok(Some(_))) => {
+                    self.compaction_succeeded = self.compaction_succeeded.saturating_add(1);
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(_)) => {
+                    self.compaction_failed = self.compaction_failed.saturating_add(1);
+                }
+                Err(e) => {
+                    self.compaction_failed = self.compaction_failed.saturating_add(1);
+                    warn!(error = %e, "ML accepted writer compaction task join falhou");
+                }
             }
         }
     }
@@ -314,6 +332,8 @@ impl JsonlWriter {
         WriterStats {
             total_written: self.total_written,
             total_dropped: self.total_dropped,
+            compaction_succeeded: self.compaction_succeeded,
+            compaction_failed: self.compaction_failed,
         }
     }
 
@@ -680,6 +700,8 @@ mod tests {
 
         let stats = handle.seal_current_file().await.expect("seal writer");
         assert_eq!(stats.total_written, 1);
+        assert_eq!(stats.compaction_succeeded, 1);
+        assert_eq!(stats.compaction_failed, 0);
 
         let hour14 = tmp.path().join("year=2025/month=04/day=20/hour=14");
         let parquet_files: Vec<_> = std::fs::read_dir(&hour14)
@@ -706,6 +728,70 @@ mod tests {
             jsonl_files.is_empty(),
             "seal deve remover JSONL apos sucesso"
         );
+
+        drop(handle);
+        task.await.expect("task join");
+    }
+
+    #[tokio::test]
+    async fn seal_current_file_reports_compaction_failure() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let cfg = WriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 16,
+            flush_after_n: 1,
+            flush_interval: Duration::from_secs(60),
+            file_prefix: "seal-failure".into(),
+            rotation_interval: Duration::from_secs(600),
+            parquet: ParquetCompactionConfig {
+                zstd_level: 10_000,
+                ..ParquetCompactionConfig::default()
+            },
+        };
+        let (writer, handle) = JsonlWriter::create(cfg);
+        let task = tokio::spawn(writer.run());
+
+        handle
+            .try_send(AcceptedSample::new(
+                1_745_157_600u64 * 1_000_000_000,
+                0,
+                mk_route(),
+                "BTC-USDT",
+                2.0,
+                -1.0,
+                1e6,
+                1e6,
+                SampleDecision::Accept,
+                "0000000000000001",
+                "accepted_full_capture",
+                1.0,
+            ))
+            .expect("send sample");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stats = handle.seal_current_file().await.expect("seal writer");
+        assert_eq!(stats.total_written, 1);
+        assert_eq!(stats.compaction_succeeded, 0);
+        assert_eq!(stats.compaction_failed, 1);
+
+        let hour14 = tmp.path().join("year=2025/month=04/day=20/hour=14");
+        let jsonl_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("jsonl")).then_some(p)
+            })
+            .collect();
+        let parquet_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("parquet")).then_some(p)
+            })
+            .collect();
+
+        assert_eq!(jsonl_files.len(), 1, "JSONL deve ficar para reprocesso");
+        assert!(parquet_files.is_empty());
 
         drop(handle);
         task.await.expect("task join");
