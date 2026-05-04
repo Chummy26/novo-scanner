@@ -110,9 +110,9 @@ pub struct MlConfig {
     #[serde(default)]
     pub retention: MlRetentionConfig,
 
-    /// Compactação de partições fechadas para Parquet/ZSTD.
+    /// Compactação de arquivos fechados para Parquet/ZSTD.
     /// Mantém o hot path em JSONL append-only e converte apenas quando
-    /// a partição horária fecha.
+    /// um arquivo JSONL fecha.
     #[serde(default)]
     pub parquet: MlParquetConfig,
 
@@ -196,12 +196,18 @@ impl Default for MlRetentionConfig {
     }
 }
 
-/// Política de compactação das partições horárias para Parquet/ZSTD.
+/// Política de rotação/compactação dos arquivos JSONL para Parquet/ZSTD.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MlParquetConfig {
     /// Ativa compactação assíncrona de arquivos `.jsonl` fechados.
     #[serde(default = "default_parquet_enabled")]
     pub enabled: bool,
+
+    /// Fecha o arquivo JSONL quente a cada N segundos para compactar mais
+    /// cedo. O particionamento em disco continua por hora; este campo só
+    /// controla o tamanho/tempo do arquivo aberto dentro da hora.
+    #[serde(default = "default_parquet_rotation_interval_s")]
+    pub rotation_interval_s: u64,
 
     /// Remove o `.jsonl` após gerar o `.parquet` com sucesso.
     #[serde(default = "default_parquet_delete_jsonl_after_success")]
@@ -220,6 +226,7 @@ impl Default for MlParquetConfig {
     fn default() -> Self {
         Self {
             enabled: default_parquet_enabled(),
+            rotation_interval_s: default_parquet_rotation_interval_s(),
             delete_jsonl_after_success: default_parquet_delete_jsonl_after_success(),
             batch_size: default_parquet_batch_size(),
             zstd_level: default_parquet_zstd_level(),
@@ -305,6 +312,9 @@ fn default_labeled_retention_days() -> u16 {
 }
 fn default_parquet_enabled() -> bool {
     true
+}
+fn default_parquet_rotation_interval_s() -> u64 {
+    600
 }
 fn default_parquet_delete_jsonl_after_success() -> bool {
     true
@@ -535,6 +545,7 @@ mod tests {
         assert!(cfg.ml.retention.enabled);
         assert_eq!(cfg.ml.retention.raw_retention_days, 30);
         assert!(cfg.ml.parquet.enabled);
+        assert_eq!(cfg.ml.parquet.rotation_interval_s, 600);
         assert_eq!(cfg.ml.parquet.zstd_level, 3);
         assert_eq!(cfg.ml.windows.train_window_days, 90);
     }
@@ -584,6 +595,7 @@ labeled_retention_days = 400
 
 [ml.parquet]
 enabled = true
+rotation_interval_s = 300
 delete_jsonl_after_success = true
 batch_size = 8192
 zstd_level = 6
@@ -599,6 +611,7 @@ archive_reference_days = 500
         assert_eq!(cfg.ml.retention.accepted_retention_days, 21);
         assert_eq!(cfg.ml.retention.labeled_retention_days, 400);
         assert!(cfg.ml.parquet.enabled);
+        assert_eq!(cfg.ml.parquet.rotation_interval_s, 300);
         assert!(cfg.ml.parquet.delete_jsonl_after_success);
         assert_eq!(cfg.ml.parquet.batch_size, 8192);
         assert_eq!(cfg.ml.parquet.zstd_level, 6);

@@ -11,7 +11,8 @@
 //!    data_dir por acidente.
 //!
 //! Core rotation logic (hour-key helper) é importado de
-//! [`super::writer::hour_key_for_ns`] — ponto único de verdade.
+//! [`super::writer::hour_key_for_ns`] e a rotação por intervalo é o mesmo
+//! mecanismo do writer de `AcceptedSample`.
 
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -25,7 +26,7 @@ use crate::ml::persistence::parquet_compactor::{
     compact_jsonl_file, DatasetKind, ParquetCompactionConfig,
 };
 use crate::ml::persistence::raw_sample::RawSample;
-use crate::ml::persistence::writer::hour_key_for_ns;
+use crate::ml::persistence::writer::{hour_key_for_ns, rotation_key_for_ns, rotation_start_ns_for};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -38,6 +39,7 @@ pub struct RawWriterConfig {
     pub flush_after_n: usize,
     pub flush_interval: Duration,
     pub file_prefix: String,
+    pub rotation_interval: Duration,
     pub parquet: ParquetCompactionConfig,
 }
 
@@ -51,6 +53,7 @@ impl Default for RawWriterConfig {
             flush_after_n: 1024,
             flush_interval: Duration::from_secs(5),
             file_prefix: format!("raw-{}-{}", hostname, pid),
+            rotation_interval: Duration::from_secs(600),
             parquet: ParquetCompactionConfig::default(),
         }
     }
@@ -113,7 +116,7 @@ pub enum RawWriterSendError {
 pub struct RawSampleWriter {
     cfg: RawWriterConfig,
     rx: mpsc::Receiver<RawWriterCommand>,
-    current_hour_key: Option<String>,
+    current_rotation_key: Option<String>,
     writer: Option<BufWriter<std::fs::File>>,
     current_path: Option<PathBuf>,
     lines_since_flush: usize,
@@ -128,7 +131,7 @@ impl RawSampleWriter {
         let writer = Self {
             cfg,
             rx,
-            current_hour_key: None,
+            current_rotation_key: None,
             writer: None,
             current_path: None,
             lines_since_flush: 0,
@@ -180,14 +183,16 @@ impl RawSampleWriter {
     }
 
     async fn write_one(&mut self, sample: RawSample) {
-        let hour_key = hour_key_for_ns(sample.ts_ns);
-        if self.current_hour_key.as_deref() != Some(hour_key.as_str()) {
+        let rotation_key = rotation_key_for_ns(sample.ts_ns, self.cfg.rotation_interval);
+        if self.current_rotation_key.as_deref() != Some(rotation_key.as_str()) {
             self.close_current_file();
-            match self.open_writer_for_hour(&hour_key) {
+            let hour_key = hour_key_for_ns(sample.ts_ns);
+            let rotation_start_ns = rotation_start_ns_for(sample.ts_ns, self.cfg.rotation_interval);
+            match self.open_writer_for_hour(&hour_key, rotation_start_ns) {
                 Ok((w, path)) => {
                     self.writer = Some(w);
                     self.current_path = Some(path);
-                    self.current_hour_key = Some(hour_key);
+                    self.current_rotation_key = Some(rotation_key);
                 }
                 Err(e) => {
                     warn!(error = %e, "ML raw writer: falha ao abrir arquivo; sample descartada");
@@ -232,6 +237,7 @@ impl RawSampleWriter {
         let Some(path) = self.current_path.take() else {
             return;
         };
+        self.current_rotation_key = None;
         self.lines_since_flush = 0;
 
         if !self.cfg.parquet.enabled {
@@ -279,6 +285,7 @@ impl RawSampleWriter {
     fn open_writer_for_hour(
         &self,
         hour_key: &str,
+        rotation_start_ns: u64,
     ) -> std::io::Result<(BufWriter<std::fs::File>, PathBuf)> {
         let dir_path = self.cfg.data_dir.join(hour_key);
         create_dir_all(&dir_path)?;
@@ -286,7 +293,11 @@ impl RawSampleWriter {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let filename = format!("{}_{}.jsonl", self.cfg.file_prefix, start_ts);
+        let rotation_start_s = rotation_start_ns / 1_000_000_000;
+        let filename = format!(
+            "{}_{}_part-{}.jsonl",
+            self.cfg.file_prefix, start_ts, rotation_start_s
+        );
         let path = dir_path.join(filename);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         info!(path = %path.display(), "ML raw writer: abrindo novo arquivo");
@@ -323,6 +334,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "rawtest".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -390,6 +402,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "rawtest".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig::default(),
         };
         let (writer, handle) = RawSampleWriter::create(cfg);
@@ -448,6 +461,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_secs(60),
             file_prefix: "rawtest".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()

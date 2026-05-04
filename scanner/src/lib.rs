@@ -97,6 +97,17 @@ fn parquet_compaction_from_ml_config(
     })
 }
 
+fn dataset_rotation_interval_from_ml_config(ml: &config::MlConfig) -> anyhow::Result<Duration> {
+    let seconds = ml.parquet.rotation_interval_s;
+    if seconds == 0 {
+        anyhow::bail!("ml.parquet.rotation_interval_s must be >= 1");
+    }
+    if seconds > 3600 {
+        anyhow::bail!("ml.parquet.rotation_interval_s must be <= 3600");
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 async fn compact_existing_partitions(
     root: PathBuf,
     dataset_kind: DatasetKind,
@@ -133,6 +144,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .map_err(|e| Error::Config(format!("ml.windows: {}", e)))?;
     let parquet_compaction = parquet_compaction_from_ml_config(&cfg.ml)
         .map_err(|e| Error::Config(format!("ml.parquet: {}", e)))?;
+    let dataset_rotation_interval = dataset_rotation_interval_from_ml_config(&cfg.ml)
+        .map_err(|e| Error::Config(format!("ml.parquet: {}", e)))?;
     info!(
         train_window_days = model_window_policy.train_window_days,
         calibration_window_days = model_window_policy.calibration_window_days,
@@ -140,6 +153,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         parquet_enabled = parquet_compaction.enabled,
         parquet_batch_size = parquet_compaction.batch_size,
         parquet_zstd_level = parquet_compaction.zstd_level,
+        parquet_rotation_interval_s = dataset_rotation_interval.as_secs(),
         "ML window policy carregada"
     );
 
@@ -235,6 +249,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // coleta podia "sumir" silenciosamente no disco errado.
     let mut raw_writer_cfg = RawWriterConfig::default();
     raw_writer_cfg.parquet = parquet_compaction.clone();
+    raw_writer_cfg.rotation_interval = dataset_rotation_interval;
     let raw_writer_abs = std::env::current_dir()
         .map(|cwd| cwd.join(&raw_writer_cfg.data_dir))
         .unwrap_or_else(|_| raw_writer_cfg.data_dir.clone());
@@ -259,6 +274,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // --- Wave V: Labeled trade writer + resolver + ranker ---
     let mut labeled_writer_cfg = LabeledWriterConfig::default();
     labeled_writer_cfg.parquet = parquet_compaction.clone();
+    labeled_writer_cfg.rotation_interval = dataset_rotation_interval;
     let labeled_writer_abs = std::env::current_dir()
         .map(|cwd| cwd.join(&labeled_writer_cfg.data_dir))
         .unwrap_or_else(|_| labeled_writer_cfg.data_dir.clone());
@@ -447,13 +463,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // --- ML dataset writer (C1 fix) ---
     // Consumer task que grava cada `AcceptedSample` em JSONL rotativa
-    // horária em `{data_dir}/year=YYYY/month=MM/day=DD/hour=HH/`. Alimenta
+    // dentro de partição horária em `{data_dir}/year=YYYY/month=MM/day=DD/hour=HH/`. Alimenta
     // o dataset de treino do modelo A2 (Marco 2). Canal bounded 100k
     // amortece picos de ~100 min a 17 req/s.
     //
     // Fix pós-auditoria: log ABSOLUTO do path.
     let mut writer_cfg = WriterConfig::default();
     writer_cfg.parquet = parquet_compaction;
+    writer_cfg.rotation_interval = dataset_rotation_interval;
     let writer_abs = std::env::current_dir()
         .map(|cwd| cwd.join(&writer_cfg.data_dir))
         .unwrap_or_else(|_| writer_cfg.data_dir.clone());
@@ -1091,15 +1108,32 @@ mod tests {
     fn parquet_compaction_uses_configured_policy() {
         let mut ml = crate::config::MlConfig::default();
         ml.parquet.enabled = true;
+        ml.parquet.rotation_interval_s = 300;
         ml.parquet.delete_jsonl_after_success = true;
         ml.parquet.batch_size = 8192;
         ml.parquet.zstd_level = 6;
 
         let parquet = super::parquet_compaction_from_ml_config(&ml).expect("parquet cfg");
+        let rotation =
+            super::dataset_rotation_interval_from_ml_config(&ml).expect("rotation interval");
 
         assert!(parquet.enabled);
         assert!(parquet.delete_jsonl_after_success);
         assert_eq!(parquet.batch_size, 8192);
         assert_eq!(parquet.zstd_level, 6);
+        assert_eq!(rotation.as_secs(), 300);
+    }
+
+    #[test]
+    fn parquet_rotation_interval_rejects_unbounded_open_jsonl_window() {
+        let mut ml = crate::config::MlConfig::default();
+        ml.parquet.rotation_interval_s = 3601;
+
+        let result = super::dataset_rotation_interval_from_ml_config(&ml);
+
+        assert!(
+            result.is_err(),
+            "rotation_interval_s > 1h manteria JSONL quente grande demais"
+        );
     }
 }

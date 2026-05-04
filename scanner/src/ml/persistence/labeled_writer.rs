@@ -1,7 +1,7 @@
 //! Writer JSONL para `LabeledTrade` — análogo a `JsonlWriter`.
 //!
-//! Mesmo padrão de `persistence/writer.rs`: canal mpsc, rotação horária
-//! Hive-style, flush periódico.
+//! Mesmo padrão de `persistence/writer.rs`: canal mpsc, partição horária
+//! Hive-style, rotação por intervalo e flush periódico.
 //!
 //! Default `data_dir = data/ml/labeled_trades`. Nome de arquivo
 //! `labeled-{hostname}-{pid}_{start_ts}.jsonl`.
@@ -18,7 +18,7 @@ use crate::ml::persistence::labeled_trade::LabeledTrade;
 use crate::ml::persistence::parquet_compactor::{
     compact_jsonl_file, DatasetKind, ParquetCompactionConfig,
 };
-use crate::ml::persistence::writer::hour_key_for_ns;
+use crate::ml::persistence::writer::{hour_key_for_ns, rotation_key_for_ns, rotation_start_ns_for};
 
 #[derive(Debug, Clone)]
 pub struct LabeledWriterConfig {
@@ -27,6 +27,7 @@ pub struct LabeledWriterConfig {
     pub flush_after_n: usize,
     pub flush_interval: Duration,
     pub file_prefix: String,
+    pub rotation_interval: Duration,
     pub parquet: ParquetCompactionConfig,
 }
 
@@ -40,6 +41,7 @@ impl Default for LabeledWriterConfig {
             flush_after_n: 512,
             flush_interval: Duration::from_secs(5),
             file_prefix: format!("labeled-{}-{}", hostname, pid),
+            rotation_interval: Duration::from_secs(600),
             parquet: ParquetCompactionConfig::default(),
         }
     }
@@ -101,7 +103,7 @@ pub enum LabeledWriterSendError {
 pub struct LabeledJsonlWriter {
     cfg: LabeledWriterConfig,
     rx: mpsc::Receiver<LabeledWriterCommand>,
-    current_hour_key: Option<String>,
+    current_rotation_key: Option<String>,
     writer: Option<BufWriter<std::fs::File>>,
     current_path: Option<PathBuf>,
     lines_since_flush: usize,
@@ -117,7 +119,7 @@ impl LabeledJsonlWriter {
             Self {
                 cfg,
                 rx,
-                current_hour_key: None,
+                current_rotation_key: None,
                 writer: None,
                 current_path: None,
                 lines_since_flush: 0,
@@ -174,14 +176,17 @@ impl LabeledJsonlWriter {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
             .unwrap_or(label.closed_ts_ns);
-        let hour_key = hour_key_for_ns(label.closed_ts_ns);
-        if self.current_hour_key.as_deref() != Some(hour_key.as_str()) {
+        let rotation_key = rotation_key_for_ns(label.closed_ts_ns, self.cfg.rotation_interval);
+        if self.current_rotation_key.as_deref() != Some(rotation_key.as_str()) {
             self.close_current_file();
-            match self.open_writer_for_hour(&hour_key) {
+            let hour_key = hour_key_for_ns(label.closed_ts_ns);
+            let rotation_start_ns =
+                rotation_start_ns_for(label.closed_ts_ns, self.cfg.rotation_interval);
+            match self.open_writer_for_hour(&hour_key, rotation_start_ns) {
                 Ok((w, path)) => {
                     self.writer = Some(w);
                     self.current_path = Some(path);
-                    self.current_hour_key = Some(hour_key);
+                    self.current_rotation_key = Some(rotation_key);
                 }
                 Err(e) => {
                     warn!(error = %e, "labeled writer: falha ao abrir arquivo; sample descartada");
@@ -222,6 +227,7 @@ impl LabeledJsonlWriter {
         let Some(path) = self.current_path.take() else {
             return;
         };
+        self.current_rotation_key = None;
         self.lines_since_flush = 0;
 
         if !self.cfg.parquet.enabled {
@@ -269,6 +275,7 @@ impl LabeledJsonlWriter {
     fn open_writer_for_hour(
         &self,
         hour_key: &str,
+        rotation_start_ns: u64,
     ) -> std::io::Result<(BufWriter<std::fs::File>, PathBuf)> {
         let dir_path = self.cfg.data_dir.join(hour_key);
         create_dir_all(&dir_path)?;
@@ -276,7 +283,11 @@ impl LabeledJsonlWriter {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let filename = format!("{}_{}.jsonl", self.cfg.file_prefix, start_ts);
+        let rotation_start_s = rotation_start_ns / 1_000_000_000;
+        let filename = format!(
+            "{}_{}_part-{}.jsonl",
+            self.cfg.file_prefix, start_ts, rotation_start_s
+        );
         let path = dir_path.join(filename);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         info!(path = %path.display(), "labeled writer: abrindo novo arquivo");
@@ -431,6 +442,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "labtest".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -464,6 +476,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_secs(60),
             file_prefix: "labtest".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -487,6 +500,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "labtest".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -524,6 +538,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "labtest".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig::default(),
         };
         let (writer, handle) = LabeledJsonlWriter::create(cfg);

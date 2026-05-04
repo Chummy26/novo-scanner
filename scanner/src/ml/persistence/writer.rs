@@ -1,4 +1,4 @@
-//! Writer JSONL com rotação horária.
+//! Writer JSONL com rotação configurável dentro de partições horárias.
 //!
 //! Implementa **C1 fix (MVP)** — persistência do dataset de treino.
 //!
@@ -11,7 +11,7 @@
 //!                                                       |
 //!                           [JsonlWriter task]<---------+
 //!                                  |
-//!                                  v  (rotação horária)
+//!                                  v  (rotação por tempo; partição por hora)
 //!   {data_dir}/year=YYYY/month=MM/day=DD/hour=HH/{hostname}_{start_ts}.jsonl
 //! ```
 //!
@@ -20,7 +20,8 @@
 //! - **Canal bounded 100k**: cobre picos de ~100 min a 17 req/s sem
 //!   backpressure. Em overflow, `try_send` descarta — acepitável para
 //!   shadow mode (contagem em `ServerMetrics` marca perdas).
-//! - **Rotação por hora UTC**: arquivos < 100 MB gz típico.
+//! - **Rotação por tempo UTC dentro da hora**: reduz o tempo em JSONL aberto
+//!   antes da compactação Parquet/ZSTD sem alterar o particionamento Hive.
 //! - **Append-only**: writer flush via `BufWriter::flush()` a cada
 //!   5s ou a cada `flush_after_n` linhas (default 1024) — garante
 //!   durabilidade sem sobrecarregar FS.
@@ -60,6 +61,10 @@ pub struct WriterConfig {
     /// Default: hostname + pid. Permite múltiplos scanners no mesmo
     /// disco sem conflito.
     pub file_prefix: String,
+    /// Intervalo máximo de arquivo JSONL aberto antes de fechar e compactar.
+    /// O diretório continua particionado por hora; este intervalo só cria
+    /// mais arquivos fechados dentro da mesma hora.
+    pub rotation_interval: Duration,
     /// Compactação assíncrona do JSONL fechado para Parquet/ZSTD.
     pub parquet: ParquetCompactionConfig,
 }
@@ -74,6 +79,7 @@ impl Default for WriterConfig {
             flush_after_n: 1024,
             flush_interval: Duration::from_secs(5),
             file_prefix: format!("{}-{}", hostname, pid),
+            rotation_interval: Duration::from_secs(600),
             parquet: ParquetCompactionConfig::default(),
         }
     }
@@ -137,11 +143,11 @@ pub enum WriterSendError {
 // ---------------------------------------------------------------------------
 
 /// Task background que consome `AcceptedSample` do canal e escreve em
-/// arquivos JSONL com rotação horária.
+/// arquivos JSONL com rotação por intervalo dentro da partição horária.
 pub struct JsonlWriter {
     cfg: WriterConfig,
     rx: mpsc::Receiver<WriterCommand>,
-    current_hour_key: Option<String>,
+    current_rotation_key: Option<String>,
     writer: Option<BufWriter<std::fs::File>>,
     current_path: Option<PathBuf>,
     lines_since_flush: usize,
@@ -158,7 +164,7 @@ impl JsonlWriter {
         let writer = Self {
             cfg,
             rx,
-            current_hour_key: None,
+            current_rotation_key: None,
             writer: None,
             current_path: None,
             lines_since_flush: 0,
@@ -212,14 +218,16 @@ impl JsonlWriter {
     }
 
     async fn write_one(&mut self, sample: AcceptedSample) {
-        let hour_key = hour_key_for_ns(sample.ts_ns);
-        if self.current_hour_key.as_deref() != Some(hour_key.as_str()) {
+        let rotation_key = rotation_key_for_ns(sample.ts_ns, self.cfg.rotation_interval);
+        if self.current_rotation_key.as_deref() != Some(rotation_key.as_str()) {
             self.close_current_file();
-            match self.open_writer_for_hour(&hour_key) {
+            let hour_key = hour_key_for_ns(sample.ts_ns);
+            let rotation_start_ns = rotation_start_ns_for(sample.ts_ns, self.cfg.rotation_interval);
+            match self.open_writer_for_hour(&hour_key, rotation_start_ns) {
                 Ok((w, path)) => {
                     self.writer = Some(w);
                     self.current_path = Some(path);
-                    self.current_hour_key = Some(hour_key);
+                    self.current_rotation_key = Some(rotation_key);
                 }
                 Err(e) => {
                     warn!(error = %e, "ML writer: falha ao abrir arquivo; sample descartada");
@@ -264,6 +272,7 @@ impl JsonlWriter {
         let Some(path) = self.current_path.take() else {
             return;
         };
+        self.current_rotation_key = None;
         self.lines_since_flush = 0;
 
         if !self.cfg.parquet.enabled {
@@ -311,6 +320,7 @@ impl JsonlWriter {
     fn open_writer_for_hour(
         &self,
         hour_key: &str,
+        rotation_start_ns: u64,
     ) -> std::io::Result<(BufWriter<std::fs::File>, PathBuf)> {
         let dir_path = self.cfg.data_dir.join(hour_key);
         create_dir_all(&dir_path)?;
@@ -318,7 +328,11 @@ impl JsonlWriter {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let filename = format!("{}_{}.jsonl", self.cfg.file_prefix, start_ts);
+        let rotation_start_s = rotation_start_ns / 1_000_000_000;
+        let filename = format!(
+            "{}_{}_part-{}.jsonl",
+            self.cfg.file_prefix, start_ts, rotation_start_s
+        );
         let path = dir_path.join(filename);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         info!(path = %path.display(), "ML writer: abrindo novo arquivo");
@@ -343,6 +357,16 @@ pub fn hour_key_for_ns(ns: u64) -> String {
         "year={:04}/month={:02}/day={:02}/hour={:02}",
         year, month, day, hour
     )
+}
+
+pub fn rotation_start_ns_for(ns: u64, interval: Duration) -> u64 {
+    let interval_ns = interval.as_nanos().clamp(1, u64::MAX as u128) as u64;
+    ns / interval_ns * interval_ns
+}
+
+pub fn rotation_key_for_ns(ns: u64, interval: Duration) -> String {
+    let rotation_start_s = rotation_start_ns_for(ns, interval) / 1_000_000_000;
+    format!("{}|part={}", hour_key_for_ns(ns), rotation_start_s)
 }
 
 // ---------------------------------------------------------------------------
@@ -383,6 +407,26 @@ mod tests {
     }
 
     #[test]
+    fn rotation_key_changes_inside_hour_without_changing_hour_partition() {
+        // 2025-04-20 14:00:00, 14:09:59, 14:10:00 UTC.
+        let base = 1_745_157_600u64 * 1_000_000_000;
+        let interval = Duration::from_secs(600);
+        assert_eq!(hour_key_for_ns(base), "year=2025/month=04/day=20/hour=14");
+        assert_eq!(
+            hour_key_for_ns(base + 600_000_000_000),
+            "year=2025/month=04/day=20/hour=14"
+        );
+        assert_eq!(
+            rotation_key_for_ns(base, interval),
+            rotation_key_for_ns(base + 599_000_000_000, interval)
+        );
+        assert_ne!(
+            rotation_key_for_ns(base, interval),
+            rotation_key_for_ns(base + 600_000_000_000, interval)
+        );
+    }
+
+    #[test]
     fn leap_year_handled() {
         // 2024-02-29 é válido (leap year).
         // 2024-02-29 00:00:00 UTC = 1_709_164_800 secs.
@@ -400,6 +444,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "test".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -490,6 +535,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(100),
             file_prefix: "test".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig::default(),
         };
         let (writer, handle) = JsonlWriter::create(cfg);
@@ -540,6 +586,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn writer_rotates_and_compacts_inside_same_hour() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let cfg = WriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 16,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(100),
+            file_prefix: "test".into(),
+            rotation_interval: Duration::from_secs(600),
+            parquet: ParquetCompactionConfig::default(),
+        };
+        let (writer, handle) = JsonlWriter::create(cfg);
+        let task = tokio::spawn(writer.run());
+
+        let route = mk_route();
+        let base = 1_745_157_600u64 * 1_000_000_000; // 2025-04-20 14:00 UTC.
+        for (cycle_seq, ts_ns) in [(0, base), (1, base + 600_000_000_000)] {
+            handle
+                .try_send(AcceptedSample::new(
+                    ts_ns,
+                    cycle_seq,
+                    route,
+                    "BTC-USDT",
+                    2.0,
+                    -1.0,
+                    1e6,
+                    1e6,
+                    SampleDecision::Accept,
+                    "0000000000000001",
+                    "accepted_full_capture",
+                    1.0,
+                ))
+                .expect("send sample");
+        }
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(handle);
+        task.await.expect("task join");
+
+        let hour14 = tmp.path().join("year=2025/month=04/day=20/hour=14");
+        let parquet_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("parquet")).then_some(p)
+            })
+            .collect();
+        let jsonl_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("jsonl")).then_some(p)
+            })
+            .collect();
+
+        assert_eq!(parquet_files.len(), 2, "duas rotações de 10 min");
+        assert!(jsonl_files.is_empty(), "JSONL fechado deve ser removido");
+    }
+
+    #[tokio::test]
+    async fn seal_current_file_compacts_open_jsonl_before_handle_drop() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let cfg = WriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 16,
+            flush_after_n: 1,
+            flush_interval: Duration::from_secs(60),
+            file_prefix: "seal".into(),
+            rotation_interval: Duration::from_secs(600),
+            parquet: ParquetCompactionConfig::default(),
+        };
+        let (writer, handle) = JsonlWriter::create(cfg);
+        let task = tokio::spawn(writer.run());
+
+        handle
+            .try_send(AcceptedSample::new(
+                1_745_157_600u64 * 1_000_000_000,
+                0,
+                mk_route(),
+                "BTC-USDT",
+                2.0,
+                -1.0,
+                1e6,
+                1e6,
+                SampleDecision::Accept,
+                "0000000000000001",
+                "accepted_full_capture",
+                1.0,
+            ))
+            .expect("send sample");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stats = handle.seal_current_file().await.expect("seal writer");
+        assert_eq!(stats.total_written, 1);
+
+        let hour14 = tmp.path().join("year=2025/month=04/day=20/hour=14");
+        let parquet_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("parquet")).then_some(p)
+            })
+            .collect();
+        let jsonl_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("jsonl")).then_some(p)
+            })
+            .collect();
+
+        assert_eq!(
+            parquet_files.len(),
+            1,
+            "seal deve compactar o arquivo atual"
+        );
+        assert!(
+            jsonl_files.is_empty(),
+            "seal deve remover JSONL apos sucesso"
+        );
+
+        drop(handle);
+        task.await.expect("task join");
+    }
+
+    #[tokio::test]
     async fn backpressure_drops_without_blocking() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         // Canal 1 de capacidade.
@@ -549,6 +721,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_secs(60),
             file_prefix: "test".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()

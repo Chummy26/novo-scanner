@@ -5,8 +5,8 @@
 //! - [`sample`] — `AcceptedSample` struct (C4 fix) + serialização para
 //!   JSONL. Dataset **pós-trigger**, candidato de entrada; label
 //!   supervisionado vive em [`labeled_trade`].
-//! - [`writer`] — `JsonlWriter` com rotação horária (C1 fix MVP) — consome
-//!   `AcceptedSample`.
+//! - [`writer`] — `JsonlWriter` com rotação por intervalo dentro de
+//!   partições horárias — consome `AcceptedSample`.
 //! - [`raw_sample`] — `RawSample` + `RouteDecimator` (ADR-025). Dataset
 //!   **pré-trigger**, decimação residual por observação, para medição
 //!   menos enviesada de gates empíricos (E1/E2/E4/E6/E8/E10/E11).
@@ -16,7 +16,7 @@
 //! # Escolha de formato: JSONL no hot path, Parquet/ZSTD após fechamento
 //!
 //! O scanner continua escrevendo **JSONL append-only** no hot path e
-//! compacta a partição horária fechada para **Parquet/ZSTD**. Racional:
+//! compacta cada arquivo fechado para **Parquet/ZSTD**. Racional:
 //!
 //! 1. **Persistência simples e robusta** durante o ciclo atual — só
 //!    append/flush no arquivo aberto.

@@ -984,6 +984,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "lrtest".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -1493,6 +1494,7 @@ mod tests {
             flush_after_n: 512,
             flush_interval: Duration::from_secs(60),
             file_prefix: "lr-shutdown-drain".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()

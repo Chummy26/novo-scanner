@@ -2400,6 +2400,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "test".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -2479,6 +2480,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "pit".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -2536,6 +2538,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "neg-label".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -2600,6 +2603,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "bg-label".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -2664,6 +2668,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "bg-accept-label".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()
@@ -2732,6 +2737,7 @@ mod tests {
             flush_after_n: 1,
             flush_interval: Duration::from_millis(50),
             file_prefix: "pit-label".into(),
+            rotation_interval: Duration::from_secs(3600),
             parquet: ParquetCompactionConfig {
                 enabled: false,
                 ..ParquetCompactionConfig::default()

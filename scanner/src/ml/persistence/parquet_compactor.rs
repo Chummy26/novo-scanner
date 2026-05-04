@@ -9,6 +9,7 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 
 use crate::ml::persistence::labeled_trade::LABELED_TRADE_SCHEMA_VERSION;
 use crate::ml::persistence::raw_sample::RAW_SAMPLE_SCHEMA_VERSION;
@@ -145,6 +146,19 @@ pub fn compact_jsonl_file(
         return Ok(None);
     }
 
+    let parquet_rows = parquet_row_count(&temp_parquet_path)
+        .with_context(|| format!("validate parquet row count {}", temp_parquet_path.display()))?;
+    if parquet_rows != rows_written as u64 {
+        let _ = fs::remove_file(&temp_parquet_path);
+        anyhow::bail!(
+            "parquet row-count mismatch em {}: writer_rows={}, parquet_rows={}. \
+             JSONL fonte preservado; nao removendo apos compactacao inconsistente.",
+            jsonl_path.display(),
+            rows_written,
+            parquet_rows
+        );
+    }
+
     fs::rename(&temp_parquet_path, &parquet_path).with_context(|| {
         format!(
             "rename parquet {} -> {}",
@@ -158,6 +172,14 @@ pub fn compact_jsonl_file(
     }
 
     Ok(Some(parquet_path))
+}
+
+fn parquet_row_count(path: &Path) -> Result<u64> {
+    let file =
+        File::open(path).with_context(|| format!("open parquet metadata {}", path.display()))?;
+    let reader = SerializedFileReader::new(file)
+        .with_context(|| format!("read parquet metadata {}", path.display()))?;
+    Ok(reader.metadata().file_metadata().num_rows().max(0) as u64)
 }
 
 pub fn compact_existing_jsonl_in_tree(

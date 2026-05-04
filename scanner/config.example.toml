@@ -86,9 +86,11 @@ labeled_retention_days = 365
 dry_run = false
 
 [ml.parquet]
-# Closed hourly JSONL partitions are compacted to Parquet/ZSTD.
-# Hot path stays append-only JSONL; compression happens only after close.
+# JSONL files are closed every 10 min inside hourly Hive partitions, then
+# compacted to Parquet/ZSTD. Hot path stays append-only JSONL; compression
+# happens only after close.
 enabled = true
+rotation_interval_s = 600
 delete_jsonl_after_success = true
 batch_size = 4096
 zstd_level = 3
