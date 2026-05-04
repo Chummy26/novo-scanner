@@ -30,8 +30,10 @@ env/
 logs/
 
 # Local runtime artifacts
+.tmp/collect-*.toml
 .tmp/*.json
 .tmp/*.jsonl
+.tmp/*.parquet
 .tmp/*.pid
 .tmp/*.txt
 
@@ -39,6 +41,9 @@ logs/
 **/data/ml/
 !**/data/ml/README.md
 !**/data/ml/.gitkeep
+**/data/ml_backups/
+!**/data/ml_backups/README.md
+!**/data/ml_backups/.gitkeep
 
 # Configs locais / segredos
 config.toml
@@ -59,4 +64,3 @@ secrets/
 .DS_Store
 Thumbs.db
 desktop.ini
-
