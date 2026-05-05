@@ -177,13 +177,13 @@ impl RecommendationBroadcaster {
             symbol_name,
             rec,
         );
-        match rec {
-            Recommendation::Trade(_) => {
+        match &frame.dto {
+            RecommendationDto::Trade { .. } => {
                 self.metrics
                     .trade_published_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            Recommendation::Abstain { .. } => {
+            RecommendationDto::Abstain { .. } => {
                 self.metrics
                     .abstain_published_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -303,6 +303,25 @@ mod tests {
         }
     }
 
+    fn mk_degraded_trade() -> Recommendation {
+        let Recommendation::Trade(mut setup) = mk_trade() else {
+            unreachable!();
+        };
+        setup.source_kind = crate::ml::contract::SourceKind::Baseline;
+        setup.calibration_status = CalibStatus::Degraded;
+        setup.p_hit = None;
+        setup.p_hit_ci = None;
+        setup.exit_q25 = None;
+        setup.exit_q50 = None;
+        setup.exit_q75 = None;
+        setup.t_hit_p25_s = None;
+        setup.t_hit_median_s = None;
+        setup.t_hit_p75_s = None;
+        setup.p_censor = None;
+        setup.ci_method = "wilson_marginal";
+        Recommendation::Trade(setup)
+    }
+
     #[tokio::test]
     async fn publish_without_subscribers_does_not_panic() {
         let b = RecommendationBroadcaster::new();
@@ -337,6 +356,21 @@ mod tests {
         let _ = rx.recv().await;
 
         assert_eq!(b.metrics().trade_published_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            b.metrics().abstain_published_total.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn dto_downgraded_trade_counts_as_abstain_publication() {
+        let b = RecommendationBroadcaster::new();
+        let mut rx = b.subscribe();
+        b.publish(1, 1, mk_route(), "BTC-USDT", &mk_degraded_trade());
+        let frame = rx.recv().await.expect("frame recv");
+
+        assert!(matches!(frame.dto, RecommendationDto::Abstain { .. }));
+        assert_eq!(b.metrics().trade_published_total.load(Ordering::Relaxed), 0);
         assert_eq!(
             b.metrics().abstain_published_total.load(Ordering::Relaxed),
             1

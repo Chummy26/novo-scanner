@@ -1597,7 +1597,7 @@ impl MlServer {
         };
 
         // 3. Gera recomendação apenas a partir dos spreads e histórico PIT.
-        let rec = self
+        let prediction_rec = self
             .baseline
             .recommend(route, entry_spread, exit_spread, now_ns);
         let n_observations = self
@@ -1606,7 +1606,7 @@ impl MlServer {
             .n_observations(route)
             .min(u32::MAX as u64) as u32;
         let rec = enforce_recommendation_invariants(
-            rec,
+            prediction_rec.clone(),
             n_observations,
             Some(&self.metrics.rec_invariant_blocked),
         );
@@ -1727,7 +1727,10 @@ impl MlServer {
             if !clean {
                 return (rec, sample_dec, accepted);
             }
-            let rec_meta = recommendation_persistence(&rec);
+            // Persistencia usa o snapshot pre-gate para shadow-mode: A3/modelo
+            // podem produzir um proxy auditavel mesmo quando o contrato publico
+            // e rebaixado para LowConfidence.
+            let rec_meta = recommendation_persistence(&prediction_rec);
             let features_t0 = FeaturesT0 {
                 half_spread_buy_now,
                 half_spread_sell_now,
@@ -2864,6 +2867,19 @@ mod tests {
         let line = content.lines().next().expect("at least 1 label");
         let v: serde_json::Value = serde_json::from_str(line).unwrap();
         assert_eq!(v["sample_decision"], "accept");
+        assert_eq!(v["policy_metadata"]["recommendation_kind"], "trade");
+        assert_eq!(v["policy_metadata"]["baseline_recommended"], true);
+        assert_eq!(v["policy_metadata"]["prediction_source_kind"], "baseline");
+        assert_eq!(
+            v["policy_metadata"]["prediction_calibration_status"],
+            "degraded"
+        );
+        assert!(
+            v["policy_metadata"]["baseline_historical_base_rate_24h"]
+                .as_f64()
+                .is_some(),
+            "label deve preservar snapshot A3 para shadow-mode mesmo quando Trade publico vira LowConfidence"
+        );
         assert!(
             v["label_floor_hits"].as_array().unwrap().len() > 1,
             "label deve carregar multiplos floors para curva P(exit>=floor)"

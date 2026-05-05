@@ -592,12 +592,12 @@ impl LabelResolver {
                             // sobrescrevia realizacoes ja observadas quando
                             // a rota ficava dormente antes do deadline.
                             let final_outcome = LabelOutcome::from_pending(&snap, idx);
-                            // `IncompleteWindow` removido. Se outcome é
-                            // Censored sem reason específico (caminho
-                            // teoricamente inalcançável dado o gate acima),
-                            // usa `RouteDormant` como fallback conservador.
+                            // Expirado sem cobertura ate o deadline nao e miss
+                            // falsificavel; marca IncompleteWindow. Dormant e
+                            // Delisted so entram quando o gate de idle fechou
+                            // antes do deadline.
                             let final_reason = if matches!(final_outcome, LabelOutcome::Censored) {
-                                reason.or(Some(CensorReason::RouteDormant))
+                                reason.or(Some(CensorReason::IncompleteWindow))
                             } else {
                                 None
                             };
@@ -1020,6 +1020,23 @@ mod tests {
         (resolver, tmp, task)
     }
 
+    fn first_labeled_json(tmp: &tempfile::TempDir) -> serde_json::Value {
+        let mut stack = vec![tmp.path().to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                    let content = std::fs::read_to_string(path).unwrap();
+                    let line = content.lines().next().expect("at least one label");
+                    return serde_json::from_str(line).unwrap();
+                }
+            }
+        }
+        panic!("no labeled jsonl found");
+    }
+
     #[tokio::test]
     async fn realized_when_first_hit_occurs_within_horizon() {
         let cfg = ResolverConfig {
@@ -1214,6 +1231,9 @@ mod tests {
         let m = resolver.metrics();
         assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 1);
         assert_eq!(m.labels_written_miss_total.load(Ordering::Relaxed), 0);
+        let v = first_labeled_json(&tmp);
+        assert_eq!(v["outcome"], "censored");
+        assert_eq!(v["censor_reason"], "incomplete_window");
         drop(resolver);
         drop(tmp);
     }

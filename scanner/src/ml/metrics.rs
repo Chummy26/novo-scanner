@@ -1007,9 +1007,9 @@ mod tests {
                 kind: ReasonKind::Combined,
                 detail: crate::ml::ReasonDetail::placeholder(),
             },
-            ci_method: "wilson_marginal",
+            ci_method: "conformal_split",
             model_version: "baseline-a3-0.2.0".into(),
-            source_kind: crate::ml::contract::SourceKind::Baseline,
+            source_kind: crate::ml::contract::SourceKind::Model,
             emitted_at: 1_700_000_000_000_000_000,
             valid_until: 1_700_000_150_000_000_000,
         });
