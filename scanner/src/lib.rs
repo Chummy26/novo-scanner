@@ -31,9 +31,10 @@ use crate::ml::contract::RouteId;
 use crate::ml::feature_store::HotQueryCache;
 use crate::ml::metrics::MlPrometheusMetrics;
 use crate::ml::persistence::{
-    compact_existing_jsonl_in_tree, DatasetKind, JsonlWriter, LabelResolver, LabeledJsonlWriter,
-    LabeledWriterConfig, ParquetCompactionConfig, RawSampleWriter, RawWriterConfig, ResolverConfig,
-    RouteDecimator, RouteRanking, WriterConfig, WriterHandle, WriterSendError,
+    compact_existing_jsonl_in_tree, write_run_audit, DatasetKind, JsonlWriter, LabelResolver,
+    LabelShutdownAudit, LabeledJsonlWriter, LabeledWriterConfig, ParquetCompactionConfig,
+    RawSampleWriter, RawWriterConfig, ResolverConfig, RouteDecimator, RouteRanking, RunAuditInput,
+    RunAuditVerdict, WriterAudit, WriterConfig, WriterHandle, WriterSendError,
 };
 use crate::ml::retention::{
     sweep_datasets, DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy,
@@ -94,6 +95,7 @@ fn parquet_compaction_from_ml_config(
         delete_jsonl_after_success: ml.parquet.delete_jsonl_after_success,
         batch_size: ml.parquet.batch_size,
         zstd_level: ml.parquet.zstd_level,
+        rotation_interval_s: ml.parquet.rotation_interval_s,
     })
 }
 
@@ -137,6 +139,8 @@ async fn compact_existing_partitions(
 /// spread engine → broadcast server.
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
     obs::Metrics::init();
+    let run_started_ns = now_ns();
+    let run_id = format!("scanner-{}-{}", std::process::id(), run_started_ns);
 
     let model_window_policy = ModelWindowPolicy::from(&cfg.ml.windows);
     model_window_policy
@@ -154,6 +158,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         parquet_batch_size = parquet_compaction.batch_size,
         parquet_zstd_level = parquet_compaction.zstd_level,
         parquet_rotation_interval_s = dataset_rotation_interval.as_secs(),
+        parquet_strict_lossless = cfg.ml.parquet.strict_lossless,
+        run_id = %run_id,
         "ML window policy carregada"
     );
 
@@ -648,56 +654,164 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             n_dropped_channel_closed = label_stats.dropped_channel_closed_total,
             "shutdown: labels pendentes fechados"
         );
-        match labeled_shutdown_handle.seal_current_file().await {
-            Ok(stats) if stats.compaction_failed > 0 => warn!(
-                total_written = stats.total_written,
-                total_dropped = stats.total_dropped,
-                compaction_succeeded = stats.compaction_succeeded,
-                compaction_failed = stats.compaction_failed,
-                "shutdown: labeled writer selado com falha de compactacao"
-            ),
-            Ok(stats) => info!(
-                total_written = stats.total_written,
-                total_dropped = stats.total_dropped,
-                compaction_succeeded = stats.compaction_succeeded,
-                compaction_failed = stats.compaction_failed,
-                "shutdown: labeled writer selado"
-            ),
-            Err(e) => warn!(error = ?e, "shutdown: falha selando labeled writer"),
+        let mut preexisting_issues = Vec::new();
+        let labeled_writer_stats = match labeled_shutdown_handle.seal_current_file().await {
+            Ok(stats) => {
+                if stats.compaction_failed > 0 {
+                    warn!(
+                        total_written = stats.total_written,
+                        total_dropped = stats.total_dropped,
+                        compaction_succeeded = stats.compaction_succeeded,
+                        compaction_failed = stats.compaction_failed,
+                        "shutdown: labeled writer selado com falha de compactacao"
+                    );
+                } else {
+                    info!(
+                        total_written = stats.total_written,
+                        total_dropped = stats.total_dropped,
+                        compaction_succeeded = stats.compaction_succeeded,
+                        compaction_failed = stats.compaction_failed,
+                        "shutdown: labeled writer selado"
+                    );
+                }
+                Some(stats)
+            }
+            Err(e) => {
+                warn!(error = ?e, "shutdown: falha selando labeled writer");
+                preexisting_issues.push(format!("labeled writer seal failed: {:?}", e));
+                None
+            }
+        };
+        let raw_writer_stats = match raw_shutdown_handle.seal_current_file().await {
+            Ok(stats) => {
+                if stats.compaction_failed > 0 {
+                    warn!(
+                        total_written = stats.total_written,
+                        total_dropped = stats.total_dropped,
+                        compaction_succeeded = stats.compaction_succeeded,
+                        compaction_failed = stats.compaction_failed,
+                        "shutdown: raw writer selado com falha de compactacao"
+                    );
+                } else {
+                    info!(
+                        total_written = stats.total_written,
+                        total_dropped = stats.total_dropped,
+                        compaction_succeeded = stats.compaction_succeeded,
+                        compaction_failed = stats.compaction_failed,
+                        "shutdown: raw writer selado"
+                    );
+                }
+                Some(stats)
+            }
+            Err(e) => {
+                warn!(error = ?e, "shutdown: falha selando raw writer");
+                preexisting_issues.push(format!("raw writer seal failed: {:?}", e));
+                None
+            }
+        };
+        let accepted_writer_stats = match accepted_shutdown_handle.seal_current_file().await {
+            Ok(stats) => {
+                if stats.compaction_failed > 0 {
+                    warn!(
+                        total_written = stats.total_written,
+                        total_dropped = stats.total_dropped,
+                        compaction_succeeded = stats.compaction_succeeded,
+                        compaction_failed = stats.compaction_failed,
+                        "shutdown: accepted writer selado com falha de compactacao"
+                    );
+                } else {
+                    info!(
+                        total_written = stats.total_written,
+                        total_dropped = stats.total_dropped,
+                        compaction_succeeded = stats.compaction_succeeded,
+                        compaction_failed = stats.compaction_failed,
+                        "shutdown: accepted writer selado"
+                    );
+                }
+                Some(stats)
+            }
+            Err(e) => {
+                warn!(error = ?e, "shutdown: falha selando accepted writer");
+                preexisting_issues.push(format!("accepted writer seal failed: {:?}", e));
+                None
+            }
+        };
+
+        let mut writers = Vec::new();
+        if let Some(stats) = raw_writer_stats {
+            writers.push(WriterAudit {
+                dataset_kind: "raw_samples".to_string(),
+                total_written: stats.total_written,
+                total_dropped: stats.total_dropped,
+                compaction_succeeded: stats.compaction_succeeded,
+                compaction_failed: stats.compaction_failed,
+            });
         }
-        match raw_shutdown_handle.seal_current_file().await {
-            Ok(stats) if stats.compaction_failed > 0 => warn!(
-                total_written = stats.total_written,
-                total_dropped = stats.total_dropped,
-                compaction_succeeded = stats.compaction_succeeded,
-                compaction_failed = stats.compaction_failed,
-                "shutdown: raw writer selado com falha de compactacao"
-            ),
-            Ok(stats) => info!(
-                total_written = stats.total_written,
-                total_dropped = stats.total_dropped,
-                compaction_succeeded = stats.compaction_succeeded,
-                compaction_failed = stats.compaction_failed,
-                "shutdown: raw writer selado"
-            ),
-            Err(e) => warn!(error = ?e, "shutdown: falha selando raw writer"),
+        if let Some(stats) = accepted_writer_stats {
+            writers.push(WriterAudit {
+                dataset_kind: "accepted_samples".to_string(),
+                total_written: stats.total_written,
+                total_dropped: stats.total_dropped,
+                compaction_succeeded: stats.compaction_succeeded,
+                compaction_failed: stats.compaction_failed,
+            });
         }
-        match accepted_shutdown_handle.seal_current_file().await {
-            Ok(stats) if stats.compaction_failed > 0 => warn!(
-                total_written = stats.total_written,
-                total_dropped = stats.total_dropped,
-                compaction_succeeded = stats.compaction_succeeded,
-                compaction_failed = stats.compaction_failed,
-                "shutdown: accepted writer selado com falha de compactacao"
-            ),
-            Ok(stats) => info!(
-                total_written = stats.total_written,
-                total_dropped = stats.total_dropped,
-                compaction_succeeded = stats.compaction_succeeded,
-                compaction_failed = stats.compaction_failed,
-                "shutdown: accepted writer selado"
-            ),
-            Err(e) => warn!(error = ?e, "shutdown: falha selando accepted writer"),
+        if let Some(stats) = labeled_writer_stats {
+            writers.push(WriterAudit {
+                dataset_kind: "labeled_trades".to_string(),
+                total_written: stats.total_written,
+                total_dropped: stats.total_dropped,
+                compaction_succeeded: stats.compaction_succeeded,
+                compaction_failed: stats.compaction_failed,
+            });
+        }
+
+        let audit_report = write_run_audit(RunAuditInput {
+            run_id: run_id.clone(),
+            pid: std::process::id(),
+            started_ns: run_started_ns,
+            ended_ns: now_ns(),
+            root_dir: std::env::current_dir()
+                .map(|cwd| cwd.join("data/ml"))
+                .unwrap_or_else(|_| PathBuf::from("data/ml")),
+            raw_root: raw_writer_abs.clone(),
+            accepted_root: writer_abs.clone(),
+            labeled_root: labeled_writer_abs.clone(),
+            parquet_enabled: cfg.ml.parquet.enabled,
+            strict_lossless: cfg.ml.parquet.strict_lossless,
+            cycles_started: ml_server.cycles_started(),
+            label_shutdown: LabelShutdownAudit {
+                closed_total: label_stats.closed_total,
+                sent_total: label_stats.sent_total,
+                censored_total: label_stats.censored_total,
+                dropped_channel_closed_total: label_stats.dropped_channel_closed_total,
+            },
+            writers,
+            preexisting_issues,
+        });
+        match audit_report {
+            Ok(report) => {
+                info!(
+                    run_id = %report.run_id,
+                    verdict = ?report.verdict,
+                    issues = report.issues.len(),
+                    projected_7d_bytes = report.total_projected_7d_bytes,
+                    "ML run audit concluída"
+                );
+                if cfg.ml.parquet.strict_lossless && report.verdict != RunAuditVerdict::Green {
+                    anyhow::bail!(
+                        "ML strict_lossless: run {} unhealthy: {}",
+                        report.run_id,
+                        report.issues.join("; ")
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, run_id = %run_id, "ML run audit falhou");
+                if cfg.ml.parquet.strict_lossless {
+                    return Err(e.context("ML strict_lossless: run audit failed"));
+                }
+            }
         }
     }
     Ok(())
@@ -1148,6 +1262,7 @@ mod tests {
         assert!(parquet.delete_jsonl_after_success);
         assert_eq!(parquet.batch_size, 8192);
         assert_eq!(parquet.zstd_level, 6);
+        assert_eq!(parquet.rotation_interval_s, 300);
         assert_eq!(rotation.as_secs(), 300);
     }
 

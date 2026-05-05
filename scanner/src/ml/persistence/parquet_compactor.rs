@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -5,7 +6,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow_array::{
-    Array, ArrayRef, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+    Array, ArrayRef, Float32Array, ListArray, RecordBatch, StringArray, StructArray, UInt16Array,
+    UInt32Array, UInt64Array,
 };
 use arrow_json::reader::ReaderBuilder;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -13,6 +15,7 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
+use serde::{Deserialize, Serialize};
 
 use crate::ml::persistence::labeled_trade::LABELED_TRADE_SCHEMA_VERSION;
 use crate::ml::persistence::raw_sample::RAW_SAMPLE_SCHEMA_VERSION;
@@ -25,12 +28,38 @@ pub enum DatasetKind {
     LabeledTrades,
 }
 
+impl DatasetKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DatasetKind::AcceptedSamples => "accepted_samples",
+            DatasetKind::RawSamples => "raw_samples",
+            DatasetKind::LabeledTrades => "labeled_trades",
+        }
+    }
+
+    fn expected_schema_version(self) -> u16 {
+        match self {
+            DatasetKind::AcceptedSamples => ACCEPTED_SAMPLE_SCHEMA_VERSION,
+            DatasetKind::RawSamples => RAW_SAMPLE_SCHEMA_VERSION,
+            DatasetKind::LabeledTrades => LABELED_TRADE_SCHEMA_VERSION,
+        }
+    }
+
+    fn timestamp_column(self) -> &'static str {
+        match self {
+            DatasetKind::AcceptedSamples | DatasetKind::RawSamples => "ts_ns",
+            DatasetKind::LabeledTrades => "ts_emit_ns",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ParquetCompactionConfig {
     pub enabled: bool,
     pub delete_jsonl_after_success: bool,
     pub batch_size: usize,
     pub zstd_level: i32,
+    pub rotation_interval_s: u64,
 }
 
 impl Default for ParquetCompactionConfig {
@@ -40,9 +69,12 @@ impl Default for ParquetCompactionConfig {
             delete_jsonl_after_success: true,
             batch_size: 4096,
             zstd_level: 3,
+            rotation_interval_s: 600,
         }
     }
 }
+
+const COMPACTOR_VERSION: &str = "parquet-compactor-v2-strict-lossless";
 
 pub fn compact_jsonl_file(
     jsonl_path: &Path,
@@ -181,6 +213,11 @@ pub fn compact_jsonl_file(
         );
     }
 
+    let temp_parquet_bytes = fs::metadata(&temp_parquet_path)
+        .with_context(|| format!("metadata {}", temp_parquet_path.display()))?
+        .len();
+    let source_bytes = metadata.len();
+
     fs::rename(&temp_parquet_path, &parquet_path).with_context(|| {
         format!(
             "rename parquet {} -> {}",
@@ -188,12 +225,66 @@ pub fn compact_jsonl_file(
             parquet_path.display()
         )
     })?;
+
+    let manifest = ParquetManifest::new(
+        dataset_kind,
+        jsonl_path,
+        &parquet_path,
+        &source_validation,
+        source_bytes,
+        temp_parquet_bytes,
+        cfg,
+    );
+    write_and_validate_manifest(&manifest, &manifest_path_for(&parquet_path)).with_context(
+        || {
+            format!(
+                "write parquet manifest {}",
+                manifest_path_for(&parquet_path).display()
+            )
+        },
+    )?;
+
     if cfg.delete_jsonl_after_success {
         fs::remove_file(jsonl_path)
             .with_context(|| format!("remove source {}", jsonl_path.display()))?;
     }
 
     Ok(Some(parquet_path))
+}
+
+fn manifest_path_for(parquet_path: &Path) -> PathBuf {
+    parquet_path.with_extension("parquet.manifest.json")
+}
+
+fn write_and_validate_manifest(manifest: &ParquetManifest, path: &Path) -> Result<()> {
+    let temp_path = path.with_extension("manifest.json.tmp");
+    if temp_path.exists() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    {
+        let file = File::create(&temp_path)
+            .with_context(|| format!("create manifest {}", temp_path.display()))?;
+        serde_json::to_writer_pretty(file, manifest)
+            .with_context(|| format!("serialize manifest {}", temp_path.display()))?;
+    }
+    let file =
+        File::open(&temp_path).with_context(|| format!("open manifest {}", temp_path.display()))?;
+    let roundtrip: ParquetManifest = serde_json::from_reader(file)
+        .with_context(|| format!("validate manifest {}", temp_path.display()))?;
+    if &roundtrip != manifest {
+        let _ = fs::remove_file(&temp_path);
+        anyhow::bail!(
+            "manifest roundtrip mismatch em {}. JSONL fonte preservado.",
+            path.display()
+        );
+    }
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "rename manifest {} -> {}",
+            temp_path.display(),
+            path.display()
+        )
+    })
 }
 
 fn parquet_row_count(path: &Path) -> Result<u64> {
@@ -327,10 +418,115 @@ fn required_columns(dataset_kind: DatasetKind) -> &'static [RequiredColumn] {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParquetManifest {
+    pub manifest_version: u16,
+    pub compactor_version: String,
+    pub dataset_kind: String,
+    pub schema_version: u16,
+    pub source_jsonl_path: String,
+    pub parquet_path: String,
+    pub source_row_count: u64,
+    pub parquet_row_count: u64,
+    pub source_file_bytes: u64,
+    pub parquet_file_bytes: u64,
+    pub timestamp_column: String,
+    pub min_timestamp_ns: Option<u64>,
+    pub max_timestamp_ns: Option<u64>,
+    pub required_columns: Vec<String>,
+    pub required_null_counts: BTreeMap<String, u64>,
+    pub required_field_digest_hex: String,
+    pub parquet_config: ParquetManifestConfig,
+    pub semantic_stats: DatasetSemanticStats,
+}
+
+impl ParquetManifest {
+    fn new(
+        dataset_kind: DatasetKind,
+        jsonl_path: &Path,
+        parquet_path: &Path,
+        validation: &ValidationDigest,
+        source_file_bytes: u64,
+        parquet_file_bytes: u64,
+        cfg: &ParquetCompactionConfig,
+    ) -> Self {
+        Self {
+            manifest_version: 1,
+            compactor_version: COMPACTOR_VERSION.to_string(),
+            dataset_kind: dataset_kind.as_str().to_string(),
+            schema_version: dataset_kind.expected_schema_version(),
+            source_jsonl_path: jsonl_path.display().to_string(),
+            parquet_path: parquet_path.display().to_string(),
+            source_row_count: validation.rows,
+            parquet_row_count: validation.rows,
+            source_file_bytes,
+            parquet_file_bytes,
+            timestamp_column: dataset_kind.timestamp_column().to_string(),
+            min_timestamp_ns: validation.semantic.min_timestamp_ns,
+            max_timestamp_ns: validation.semantic.max_timestamp_ns,
+            required_columns: required_columns(dataset_kind)
+                .iter()
+                .map(|c| c.name.to_string())
+                .collect(),
+            required_null_counts: validation.required_null_counts.clone(),
+            required_field_digest_hex: format!("{:016x}", validation.hash),
+            parquet_config: ParquetManifestConfig {
+                zstd_level: cfg.zstd_level,
+                batch_size: cfg.batch_size,
+                rotation_interval_s: cfg.rotation_interval_s,
+                delete_jsonl_after_success: cfg.delete_jsonl_after_success,
+            },
+            semantic_stats: validation.semantic.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParquetManifestConfig {
+    pub zstd_level: i32,
+    pub batch_size: usize,
+    pub rotation_interval_s: u64,
+    pub delete_jsonl_after_success: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetSemanticStats {
+    pub min_timestamp_ns: Option<u64>,
+    pub max_timestamp_ns: Option<u64>,
+    pub schema_versions: BTreeMap<u16, u64>,
+    pub sample_decisions: BTreeMap<String, u64>,
+    pub horizons_s: BTreeMap<u32, u64>,
+    pub outcomes: BTreeMap<String, u64>,
+    pub censor_reasons: BTreeMap<String, u64>,
+    pub label_floor_hit_lengths: BTreeMap<u32, u64>,
+    pub label_floor_values: BTreeSet<String>,
+}
+
+impl DatasetSemanticStats {
+    fn observe_timestamp(&mut self, ts: u64) {
+        self.min_timestamp_ns = Some(self.min_timestamp_ns.map_or(ts, |v| v.min(ts)));
+        self.max_timestamp_ns = Some(self.max_timestamp_ns.map_or(ts, |v| v.max(ts)));
+    }
+
+    fn inc_str(map: &mut BTreeMap<String, u64>, value: &str) {
+        *map.entry(value.to_string()).or_insert(0) += 1;
+    }
+
+    fn inc_u16(map: &mut BTreeMap<u16, u64>, value: u16) {
+        *map.entry(value).or_insert(0) += 1;
+    }
+
+    fn inc_u32(map: &mut BTreeMap<u32, u64>, value: u32) {
+        *map.entry(value).or_insert(0) += 1;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ValidationDigest {
     rows: u64,
     hash: u64,
+    required_null_counts: BTreeMap<String, u64>,
+    semantic: DatasetSemanticStats,
 }
 
 impl ValidationDigest {
@@ -338,12 +534,18 @@ impl ValidationDigest {
     const FNV_PRIME: u64 = 0x100000001b3;
 
     fn new(dataset_kind: DatasetKind) -> Self {
+        let mut required_null_counts = BTreeMap::new();
+        for col in required_columns(dataset_kind) {
+            required_null_counts.insert(col.name.to_string(), 0);
+        }
         let mut digest = Self {
             rows: 0,
             hash: Self::FNV_OFFSET,
+            required_null_counts,
+            semantic: DatasetSemanticStats::default(),
         };
         digest.update_bytes(b"dataset");
-        digest.update_bytes(format!("{dataset_kind:?}").as_bytes());
+        digest.update_bytes(dataset_kind.as_str().as_bytes());
         digest
     }
 
@@ -409,6 +611,7 @@ fn validate_required_batch(
             validate_required_value(dataset_kind, *required, array, row_idx, global_row, digest)?;
         }
     }
+    update_semantic_stats(dataset_kind, batch, digest)?;
     digest.rows = digest.rows.saturating_add(batch.num_rows() as u64);
     Ok(())
 }
@@ -422,6 +625,9 @@ fn validate_required_value(
     digest: &mut ValidationDigest,
 ) -> Result<()> {
     if array.is_null(row_idx) {
+        if let Some(count) = digest.required_null_counts.get_mut(required.name) {
+            *count = count.saturating_add(1);
+        }
         anyhow::bail!(
             "{dataset_kind:?} required field '{}' is null at row {}",
             required.name,
@@ -472,6 +678,9 @@ fn validate_required_value(
                     expected
                 );
             }
+            if required.name == "schema_version" {
+                DatasetSemanticStats::inc_u16(&mut digest.semantic.schema_versions, value);
+            }
             digest.update_u16(value);
         }
         RequiredColumnKind::U32 => {
@@ -485,7 +694,8 @@ fn validate_required_value(
                         array.data_type()
                     )
                 })?;
-            digest.update_u32(values.value(row_idx));
+            let value = values.value(row_idx);
+            digest.update_u32(value);
         }
         RequiredColumnKind::U64 => {
             let values = array
@@ -498,10 +708,117 @@ fn validate_required_value(
                         array.data_type()
                     )
                 })?;
-            digest.update_u64(values.value(row_idx));
+            let value = values.value(row_idx);
+            if required.name == dataset_kind.timestamp_column() {
+                digest.semantic.observe_timestamp(value);
+            }
+            digest.update_u64(value);
         }
     }
 
+    Ok(())
+}
+
+fn update_semantic_stats(
+    dataset_kind: DatasetKind,
+    batch: &RecordBatch,
+    digest: &mut ValidationDigest,
+) -> Result<()> {
+    if let Ok(idx) = batch.schema().index_of("sample_decision") {
+        update_string_counts(
+            &batch.column(idx),
+            &mut digest.semantic.sample_decisions,
+            "sample_decision",
+        )?;
+    }
+    if matches!(dataset_kind, DatasetKind::LabeledTrades) {
+        if let Ok(idx) = batch.schema().index_of("horizon_s") {
+            let values = batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<UInt32Array>()
+                .context("horizon_s has non-UInt32 type")?;
+            for row in 0..values.len() {
+                if !values.is_null(row) {
+                    DatasetSemanticStats::inc_u32(
+                        &mut digest.semantic.horizons_s,
+                        values.value(row),
+                    );
+                }
+            }
+        }
+        if let Ok(idx) = batch.schema().index_of("outcome") {
+            update_string_counts(&batch.column(idx), &mut digest.semantic.outcomes, "outcome")?;
+        }
+        if let Ok(idx) = batch.schema().index_of("censor_reason") {
+            update_string_counts(
+                &batch.column(idx),
+                &mut digest.semantic.censor_reasons,
+                "censor_reason",
+            )?;
+        }
+        if let Ok(idx) = batch.schema().index_of("label_floor_hits") {
+            update_floor_hit_stats(&batch.column(idx), &mut digest.semantic)?;
+        }
+    }
+    Ok(())
+}
+
+fn update_string_counts(
+    array: &ArrayRef,
+    counts: &mut BTreeMap<String, u64>,
+    name: &str,
+) -> Result<()> {
+    let values = array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .with_context(|| format!("{name} has non-Utf8 type {:?}", array.data_type()))?;
+    for row in 0..values.len() {
+        if !values.is_null(row) {
+            DatasetSemanticStats::inc_str(counts, values.value(row));
+        }
+    }
+    Ok(())
+}
+
+fn update_floor_hit_stats(array: &ArrayRef, stats: &mut DatasetSemanticStats) -> Result<()> {
+    let lists = array
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .with_context(|| format!("label_floor_hits has non-List type {:?}", array.data_type()))?;
+    let values = lists.values();
+    let structs = values
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .with_context(|| {
+            format!(
+                "label_floor_hits values have non-Struct type {:?}",
+                values.data_type()
+            )
+        })?;
+    let floor_col = structs
+        .column_by_name("floor_pct")
+        .context("label_floor_hits.floor_pct missing")?
+        .as_any()
+        .downcast_ref::<Float32Array>()
+        .context("label_floor_hits.floor_pct has non-Float32 type")?;
+
+    for row in 0..lists.len() {
+        if lists.is_null(row) {
+            DatasetSemanticStats::inc_u32(&mut stats.label_floor_hit_lengths, 0);
+            continue;
+        }
+        let start = lists.value_offsets()[row] as usize;
+        let end = lists.value_offsets()[row + 1] as usize;
+        DatasetSemanticStats::inc_u32(&mut stats.label_floor_hit_lengths, (end - start) as u32);
+        for idx in start..end {
+            if !floor_col.is_null(idx) {
+                stats
+                    .label_floor_values
+                    .insert(format!("{:.6}", floor_col.value(idx)));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -799,6 +1116,11 @@ mod tests {
         total
     }
 
+    fn read_manifest(parquet: &Path) -> ParquetManifest {
+        let file = File::open(manifest_path_for(parquet)).expect("open manifest");
+        serde_json::from_reader(file).expect("manifest json")
+    }
+
     #[test]
     fn compacts_accepted_jsonl_to_parquet() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -820,6 +1142,12 @@ mod tests {
 
         assert!(!jsonl.exists());
         assert_eq!(parquet_row_count(&parquet), 1);
+        let manifest = read_manifest(&parquet);
+        assert_eq!(manifest.dataset_kind, "accepted_samples");
+        assert_eq!(manifest.source_row_count, 1);
+        assert_eq!(manifest.parquet_row_count, 1);
+        assert_eq!(manifest.min_timestamp_ns, Some(1));
+        assert_eq!(manifest.semantic_stats.sample_decisions["accept"], 1);
     }
 
     #[test]
@@ -843,6 +1171,10 @@ mod tests {
 
         assert!(!jsonl.exists());
         assert_eq!(parquet_row_count(&parquet), 1);
+        let manifest = read_manifest(&parquet);
+        assert_eq!(manifest.dataset_kind, "raw_samples");
+        assert_eq!(manifest.semantic_stats.sample_decisions["accept"], 1);
+        assert_eq!(manifest.parquet_config.rotation_interval_s, 600);
     }
 
     #[test]
@@ -913,6 +1245,15 @@ mod tests {
 
         assert!(!jsonl.exists());
         assert_eq!(parquet_row_count(&parquet), 1);
+        let manifest = read_manifest(&parquet);
+        assert_eq!(manifest.dataset_kind, "labeled_trades");
+        assert_eq!(manifest.semantic_stats.horizons_s[&900], 1);
+        assert_eq!(manifest.semantic_stats.outcomes["realized"], 1);
+        assert_eq!(manifest.semantic_stats.label_floor_hit_lengths[&1], 1);
+        assert!(manifest
+            .semantic_stats
+            .label_floor_values
+            .contains("0.800000"));
     }
 
     #[test]
@@ -938,6 +1279,7 @@ mod tests {
 
         assert!(!jsonl.exists());
         assert_eq!(parquet_row_count(&parquet), 1);
+        assert!(manifest_path_for(&parquet).exists());
     }
 
     #[test]
@@ -965,6 +1307,7 @@ mod tests {
             "JSONL fonte deve ser preservado quando a validacao falha"
         );
         assert!(!jsonl.with_extension("parquet").exists());
+        assert!(!jsonl.with_extension("parquet.manifest.json").exists());
     }
 
     #[test]
@@ -992,6 +1335,7 @@ mod tests {
         assert!(jsonl.exists());
         assert!(!jsonl.with_extension("parquet").exists());
         assert!(!jsonl.with_extension("parquet.tmp").exists());
+        assert!(!jsonl.with_extension("parquet.manifest.json").exists());
     }
 
     #[test]
@@ -1019,5 +1363,6 @@ mod tests {
         assert!(jsonl.exists());
         assert!(!jsonl.with_extension("parquet").exists());
         assert!(!jsonl.with_extension("parquet.tmp").exists());
+        assert!(!jsonl.with_extension("parquet.manifest.json").exists());
     }
 }

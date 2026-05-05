@@ -220,6 +220,11 @@ pub struct MlParquetConfig {
     /// Nível do codec ZSTD do Parquet.
     #[serde(default = "default_parquet_zstd_level")]
     pub zstd_level: i32,
+
+    /// Modo strict-lossless: qualquer falha de flush/seal/compaction/auditoria
+    /// marca a coleta como não saudável. O JSONL fonte é preservado.
+    #[serde(default = "default_parquet_strict_lossless")]
+    pub strict_lossless: bool,
 }
 
 impl Default for MlParquetConfig {
@@ -230,6 +235,7 @@ impl Default for MlParquetConfig {
             delete_jsonl_after_success: default_parquet_delete_jsonl_after_success(),
             batch_size: default_parquet_batch_size(),
             zstd_level: default_parquet_zstd_level(),
+            strict_lossless: default_parquet_strict_lossless(),
         }
     }
 }
@@ -324,6 +330,9 @@ fn default_parquet_batch_size() -> usize {
 }
 fn default_parquet_zstd_level() -> i32 {
     3
+}
+fn default_parquet_strict_lossless() -> bool {
+    true
 }
 fn default_train_window_days() -> u16 {
     90
@@ -547,6 +556,7 @@ mod tests {
         assert!(cfg.ml.parquet.enabled);
         assert_eq!(cfg.ml.parquet.rotation_interval_s, 600);
         assert_eq!(cfg.ml.parquet.zstd_level, 3);
+        assert!(cfg.ml.parquet.strict_lossless);
         assert_eq!(cfg.ml.windows.train_window_days, 90);
     }
 
@@ -599,6 +609,7 @@ rotation_interval_s = 300
 delete_jsonl_after_success = true
 batch_size = 8192
 zstd_level = 6
+strict_lossless = false
 
 [ml.windows]
 train_window_days = 120
@@ -615,6 +626,7 @@ archive_reference_days = 500
         assert!(cfg.ml.parquet.delete_jsonl_after_success);
         assert_eq!(cfg.ml.parquet.batch_size, 8192);
         assert_eq!(cfg.ml.parquet.zstd_level, 6);
+        assert!(!cfg.ml.parquet.strict_lossless);
         assert_eq!(cfg.ml.windows.train_window_days, 120);
         assert_eq!(cfg.ml.windows.calibration_window_days, 30);
         assert_eq!(cfg.ml.windows.archive_reference_days, 500);

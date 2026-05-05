@@ -6,7 +6,7 @@
 //! Default `data_dir = data/ml/labeled_trades`. Nome de arquivo
 //! `labeled-{hostname}-{pid}_{start_ts}.jsonl`.
 
-use std::fs::{create_dir_all, OpenOptions};
+use std::fs::{self, create_dir_all, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -16,7 +16,7 @@ use tracing::{info, warn};
 
 use crate::ml::persistence::labeled_trade::LabeledTrade;
 use crate::ml::persistence::parquet_compactor::{
-    compact_jsonl_file, DatasetKind, ParquetCompactionConfig,
+    compact_jsonl_file, DatasetKind, ParquetCompactionConfig, ParquetManifest,
 };
 use crate::ml::persistence::writer::{hour_key_for_ns, rotation_key_for_ns, rotation_start_ns_for};
 
@@ -245,6 +245,12 @@ impl LabeledJsonlWriter {
             let result = compact_jsonl_file(&path, DatasetKind::LabeledTrades, &parquet_cfg);
             match &result {
                 Ok(Some(parquet_path)) => {
+                    record_compaction_metric(
+                        DatasetKind::LabeledTrades,
+                        "success",
+                        Some(parquet_path),
+                        &path,
+                    );
                     info!(
                         source = %path.display(),
                         parquet = %parquet_path.display(),
@@ -253,6 +259,7 @@ impl LabeledJsonlWriter {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    record_compaction_metric(DatasetKind::LabeledTrades, "failure", None, &path);
                     warn!(
                         error = %e,
                         path = %path.display(),
@@ -313,6 +320,34 @@ impl LabeledJsonlWriter {
         info!(path = %path.display(), "labeled writer: abrindo novo arquivo");
         Ok((BufWriter::with_capacity(64 * 1024, file), path))
     }
+}
+
+fn record_compaction_metric(
+    dataset: DatasetKind,
+    status: &'static str,
+    parquet_path: Option<&PathBuf>,
+    source_path: &PathBuf,
+) {
+    let mut rows = 0;
+    let mut source_bytes = fs::metadata(source_path).map(|m| m.len()).unwrap_or(0);
+    let mut parquet_bytes = 0;
+    if let Some(path) = parquet_path {
+        let manifest_path = path.with_extension("parquet.manifest.json");
+        if let Ok(file) = File::open(&manifest_path) {
+            if let Ok(manifest) = serde_json::from_reader::<_, ParquetManifest>(file) {
+                rows = manifest.parquet_row_count;
+                source_bytes = manifest.source_file_bytes;
+                parquet_bytes = manifest.parquet_file_bytes;
+            }
+        }
+    }
+    crate::obs::Metrics::init().record_ml_dataset_compaction(
+        dataset.as_str(),
+        status,
+        rows,
+        source_bytes,
+        parquet_bytes,
+    );
 }
 
 // ---------------------------------------------------------------------------

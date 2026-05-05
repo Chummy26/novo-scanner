@@ -94,6 +94,9 @@ rotation_interval_s = 600
 delete_jsonl_after_success = true
 batch_size = 4096
 zstd_level = 3
+# If true, shutdown/flush/seal/compaction/audit failures mark the run unhealthy.
+# JSONL source files are preserved on failure.
+strict_lossless = true
 
 [ml.windows]
 # Statistical memory of the model/trainer. These windows do not delete

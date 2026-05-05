@@ -819,6 +819,10 @@ impl MlServer {
         (self.cycle_seq.fetch_add(1, Ordering::Relaxed) & 0xFFFF_FFFF) as u32
     }
 
+    pub fn cycles_started(&self) -> u64 {
+        self.cycle_seq.load(Ordering::Relaxed)
+    }
+
     fn observe_clean_spread(
         &self,
         route: RouteId,

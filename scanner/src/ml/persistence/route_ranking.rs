@@ -177,10 +177,7 @@ impl RouteRanking {
                 non_empty_buckets = non_empty_buckets.saturating_add(1);
             }
         }
-        if score.accept_count_24h == 0
-            && score.candidate_count_24h == 0
-            && non_empty_buckets == 0
-        {
+        if score.accept_count_24h == 0 && score.candidate_count_24h == 0 && non_empty_buckets == 0 {
             return None;
         }
         if non_empty_buckets > 0 {

@@ -20,6 +20,9 @@ pub struct Metrics {
     pub stale_drops_total: IntCounterVec,
     pub asym_drops_total: IntCounterVec,
     pub opportunities_total: IntCounter,
+    pub ml_dataset_compactions_total: IntCounterVec,
+    pub ml_dataset_compaction_rows_total: IntCounterVec,
+    pub ml_dataset_compaction_bytes_total: IntCounterVec,
     /// Per-venue ingest-latency histograms (frame decode + book write), ns.
     pub ingest_hist: [Mutex<Histogram<u64>>; VENUE_COUNT],
     /// Spread-engine scan latency histogram, ns. Nome Prometheus legado:
@@ -59,6 +62,30 @@ impl Metrics {
                 "Opportunities emitted to clients",
             )
             .expect("register opportunities_total");
+            let ml_dataset_compactions_total = IntCounterVec::new(
+                Opts::new(
+                    "ml_dataset_compactions_total",
+                    "ML dataset compactions by dataset and status",
+                ),
+                &["dataset", "status"],
+            )
+            .expect("register ml_dataset_compactions_total");
+            let ml_dataset_compaction_rows_total = IntCounterVec::new(
+                Opts::new(
+                    "ml_dataset_compaction_rows_total",
+                    "Rows validated during ML dataset compaction by dataset and status",
+                ),
+                &["dataset", "status"],
+            )
+            .expect("register ml_dataset_compaction_rows_total");
+            let ml_dataset_compaction_bytes_total = IntCounterVec::new(
+                Opts::new(
+                    "ml_dataset_compaction_bytes_total",
+                    "Bytes observed during ML dataset compaction by dataset, direction and status",
+                ),
+                &["dataset", "direction", "status"],
+            )
+            .expect("register ml_dataset_compaction_bytes_total");
 
             registry
                 .register(Box::new(ws_frames_total.clone()))
@@ -72,6 +99,31 @@ impl Metrics {
             registry
                 .register(Box::new(opportunities_total.clone()))
                 .expect("reg");
+            registry
+                .register(Box::new(ml_dataset_compactions_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_dataset_compaction_rows_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_dataset_compaction_bytes_total.clone()))
+                .expect("reg");
+
+            for dataset in &["raw_samples", "accepted_samples", "labeled_trades"] {
+                for status in &["success", "failure"] {
+                    ml_dataset_compactions_total
+                        .with_label_values(&[dataset, status])
+                        .inc_by(0);
+                    ml_dataset_compaction_rows_total
+                        .with_label_values(&[dataset, status])
+                        .inc_by(0);
+                    for direction in &["source_jsonl", "parquet"] {
+                        ml_dataset_compaction_bytes_total
+                            .with_label_values(&[dataset, direction, status])
+                            .inc_by(0);
+                    }
+                }
+            }
 
             // HdrHistogram: track 1ns..10s with 3 sig figs. Per-venue instance
             // so recording is contention-scoped to each adapter task.
@@ -88,6 +140,9 @@ impl Metrics {
                 stale_drops_total,
                 asym_drops_total,
                 opportunities_total,
+                ml_dataset_compactions_total,
+                ml_dataset_compaction_rows_total,
+                ml_dataset_compaction_bytes_total,
                 ingest_hist,
                 cycle_hist,
                 full_cycle_hist,
@@ -128,6 +183,29 @@ impl Metrics {
     pub fn record_ml_background(&self, ns: u64) {
         record_hist(&self.ml_background_hist, ns);
     }
+
+    #[inline]
+    pub fn record_ml_dataset_compaction(
+        &self,
+        dataset: &'static str,
+        status: &'static str,
+        rows: u64,
+        source_bytes: u64,
+        parquet_bytes: u64,
+    ) {
+        self.ml_dataset_compactions_total
+            .with_label_values(&[dataset, status])
+            .inc();
+        self.ml_dataset_compaction_rows_total
+            .with_label_values(&[dataset, status])
+            .inc_by(rows);
+        self.ml_dataset_compaction_bytes_total
+            .with_label_values(&[dataset, "source_jsonl", status])
+            .inc_by(source_bytes);
+        self.ml_dataset_compaction_bytes_total
+            .with_label_values(&[dataset, "parquet", status])
+            .inc_by(parquet_bytes);
+    }
 }
 
 #[inline]
@@ -165,6 +243,21 @@ mod tests {
         let after = m
             .ws_frames_total
             .with_label_values(&[Venue::BinanceSpot.as_str()])
+            .get();
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn record_ml_dataset_compaction_increments_counter() {
+        let m = Metrics::init();
+        let before = m
+            .ml_dataset_compactions_total
+            .with_label_values(&["raw_samples", "success"])
+            .get();
+        m.record_ml_dataset_compaction("raw_samples", "success", 3, 10, 4);
+        let after = m
+            .ml_dataset_compactions_total
+            .with_label_values(&["raw_samples", "success"])
             .get();
         assert_eq!(after, before + 1);
     }

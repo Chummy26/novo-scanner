@@ -36,6 +36,7 @@ pub mod parquet_compactor;
 pub mod raw_sample;
 pub mod raw_writer;
 pub mod route_ranking;
+pub mod run_audit;
 pub mod sample;
 pub mod sample_id;
 pub mod writer;
@@ -61,5 +62,9 @@ pub use raw_sample::{
     DecisionResult, RawSample, RouteDecimator, SamplingTier, RAW_SAMPLE_SCHEMA_VERSION,
 };
 pub use raw_writer::{RawSampleWriter, RawWriterConfig, RawWriterHandle, RawWriterSendError};
+pub use run_audit::{
+    write_run_audit, LabelShutdownAudit, RunAuditInput, RunAuditReport, RunAuditVerdict,
+    WriterAudit,
+};
 pub use sample::{AcceptedSample, ACCEPTED_SAMPLE_SCHEMA_VERSION};
 pub use writer::{JsonlWriter, WriterConfig, WriterHandle, WriterSendError};
