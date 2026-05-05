@@ -110,11 +110,57 @@ pub fn compact_jsonl_file(
     if temp_manifest_path.exists() {
         let _ = fs::remove_file(&temp_manifest_path);
     }
+    if parquet_path.exists() && manifest_path.exists() {
+        if published_pair_matches_source(
+            jsonl_path,
+            dataset_kind,
+            cfg.batch_size,
+            &parquet_path,
+            &manifest_path,
+            metadata.len(),
+        )
+        .with_context(|| {
+            format!(
+                "validate existing parquet+manifest publication for {}",
+                jsonl_path.display()
+            )
+        })? {
+            if cfg.delete_jsonl_after_success {
+                fs::remove_file(jsonl_path).with_context(|| {
+                    format!(
+                        "remove duplicate source after validated existing publication {}",
+                        jsonl_path.display()
+                    )
+                })?;
+            }
+            return Ok(Some(parquet_path));
+        }
+        remove_file_if_exists(&manifest_path).with_context(|| {
+            format!(
+                "remove stale manifest before retry {}",
+                manifest_path.display()
+            )
+        })?;
+        remove_file_if_exists(&parquet_path).with_context(|| {
+            format!(
+                "remove stale parquet before retry {}",
+                parquet_path.display()
+            )
+        })?;
+    }
     if parquet_path.exists() && !manifest_path.exists() {
         fs::remove_file(&parquet_path).with_context(|| {
             format!(
                 "remove orphan parquet without manifest {}",
                 parquet_path.display()
+            )
+        })?;
+    }
+    if manifest_path.exists() && !parquet_path.exists() {
+        fs::remove_file(&manifest_path).with_context(|| {
+            format!(
+                "remove orphan manifest without parquet {}",
+                manifest_path.display()
             )
         })?;
     }
@@ -339,6 +385,67 @@ fn write_and_validate_manifest_temp(manifest: &ParquetManifest, path: &Path) -> 
         );
     }
     Ok(temp_path)
+}
+
+fn published_pair_matches_source(
+    jsonl_path: &Path,
+    dataset_kind: DatasetKind,
+    batch_size: usize,
+    parquet_path: &Path,
+    manifest_path: &Path,
+    source_file_bytes: u64,
+) -> Result<bool> {
+    let manifest = read_manifest(manifest_path)?;
+    if manifest.dataset_kind != dataset_kind.as_str()
+        || manifest.schema_version != dataset_kind.expected_schema_version()
+        || manifest.source_file_bytes != source_file_bytes
+    {
+        return Ok(false);
+    }
+
+    let source_digest = jsonl_validation_digest(jsonl_path, dataset_kind, batch_size)?;
+    if manifest.source_row_count != source_digest.rows
+        || manifest.parquet_row_count != source_digest.rows
+        || manifest.required_field_digest_hex != format!("{:016x}", source_digest.hash)
+        || manifest.required_null_counts != source_digest.required_null_counts
+        || manifest.semantic_stats != source_digest.semantic
+    {
+        return Ok(false);
+    }
+
+    let parquet_rows = parquet_row_count(parquet_path)?;
+    if parquet_rows != manifest.parquet_row_count {
+        return Ok(false);
+    }
+    let parquet_digest = parquet_validation_digest(parquet_path, dataset_kind)?;
+    Ok(parquet_digest == source_digest)
+}
+
+fn read_manifest(path: &Path) -> Result<ParquetManifest> {
+    let file = File::open(path).with_context(|| format!("open manifest {}", path.display()))?;
+    serde_json::from_reader(file).with_context(|| format!("parse manifest {}", path.display()))
+}
+
+fn jsonl_validation_digest(
+    jsonl_path: &Path,
+    dataset_kind: DatasetKind,
+    batch_size: usize,
+) -> Result<ValidationDigest> {
+    let input =
+        File::open(jsonl_path).with_context(|| format!("open input {}", jsonl_path.display()))?;
+    let reader = BufReader::new(input);
+    let mut json_reader = ReaderBuilder::new(schema_for(dataset_kind))
+        .with_batch_size(batch_size)
+        .build(reader)
+        .with_context(|| format!("build json reader for {}", jsonl_path.display()))?;
+    let mut digest = ValidationDigest::new(dataset_kind);
+    for maybe_batch in &mut json_reader {
+        let batch = maybe_batch
+            .with_context(|| format!("read record batch from {}", jsonl_path.display()))?;
+        validate_required_batch(dataset_kind, &batch, &mut digest)
+            .with_context(|| format!("validate required fields from {}", jsonl_path.display()))?;
+    }
+    Ok(digest)
 }
 
 fn parquet_row_count(path: &Path) -> Result<u64> {
@@ -1399,6 +1506,89 @@ mod tests {
         assert!(!jsonl.exists());
         assert_eq!(parquet_row_count(&parquet), 1);
         assert!(manifest_path_for(&parquet).exists());
+    }
+
+    #[test]
+    fn compactor_reuses_valid_publication_and_removes_duplicate_jsonl() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("accepted_duplicate_source.jsonl");
+        write_lines(
+            &jsonl,
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":10,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":true}"#,
+            ],
+        );
+        let keep_jsonl_cfg = ParquetCompactionConfig {
+            delete_jsonl_after_success: false,
+            ..ParquetCompactionConfig::default()
+        };
+        let parquet = compact_jsonl_file(&jsonl, DatasetKind::AcceptedSamples, &keep_jsonl_cfg)
+            .expect("first compact")
+            .expect("parquet path");
+        let parquet_mtime_before = std::fs::metadata(&parquet)
+            .expect("parquet metadata")
+            .modified()
+            .expect("parquet modified");
+
+        let retry_parquet = compact_jsonl_file(
+            &jsonl,
+            DatasetKind::AcceptedSamples,
+            &ParquetCompactionConfig::default(),
+        )
+        .expect("retry compact")
+        .expect("parquet path");
+
+        assert_eq!(retry_parquet, parquet);
+        assert!(!jsonl.exists());
+        assert_eq!(parquet_row_count(&parquet), 1);
+        assert!(manifest_path_for(&parquet).exists());
+        let parquet_mtime_after = std::fs::metadata(&parquet)
+            .expect("parquet metadata")
+            .modified()
+            .expect("parquet modified");
+        assert_eq!(parquet_mtime_after, parquet_mtime_before);
+    }
+
+    #[test]
+    fn compactor_rebuilds_stale_publication_when_jsonl_changed() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("accepted_stale_publication.jsonl");
+        write_lines(
+            &jsonl,
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":10,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":true}"#,
+            ],
+        );
+        let keep_jsonl_cfg = ParquetCompactionConfig {
+            delete_jsonl_after_success: false,
+            ..ParquetCompactionConfig::default()
+        };
+        let parquet = compact_jsonl_file(&jsonl, DatasetKind::AcceptedSamples, &keep_jsonl_cfg)
+            .expect("first compact")
+            .expect("parquet path");
+
+        write_lines(
+            &jsonl,
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":10,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":true}"#,
+                r#"{"ts_ns":2,"cycle_seq":2,"schema_version":10,"scanner_version":"0.1.0","sample_id":"id2","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.1,"exit_spread":-1.1,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":2,"route_active_until_ns":null,"route_n_snapshots":2,"was_recommended":true}"#,
+            ],
+        );
+
+        let rebuilt = compact_jsonl_file(
+            &jsonl,
+            DatasetKind::AcceptedSamples,
+            &ParquetCompactionConfig::default(),
+        )
+        .expect("retry compact")
+        .expect("parquet path");
+
+        assert_eq!(rebuilt, parquet);
+        assert!(!jsonl.exists());
+        assert_eq!(parquet_row_count(&parquet), 2);
+        let manifest = read_manifest(&parquet);
+        assert_eq!(manifest.source_row_count, 2);
+        assert_eq!(manifest.parquet_row_count, 2);
     }
 
     #[test]
