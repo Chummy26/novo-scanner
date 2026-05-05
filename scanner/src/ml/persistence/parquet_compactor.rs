@@ -99,11 +99,24 @@ pub fn compact_jsonl_file(
     }
 
     let parquet_path = jsonl_path.with_extension("parquet");
+    let manifest_path = manifest_path_for(&parquet_path);
     let temp_parquet_path = jsonl_path.with_extension("parquet.tmp");
     let schema = schema_for(dataset_kind);
 
     if temp_parquet_path.exists() {
         let _ = fs::remove_file(&temp_parquet_path);
+    }
+    let temp_manifest_path = manifest_temp_path_for(&manifest_path);
+    if temp_manifest_path.exists() {
+        let _ = fs::remove_file(&temp_manifest_path);
+    }
+    if parquet_path.exists() && !manifest_path.exists() {
+        fs::remove_file(&parquet_path).with_context(|| {
+            format!(
+                "remove orphan parquet without manifest {}",
+                parquet_path.display()
+            )
+        })?;
     }
 
     let input =
@@ -218,14 +231,6 @@ pub fn compact_jsonl_file(
         .len();
     let source_bytes = metadata.len();
 
-    fs::rename(&temp_parquet_path, &parquet_path).with_context(|| {
-        format!(
-            "rename parquet {} -> {}",
-            temp_parquet_path.display(),
-            parquet_path.display()
-        )
-    })?;
-
     let manifest = ParquetManifest::new(
         dataset_kind,
         jsonl_path,
@@ -235,14 +240,7 @@ pub fn compact_jsonl_file(
         temp_parquet_bytes,
         cfg,
     );
-    write_and_validate_manifest(&manifest, &manifest_path_for(&parquet_path)).with_context(
-        || {
-            format!(
-                "write parquet manifest {}",
-                manifest_path_for(&parquet_path).display()
-            )
-        },
-    )?;
+    publish_parquet_with_manifest(&temp_parquet_path, &parquet_path, &manifest, &manifest_path)?;
 
     if cfg.delete_jsonl_after_success {
         fs::remove_file(jsonl_path)
@@ -256,8 +254,70 @@ fn manifest_path_for(parquet_path: &Path) -> PathBuf {
     parquet_path.with_extension("parquet.manifest.json")
 }
 
-fn write_and_validate_manifest(manifest: &ParquetManifest, path: &Path) -> Result<()> {
-    let temp_path = path.with_extension("manifest.json.tmp");
+fn manifest_temp_path_for(manifest_path: &Path) -> PathBuf {
+    let mut temp_path = manifest_path.as_os_str().to_owned();
+    temp_path.push(".tmp");
+    PathBuf::from(temp_path)
+}
+
+fn publish_parquet_with_manifest(
+    temp_parquet_path: &Path,
+    parquet_path: &Path,
+    manifest: &ParquetManifest,
+    manifest_path: &Path,
+) -> Result<()> {
+    let temp_manifest_path = match write_and_validate_manifest_temp(manifest, manifest_path) {
+        Ok(path) => path,
+        Err(e) => {
+            let _ = fs::remove_file(temp_parquet_path);
+            return Err(e)
+                .with_context(|| format!("write parquet manifest {}", manifest_path.display()));
+        }
+    };
+
+    if let Err(e) = fs::rename(temp_parquet_path, parquet_path) {
+        let _ = fs::remove_file(temp_parquet_path);
+        let _ = fs::remove_file(&temp_manifest_path);
+        return Err(e).with_context(|| {
+            format!(
+                "rename parquet {} -> {}",
+                temp_parquet_path.display(),
+                parquet_path.display()
+            )
+        });
+    }
+
+    if let Err(e) = fs::rename(&temp_manifest_path, manifest_path) {
+        let _ = fs::remove_file(&temp_manifest_path);
+        let cleanup = remove_file_if_exists(parquet_path);
+        let publish_error = anyhow::Error::new(e).context(format!(
+            "rename manifest {} -> {}",
+            temp_manifest_path.display(),
+            manifest_path.display()
+        ));
+        if let Err(cleanup_error) = cleanup {
+            return Err(publish_error).context(format!(
+                "cleanup partial parquet {} failed: {}",
+                parquet_path.display(),
+                cleanup_error
+            ));
+        }
+        return Err(publish_error);
+    }
+
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn write_and_validate_manifest_temp(manifest: &ParquetManifest, path: &Path) -> Result<PathBuf> {
+    let temp_path = manifest_temp_path_for(path);
     if temp_path.exists() {
         let _ = fs::remove_file(&temp_path);
     }
@@ -278,13 +338,7 @@ fn write_and_validate_manifest(manifest: &ParquetManifest, path: &Path) -> Resul
             path.display()
         );
     }
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "rename manifest {} -> {}",
-            temp_path.display(),
-            path.display()
-        )
-    })
+    Ok(temp_path)
 }
 
 fn parquet_row_count(path: &Path) -> Result<u64> {
@@ -1277,6 +1331,71 @@ mod tests {
         .expect("compact")
         .expect("parquet path");
 
+        assert!(!jsonl.exists());
+        assert_eq!(parquet_row_count(&parquet), 1);
+        assert!(manifest_path_for(&parquet).exists());
+    }
+
+    #[test]
+    fn compactor_cleans_final_parquet_when_manifest_publish_fails() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("accepted.jsonl");
+        write_lines(
+            &jsonl,
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":10,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":true}"#,
+            ],
+        );
+
+        let parquet = jsonl.with_extension("parquet");
+        let manifest_path = manifest_path_for(&parquet);
+        fs::create_dir(&manifest_path).expect("block manifest final path");
+
+        let result = compact_jsonl_file(
+            &jsonl,
+            DatasetKind::AcceptedSamples,
+            &ParquetCompactionConfig::default(),
+        );
+
+        assert!(
+            result.is_err(),
+            "manifest final path bloqueado deve falhar a publicacao"
+        );
+        assert!(
+            jsonl.exists(),
+            "JSONL fonte deve ficar para retry apos falha de manifesto"
+        );
+        assert!(
+            !parquet.exists(),
+            "Parquet final sem manifesto deve ser removido para nao bloquear retry"
+        );
+        assert!(!jsonl.with_extension("parquet.tmp").exists());
+        assert!(!manifest_temp_path_for(&manifest_path).exists());
+        assert!(manifest_path.is_dir());
+    }
+
+    #[test]
+    fn compactor_removes_orphan_parquet_without_manifest_before_retry() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("accepted_retry.jsonl");
+        write_lines(
+            &jsonl,
+            &[
+                r#"{"ts_ns":1,"cycle_seq":1,"schema_version":10,"scanner_version":"0.1.0","sample_id":"id1","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1,"was_recommended":true}"#,
+            ],
+        );
+        let orphan = jsonl.with_extension("parquet");
+        fs::write(&orphan, b"orphan parquet without manifest").expect("orphan parquet");
+
+        let parquet = compact_jsonl_file(
+            &jsonl,
+            DatasetKind::AcceptedSamples,
+            &ParquetCompactionConfig::default(),
+        )
+        .expect("retry compact")
+        .expect("parquet path");
+
+        assert_eq!(parquet, orphan);
         assert!(!jsonl.exists());
         assert_eq!(parquet_row_count(&parquet), 1);
         assert!(manifest_path_for(&parquet).exists());
