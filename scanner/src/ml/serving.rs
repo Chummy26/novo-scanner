@@ -5,7 +5,8 @@
 //! 1. `HotQueryCache` (ADR-012 Camada 1b) — recebe observação de spread.
 //! 2. `SamplingTrigger` (ADR-009 + ADR-014) — decide se snapshot entra
 //!    no dataset (para shadow mode posterior).
-//! 3. `BaselineA3` (ADR-001) — emite `Recommendation`.
+//! 3. `BaselineA3` (ADR-001) — gera proxy degradado que só atravessa como
+//!    `Trade` se os invariantes finais de calibração estiverem completos.
 //!
 //! # Por que síncrono no MVP (não A2 thread dedicada)
 //!
@@ -44,8 +45,8 @@ use crate::ml::listing_history::{ListingHistory, RouteLifecycle};
 use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
 use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::persistence::{
-    AcceptedSample, FeaturesT0, LabelResolver, PolicyMetadata, RawSample, RawWriterHandle,
-    RouteDecimator, RouteRanking, SamplingTier,
+    AcceptedSample, DecisionResult, FeaturesT0, LabelResolver, PolicyMetadata, RawSample,
+    RawWriterHandle, RouteDecimator, RouteRanking, SamplingTier,
 };
 use crate::ml::trigger::{SampleDecision, SamplingTrigger};
 use ahash::AHashMap;
@@ -226,6 +227,23 @@ fn calib_status_label(status: CalibStatus) -> &'static str {
 
 /// Largura máxima de IC 95% antes de abstenção por `LowConfidence`.
 const IC_WIDTH_LIMIT: f32 = 0.20;
+
+#[derive(Debug, Clone, Copy)]
+struct LabelTierSnapshot {
+    tier: SamplingTier,
+    probability: f32,
+    selected: bool,
+}
+
+impl From<DecisionResult> for LabelTierSnapshot {
+    fn from(d: DecisionResult) -> Self {
+        Self {
+            tier: d.tier,
+            probability: d.probability,
+            selected: d.should_persist,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // MlServer
@@ -1009,9 +1027,9 @@ impl MlServer {
         features_t0: FeaturesT0,
         tier: SamplingTier,
         raw_sampling_probability: f32,
+        label_sampling_probability: f32,
         rec_meta: &RecommendationPersistence,
     ) {
-        let label_sampling_probability = f32::NAN;
         let (candidates_24h, accepts_24h) = self
             .route_ranking
             .as_ref()
@@ -1256,12 +1274,12 @@ impl MlServer {
                     }
                 }
             }
-            Some((dr.tier, dr.probability))
+            Some(LabelTierSnapshot::from(dr))
         } else {
             let dr = self
                 .raw_decimator
                 .decide_for_sample(route, now_ns, cycle_seq);
-            Some((dr.tier, dr.probability))
+            Some(LabelTierSnapshot::from(dr))
         };
 
         let accepted = self.build_accepted_sample(
@@ -1277,11 +1295,17 @@ impl MlServer {
             lifecycle,
         );
 
-        // Background abaixo do threshold visual alimenta historico PIT e
-        // resolve labels existentes, mas nao pode criar um PendingLabel para
-        // todo tick limpo: isso explode cardinalidade e trava o ciclo. So
-        // materializa candidato novo aqui se o proprio trigger aceitou.
-        let features_t0 = if clean && sample_dec == SampleDecision::Accept {
+        let should_label_background = clean
+            && (sample_dec == SampleDecision::Accept
+                || tier_snapshot
+                    .map(|snapshot| snapshot.selected)
+                    .unwrap_or(false));
+
+        // Background abaixo do threshold visual alimenta histórico PIT e
+        // resolve labels existentes. Para não explodir cardinalidade, rejeições
+        // limpas viram labels apenas quando o decimator raw selecionou o
+        // snapshot; Accept continua full-capture.
+        let features_t0 = if should_label_background {
             Some(self.build_features_t0(
                 route,
                 entry_spread,
@@ -1308,11 +1332,15 @@ impl MlServer {
         }
 
         if clean {
-            if let (Some(resolver), Some((tier, raw_sampling_probability))) =
-                (self.label_resolver.as_ref(), tier_snapshot)
+            if let (Some(resolver), Some(snapshot)) = (self.label_resolver.as_ref(), tier_snapshot)
             {
                 let Some(features_t0) = features_t0 else {
                     return (sample_dec, accepted);
+                };
+                let label_sampling_probability = if sample_dec == SampleDecision::Accept {
+                    1.0
+                } else {
+                    snapshot.probability
                 };
                 let label_sample_id = accepted
                     .as_ref()
@@ -1339,8 +1367,9 @@ impl MlServer {
                     entry_spread,
                     exit_spread,
                     features_t0,
-                    tier,
-                    raw_sampling_probability,
+                    snapshot.tier,
+                    snapshot.probability,
+                    label_sampling_probability,
                     &rec_meta,
                 );
             }
@@ -1557,14 +1586,14 @@ impl MlServer {
                     }
                 }
             }
-            Some((dr.tier, dr.probability))
+            Some(LabelTierSnapshot::from(dr))
         } else {
             // Sem raw_writer, ainda calcula o tier para alimentar o label
             // resolver (correção B1 — label persiste mesmo sem raw).
             let dr = self
                 .raw_decimator
                 .decide_for_sample(route, now_ns, cycle_seq);
-            Some((dr.tier, dr.probability))
+            Some(LabelTierSnapshot::from(dr))
         };
 
         // 3. Gera recomendação apenas a partir dos spreads e histórico PIT.
@@ -1694,9 +1723,7 @@ impl MlServer {
         // apenas Accept. Isso dá negativos supervisionáveis
         // (insufficient_history/below_tail) para abstenção sem contaminar
         // com low-volume operacional.
-        if let (Some(resolver), Some((tier, raw_sampling_probability))) =
-            (self.label_resolver.as_ref(), tier_snapshot)
-        {
+        if let (Some(resolver), Some(snapshot)) = (self.label_resolver.as_ref(), tier_snapshot) {
             if !clean {
                 return (rec, sample_dec, accepted);
             }
@@ -1736,10 +1763,10 @@ impl MlServer {
                 route_active_until_ns: lifecycle.and_then(|lc| lc.active_until_ns),
                 route_n_snapshots: lifecycle.map(|lc| lc.n_snapshots),
             };
-            // Probabilidade efetiva do label é desconhecida online: o labeler
-            // usa stride por rota, então IPW correto depende da taxa observada
-            // de candidates/accepts por rota e deve ser estimado offline.
-            let label_sampling_probability = f32::NAN;
+            // Foreground limpo é candidatado integralmente; o stride temporal
+            // por horizonte é determinístico e fica versionado em
+            // effective_stride_s no label fechado.
+            let label_sampling_probability = 1.0;
             // contadores de RouteRanking para IPW offline.
             let (candidates_24h, accepts_24h) = self
                 .route_ranking
@@ -1830,8 +1857,8 @@ impl MlServer {
                 self.label_floor_pct,
                 self.label_floors_pct.clone(),
                 policy,
-                tier.as_str(),
-                raw_sampling_probability,
+                snapshot.tier.as_str(),
+                snapshot.probability,
                 self.label_stride_s,
                 cluster_id,
                 cluster_size,
@@ -2107,9 +2134,9 @@ mod tests {
                 kind: ReasonKind::Tail,
                 detail: crate::ml::ReasonDetail::placeholder(),
             },
-            ci_method: "wilson_marginal",
+            ci_method: "conformal_split",
             model_version: "test-0.1.0".into(),
-            source_kind: crate::ml::contract::SourceKind::Baseline,
+            source_kind: crate::ml::contract::SourceKind::Model,
             emitted_at: 1_700_000_000_000_000_000,
             // valid_until ≥ 2 × t_hit_p75_s (3120s); usar 7000s para folga.
             valid_until: 1_700_000_000_000_000_000 + 7000 * 1_000_000_000,
@@ -2120,6 +2147,41 @@ mod tests {
             .unwrap()
             .gross_profit_p25 = 0.5;
         setup
+    }
+
+    fn mk_calibrated_setup(route: RouteId, emitted_at: u64) -> crate::ml::contract::TradeSetup {
+        use crate::ml::contract::{CalibStatus, ReasonKind, SourceKind, TradeReason, TradeSetup};
+
+        TradeSetup {
+            route_id: route,
+            entry_now: 3.0,
+            exit_target: 0.4,
+            gross_profit_target: 3.5,
+            p_hit: Some(0.82),
+            p_hit_ci: Some((0.76, 0.88)),
+            exit_q25: Some(0.2),
+            exit_q50: Some(0.5),
+            exit_q75: Some(0.8),
+            t_hit_p25_s: Some(1),
+            t_hit_median_s: Some(2),
+            t_hit_p75_s: Some(10),
+            p_censor: Some(0.03),
+            baseline_diagnostics: None,
+            cluster_id: None,
+            cluster_size: 1,
+            cluster_rank: 1,
+            cluster_detection_status: "not_implemented",
+            calibration_status: CalibStatus::Ok,
+            reason: TradeReason {
+                kind: ReasonKind::Combined,
+                detail: crate::ml::ReasonDetail::placeholder(),
+            },
+            ci_method: "conformal_split",
+            model_version: "model-test-0.1.0".into(),
+            source_kind: SourceKind::Model,
+            emitted_at,
+            valid_until: emitted_at + 30 * 1_000_000_000,
+        }
     }
 
     #[test]
@@ -2174,7 +2236,7 @@ mod tests {
     }
 
     #[test]
-    fn accumulated_observations_eventually_emit_trade() {
+    fn accumulated_observations_without_calibrated_model_abstain_low_confidence() {
         let server = mk_server().with_recommendation_cooldown_s(0);
         let route = mk_route();
         // Popula 200 observações "regime opportunity".
@@ -2200,21 +2262,12 @@ mod tests {
         assert_eq!(accepted.sampling_probability, 1.0);
         assert_eq!(accepted.sampling_probability_kind, "marginal_full_capture");
         match rec {
-            Recommendation::Trade(setup) => {
-                assert_eq!(setup.route_id, route);
-                assert!(
-                    setup
-                        .baseline_diagnostics
-                        .as_ref()
-                        .unwrap()
-                        .historical_base_rate_24h
-                        > 0.0
-                );
-                assert!(setup.p_hit.is_none());
-                assert!(setup.t_hit_median_s.is_none());
+            Recommendation::Abstain { reason, diagnostic } => {
+                assert_eq!(reason, AbstainReason::LowConfidence);
+                assert_eq!(diagnostic.model_version, "baseline-a3-0.2.0");
             }
-            Recommendation::Abstain { reason, .. } => {
-                panic!("expected Trade, got Abstain({:?})", reason);
+            Recommendation::Trade(setup) => {
+                panic!("degraded baseline must not cross as Trade: {:?}", setup);
             }
         }
     }
@@ -2227,11 +2280,20 @@ mod tests {
         let t1 = t0 + 1_000_000_000;
         let t2 = t1 + 1_000_000_000;
 
-        let _ = server.on_opportunity(0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0);
-        let (first, _, _) = server.on_opportunity(1, route, "BTC-USDT", 3.1, 0.6, 1e6, 1e6, t1);
+        let first = server.apply_trade_cooldown(
+            route,
+            t1,
+            10,
+            Recommendation::Trade(mk_calibrated_setup(route, t1)),
+        );
         assert!(matches!(first, Recommendation::Trade(_)));
 
-        let (second, _, _) = server.on_opportunity(2, route, "BTC-USDT", 3.2, 0.7, 1e6, 1e6, t2);
+        let second = server.apply_trade_cooldown(
+            route,
+            t2,
+            10,
+            Recommendation::Trade(mk_calibrated_setup(route, t2)),
+        );
         match second {
             Recommendation::Abstain { reason, .. } => {
                 assert_eq!(reason, AbstainReason::Cooldown);
@@ -2242,37 +2304,39 @@ mod tests {
 
     #[test]
     fn economic_tracker_resolves_a_trade_in_sequence() {
-        // Semântica pós-auditoria: requer 3 ticks.
-        // t0: populate cache + abstain InsufficientHistory
-        // t1: emite Trade e trava entry_now em t1 (cache tem 1 sample, n_min=1)
-        // t2: tick futuro com exit >= exit_target realiza o trade.
-        let server = mk_server_with_min_history(1);
         let route = mk_route();
-
-        let t0: u64 = 1_000_000_000;
-        let t1: u64 = t0 + 1_000_000_000;
-        let t2: u64 = t1 + 1_000_000_000;
-
-        // Tick 0: populate cache (entry=3.0, exit=0.5 → gross=3.5, bem acima do floor).
-        let (_rec, dec, _) = server.on_opportunity(0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0);
-        assert_eq!(dec, SampleDecision::RejectInsufficientHistory);
-
-        // Tick 1: agora cache tem 1 sample ≥ n_min. Emite Trade.
-        let (rec, _dec, _accepted) =
-            server.on_opportunity(1, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t1);
-        let setup = match rec {
-            Recommendation::Trade(s) => s,
-            Recommendation::Abstain { reason, .. } => panic!("esperava Trade, got {:?}", reason),
-        };
-
-        // Tick 2: entry já está travado em t1; só exit futuro precisa cruzar o alvo.
+        let t1: u64 = 2_000_000_000;
+        let t2: u64 = t1 + MIN_HORIZON_NS + 1;
+        let setup = mk_calibrated_setup(route, t1);
         assert_eq!(setup.entry_now, 3.0);
-        assert!(setup.exit_target <= 0.5 + 0.01);
 
-        let (_rec, _dec, _accepted) =
-            server.on_opportunity(2, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t2);
+        let mut tracker = EconomicTracker::new();
+        tracker.process(
+            route,
+            setup.entry_now,
+            -1.0,
+            t1,
+            &Recommendation::Trade(setup),
+        );
+        tracker.process(
+            route,
+            3.0,
+            0.5,
+            t2,
+            &Recommendation::Abstain {
+                reason: AbstainReason::NoOpportunity,
+                diagnostic: AbstainDiagnostic {
+                    n_observations: 1,
+                    ci_width_if_emitted: None,
+                    nearest_feasible_utility: None,
+                    tail_ratio_p99_p95: None,
+                    model_version: "test".into(),
+                    regime_posterior: [1.0, 0.0, 0.0],
+                },
+            },
+        );
 
-        let econ = server.economic_metrics();
+        let econ = tracker.metrics();
         assert_eq!(
             econ.n_emissions_total.load(Ordering::Relaxed),
             1,
@@ -2289,25 +2353,21 @@ mod tests {
     fn economic_tracker_refuses_intra_tick_resolution() {
         // Fix pós-auditoria: trade recém-emitido não pode "realizar" no
         // mesmo tick em que foi emitido (viola identidade estrutural §2).
-        let server = mk_server_with_min_history(1);
         let route = mk_route();
-
-        let t0: u64 = 1_000_000_000;
-        let t_emit: u64 = t0 + 1_000_000_000;
-
-        // Primeiro popula cache.
-        let _ = server.on_opportunity(0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0);
-
-        // Tick de emissão: entry E exit já favoráveis no MESMO tick.
-        let (rec, _, _) = server.on_opportunity(1, route, "BTC-USDT", 3.5, 0.5, 1e6, 1e6, t_emit);
-        assert!(
-            matches!(rec, Recommendation::Trade(_)),
-            "cache populado deve emitir Trade no 2º tick"
+        let t_emit: u64 = 2_000_000_000;
+        let setup = mk_calibrated_setup(route, t_emit);
+        let mut tracker = EconomicTracker::new();
+        tracker.process(
+            route,
+            setup.entry_now,
+            0.5,
+            t_emit,
+            &Recommendation::Trade(setup),
         );
 
         // SEM fix, trade realizaria no mesmo tick em horizon=0s
         // (violando skill §2). COM fix, grace MIN_HORIZON_NS bloqueia.
-        let econ = server.economic_metrics();
+        let econ = tracker.metrics();
         let realized_after_emit = econ.n_realized_total.load(Ordering::Relaxed);
         assert_eq!(
             realized_after_emit, 0,
@@ -2317,17 +2377,20 @@ mod tests {
 
     #[test]
     fn economic_sweeper_closes_silent_route_after_valid_until() {
-        let server = mk_server_with_min_history(1);
         let route = mk_route();
-        let t0: u64 = 1_000_000_000;
-        let t_emit: u64 = t0 + 1_000_000_000;
+        let t_emit: u64 = 2_000_000_000;
+        let setup = mk_calibrated_setup(route, t_emit);
+        let mut tracker = EconomicTracker::new();
+        tracker.process(
+            route,
+            setup.entry_now,
+            0.0,
+            t_emit,
+            &Recommendation::Trade(setup),
+        );
 
-        let _ = server.on_opportunity(0, route, "BTC-USDT", 3.0, 0.5, 1e6, 1e6, t0);
-        let (rec, _, _) = server.on_opportunity(1, route, "BTC-USDT", 3.0, 0.4, 1e6, 1e6, t_emit);
-        assert!(matches!(rec, Recommendation::Trade(_)));
-
-        let closed = server.economic_sweep(t_emit + 31_000_000_000);
-        let econ = server.economic_metrics();
+        let closed = tracker.sweep(t_emit + 31_000_000_000);
+        let econ = tracker.metrics();
         assert_eq!(closed, 1);
         assert_eq!(econ.n_emissions_total.load(Ordering::Relaxed), 1);
         assert_eq!(econ.n_censored_total.load(Ordering::Relaxed), 1);
@@ -2592,7 +2655,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_background_below_tail_does_not_create_new_label_candidate() {
+    async fn clean_background_below_tail_selected_by_decimator_creates_label_candidate() {
         use crate::ml::persistence::{
             LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, ResolverConfig,
         };
@@ -2647,8 +2710,8 @@ mod tests {
                 .metrics()
                 .pending_created_total
                 .load(Ordering::Relaxed),
-            0,
-            "background below-tail alimenta cache/raw e resolve labels existentes, mas nao cria pending por tick"
+            1,
+            "background below-tail limpo selecionado pelo decimator deve gerar negativo supervisionavel"
         );
         drop(server);
         drop(resolver);
@@ -2831,8 +2894,10 @@ mod tests {
         );
         assert!(
             v["sampling_probability"].as_f64().is_some()
-                && v["policy_metadata"]["label_sampling_probability"].is_null(),
-            "sampling_probability top-level carrega contexto do raw decimator; probabilidade efetiva do label depende do stride por rota e fica em policy_metadata.label_sampling_probability"
+                && v["policy_metadata"]["label_sampling_probability"]
+                    .as_f64()
+                    .is_some(),
+            "sampling_probability top-level carrega contexto do raw decimator; policy_metadata.label_sampling_probability deve materializar a probabilidade conhecida de candidatura supervisionada"
         );
     }
 }

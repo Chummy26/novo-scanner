@@ -1,13 +1,13 @@
 //! Verificadores de invariantes estruturais do `TradeSetup`.
 //!
 //! Chamar `verify_tradesetup(&setup)` antes de broadcast / persistência.
-//! Em caso de violação, retornar `InvariantError` permite ao caller
-//! decidir: rejeitar emissão (abstenção silenciosa) OU aceitar com flag
-//! de warning (calibration_status = Degraded).
+//! Em caso de violação, o caller deve rejeitar a emissão ativa e converter
+//! para abstenção tipada. `calibration_status = Degraded` não atravessa como
+//! `Recommendation::Trade`.
 //!
 //! Runtime overhead: ~80 ns/verificação (10 comparações float).
 
-use crate::ml::contract::{SourceKind, TradeSetup};
+use crate::ml::contract::{CalibStatus, SourceKind, TradeSetup};
 
 /// Tipos de violação de invariante detectados.
 ///
@@ -63,10 +63,11 @@ pub enum InvariantError {
     /// `entry_now < 0` em `TradeSetup` ativo. Observações negativas podem
     /// existir no dataset bruto/abstenção, mas não são entrada acionável.
     NegativeEntryForActiveTrade { entry_now: f32 },
-    /// `source_kind=Model` tentou emitir `TradeSetup` sem os campos
-    /// calibrados obrigatórios do contrato final (`P`, `IC`, `T` ou
-    /// `P_censura`). Baseline degradado pode carregar `None`; modelo não.
-    ModelTradeMissingCalibratedOutput { field: &'static str },
+    /// `Recommendation::Trade` tentou atravessar o contrato ativo sem os
+    /// campos calibrados obrigatórios do CLAUDE.md (`P`, `IC`, `T` e
+    /// `P_censura`) ou sem fonte/modelo calibrado. Baseline degradado é
+    /// diagnóstico interno; no contrato público precisa virar Abstain.
+    ActiveTradeMissingCalibratedOutput { field: &'static str },
 }
 
 /// Piso mínimo de `p_hit` para aceitar emissão. CLAUDE.md §Critérios
@@ -336,29 +337,37 @@ fn verify_tradesetup_inner(
         }
     }
 
-    // 13. `SourceKind::Model` é o contrato final do operador: se emite
-    //     TradeSetup, precisa carregar P, IC, T e P_censura honestos. O
-    //     baseline A3 continua permitido como fallback degradado, mas nunca
-    //     deve ser confundido com recomendação calibrada completa.
-    if s.source_kind == SourceKind::Model {
-        if s.p_hit.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "p_hit" });
-        }
-        if s.p_hit_ci.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "p_hit_ci" });
-        }
-        if matches!(s.ci_method, "none" | "") {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "ci_method" });
-        }
-        if s.exit_q25.is_none() || s.exit_q50.is_none() || s.exit_q75.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "exit_q*" });
-        }
-        if s.t_hit_p25_s.is_none() || s.t_hit_median_s.is_none() || s.t_hit_p75_s.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "t_hit_*" });
-        }
-        if s.p_censor.is_none() {
-            return Err(InvariantError::ModelTradeMissingCalibratedOutput { field: "p_censor" });
-        }
+    // 13. `Recommendation::Trade` é contrato ativo, não diagnóstico. Se
+    //     atravessa broadcast/persistência como Trade, precisa carregar a
+    //     tupla calibrada completa do CLAUDE.md. Baseline A3 marginal deve
+    //     virar `Abstain(LowConfidence)` antes de chegar ao consumidor.
+    if s.source_kind != SourceKind::Model {
+        return Err(InvariantError::ActiveTradeMissingCalibratedOutput {
+            field: "source_kind",
+        });
+    }
+    if s.calibration_status != CalibStatus::Ok {
+        return Err(InvariantError::ActiveTradeMissingCalibratedOutput {
+            field: "calibration_status",
+        });
+    }
+    if s.p_hit.is_none() {
+        return Err(InvariantError::ActiveTradeMissingCalibratedOutput { field: "p_hit" });
+    }
+    if s.p_hit_ci.is_none() {
+        return Err(InvariantError::ActiveTradeMissingCalibratedOutput { field: "p_hit_ci" });
+    }
+    if matches!(s.ci_method, "none" | "" | "wilson_marginal") {
+        return Err(InvariantError::ActiveTradeMissingCalibratedOutput { field: "ci_method" });
+    }
+    if s.exit_q25.is_none() || s.exit_q50.is_none() || s.exit_q75.is_none() {
+        return Err(InvariantError::ActiveTradeMissingCalibratedOutput { field: "exit_q*" });
+    }
+    if s.t_hit_p25_s.is_none() || s.t_hit_median_s.is_none() || s.t_hit_p75_s.is_none() {
+        return Err(InvariantError::ActiveTradeMissingCalibratedOutput { field: "t_hit_*" });
+    }
+    if s.p_censor.is_none() {
+        return Err(InvariantError::ActiveTradeMissingCalibratedOutput { field: "p_censor" });
     }
 
     Ok(())
@@ -389,7 +398,7 @@ mod tests {
             gross_profit_target: 1.0, // entry_now + exit_q50
             p_hit: Some(0.83),
             p_hit_ci: Some((0.77, 0.88)),
-            ci_method: "wilson_marginal",
+            ci_method: "conformal_split",
             exit_q25: Some(-1.4),
             exit_q50: Some(-1.0),
             exit_q75: Some(-0.7),
@@ -423,8 +432,8 @@ mod tests {
                 kind: ReasonKind::Combined,
                 detail: ReasonDetail::placeholder(),
             },
-            model_version: "baseline-a3-0.2.0".into(),
-            source_kind: SourceKind::Baseline,
+            model_version: "model-test-0.1.0".into(),
+            source_kind: SourceKind::Model,
             emitted_at,
             valid_until: emitted_at + valid_for_ns,
         }
@@ -557,14 +566,16 @@ mod tests {
     }
 
     #[test]
-    fn gross_identity_falls_back_to_exit_target_when_q50_absent() {
-        // Quando modelo degradado não tem distribuição, identidade usa exit_target.
+    fn active_trade_rejects_missing_exit_quantiles() {
         let mut s = valid();
         s.exit_q25 = None;
         s.exit_q50 = None;
         s.exit_q75 = None;
-        // gross = entry_now + exit_target = 2.0 + (-1.0) = 1.0
-        assert!(verify_tradesetup(&s).is_ok());
+        let err = verify_tradesetup(&s).unwrap_err();
+        assert!(matches!(
+            err,
+            InvariantError::ActiveTradeMissingCalibratedOutput { field: "exit_q*" }
+        ));
     }
 
     // ---- p_censor obrigatório quando t_hit_* presente -----------
@@ -581,13 +592,17 @@ mod tests {
     }
 
     #[test]
-    fn absence_of_t_hit_does_not_require_p_censor() {
+    fn active_trade_requires_time_quantiles_and_p_censor() {
         let mut s = valid();
         s.t_hit_p25_s = None;
         s.t_hit_median_s = None;
         s.t_hit_p75_s = None;
         s.p_censor = None;
-        assert!(verify_tradesetup(&s).is_ok());
+        let err = verify_tradesetup(&s).unwrap_err();
+        assert!(matches!(
+            err,
+            InvariantError::ActiveTradeMissingCalibratedOutput { field: "t_hit_*" }
+        ));
     }
 
     // ---- valid_until ≥ 2 × t_hit_p75_s -------------------------
@@ -640,12 +655,12 @@ mod tests {
         let err = verify_tradesetup(&s).unwrap_err();
         assert!(matches!(
             err,
-            InvariantError::ModelTradeMissingCalibratedOutput { field: "p_hit" }
+            InvariantError::ActiveTradeMissingCalibratedOutput { field: "p_hit" }
         ));
     }
 
     #[test]
-    fn baseline_degraded_may_omit_model_only_calibration_fields() {
+    fn baseline_degraded_cannot_cross_active_trade_contract() {
         let mut s = valid();
         s.source_kind = SourceKind::Baseline;
         s.p_hit = None;
@@ -654,6 +669,12 @@ mod tests {
         s.t_hit_median_s = None;
         s.t_hit_p75_s = None;
         s.p_censor = None;
-        assert!(verify_tradesetup(&s).is_ok());
+        let err = verify_tradesetup(&s).unwrap_err();
+        assert!(matches!(
+            err,
+            InvariantError::ActiveTradeMissingCalibratedOutput {
+                field: "source_kind"
+            }
+        ));
     }
 }

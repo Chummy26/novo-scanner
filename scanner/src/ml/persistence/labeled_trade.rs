@@ -29,8 +29,10 @@
 //!
 //! Treino precision-first pode priorizar `df_tail`, mas calibração de
 //! recomendação e análise de abstenção precisam de `df_recommended` e
-//! `df_background`. `label_sampling_probability = null` não equivale a 1.0:
-//! o trainer deve estimar/reconstruir pesos de seleção antes de IPW.
+//! `df_background`. `label_sampling_probability = null` em histórico legado
+//! não equivale a 1.0. Nas versões atuais, o campo deve carregar a
+//! probabilidade conhecida de candidatura supervisionada; o stride temporal
+//! continua versionado por `effective_stride_s` para reconstrução offline.
 //!
 //! # Opção B: 1 record por (sample_id, horizon_s)
 //!
@@ -96,6 +98,9 @@ pub enum CensorReason {
     RouteDelisted,
     /// Shutdown limpo do scanner; pendings sem horizonte completo.
     Shutdown,
+    /// A próxima observação limpa chegou só depois do deadline sem cobertura
+    /// suficiente dentro da janela; não é falsificável como miss.
+    IncompleteWindow,
 }
 
 impl CensorReason {
@@ -104,6 +109,7 @@ impl CensorReason {
             CensorReason::RouteDormant => "route_dormant",
             CensorReason::RouteDelisted => "route_delisted",
             CensorReason::Shutdown => "shutdown",
+            CensorReason::IncompleteWindow => "incomplete_window",
         }
     }
 }
@@ -231,12 +237,12 @@ pub struct PolicyMetadata {
     pub label_stride_s: u32,
     /// stride efetivo por horizonte deste record específico.
     pub effective_stride_s: u32,
-    /// Probabilidade efetiva do label quando conhecida.
+    /// Probabilidade conhecida de candidatura supervisionada.
     ///
-    /// No runtime atual, o labeler usa stride por rota, não amostragem
-    /// Bernoulli independente. A probabilidade efetiva depende da taxa
-    /// observada de candidates por rota/horizonte; quando não for conhecida
-    /// online, serializa como `null` e o trainer deve estimar offline.
+    /// O stride por rota/horizonte é determinístico e fica registrado em
+    /// `effective_stride_s`. Quando este campo for `null`, trata-se de
+    /// histórico legado ou política sem probabilidade materializável; o
+    /// trainer não deve imputar 1.0.
     pub label_sampling_probability: f32,
     /// candidates da rota nas últimas 24h (pré-stride). Permite
     /// trainer reconstruir `π(x)` offline sem ambiguidade.

@@ -21,3 +21,4 @@ em `06_labels_and_data/`.
 - `06_labels_and_data/label_schema.md` descreve os três streams persistidos.
 - `06_labels_and_data/data_lineage.md` descreve origem, ordem point-in-time e
   campos que não pertencem ao objetivo do modelo.
+

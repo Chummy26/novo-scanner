@@ -25,8 +25,10 @@ Streams:
   carrega config hash, tier/probabilidade de amostragem e lifecycle.
 - `labeled_trades` (`LabeledTrade` v11): um registro por
   `(sample_id, horizon_s)`, com `outcome in {realized, miss, censored}`.
-  O resolver cria labels para candidates limpos, inclusive `sample_decision !=
-  "accept"`, para auditoria de abstenção/background.
+  O resolver cria labels para candidates limpos. No foreground, isso inclui
+  `sample_decision != "accept"`; no background abaixo do threshold visual,
+  rejeições limpas entram quando selecionadas pelo decimator raw, preservando
+  auditoria de abstenção/background sem capturar todo tick.
 
 `features_t0` não inclui diagnósticos operacionais do book. Volume 24h pode
 existir nos streams bruto/aceito como metadado de amostragem/filtro de
@@ -39,10 +41,12 @@ Não são target supervisionado principal.
 
 Invariantes do trainer:
 
-- Não tratar `label_sampling_probability = null` como `1.0`. O labeler usa
-  stride por rota/horizonte; pesos de seleção precisam ser reconstruídos a
-  partir de `effective_stride_s`, `candidates_in_route_last_24h`,
-  `accepts_in_route_last_24h`, `sampling_tier` e `sampling_probability_kind`.
+- Não tratar `label_sampling_probability = null` como `1.0`. Em dados novos,
+  o campo deve carregar a probabilidade conhecida de candidatura
+  supervisionada; `null` indica histórico legado ou política sem probabilidade
+  materializável. O trainer ainda deve considerar `effective_stride_s`,
+  `candidates_in_route_last_24h`, `accepts_in_route_last_24h`,
+  `sampling_tier` e `sampling_probability_kind`.
 - Não filtrar cegamente `labeled_trades` por `sample_decision == "accept"`.
   Treino precision-first pode priorizar a cauda aceita, mas calibração de
   recomendações em shadow mode deve avaliar todas as linhas onde

@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::ml::contract::{
     AbstainDiagnostic, AbstainReason, BaselineDiagnostics, CalibStatus, ReasonKind, Recommendation,
-    RouteId, TradeSetup,
+    RouteId, SourceKind, TradeSetup,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,9 +66,23 @@ pub enum RecommendationDto {
 impl From<&Recommendation> for RecommendationDto {
     fn from(r: &Recommendation) -> Self {
         match r {
-            Recommendation::Trade(s) => RecommendationDto::Trade {
-                status: classify_trade_status(s),
-                setup: TradeSetupDto::from(s),
+            Recommendation::Trade(s) if is_public_trade_setup_complete(s) => {
+                RecommendationDto::Trade {
+                    status: classify_trade_status(s),
+                    setup: TradeSetupDto::from(s),
+                }
+            }
+            Recommendation::Trade(s) => RecommendationDto::Abstain {
+                status: "LOW_CONFIDENCE",
+                reason: AbstainReasonDto::LowConfidence,
+                diagnostic: AbstainDiagnosticDto {
+                    n_observations: 0,
+                    ci_width_if_emitted: s.p_hit_ci.map(|(lo, hi)| (hi - lo).max(0.0)),
+                    nearest_feasible_utility: Some(s.gross_profit_target),
+                    tail_ratio_p99_p95: None,
+                    model_version: s.model_version.clone(),
+                    regime_posterior: [0.0; 3],
+                },
             },
             Recommendation::Abstain { reason, diagnostic } => RecommendationDto::Abstain {
                 status: abstain_status_label(*reason),
@@ -77,6 +91,21 @@ impl From<&Recommendation> for RecommendationDto {
             },
         }
     }
+}
+
+fn is_public_trade_setup_complete(s: &TradeSetup) -> bool {
+    s.source_kind == SourceKind::Model
+        && s.calibration_status == CalibStatus::Ok
+        && s.p_hit.is_some()
+        && s.p_hit_ci.is_some()
+        && !matches!(s.ci_method, "" | "none" | "wilson_marginal")
+        && s.exit_q25.is_some()
+        && s.exit_q50.is_some()
+        && s.exit_q75.is_some()
+        && s.t_hit_p25_s.is_some()
+        && s.t_hit_median_s.is_some()
+        && s.t_hit_p75_s.is_some()
+        && s.p_censor.is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -108,25 +137,26 @@ pub const STATUS_IC_WIDTH_LIMIT: f32 = 0.20;
 /// Classifica `TradeSetup` em status badge CLAUDE.md.
 ///
 /// Ordem de precedência (mais restritivo primeiro):
-/// 0. **Fix D4**: `calibration_status=Suspended` → `LOW_CONFIDENCE`;
-///    `calibration_status=Degraded` → `CAUTION`. CLAUDE.md §Critérios:
+/// 0. `calibration_status=Suspended|Degraded` → `LOW_CONFIDENCE`.
+///    CLAUDE.md §Critérios:
 ///    "se o modelo diz 80%, ~80% precisam realizar-se". ECE entre 0.05-0.10
-///    (Degraded) contradiz `ENTER`; kill switch ativo (Suspended) exige
-///    `LOW_CONFIDENCE`.
+///    (Degraded) ou kill switch ativo (Suspended) impedem emissão de números
+///    acionáveis. O gate de serving deve converter esses casos em Abstain;
+///    esta classificação é defesa em profundidade para consumidores legados.
 /// 1. `LOW_CONFIDENCE` — `ic_width >= STATUS_IC_WIDTH_LIMIT`.
 /// 2. `FLOOR` — `gross_profit_target < STATUS_GROSS_FLOOR_PCT`.
 /// 3. `CAUTION` — `p_hit < STATUS_P_FLOOR` OR (`p_hit < STATUS_P_STRONG` AND
 ///    `t_hit_median_s >= STATUS_T_LONG_S`).
 /// 4. `ENTER` — resto.
 ///
-/// Quando `p_hit.is_none()` (baseline A3 degradado), retorna `CAUTION`:
-/// sem forecast condicional, evitamos `ENTER` direto para forçar revisão
-/// manual pelo operador.
+/// Quando `p_hit.is_none()` (baseline A3 degradado), retorna
+/// `LOW_CONFIDENCE`: sem forecast condicional, números de execução não devem
+/// ser apresentados como setup acionável.
 pub fn classify_trade_status(s: &TradeSetup) -> &'static str {
     // 0. calibration_status precede todos os outros gates.
     match s.calibration_status {
         CalibStatus::Suspended => return "LOW_CONFIDENCE",
-        CalibStatus::Degraded => return "CAUTION",
+        CalibStatus::Degraded => return "LOW_CONFIDENCE",
         CalibStatus::Ok => {}
     }
     // 1. IC width gate (precede tudo — se IC é ruim, o P não é confiável).
@@ -143,7 +173,7 @@ pub fn classify_trade_status(s: &TradeSetup) -> &'static str {
     // 3. Convicção reduzida.
     let p = match s.p_hit {
         Some(p) => p,
-        None => return "CAUTION", // sem forecast condicional.
+        None => return "LOW_CONFIDENCE", // sem forecast condicional.
     };
     if p < STATUS_P_FLOOR {
         return "CAUTION";
@@ -422,9 +452,9 @@ mod tests {
                 kind: ReasonKind::Combined,
                 detail: crate::ml::ReasonDetail::placeholder(),
             },
-            ci_method: "wilson_marginal",
-            model_version: "baseline-a3-0.2.0".into(),
-            source_kind: crate::ml::contract::SourceKind::Baseline,
+            ci_method: "conformal_split",
+            model_version: "model-test-0.1.0".into(),
+            source_kind: crate::ml::contract::SourceKind::Model,
             emitted_at: 1_700_000_000_000_000_000,
             valid_until: 1_700_000_150_000_000_000,
         }
@@ -460,6 +490,29 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["kind"], "trade");
         assert!(v["route_id"].is_object());
+    }
+
+    #[test]
+    fn recommendation_dto_suppresses_degraded_trade_variant() {
+        let mut s = mk_setup();
+        s.source_kind = crate::ml::contract::SourceKind::Baseline;
+        s.calibration_status = CalibStatus::Degraded;
+        s.p_hit = None;
+        s.p_hit_ci = None;
+        s.t_hit_p25_s = None;
+        s.t_hit_median_s = None;
+        s.t_hit_p75_s = None;
+        s.p_censor = None;
+
+        let rec = Recommendation::Trade(s);
+        let dto = RecommendationDto::from(&rec);
+        let json = serde_json::to_string(&dto).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(v["kind"], "abstain");
+        assert_eq!(v["status"], "LOW_CONFIDENCE");
+        assert_eq!(v["reason"], "low_confidence");
+        assert!(v.get("entry_now").is_none());
     }
 
     #[test]
@@ -550,11 +603,11 @@ mod tests {
     }
 
     #[test]
-    fn status_caution_when_p_hit_missing() {
+    fn status_low_confidence_when_p_hit_missing() {
         let mut s = mk_setup();
         s.p_hit = None; // baseline A3 degradado
         s.p_hit_ci = None;
-        assert_eq!(classify_trade_status(&s), "CAUTION");
+        assert_eq!(classify_trade_status(&s), "LOW_CONFIDENCE");
     }
 
     #[test]

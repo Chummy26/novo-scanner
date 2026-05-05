@@ -441,7 +441,7 @@ impl LabelResolver {
         _entry_spread: f32,
         exit_spread: f32,
     ) {
-        let mut to_write: Vec<(PendingLabel, usize)> = Vec::new();
+        let mut to_write: Vec<(PendingLabel, usize, Option<CensorReason>)> = Vec::new();
         {
             let mut inner = self.inner.lock();
             let Some(queue) = inner.pending_by_route.get_mut(&route_id) else {
@@ -453,36 +453,50 @@ impl LabelResolver {
                 let t_emit = pending.ts_emit_ns;
                 let entry_locked = pending.entry_locked_pct;
                 let label_floor = pending.label_floor_pct;
-                let mut closed_idx: Vec<usize> = Vec::new();
+                let mut closed_idx: Vec<(usize, Option<CensorReason>)> = Vec::new();
                 for (idx, slot) in pending.horizons.iter_mut().enumerate() {
                     if slot.closed {
                         continue;
                     }
                     let deadline = t_emit + (slot.horizon_s as u64) * 1_000_000_000;
-                    // ramo `now_ns == deadline` era código morto (u64
-                    // nanos, igualdade exata tem probabilidade ~0). Consolidado
-                    // em `>=` — fecha na primeira observação pós-deadline.
-                    if now_ns >= deadline {
-                        // Observação pós-deadline apenas comprova que a janela foi
-                        // observada até o horizonte. Ela NÃO pode criar first-hit:
-                        // o label é falsificável só dentro de [t0, t0+h].
+                    if now_ns == deadline {
                         slot.observed_until_ns = deadline;
-                        if now_ns == deadline {
-                            let gross = entry_locked + exit_spread;
-                            if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
-                                slot.first_exit_ge_floor_ts_ns = Some(now_ns);
-                                slot.first_exit_ge_floor_pct = Some(exit_spread);
-                            }
-                            for hit in slot.floor_hits.iter_mut() {
-                                if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none()
-                                {
-                                    hit.first_exit_ge_floor_ts_ns = Some(now_ns);
-                                    hit.first_exit_ge_floor_pct = Some(exit_spread);
-                                }
+                        slot.n_clean_future_samples = slot.n_clean_future_samples.saturating_add(1);
+                        let is_better = slot
+                            .best_exit_pct_so_far
+                            .map(|b| exit_spread > b)
+                            .unwrap_or(true);
+                        if is_better {
+                            slot.best_exit_pct_so_far = Some(exit_spread);
+                            slot.best_exit_ts_ns_so_far = Some(now_ns);
+                        }
+                        let gross = entry_locked + exit_spread;
+                        if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
+                            slot.first_exit_ge_floor_ts_ns = Some(now_ns);
+                            slot.first_exit_ge_floor_pct = Some(exit_spread);
+                        }
+                        for hit in slot.floor_hits.iter_mut() {
+                            if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none() {
+                                hit.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                hit.first_exit_ge_floor_pct = Some(exit_spread);
                             }
                         }
                         slot.closed = true;
-                        closed_idx.push(idx);
+                        closed_idx.push((idx, None));
+                        continue;
+                    }
+                    if now_ns > deadline {
+                        let gap_to_deadline = deadline.saturating_sub(slot.observed_until_ns);
+                        let window_observed_close_enough = slot.n_clean_future_samples > 0
+                            && gap_to_deadline <= self.cfg.close_slack_ns;
+                        if window_observed_close_enough {
+                            slot.observed_until_ns = deadline;
+                            slot.closed = true;
+                            closed_idx.push((idx, None));
+                        } else {
+                            slot.closed = true;
+                            closed_idx.push((idx, Some(CensorReason::IncompleteWindow)));
+                        }
                         continue;
                     }
                     slot.observed_until_ns = now_ns;
@@ -509,8 +523,8 @@ impl LabelResolver {
                 }
                 if !closed_idx.is_empty() {
                     let snapshot = pending.clone();
-                    for idx in closed_idx {
-                        to_write.push((snapshot.clone(), idx));
+                    for (idx, reason) in closed_idx {
+                        to_write.push((snapshot.clone(), idx, reason));
                     }
                 }
             }
@@ -520,9 +534,14 @@ impl LabelResolver {
             }
         }
 
-        for (pending, idx) in to_write {
+        for (pending, idx, reason) in to_write {
             let outcome = LabelOutcome::from_pending(&pending, idx);
-            self.write_closed_horizon_with_reason(pending, idx, now_ns, outcome, None);
+            let reason = if matches!(outcome, LabelOutcome::Censored) {
+                reason.or(Some(CensorReason::IncompleteWindow))
+            } else {
+                None
+            };
+            self.write_closed_horizon_with_reason(pending, idx, now_ns, outcome, reason);
         }
     }
 
@@ -743,6 +762,11 @@ impl LabelResolver {
             slot.horizon_s,
             N_EVENTS_TARGET_PER_HORIZON,
         );
+        if !policy.label_sampling_probability.is_finite()
+            && pending.sampling_probability.is_finite()
+        {
+            policy.label_sampling_probability = pending.sampling_probability;
+        }
 
         LabeledTrade {
             sample_id: pending.sample_id.clone(),
@@ -1119,7 +1143,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_deadline_hit_does_not_realize_horizon() {
+    async fn post_deadline_only_observation_censors_horizon() {
         let cfg = ResolverConfig {
             horizons_s: vec![2],
             close_slack_ns: 60_000_000_000,
@@ -1145,13 +1169,14 @@ mod tests {
             1.0,
             0,
         );
-        // t+3s fica fora do horizonte de 2s. Mesmo com gross=1.5 >= floor,
-        // não pode ser marcado como realized para esse horizonte.
+        // t+3s fica fora do horizonte de 2s. Sem observação limpa dentro
+        // da janela, também não é falsificável como miss.
         resolver.on_clean_observation(mk_route(), t_emit + 3_000_000_000, 1.9, -0.5);
         sleep(Duration::from_millis(150)).await;
         let m = resolver.metrics();
         assert_eq!(m.labels_written_realized_total.load(Ordering::Relaxed), 0);
-        assert_eq!(m.labels_written_miss_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.labels_written_miss_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 1);
         drop(resolver);
         drop(tmp);
     }

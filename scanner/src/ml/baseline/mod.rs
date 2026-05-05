@@ -1,14 +1,16 @@
 //! Baseline A3 — ECDF marginal degradado.
 //!
 //! Implementa o **baseline shadow** definido em ADR-001: ECDF empírica
-//! sobre histórico da rota, emitindo `TradeSetup` (ADR-016) sem treino
-//! de modelo ML. Usa o `entry` acionável atual mais a distribuição marginal
+//! sobre histórico da rota, produzindo um proxy marginal de `TradeSetup`
+//! (ADR-016) sem treino de modelo ML. O gate público de serving converte esse
+//! proxy em `Abstain(LowConfidence)` enquanto faltarem `P/T/IC/P_censura`
+//! calibrados. Usa o `entry` acionável atual mais a distribuição marginal
 //! futura de `exit`; não usa `entry(t)+exit(t)` simultâneo como lucro
 //! econômico. Serve como:
 //!
 //! 1. **Safety-net do kill switch**: quando modelo A2 composta falha
-//!    (ECE alto, panic, latência), fallback para A3 garante que sistema
-//!    continua emitindo recomendações — nunca fica em silêncio.
+//!    (ECE alto, panic, latência), fallback para A3 preserva diagnóstico,
+//!    mas não emite recomendação ativa sem calibração completa.
 //! 2. **Barra absoluta de comparação**: qualquer modelo futuro precisa
 //!    superar A3 em ≥ 5pp de precision@10 para justificar complexidade.
 //! 3. **MVP funcional imediato**: permite operação em shadow mode desde

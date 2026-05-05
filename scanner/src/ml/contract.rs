@@ -109,8 +109,10 @@ impl SourceKind {
 /// - `p_hit`: probabilidade condicional calibrada de atingir `exit_target`.
 /// - `t_hit_*`: distribuição de tempo até atingir `exit_target`.
 ///
-/// Campos opcionais permanecem `None` quando a implementação atual não tem
-/// estimativa honesta. O baseline A3 deve usar `calibration_status=Degraded`.
+/// Campos opcionais só podem permanecer `None` antes do gate público. Um
+/// `Recommendation::Trade` que atravessa serving/broadcast precisa carregar
+/// `P`, `IC`, quantis de `T` e `P_censura` completos; fallback degradado deve
+/// virar `Abstain(LowConfidence)`.
 #[derive(Debug, Clone)]
 pub struct TradeSetup {
     pub route_id: RouteId,
@@ -244,7 +246,8 @@ pub struct AbstainDiagnostic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalibStatus {
     Ok,
-    /// ECE_4h entre 0.05 e 0.10 — monitorar; ainda emite.
+    /// ECE_4h entre 0.05 e 0.10, ou fallback marginal sem calibração
+    /// completa. Deve virar `LOW_CONFIDENCE` no contrato público.
     Degraded,
     /// Kill switch ativo — emissão via fallback baseline A3.
     Suspended,
