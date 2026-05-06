@@ -1047,9 +1047,9 @@ async fn run_spread_engine(
         // --- ML pass (M1.7 shadow mode inline) ---
         // Alimenta HotQueryCache + aciona baseline A3 + broadcast
         // `Recommendation` via `RecommendationBroadcaster` (pós-Wave T:
-        // resolve lacuna de `_rec` descartado). Se o broadcast encontra
-        // ao menos 1 consumer, `AcceptedSample.was_recommended` vira um
-        // proxy de entrega antes da persistência.
+        // resolve lacuna de `_rec` descartado). `AcceptedSample.was_recommended`
+        // preserva o sinal shadow pre-gate; entrega ao consumer é métrica
+        // separada do broadcaster.
         //
         // Latência ~1–5 µs por opp; para 50–200 opps por ciclo, overhead
         // total <1 ms em budget de 150 ms.

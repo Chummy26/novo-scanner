@@ -1689,8 +1689,10 @@ impl MlServer {
         // 4. **C4** — emite `AcceptedSample` se o trigger aceitou.
         //    O stream accepted é full-capture dos Accepts; a probabilidade
         //    aqui descreve inclusão no papel accepted, não o decimator raw.
-        //    `was_recommended` inicializa `false`; o caller marca `true`
-        //    quando a recomendação gerada para o snapshot foi `Trade`.
+        //    `was_recommended` preserva o sinal shadow pre-gate: se o
+        //    baseline/modelo quis recomendar em t0, o AcceptedSample precisa
+        //    carregar isso mesmo quando o contrato publico rebaixa para
+        //    LowConfidence.
         let accepted = if sample_dec == SampleDecision::Accept {
             let mut sample = AcceptedSample::new(
                 now_ns,
@@ -1713,6 +1715,9 @@ impl MlServer {
                     lc.active_until_ns,
                     lc.n_snapshots,
                 );
+            }
+            if matches!(&prediction_rec, Recommendation::Trade(_)) {
+                sample.mark_recommended();
             }
             Some(sample)
         } else {
@@ -2264,6 +2269,10 @@ mod tests {
         assert_eq!(accepted.sampling_tier, "accepted_full_capture");
         assert_eq!(accepted.sampling_probability, 1.0);
         assert_eq!(accepted.sampling_probability_kind, "marginal_full_capture");
+        assert!(
+            accepted.was_recommended,
+            "accepted stream deve preservar o Trade shadow A3 mesmo quando o output publico vira LowConfidence"
+        );
         match rec {
             Recommendation::Abstain { reason, diagnostic } => {
                 assert_eq!(reason, AbstainReason::LowConfidence);

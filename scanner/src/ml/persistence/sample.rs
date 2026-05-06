@@ -62,16 +62,15 @@ pub struct AcceptedSample {
     pub route_last_seen_ns: u64,
     pub route_active_until_ns: Option<u64>,
     pub route_n_snapshots: u64,
-    /// Flag de emissão do baseline — `true` se o baseline A3 produziu
-    /// `Recommendation::Trade` para este snapshot (observe: Abstain =
-    /// false). Determinado por `should_mark_sample_recommended` em
-    /// `lib.rs`: `matches!(rec, Recommendation::Trade(_))`.
+    /// Flag de emissão shadow — `true` se o baseline/modelo produziu
+    /// `Recommendation::Trade` para este snapshot antes dos gates publicos
+    /// de contrato/cooldown rebaixarem a recomendação para UI/broadcast.
     ///
     /// Fix pós-auditoria L12: a doc anterior dizia "proxy de entrega
     /// (≥1 consumer WS ativo)", mas a implementação real nunca olha o
     /// estado do broadcast. Documento reflete o comportamento vigente.
-    /// Trainer usa como sinal de "baseline quis recomendar" para comparar
-    /// contra outcomes supervisionados.
+    /// Trainer usa como sinal de "a politica shadow quis recomendar" para
+    /// comparar contra outcomes supervisionados.
     pub was_recommended: bool,
 }
 
