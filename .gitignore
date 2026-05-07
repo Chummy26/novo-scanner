@@ -30,6 +30,7 @@ env/
 logs/
 
 # Local runtime artifacts
+.tmp/validation-*/
 .tmp/collect-*.toml
 .tmp/*.json
 .tmp/**/*.json

@@ -72,6 +72,12 @@ pub struct MlConfig {
     #[serde(default = "default_raw_decimation_mod")]
     pub raw_decimation_mod: u64,
 
+    /// Decimator residual uniforme usado APENAS para candidatura supervisionada
+    /// de background/rejeições limpas. Separado de `raw_decimation_mod` para
+    /// que reduzir storage físico do raw não altere a população de labels.
+    #[serde(default = "default_label_background_decimation_mod")]
+    pub label_background_decimation_mod: u64,
+
     /// Intervalo entre reranks do `RouteRanking` (s). Default 3600 (1h).
     #[serde(default = "default_raw_rerank_interval_s")]
     pub raw_rerank_interval_s: u64,
@@ -129,6 +135,7 @@ impl Default for MlConfig {
             raw_allowlist_symbols: Vec::new(),
             raw_sampling_target_coverage: default_raw_target_coverage(),
             raw_decimation_mod: default_raw_decimation_mod(),
+            label_background_decimation_mod: default_label_background_decimation_mod(),
             raw_rerank_interval_s: default_raw_rerank_interval_s(),
             label_stride_s: default_label_stride_s(),
             label_horizons_s: default_label_horizons_s(),
@@ -275,6 +282,9 @@ fn default_raw_target_coverage() -> f64 {
     0.95
 }
 fn default_raw_decimation_mod() -> u64 {
+    10
+}
+fn default_label_background_decimation_mod() -> u64 {
     10
 }
 fn default_raw_rerank_interval_s() -> u64 {
@@ -558,6 +568,7 @@ mod tests {
         assert_eq!(cfg.ml.parquet.zstd_level, 3);
         assert!(cfg.ml.parquet.strict_lossless);
         assert_eq!(cfg.ml.windows.train_window_days, 90);
+        assert_eq!(cfg.ml.label_background_decimation_mod, 10);
     }
 
     #[test]
@@ -596,6 +607,7 @@ kucoin       = true
         let t = r#"
 [ml]
 raw_decimation_mod = 7
+label_background_decimation_mod = 11
 
 [ml.retention]
 enabled = true
@@ -618,6 +630,7 @@ archive_reference_days = 500
 "#;
         let cfg: Config = toml::from_str(t).expect("parse");
         assert_eq!(cfg.ml.raw_decimation_mod, 7);
+        assert_eq!(cfg.ml.label_background_decimation_mod, 11);
         assert_eq!(cfg.ml.retention.raw_retention_days, 14);
         assert_eq!(cfg.ml.retention.accepted_retention_days, 21);
         assert_eq!(cfg.ml.retention.labeled_retention_days, 400);

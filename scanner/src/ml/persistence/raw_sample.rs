@@ -376,7 +376,9 @@ impl SamplingTier {
 
 pub fn sampling_probability_kind_for_tier_label(tier: &str) -> &'static str {
     match tier {
-        "allowlist" | "accepted_full_capture" => "marginal_full_capture",
+        "allowlist" | "accepted_full_capture" | "foreground_full_capture" => {
+            "marginal_full_capture"
+        }
         "priority" => "conditional_priority",
         "decimated_uniform" => "marginal_uniform",
         _ => "unknown",

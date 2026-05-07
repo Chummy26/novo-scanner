@@ -81,6 +81,10 @@ fn route_decimator_from_ml_config(ml: &config::MlConfig) -> RouteDecimator {
     RouteDecimator::with_modulus(ml.raw_decimation_mod.max(1))
 }
 
+fn label_decimator_from_ml_config(ml: &config::MlConfig) -> RouteDecimator {
+    RouteDecimator::with_modulus(ml.label_background_decimation_mod.max(1))
+}
+
 fn parquet_compaction_from_ml_config(
     ml: &config::MlConfig,
 ) -> anyhow::Result<ParquetCompactionConfig> {
@@ -318,6 +322,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let ml_server = Arc::new(
         MlServer::new(ml_baseline, SamplingTrigger::with_defaults())
             .with_raw_decimator(route_decimator_from_ml_config(&cfg.ml))
+            .with_label_decimator(label_decimator_from_ml_config(&cfg.ml))
             .with_raw_writer(ml_raw_writer_handle)
             .with_route_ranking(Arc::clone(&ranker))
             .with_label_resolver(Arc::clone(&label_resolver))
@@ -370,18 +375,22 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         }
         let n_routes = allow_routes.len();
-        ml_server.raw_decimator().set_allowlist(allow_routes);
+        ml_server
+            .raw_decimator()
+            .set_allowlist(allow_routes.clone());
+        ml_server.label_decimator().set_allowlist(allow_routes);
         info!(
             n_allowlist_routes = n_routes,
             n_allowlist_symbols = cfg.ml.raw_allowlist_symbols.len(),
-            "ML allowlist carregada"
+            "ML allowlist carregada em raw e label background"
         );
     }
 
     // Task rerank (configurável via `raw_rerank_interval_s`).
     {
         let ranker_clone = Arc::clone(&ranker);
-        let decimator = ml_server.raw_decimator().clone();
+        let raw_decimator = ml_server.raw_decimator().clone();
+        let label_decimator = ml_server.label_decimator().clone();
         let ml_for_priority_metadata = Arc::clone(&ml_server);
         let rerank_interval = Duration::from_secs(cfg.ml.raw_rerank_interval_s.max(60));
         tokio::spawn(async move {
@@ -391,9 +400,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 tick.tick().await;
                 let priority = ranker_clone.snapshot_priority_set();
                 let n = priority.len();
-                decimator.set_priority_set(priority);
+                raw_decimator.set_priority_set(priority.clone());
+                label_decimator.set_priority_set(priority);
                 ml_for_priority_metadata.bump_priority_set_generation(now_ns());
-                info!(n_priority_routes = n, "ML rerank atualizou priority_set");
+                info!(
+                    n_priority_routes = n,
+                    "ML rerank atualizou priority_set raw e label"
+                );
             }
         });
     }
@@ -1243,6 +1256,19 @@ mod tests {
         let decimator = super::route_decimator_from_ml_config(&ml);
 
         assert_eq!(decimator.modulus(), 7);
+    }
+
+    #[test]
+    fn label_decimator_uses_configured_background_decimation_mod() {
+        let mut ml = crate::config::MlConfig::default();
+        ml.raw_decimation_mod = 50;
+        ml.label_background_decimation_mod = 7;
+
+        let raw_decimator = super::route_decimator_from_ml_config(&ml);
+        let label_decimator = super::label_decimator_from_ml_config(&ml);
+
+        assert_eq!(raw_decimator.modulus(), 50);
+        assert_eq!(label_decimator.modulus(), 7);
     }
 
     #[test]

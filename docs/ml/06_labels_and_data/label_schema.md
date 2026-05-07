@@ -27,8 +27,9 @@ Streams:
   `(sample_id, horizon_s)`, com `outcome in {realized, miss, censored}`.
   O resolver cria labels para candidates limpos. No foreground, isso inclui
   `sample_decision != "accept"`; no background abaixo do threshold visual,
-  rejeições limpas entram quando selecionadas pelo decimator raw, preservando
-  auditoria de abstenção/background sem capturar todo tick.
+  rejeições limpas entram quando selecionadas pelo
+  `label_background_decimation_mod`, separado do decimator físico de raw.
+  Storage raw não deve alterar a população supervisionada.
 
 `features_t0` não inclui diagnósticos operacionais do book. Volume 24h pode
 existir nos streams bruto/aceito como metadado de amostragem/filtro de
@@ -47,6 +48,9 @@ Invariantes do trainer:
   materializável. O trainer ainda deve considerar `effective_stride_s`,
   `candidates_in_route_last_24h`, `accepts_in_route_last_24h`,
   `sampling_tier` e `sampling_probability_kind`.
+- Não assumir que `runtime_config_hash` é comparável entre streams. Em
+  `accepted_samples`/`labeled_trades`, ele versiona a política supervisionada;
+  em `raw_samples`, versiona também a persistência física raw.
 - Não filtrar cegamente `labeled_trades` por `sample_decision == "accept"`.
   Treino precision-first pode priorizar a cauda aceita, mas calibração de
   recomendações em shadow mode deve avaliar todas as linhas onde

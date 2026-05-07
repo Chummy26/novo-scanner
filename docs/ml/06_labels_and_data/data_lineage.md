@@ -26,8 +26,12 @@ Lineage crítico:
 - `symbol_id` é auxiliar de runtime e não deve ser usado para join cross-run.
 - `oldest_cache_ts_ns` é a observação real mais antiga retida, não
   `last_update - 24h`.
-- `runtime_config_hash` separa datasets gerados por configs diferentes de
-  floor, stride, horizons, decimation e cooldown.
+- `runtime_config_hash` em `accepted_samples`/`labeled_trades` separa
+  políticas supervisionadas diferentes: floor, stride, horizons,
+  `label_background_decimation_mod` e cooldown. Mudanças apenas em
+  `raw_decimation_mod` não devem fragmentar labels equivalentes.
+- `runtime_config_hash` em `raw_samples` também inclui a política física de
+  persistência raw, pois ela altera a população bruta em disco.
 - `priority_set_generation_id` e `priority_set_updated_at_ns` permitem auditar
   membership do tier `priority`.
 

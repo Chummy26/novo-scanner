@@ -36,10 +36,10 @@ use std::sync::Arc;
 
 use crate::ml::baseline::BaselineA3;
 use crate::ml::contract::{
-    AbstainDiagnostic, AbstainReason, CalibStatus, Recommendation, RouteId, TradeSetup,
+    AbstainDiagnostic, AbstainReason, CalibStatus, Recommendation, RouteId, SourceKind, TradeSetup,
 };
 use crate::ml::economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome};
-use crate::ml::eval::verify_tradesetup;
+use crate::ml::eval::{verify_tradesetup, InvariantError};
 use crate::ml::feature_store::{CacheConfig, HotQueryCache};
 use crate::ml::listing_history::{ListingHistory, RouteLifecycle};
 use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
@@ -229,16 +229,30 @@ fn calib_status_label(status: CalibStatus) -> &'static str {
 const IC_WIDTH_LIMIT: f32 = 0.20;
 
 #[derive(Debug, Clone, Copy)]
-struct LabelTierSnapshot {
-    tier: SamplingTier,
+struct LabelCandidateSnapshot {
+    tier: &'static str,
     probability: f32,
     selected: bool,
 }
 
-impl From<DecisionResult> for LabelTierSnapshot {
+impl LabelCandidateSnapshot {
+    const ACCEPTED_FULL_CAPTURE: Self = Self {
+        tier: "accepted_full_capture",
+        probability: 1.0,
+        selected: true,
+    };
+
+    const FOREGROUND_FULL_CAPTURE: Self = Self {
+        tier: "foreground_full_capture",
+        probability: 1.0,
+        selected: true,
+    };
+}
+
+impl From<DecisionResult> for LabelCandidateSnapshot {
     fn from(d: DecisionResult) -> Self {
         Self {
-            tier: d.tier,
+            tier: d.tier.as_str(),
             probability: d.probability,
             selected: d.should_persist,
         }
@@ -273,6 +287,9 @@ pub struct MlServer {
     // (allowlist / priority / uniform). Seleção em `decide()`.
     raw_decimator: RouteDecimator,
     raw_writer: Option<RawWriterHandle>,
+    // Decimator usado apenas para escolher rejeições/background limpos que
+    // viram candidatos supervisionados. Não controla storage físico.
+    label_decimator: RouteDecimator,
     // Rankeador rolling que atualiza `raw_decimator` priority_set.
     // `None` quando desabilitado (tests minimalistas).
     route_ranking: Option<Arc<RouteRanking>>,
@@ -289,21 +306,25 @@ pub struct MlServer {
     alive_since_by_route: Mutex<AHashMap<RouteId, u64>>,
     opportunity_alive_threshold_pct: f32,
     recommendation_cooldown_ns: u64,
-    // fingerprint da config runtime persistida em cada record.
+    // Fingerprint da política supervisionada persistida em accepted/labeled.
+    // Intencionalmente não inclui `raw_decimation_mod`: mudar storage físico
+    // não deve fragmentar datasets supervisionados idênticos.
     runtime_config_hash: String,
+    // Fingerprint da política de persistência raw. Persistida apenas no raw.
+    raw_persistence_config_hash: String,
     // geração do priority_set (incrementado em set_priority_set_and_bump).
     priority_set_generation_id: AtomicU64,
     priority_set_updated_at_ns: AtomicU64,
 }
 
-fn compute_runtime_config_hash(
+fn compute_supervised_config_hash(
     trigger: crate::ml::trigger::SamplingConfig,
     baseline: crate::ml::baseline::BaselineConfig,
     label_stride_s: u32,
     label_floor_pct: f32,
     label_floors_pct: &[f32],
     label_horizons_s: &[u32],
-    raw_decimation_mod: u64,
+    label_background_decimation_mod: u64,
     recommendation_cooldown_ns: u64,
     opportunity_alive_threshold_pct: f32,
 ) -> String {
@@ -322,7 +343,8 @@ fn compute_runtime_config_hash(
             "scanner_version={}|trigger_n_min={}|tail_q={:.6}|min_vol_usd={:.6}|",
             "baseline_floor_pct={:.6}|baseline_n_min={}|baseline_valid_for_s={}|",
             "label_stride_s={}|label_floor_pct={:.6}|label_floors_pct=[{}]|",
-            "label_horizons_s=[{}]|raw_decimation_mod={}|recommendation_cooldown_ns={}|",
+            "label_horizons_s=[{}]|label_background_decimation_mod={}|",
+            "recommendation_cooldown_ns={}|",
             "feature_windows_s=[3600,86400,604800]|opportunity_alive_threshold_pct={:.6}"
         ),
         crate::ml::SCANNER_VERSION,
@@ -336,9 +358,19 @@ fn compute_runtime_config_hash(
         label_floor_pct,
         floors,
         horizons,
-        raw_decimation_mod,
+        label_background_decimation_mod,
         recommendation_cooldown_ns,
         opportunity_alive_threshold_pct,
+    );
+    format!("{:016x}", crate::ml::util::fnv1a_64(config_blob.as_bytes()))
+}
+
+fn compute_raw_persistence_config_hash(supervised_hash: &str, raw_decimation_mod: u64) -> String {
+    let config_blob = format!(
+        "scanner_version={}|supervised_config_hash={}|raw_decimation_mod={}|",
+        crate::ml::SCANNER_VERSION,
+        supervised_hash,
+        raw_decimation_mod,
     );
     format!("{:016x}", crate::ml::util::fnv1a_64(config_blob.as_bytes()))
 }
@@ -352,12 +384,27 @@ fn enforce_recommendation_invariants(
         Recommendation::Trade(setup) => {
             if let Err(err) = verify_tradesetup(&setup) {
                 let model_version = setup.model_version.clone();
-                tracing::warn!(
-                    route = ?setup.route_id,
-                    model_version = %model_version,
-                    error = ?err,
-                    "blocked invalid TradeSetup before broadcast"
-                );
+                let expected_baseline_proxy = setup.source_kind == SourceKind::Baseline
+                    && matches!(
+                        err,
+                        InvariantError::ActiveTradeMissingCalibratedOutput {
+                            field: "source_kind"
+                        }
+                    );
+                if expected_baseline_proxy {
+                    tracing::debug!(
+                        route = ?setup.route_id,
+                        model_version = %model_version,
+                        "downgraded baseline Trade proxy before public broadcast"
+                    );
+                } else {
+                    tracing::warn!(
+                        route = ?setup.route_id,
+                        model_version = %model_version,
+                        error = ?err,
+                        "blocked invalid TradeSetup before broadcast"
+                    );
+                }
                 if let Some(c) = invariant_blocked_counter {
                     c.fetch_add(1, Ordering::Relaxed);
                 }
@@ -621,20 +668,23 @@ impl MlServer {
         // fingerprint da config efetiva do dataset. Builders abaixo
         // recomputam depois de aplicar raw/label/cooldown config.
         let raw_decimator = RouteDecimator::new();
+        let label_decimator = RouteDecimator::new();
         let label_floors_pct = DEFAULT_LABEL_FLOORS_PCT.to_vec();
         let label_horizons_s = DEFAULT_HORIZONS_S.to_vec();
         let recommendation_cooldown_ns = 60 * 1_000_000_000;
-        let runtime_config_hash = compute_runtime_config_hash(
+        let runtime_config_hash = compute_supervised_config_hash(
             trigger.config(),
             baseline.config(),
             60,
             0.8,
             &label_floors_pct,
             &label_horizons_s,
-            raw_decimator.modulus(),
+            label_decimator.modulus(),
             recommendation_cooldown_ns,
             0.0,
         );
+        let raw_persistence_config_hash =
+            compute_raw_persistence_config_hash(&runtime_config_hash, raw_decimator.modulus());
         let cache_24h_cfg = baseline.cache().config();
         let feature_cache_1h = HotQueryCache::with_config(CacheConfig {
             window_ns: FEATURE_WINDOW_1H_NS,
@@ -663,6 +713,7 @@ impl MlServer {
             metrics: Arc::new(ServerMetrics::default()),
             cycle_seq: AtomicU64::new(0),
             raw_decimator,
+            label_decimator,
             raw_writer: None,
             route_ranking: None,
             label_resolver: None,
@@ -675,28 +726,33 @@ impl MlServer {
             opportunity_alive_threshold_pct: 0.0,
             recommendation_cooldown_ns,
             runtime_config_hash,
+            raw_persistence_config_hash,
             priority_set_generation_id: AtomicU64::new(0),
             priority_set_updated_at_ns: AtomicU64::new(0),
         }
     }
 
     fn refresh_runtime_config_hash(&mut self) {
-        self.runtime_config_hash = compute_runtime_config_hash(
+        self.runtime_config_hash = compute_supervised_config_hash(
             self.trigger.config(),
             self.baseline.config(),
             self.label_stride_s,
             self.label_floor_pct,
             &self.label_floors_pct,
             &self.label_horizons_s,
-            self.raw_decimator.modulus(),
+            self.label_decimator.modulus(),
             self.recommendation_cooldown_ns,
             self.opportunity_alive_threshold_pct,
         );
+        self.raw_persistence_config_hash = compute_raw_persistence_config_hash(
+            &self.runtime_config_hash,
+            self.raw_decimator.modulus(),
+        );
     }
 
-    /// incrementa geração do priority_set e registra timestamp de update.
-    /// Deve ser chamado por quem instala novo snapshot em
-    /// `raw_decimator.set_priority_set()`.
+    /// Incrementa geração do priority_set e registra timestamp de update.
+    /// Deve ser chamado por quem instala novo snapshot nos decimators raw e
+    /// supervisionado.
     pub fn bump_priority_set_generation(&self, now_ns: u64) {
         self.priority_set_generation_id
             .fetch_add(1, Ordering::Relaxed);
@@ -727,6 +783,14 @@ impl MlServer {
     /// querem capturar toda a série).
     pub fn with_raw_decimator(mut self, decimator: RouteDecimator) -> Self {
         self.raw_decimator = decimator;
+        self.refresh_runtime_config_hash();
+        self
+    }
+
+    /// Substitui o decimator de candidatura supervisionada de background.
+    /// Separado do raw para que storage físico não mude labels/abstenções.
+    pub fn with_label_decimator(mut self, decimator: RouteDecimator) -> Self {
+        self.label_decimator = decimator;
         self.refresh_runtime_config_hash();
         self
     }
@@ -773,6 +837,10 @@ impl MlServer {
 
     pub fn raw_decimator(&self) -> &RouteDecimator {
         &self.raw_decimator
+    }
+
+    pub fn label_decimator(&self) -> &RouteDecimator {
+        &self.label_decimator
     }
 
     pub fn baseline(&self) -> &BaselineA3 {
@@ -1012,6 +1080,22 @@ impl MlServer {
         }
     }
 
+    fn label_candidate_snapshot(
+        &self,
+        sample_dec: SampleDecision,
+        route: RouteId,
+        now_ns: u64,
+        cycle_seq: u32,
+    ) -> LabelCandidateSnapshot {
+        if sample_dec == SampleDecision::Accept {
+            return LabelCandidateSnapshot::ACCEPTED_FULL_CAPTURE;
+        }
+        LabelCandidateSnapshot::from(
+            self.label_decimator
+                .decide_for_sample(route, now_ns, cycle_seq),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn enqueue_label_candidate(
         &self,
@@ -1025,8 +1109,8 @@ impl MlServer {
         entry_spread: f32,
         exit_spread: f32,
         features_t0: FeaturesT0,
-        tier: SamplingTier,
-        raw_sampling_probability: f32,
+        sampling_tier: &'static str,
+        sampling_probability: f32,
         label_sampling_probability: f32,
         rec_meta: &RecommendationPersistence,
     ) {
@@ -1106,8 +1190,8 @@ impl MlServer {
             self.label_floor_pct,
             self.label_floors_pct.clone(),
             policy,
-            tier.as_str(),
-            raw_sampling_probability,
+            sampling_tier,
+            sampling_probability,
             self.label_stride_s,
             cluster_id,
             cluster_size,
@@ -1224,8 +1308,8 @@ impl MlServer {
             ranker.observe(route, now_ns, accepted, vol);
         }
 
-        // �� decimator em tiers.
-        let tier_snapshot = if let Some(raw_writer) = self.raw_writer.as_ref() {
+        // Decimator físico do raw: controla apenas persistência raw.
+        if let Some(raw_writer) = self.raw_writer.as_ref() {
             let dr = self
                 .raw_decimator
                 .decide_for_sample(route, now_ns, cycle_seq);
@@ -1245,7 +1329,7 @@ impl MlServer {
                     dr.probability,
                     priority_gen,
                     priority_updated_ns,
-                    self.runtime_config_hash.clone(),
+                    self.raw_persistence_config_hash.clone(),
                 );
                 if let Some(lc) = lifecycle {
                     raw.set_lifecycle(
@@ -1274,13 +1358,12 @@ impl MlServer {
                     }
                 }
             }
-            Some(LabelTierSnapshot::from(dr))
-        } else {
-            let dr = self
-                .raw_decimator
-                .decide_for_sample(route, now_ns, cycle_seq);
-            Some(LabelTierSnapshot::from(dr))
-        };
+        }
+
+        // Decimator supervisionado: controla apenas quais rejeições/background
+        // limpos viram candidatos de label. Storage raw não pode alterar esta
+        // população, ou o trainer aprende uma distribuição diferente.
+        let label_snapshot = self.label_candidate_snapshot(sample_dec, route, now_ns, cycle_seq);
 
         let accepted = self.build_accepted_sample(
             sample_dec,
@@ -1295,16 +1378,12 @@ impl MlServer {
             lifecycle,
         );
 
-        let should_label_background = clean
-            && (sample_dec == SampleDecision::Accept
-                || tier_snapshot
-                    .map(|snapshot| snapshot.selected)
-                    .unwrap_or(false));
+        let should_label_background = clean && label_snapshot.selected;
 
         // Background abaixo do threshold visual alimenta histórico PIT e
-        // resolve labels existentes. Para não explodir cardinalidade, rejeições
-        // limpas viram labels apenas quando o decimator raw selecionou o
-        // snapshot; Accept continua full-capture.
+        // resolve labels existentes. Para não explodir cardinalidade,
+        // rejeições limpas viram labels apenas quando a política
+        // supervisionada selecionou o snapshot; Accept continua full-capture.
         let features_t0 = if should_label_background {
             Some(self.build_features_t0(
                 route,
@@ -1332,15 +1411,9 @@ impl MlServer {
         }
 
         if clean {
-            if let (Some(resolver), Some(snapshot)) = (self.label_resolver.as_ref(), tier_snapshot)
-            {
+            if let Some(resolver) = self.label_resolver.as_ref() {
                 let Some(features_t0) = features_t0 else {
                     return (sample_dec, accepted);
-                };
-                let label_sampling_probability = if sample_dec == SampleDecision::Accept {
-                    1.0
-                } else {
-                    snapshot.probability
                 };
                 let label_sample_id = accepted
                     .as_ref()
@@ -1367,9 +1440,9 @@ impl MlServer {
                     entry_spread,
                     exit_spread,
                     features_t0,
-                    snapshot.tier,
-                    snapshot.probability,
-                    label_sampling_probability,
+                    label_snapshot.tier,
+                    label_snapshot.probability,
+                    label_snapshot.probability,
                     &rec_meta,
                 );
             }
@@ -1535,9 +1608,9 @@ impl MlServer {
         }
 
         // 2a. **ADR-025 + Wave V tier** — emite `RawSample` pré-trigger
-        //     se o decimator (com 3 tiers) aprovar. `sample_id` e
-        //     `sampling_tier` inclusos no schema v3.
-        let tier_snapshot = if let Some(raw_writer) = self.raw_writer.as_ref() {
+        //     se o decimator físico aprovar. Esta decisão não controla
+        //     candidatura supervisionada.
+        if let Some(raw_writer) = self.raw_writer.as_ref() {
             let dr = self
                 .raw_decimator
                 .decide_for_sample(route, now_ns, cycle_seq);
@@ -1557,7 +1630,7 @@ impl MlServer {
                     dr.probability,
                     priority_gen,
                     priority_updated_ns,
-                    self.runtime_config_hash.clone(),
+                    self.raw_persistence_config_hash.clone(),
                 );
                 if let Some(lc) = lifecycle {
                     raw.set_lifecycle(
@@ -1586,14 +1659,11 @@ impl MlServer {
                     }
                 }
             }
-            Some(LabelTierSnapshot::from(dr))
+        }
+        let label_snapshot = if sample_dec == SampleDecision::Accept {
+            LabelCandidateSnapshot::ACCEPTED_FULL_CAPTURE
         } else {
-            // Sem raw_writer, ainda calcula o tier para alimentar o label
-            // resolver (correção B1 — label persiste mesmo sem raw).
-            let dr = self
-                .raw_decimator
-                .decide_for_sample(route, now_ns, cycle_seq);
-            Some(LabelTierSnapshot::from(dr))
+            LabelCandidateSnapshot::FOREGROUND_FULL_CAPTURE
         };
 
         // 3. Gera recomendação apenas a partir dos spreads e histórico PIT.
@@ -1728,7 +1798,7 @@ impl MlServer {
         // apenas Accept. Isso dá negativos supervisionáveis
         // (insufficient_history/below_tail) para abstenção sem contaminar
         // com low-volume operacional.
-        if let (Some(resolver), Some(snapshot)) = (self.label_resolver.as_ref(), tier_snapshot) {
+        if let Some(resolver) = self.label_resolver.as_ref() {
             if !clean {
                 return (rec, sample_dec, accepted);
             }
@@ -1774,7 +1844,7 @@ impl MlServer {
             // Foreground limpo é candidatado integralmente; o stride temporal
             // por horizonte é determinístico e fica versionado em
             // effective_stride_s no label fechado.
-            let label_sampling_probability = 1.0;
+            let label_sampling_probability = label_snapshot.probability;
             // contadores de RouteRanking para IPW offline.
             let (candidates_24h, accepts_24h) = self
                 .route_ranking
@@ -1865,8 +1935,8 @@ impl MlServer {
                 self.label_floor_pct,
                 self.label_floors_pct.clone(),
                 policy,
-                snapshot.tier.as_str(),
-                snapshot.probability,
+                label_snapshot.tier,
+                label_snapshot.probability,
                 self.label_stride_s,
                 cluster_id,
                 cluster_size,
@@ -1972,6 +2042,36 @@ mod tests {
             ..SamplingConfig::default()
         });
         MlServer::new(baseline, trigger)
+    }
+
+    #[test]
+    fn raw_decimation_does_not_fragment_supervised_config_hash() {
+        let a = mk_server()
+            .with_label_decimator(RouteDecimator::with_modulus(7))
+            .with_raw_decimator(RouteDecimator::with_modulus(10));
+        let b = mk_server()
+            .with_label_decimator(RouteDecimator::with_modulus(7))
+            .with_raw_decimator(RouteDecimator::with_modulus(50));
+
+        assert_eq!(
+            a.runtime_config_hash, b.runtime_config_hash,
+            "storage-only raw decimation must not fragment accepted/labeled lineage"
+        );
+        assert_ne!(
+            a.raw_persistence_config_hash, b.raw_persistence_config_hash,
+            "raw lineage still needs to record physical persistence policy"
+        );
+    }
+
+    #[test]
+    fn label_background_decimation_changes_supervised_config_hash() {
+        let a = mk_server().with_label_decimator(RouteDecimator::with_modulus(7));
+        let b = mk_server().with_label_decimator(RouteDecimator::with_modulus(11));
+
+        assert_ne!(
+            a.runtime_config_hash, b.runtime_config_hash,
+            "label/background sampling changes supervised population and must version labels"
+        );
     }
 
     #[test]
@@ -2638,7 +2738,8 @@ mod tests {
 
         let server = mk_server()
             .with_label_resolver(Arc::clone(&resolver))
-            .with_raw_decimator(RouteDecimator::with_modulus(1));
+            .with_raw_decimator(RouteDecimator::with_modulus(u64::MAX))
+            .with_label_decimator(RouteDecimator::with_modulus(1));
         let route = mk_route();
         let (_rec, dec, accepted) = server.on_opportunity(
             0,
@@ -2703,7 +2804,8 @@ mod tests {
 
         let server = mk_server()
             .with_label_resolver(Arc::clone(&resolver))
-            .with_raw_decimator(RouteDecimator::with_modulus(1));
+            .with_raw_decimator(RouteDecimator::with_modulus(u64::MAX))
+            .with_label_decimator(RouteDecimator::with_modulus(1));
         let route = mk_route();
         let (dec, accepted) = server.observe_background(
             0,
@@ -2723,7 +2825,141 @@ mod tests {
                 .pending_created_total
                 .load(Ordering::Relaxed),
             1,
-            "background below-tail limpo selecionado pelo decimator deve gerar negativo supervisionavel"
+            "background below-tail limpo selecionado pelo label_decimator deve gerar negativo supervisionavel"
+        );
+        drop(server);
+        drop(resolver);
+        drop(tmp);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_persistence_decimator_does_not_gate_background_labels() {
+        use crate::ml::persistence::{
+            LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, ResolverConfig,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
+        let (writer, handle) = LabeledJsonlWriter::create(LabeledWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 1024,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(50),
+            file_prefix: "bg-decoupled-label".into(),
+            rotation_interval: Duration::from_secs(3600),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
+        });
+        let task = tokio::spawn(writer.run());
+        let resolver = Arc::new(LabelResolver::new(
+            ResolverConfig {
+                horizons_s: vec![1],
+                close_slack_ns: 1_000_000_000,
+                route_vanish_idle_ns: 60 * 1_000_000_000,
+                route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+                max_pending_per_route: 100,
+                sweeper_interval: Duration::from_secs(10),
+            },
+            handle,
+        ));
+
+        let server = mk_server()
+            .with_label_resolver(Arc::clone(&resolver))
+            .with_raw_decimator(RouteDecimator::with_modulus(u64::MAX))
+            .with_label_decimator(RouteDecimator::with_modulus(1));
+        let route = mk_route();
+        let (dec, accepted) = server.observe_background(
+            0,
+            route,
+            "BTC-USDT",
+            -0.1,
+            -0.8,
+            1e6,
+            1e6,
+            1_745_159_400u64 * 1_000_000_000,
+        );
+        assert_eq!(dec, SampleDecision::RejectBelowTail);
+        assert!(accepted.is_none());
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_created_total
+                .load(Ordering::Relaxed),
+            1,
+            "label_decimator deve controlar labels de background mesmo quando raw_decimator rejeita persistencia"
+        );
+        drop(server);
+        drop(resolver);
+        drop(tmp);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_full_capture_does_not_force_background_label() {
+        use crate::ml::persistence::{
+            LabelResolver, LabeledJsonlWriter, LabeledWriterConfig, ResolverConfig,
+        };
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        use crate::ml::persistence::parquet_compactor::ParquetCompactionConfig;
+        let (writer, handle) = LabeledJsonlWriter::create(LabeledWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 1024,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(50),
+            file_prefix: "bg-raw-only-label".into(),
+            rotation_interval: Duration::from_secs(3600),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
+        });
+        let task = tokio::spawn(writer.run());
+        let resolver = Arc::new(LabelResolver::new(
+            ResolverConfig {
+                horizons_s: vec![1],
+                close_slack_ns: 1_000_000_000,
+                route_vanish_idle_ns: 60 * 1_000_000_000,
+                route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+                max_pending_per_route: 100,
+                sweeper_interval: Duration::from_secs(10),
+            },
+            handle,
+        ));
+
+        let route = mk_route();
+        let t_emit = 1_745_159_400u64 * 1_000_000_000;
+        let label_decimator = RouteDecimator::with_modulus(u64::MAX);
+        let cycle_seq = (0..1_000)
+            .find(|cycle| {
+                !label_decimator
+                    .decide_for_sample(route, t_emit, *cycle)
+                    .should_persist
+            })
+            .expect("test route must have a rejected label sampling point");
+
+        let server = mk_server()
+            .with_label_resolver(Arc::clone(&resolver))
+            .with_raw_decimator(RouteDecimator::with_modulus(1))
+            .with_label_decimator(label_decimator);
+        let (dec, accepted) =
+            server.observe_background(cycle_seq, route, "BTC-USDT", -0.1, -0.8, 1e6, 1e6, t_emit);
+        assert_eq!(dec, SampleDecision::RejectBelowTail);
+        assert!(accepted.is_none());
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_created_total
+                .load(Ordering::Relaxed),
+            0,
+            "raw full-capture nao deve criar label de background sem selecao supervisionada"
         );
         drop(server);
         drop(resolver);
@@ -2922,7 +3158,7 @@ mod tests {
                 && v["policy_metadata"]["label_sampling_probability"]
                     .as_f64()
                     .is_some(),
-            "sampling_probability top-level carrega contexto do raw decimator; policy_metadata.label_sampling_probability deve materializar a probabilidade conhecida de candidatura supervisionada"
+            "sampling_probability top-level e policy_metadata.label_sampling_probability devem materializar a probabilidade conhecida de candidatura supervisionada"
         );
     }
 }
