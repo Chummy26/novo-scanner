@@ -28,8 +28,9 @@ Lineage crítico:
   `last_update - 24h`.
 - `runtime_config_hash` em `accepted_samples`/`labeled_trades` separa
   políticas supervisionadas diferentes: floor, stride, horizons,
-  `label_background_decimation_mod` e cooldown. Mudanças apenas em
-  `raw_decimation_mod` não devem fragmentar labels equivalentes.
+  `label_background_decimation_mod`, allowlist/priority compartilhados e
+  cooldown. Mudanças apenas em `raw_decimation_mod` não devem fragmentar
+  labels equivalentes.
 - `runtime_config_hash` em `raw_samples` também inclui a política física de
   persistência raw, pois ela altera a população bruta em disco.
 - `priority_set_generation_id` e `priority_set_updated_at_ns` permitem auditar

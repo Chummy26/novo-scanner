@@ -85,6 +85,26 @@ fn label_decimator_from_ml_config(ml: &config::MlConfig) -> RouteDecimator {
     RouteDecimator::with_modulus(ml.label_background_decimation_mod.max(1))
 }
 
+fn label_allowlist_symbols_key_from_ml_config(ml: &config::MlConfig) -> String {
+    let mut symbols = ml
+        .raw_allowlist_symbols
+        .iter()
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+        .collect::<Vec<_>>();
+    symbols.sort();
+    symbols.dedup();
+    symbols.join(",")
+}
+
+fn label_priority_target_coverage_from_ml_config(ml: &config::MlConfig) -> f64 {
+    ml.raw_sampling_target_coverage.clamp(0.5, 0.999)
+}
+
+fn label_priority_rerank_interval_s_from_ml_config(ml: &config::MlConfig) -> u64 {
+    ml.raw_rerank_interval_s.max(60)
+}
+
 fn parquet_compaction_from_ml_config(
     ml: &config::MlConfig,
 ) -> anyhow::Result<ParquetCompactionConfig> {
@@ -323,6 +343,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         MlServer::new(ml_baseline, SamplingTrigger::with_defaults())
             .with_raw_decimator(route_decimator_from_ml_config(&cfg.ml))
             .with_label_decimator(label_decimator_from_ml_config(&cfg.ml))
+            .with_label_population_policy(
+                label_allowlist_symbols_key_from_ml_config(&cfg.ml),
+                label_priority_target_coverage_from_ml_config(&cfg.ml),
+                label_priority_rerank_interval_s_from_ml_config(&cfg.ml),
+            )
             .with_raw_writer(ml_raw_writer_handle)
             .with_route_ranking(Arc::clone(&ranker))
             .with_label_resolver(Arc::clone(&label_resolver))
@@ -392,7 +417,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         let raw_decimator = ml_server.raw_decimator().clone();
         let label_decimator = ml_server.label_decimator().clone();
         let ml_for_priority_metadata = Arc::clone(&ml_server);
-        let rerank_interval = Duration::from_secs(cfg.ml.raw_rerank_interval_s.max(60));
+        let rerank_interval =
+            Duration::from_secs(label_priority_rerank_interval_s_from_ml_config(&cfg.ml));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(rerank_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1269,6 +1295,31 @@ mod tests {
 
         assert_eq!(raw_decimator.modulus(), 50);
         assert_eq!(label_decimator.modulus(), 7);
+    }
+
+    #[test]
+    fn label_population_policy_helpers_materialize_effective_shared_policy() {
+        let mut ml = crate::config::MlConfig::default();
+        ml.raw_allowlist_symbols = vec![
+            " eth-usdt ".to_string(),
+            "BTC-USDT".to_string(),
+            "eth-usdt".to_string(),
+        ];
+        ml.raw_sampling_target_coverage = 0.9999;
+        ml.raw_rerank_interval_s = 10;
+
+        assert_eq!(
+            super::label_allowlist_symbols_key_from_ml_config(&ml),
+            "BTC-USDT,ETH-USDT"
+        );
+        assert_eq!(
+            super::label_priority_target_coverage_from_ml_config(&ml),
+            0.999
+        );
+        assert_eq!(
+            super::label_priority_rerank_interval_s_from_ml_config(&ml),
+            60
+        );
     }
 
     #[test]

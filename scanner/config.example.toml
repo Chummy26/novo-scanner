@@ -53,16 +53,19 @@ enabled             = false
 # spread_engine_core = 11
 
 [ml]
-# Raw tier-0 symbols always persisted in full.
+# Shared tier-0 symbols always persisted in full for raw and label background.
 raw_allowlist_symbols = ["BTC-USDT", "ETH-USDT"]
 
-# Priority-set target coverage for raw sampling.
+# Priority-set target coverage for raw sampling and label background.
 raw_sampling_target_coverage = 0.95
 
 # Residual uniform raw decimation = 1-in-N.
 raw_decimation_mod = 10
 
-# Rerank cadence of the priority routes.
+# Residual uniform label-background decimation = 1-in-N.
+label_background_decimation_mod = 10
+
+# Rerank cadence of the priority routes for raw and label background.
 raw_rerank_interval_s = 3600
 
 # Label cadence / floors.

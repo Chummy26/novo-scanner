@@ -312,6 +312,12 @@ pub struct MlServer {
     runtime_config_hash: String,
     // Fingerprint da política de persistência raw. Persistida apenas no raw.
     raw_persistence_config_hash: String,
+    // Parte compartilhada da política de seleção label/background. Estes
+    // valores alteram a população supervisionada via allowlist/priority, mesmo
+    // enquanto os nomes de config ainda forem `raw_*`.
+    label_allowlist_symbols_key: String,
+    label_priority_target_coverage: f64,
+    label_priority_rerank_interval_s: u64,
     // geração do priority_set (incrementado em set_priority_set_and_bump).
     priority_set_generation_id: AtomicU64,
     priority_set_updated_at_ns: AtomicU64,
@@ -325,6 +331,9 @@ fn compute_supervised_config_hash(
     label_floors_pct: &[f32],
     label_horizons_s: &[u32],
     label_background_decimation_mod: u64,
+    label_allowlist_symbols_key: &str,
+    label_priority_target_coverage: f64,
+    label_priority_rerank_interval_s: u64,
     recommendation_cooldown_ns: u64,
     opportunity_alive_threshold_pct: f32,
 ) -> String {
@@ -344,6 +353,8 @@ fn compute_supervised_config_hash(
             "baseline_floor_pct={:.6}|baseline_n_min={}|baseline_valid_for_s={}|",
             "label_stride_s={}|label_floor_pct={:.6}|label_floors_pct=[{}]|",
             "label_horizons_s=[{}]|label_background_decimation_mod={}|",
+            "label_allowlist_symbols=[{}]|label_priority_target_coverage={:.6}|",
+            "label_priority_rerank_interval_s={}|",
             "recommendation_cooldown_ns={}|",
             "feature_windows_s=[3600,86400,604800]|opportunity_alive_threshold_pct={:.6}"
         ),
@@ -359,6 +370,9 @@ fn compute_supervised_config_hash(
         floors,
         horizons,
         label_background_decimation_mod,
+        label_allowlist_symbols_key,
+        label_priority_target_coverage,
+        label_priority_rerank_interval_s,
         recommendation_cooldown_ns,
         opportunity_alive_threshold_pct,
     );
@@ -672,6 +686,9 @@ impl MlServer {
         let label_floors_pct = DEFAULT_LABEL_FLOORS_PCT.to_vec();
         let label_horizons_s = DEFAULT_HORIZONS_S.to_vec();
         let recommendation_cooldown_ns = 60 * 1_000_000_000;
+        let label_allowlist_symbols_key = String::new();
+        let label_priority_target_coverage = 0.95;
+        let label_priority_rerank_interval_s = 3600;
         let runtime_config_hash = compute_supervised_config_hash(
             trigger.config(),
             baseline.config(),
@@ -680,6 +697,9 @@ impl MlServer {
             &label_floors_pct,
             &label_horizons_s,
             label_decimator.modulus(),
+            &label_allowlist_symbols_key,
+            label_priority_target_coverage,
+            label_priority_rerank_interval_s,
             recommendation_cooldown_ns,
             0.0,
         );
@@ -727,6 +747,9 @@ impl MlServer {
             recommendation_cooldown_ns,
             runtime_config_hash,
             raw_persistence_config_hash,
+            label_allowlist_symbols_key,
+            label_priority_target_coverage,
+            label_priority_rerank_interval_s,
             priority_set_generation_id: AtomicU64::new(0),
             priority_set_updated_at_ns: AtomicU64::new(0),
         }
@@ -741,6 +764,9 @@ impl MlServer {
             &self.label_floors_pct,
             &self.label_horizons_s,
             self.label_decimator.modulus(),
+            &self.label_allowlist_symbols_key,
+            self.label_priority_target_coverage,
+            self.label_priority_rerank_interval_s,
             self.recommendation_cooldown_ns,
             self.opportunity_alive_threshold_pct,
         );
@@ -791,6 +817,21 @@ impl MlServer {
     /// Separado do raw para que storage físico não mude labels/abstenções.
     pub fn with_label_decimator(mut self, decimator: RouteDecimator) -> Self {
         self.label_decimator = decimator;
+        self.refresh_runtime_config_hash();
+        self
+    }
+
+    /// Versiona a política que escolhe quais rejeições/background entram como
+    /// candidatos supervisionados via allowlist e priority_set compartilhados.
+    pub fn with_label_population_policy(
+        mut self,
+        allowlist_symbols_key: String,
+        priority_target_coverage: f64,
+        priority_rerank_interval_s: u64,
+    ) -> Self {
+        self.label_allowlist_symbols_key = allowlist_symbols_key;
+        self.label_priority_target_coverage = priority_target_coverage;
+        self.label_priority_rerank_interval_s = priority_rerank_interval_s;
         self.refresh_runtime_config_hash();
         self
     }
@@ -2071,6 +2112,30 @@ mod tests {
         assert_ne!(
             a.runtime_config_hash, b.runtime_config_hash,
             "label/background sampling changes supervised population and must version labels"
+        );
+    }
+
+    #[test]
+    fn label_population_policy_changes_supervised_config_hash() {
+        let base = mk_server().with_label_population_policy("BTC-USDT,ETH-USDT".into(), 0.95, 3600);
+        let changed_allowlist =
+            mk_server().with_label_population_policy("BTC-USDT".into(), 0.95, 3600);
+        let changed_priority_target =
+            mk_server().with_label_population_policy("BTC-USDT,ETH-USDT".into(), 0.90, 3600);
+        let changed_rerank =
+            mk_server().with_label_population_policy("BTC-USDT,ETH-USDT".into(), 0.95, 900);
+
+        assert_ne!(
+            base.runtime_config_hash, changed_allowlist.runtime_config_hash,
+            "allowlist compartilhada altera quais backgrounds viram labels"
+        );
+        assert_ne!(
+            base.runtime_config_hash, changed_priority_target.runtime_config_hash,
+            "target coverage do priority_set altera full-capture supervisionado"
+        );
+        assert_ne!(
+            base.runtime_config_hash, changed_rerank.runtime_config_hash,
+            "cadencia de rerank altera quando rotas entram em priority supervisionado"
         );
     }
 

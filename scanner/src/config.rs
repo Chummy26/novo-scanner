@@ -60,11 +60,14 @@ pub struct Config {
 #[derive(Debug, Clone, Deserialize)]
 pub struct MlConfig {
     /// Símbolos (canonical "BASE-QUOTE") sempre persistidos no RawSample,
-    /// independentemente de ranking. Ex.: `["BTC-USDT", "ETH-USDT"]`.
+    /// independentemente de ranking. Enquanto a allowlist ainda é
+    /// compartilhada, estes símbolos também entram full-capture na candidatura
+    /// supervisionada de background. Ex.: `["BTC-USDT", "ETH-USDT"]`.
     #[serde(default)]
     pub raw_allowlist_symbols: Vec<String>,
 
-    /// Fração de `accept_count_24h` coberta pelo priority_set. Default 0.95.
+    /// Fração de `accept_count_24h` coberta pelo priority_set. O mesmo
+    /// priority_set alimenta raw e labels de background. Default 0.95.
     #[serde(default = "default_raw_target_coverage")]
     pub raw_sampling_target_coverage: f64,
 
@@ -78,7 +81,8 @@ pub struct MlConfig {
     #[serde(default = "default_label_background_decimation_mod")]
     pub label_background_decimation_mod: u64,
 
-    /// Intervalo entre reranks do `RouteRanking` (s). Default 3600 (1h).
+    /// Intervalo entre reranks do `RouteRanking` (s). Afeta raw e labels de
+    /// background porque ambos recebem o mesmo priority_set. Default 3600 (1h).
     #[serde(default = "default_raw_rerank_interval_s")]
     pub raw_rerank_interval_s: u64,
 

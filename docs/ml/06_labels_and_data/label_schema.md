@@ -28,8 +28,9 @@ Streams:
   O resolver cria labels para candidates limpos. No foreground, isso inclui
   `sample_decision != "accept"`; no background abaixo do threshold visual,
   rejeições limpas entram quando selecionadas pelo
-  `label_background_decimation_mod`, separado do decimator físico de raw.
-  Storage raw não deve alterar a população supervisionada.
+  `label_background_decimation_mod` e pelos tiers allowlist/priority
+  compartilhados. O decimator físico de raw é separado: storage raw não deve
+  alterar a população supervisionada.
 
 `features_t0` não inclui diagnósticos operacionais do book. Volume 24h pode
 existir nos streams bruto/aceito como metadado de amostragem/filtro de
