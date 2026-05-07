@@ -163,6 +163,7 @@ impl RawSampleWriter {
                 biased;
                 _ = flush_interval.tick() => {
                     self.periodic_flush();
+                    self.reap_finished_compactions().await;
                 }
                 maybe_sample = self.rx.recv() => {
                     match maybe_sample {
@@ -192,6 +193,7 @@ impl RawSampleWriter {
         let rotation_key = rotation_key_for_ns(sample.ts_ns, self.cfg.rotation_interval);
         if self.current_rotation_key.as_deref() != Some(rotation_key.as_str()) {
             self.close_current_file();
+            self.reap_finished_compactions().await;
             let hour_key = hour_key_for_ns(sample.ts_ns);
             let rotation_start_ns = rotation_start_ns_for(sample.ts_ns, self.cfg.rotation_interval);
             match self.open_writer_for_hour(&hour_key, rotation_start_ns) {
@@ -284,18 +286,40 @@ impl RawSampleWriter {
 
     async fn await_pending_compactions(&mut self) {
         while let Some(handle) = self.compaction_tasks.pop() {
-            match handle.await {
-                Ok(Ok(Some(_))) => {
-                    self.compaction_succeeded = self.compaction_succeeded.saturating_add(1);
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(_)) => {
-                    self.compaction_failed = self.compaction_failed.saturating_add(1);
-                }
-                Err(e) => {
-                    self.compaction_failed = self.compaction_failed.saturating_add(1);
-                    warn!(error = %e, "ML raw writer compaction task join falhou");
-                }
+            let result = handle.await;
+            self.record_compaction_join_result(result);
+        }
+    }
+
+    async fn reap_finished_compactions(&mut self) {
+        let mut pending = Vec::with_capacity(self.compaction_tasks.len());
+        let handles = std::mem::take(&mut self.compaction_tasks);
+        for handle in handles {
+            if handle.is_finished() {
+                let result = handle.await;
+                self.record_compaction_join_result(result);
+            } else {
+                pending.push(handle);
+            }
+        }
+        self.compaction_tasks = pending;
+    }
+
+    fn record_compaction_join_result(
+        &mut self,
+        result: Result<anyhow::Result<Option<PathBuf>>, tokio::task::JoinError>,
+    ) {
+        match result {
+            Ok(Ok(Some(_))) => {
+                self.compaction_succeeded = self.compaction_succeeded.saturating_add(1);
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(_)) => {
+                self.compaction_failed = self.compaction_failed.saturating_add(1);
+            }
+            Err(e) => {
+                self.compaction_failed = self.compaction_failed.saturating_add(1);
+                warn!(error = %e, "ML raw writer compaction task join falhou");
             }
         }
     }

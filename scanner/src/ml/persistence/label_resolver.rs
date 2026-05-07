@@ -441,7 +441,7 @@ impl LabelResolver {
         _entry_spread: f32,
         exit_spread: f32,
     ) {
-        let mut to_write: Vec<(PendingLabel, usize, Option<CensorReason>)> = Vec::new();
+        let mut to_write: Vec<(Arc<PendingLabel>, usize, Option<CensorReason>)> = Vec::new();
         {
             let mut inner = self.inner.lock();
             let Some(queue) = inner.pending_by_route.get_mut(&route_id) else {
@@ -522,9 +522,9 @@ impl LabelResolver {
                     }
                 }
                 if !closed_idx.is_empty() {
-                    let snapshot = pending.clone();
+                    let snapshot = Arc::new(pending.clone());
                     for (idx, reason) in closed_idx {
-                        to_write.push((snapshot.clone(), idx, reason));
+                        to_write.push((Arc::clone(&snapshot), idx, reason));
                     }
                 }
             }
@@ -535,13 +535,13 @@ impl LabelResolver {
         }
 
         for (pending, idx, reason) in to_write {
-            let outcome = LabelOutcome::from_pending(&pending, idx);
+            let outcome = LabelOutcome::from_pending(pending.as_ref(), idx);
             let reason = if matches!(outcome, LabelOutcome::Censored) {
                 reason.or(Some(CensorReason::IncompleteWindow))
             } else {
                 None
             };
-            self.write_closed_horizon_with_reason(pending, idx, now_ns, outcome, reason);
+            self.write_closed_horizon_with_reason(pending.as_ref(), idx, now_ns, outcome, reason);
         }
     }
 
@@ -549,7 +549,7 @@ impl LabelResolver {
     /// Fecha horizontes vencidos (mesmo sem observações) e censura rotas
     /// sumidas. Retorna número de horizontes fechados nesta passagem.
     pub fn sweep(&self, now_ns: u64) -> u64 {
-        let mut to_write: Vec<(PendingLabel, usize, LabelOutcome, Option<CensorReason>)> =
+        let mut to_write: Vec<(Arc<PendingLabel>, usize, LabelOutcome, Option<CensorReason>)> =
             Vec::new();
         {
             let mut inner = self.inner.lock();
@@ -585,13 +585,13 @@ impl LabelResolver {
                         }
                     }
                     if !closed_this_sweep.is_empty() {
-                        let snap = pending.clone();
+                        let snap = Arc::new(pending.clone());
                         for (idx, _outcome_hint, reason) in closed_this_sweep {
                             // Hit dentro da janela vence qualquer fechamento
                             // posterior por sweep. Forcar Censored aqui
                             // sobrescrevia realizacoes ja observadas quando
                             // a rota ficava dormente antes do deadline.
-                            let final_outcome = LabelOutcome::from_pending(&snap, idx);
+                            let final_outcome = LabelOutcome::from_pending(snap.as_ref(), idx);
                             // Expirado sem cobertura ate o deadline nao e miss
                             // falsificavel; marca IncompleteWindow. Dormant e
                             // Delisted so entram quando o gate de idle fechou
@@ -601,7 +601,7 @@ impl LabelResolver {
                             } else {
                                 None
                             };
-                            to_write.push((snap.clone(), idx, final_outcome, final_reason));
+                            to_write.push((Arc::clone(&snap), idx, final_outcome, final_reason));
                         }
                     }
                 }
@@ -612,7 +612,7 @@ impl LabelResolver {
 
         let n = to_write.len() as u64;
         for (pending, idx, outcome, reason) in to_write {
-            self.write_closed_horizon_with_reason(pending, idx, now_ns, outcome, reason);
+            self.write_closed_horizon_with_reason(pending.as_ref(), idx, now_ns, outcome, reason);
         }
         n
     }
@@ -627,7 +627,7 @@ impl LabelResolver {
     /// chamar `LabelOutcome::from_pending()` e só atribuir `Shutdown` quando
     /// o outcome for de fato `Censored` (incomplete window).
     pub async fn shutdown_flush(&self, now_ns: u64) -> ShutdownFlushStats {
-        let mut to_write: Vec<(PendingLabel, usize, LabelOutcome, Option<CensorReason>)> =
+        let mut to_write: Vec<(Arc<PendingLabel>, usize, LabelOutcome, Option<CensorReason>)> =
             Vec::new();
         {
             let mut inner = self.inner.lock();
@@ -641,14 +641,14 @@ impl LabelResolver {
                         }
                     }
                     if !closed_idx.is_empty() {
-                        let snap = pending.clone();
+                        let snap = Arc::new(pending.clone());
                         for idx in closed_idx {
-                            let outcome = LabelOutcome::from_pending(&snap, idx);
+                            let outcome = LabelOutcome::from_pending(snap.as_ref(), idx);
                             let reason = match outcome {
                                 LabelOutcome::Censored => Some(CensorReason::Shutdown),
                                 _ => None,
                             };
-                            to_write.push((snap.clone(), idx, outcome, reason));
+                            to_write.push((Arc::clone(&snap), idx, outcome, reason));
                         }
                     }
                 }
@@ -669,7 +669,8 @@ impl LabelResolver {
                     .shutdown_lost_pending_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            let label = self.build_closed_horizon_label(pending, idx, now_ns, outcome, reason);
+            let label =
+                self.build_closed_horizon_label(pending.as_ref(), idx, now_ns, outcome, reason);
             match self.writer.send(label).await {
                 Ok(()) => {
                     stats.sent_total = stats.sent_total.saturating_add(1);
@@ -696,7 +697,7 @@ impl LabelResolver {
 
     fn write_closed_horizon_with_reason(
         &self,
-        pending: PendingLabel,
+        pending: &PendingLabel,
         idx: usize,
         now_ns: u64,
         outcome: LabelOutcome,
@@ -722,7 +723,7 @@ impl LabelResolver {
 
     fn build_closed_horizon_label(
         &self,
-        pending: PendingLabel,
+        pending: &PendingLabel,
         idx: usize,
         now_ns: u64,
         outcome: LabelOutcome,
