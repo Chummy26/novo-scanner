@@ -477,6 +477,44 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         });
     }
+
+    // Sweeper dos HotQueryCaches: remove apenas amostras que já saíram da
+    // janela estatística da própria feature (1h/24h/7d). Não altera labels,
+    // floors, horizontes ou política de sampling; evita reter rotas frias que
+    // não recebem nova observação decimada para disparar expiração local.
+    {
+        let server_clone = Arc::clone(&ml_server);
+        let interval = Duration::from_secs(cfg.ml.label_sweeper_interval_s.max(60));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let (s24h, s1h, s7d) = server_clone.cache_sweep_expired(now_ns());
+                if s24h.routes_removed
+                    + s1h.routes_removed
+                    + s7d.routes_removed
+                    + s24h.routes_rebuilt
+                    + s1h.routes_rebuilt
+                    + s7d.routes_rebuilt
+                    > 0
+                {
+                    tracing::debug!(
+                        removed_24h = s24h.routes_removed,
+                        removed_1h = s1h.routes_removed,
+                        removed_7d = s7d.routes_removed,
+                        rebuilt_24h = s24h.routes_rebuilt,
+                        rebuilt_1h = s1h.routes_rebuilt,
+                        rebuilt_7d = s7d.routes_rebuilt,
+                        expired_ticks_24h = s24h.ticks_expired,
+                        expired_ticks_1h = s1h.ticks_expired,
+                        expired_ticks_7d = s7d.ticks_expired,
+                        "hot cache sweep expired out-of-window samples"
+                    );
+                }
+            }
+        });
+    }
     let ml_metrics_opt = match MlPrometheusMetrics::register(&obs::Metrics::init().registry) {
         Ok(m) => {
             info!("ML prometheus metrics registered");

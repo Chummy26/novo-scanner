@@ -27,4 +27,4 @@
 
 pub mod hot_cache;
 
-pub use hot_cache::{CacheConfig, HotCacheStats, HotQueryCache};
+pub use hot_cache::{CacheConfig, HotCacheStats, HotCacheSweepStats, HotQueryCache};

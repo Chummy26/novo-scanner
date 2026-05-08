@@ -1,0 +1,8 @@
+started_at=2026-05-08T02:32:28.9782458-03:00
+duration_seconds=2400
+pid=29768
+exe=C:\Users\nicoolas\Pictures\novo sc anner\scanner\target\release\scanner.exe
+config=C:\Users\nicoolas\Pictures\novo sc anner\.tmp\collect-long-7d-20260507.toml
+stdout=C:\Users\nicoolas\Pictures\novo sc anner\.tmp\collect-40m-20260508-023228\scanner.stdout.log
+stderr=C:\Users\nicoolas\Pictures\novo sc anner\.tmp\collect-40m-20260508-023228\scanner.stderr.log
+stopper_pid=32932

@@ -51,6 +51,7 @@
 //! Precisão com `sigfig=2` + `median_equivalent` → bucket effective
 //! ≈ 0.01% em spreads típicos.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -129,6 +130,17 @@ pub struct HotCacheStats {
     pub routes_tracked: usize,
     pub materialized_routes: usize,
     pub retained_ticks: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotCacheSweepStats {
+    pub routes_removed: usize,
+    pub routes_rebuilt: usize,
+    pub ticks_expired: u64,
+}
+
+thread_local! {
+    static RUN_DURATION_SCRATCH: RefCell<Vec<u64>> = RefCell::new(Vec::new());
 }
 
 impl Default for CacheConfig {
@@ -398,33 +410,36 @@ impl PerRouteCache {
         }
 
         let threshold_bucket = to_bucket(exit_threshold) as u32;
-        let mut runs: Vec<u64> = Vec::new();
-        let mut active_start: Option<u64> = None;
-        let mut last_ts: Option<u64> = None;
+        RUN_DURATION_SCRATCH.with(|scratch| {
+            let mut runs = scratch.borrow_mut();
+            runs.clear();
+            let mut active_start: Option<u64> = None;
+            let mut last_ts: Option<u64> = None;
 
-        for s in &storage.ring {
-            last_ts = Some(s.ts_ns);
-            if s.exit_bucket >= threshold_bucket {
-                if active_start.is_none() {
-                    active_start = Some(s.ts_ns);
+            for s in &storage.ring {
+                last_ts = Some(s.ts_ns);
+                if s.exit_bucket >= threshold_bucket {
+                    if active_start.is_none() {
+                        active_start = Some(s.ts_ns);
+                    }
+                } else if let Some(start) = active_start.take() {
+                    runs.push((s.ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000);
                 }
-            } else if let Some(start) = active_start.take() {
-                runs.push((s.ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000);
             }
-        }
 
-        if let (Some(start), Some(end)) = (active_start, last_ts) {
-            runs.push((end.saturating_sub(start) + 999_999_999) / 1_000_000_000);
-        }
+            if let (Some(start), Some(end)) = (active_start, last_ts) {
+                runs.push((end.saturating_sub(start) + 999_999_999) / 1_000_000_000);
+            }
 
-        if runs.is_empty() {
-            return None;
-        }
+            if runs.is_empty() {
+                return None;
+            }
 
-        let p05 = select_quantile_u64(&mut runs, 0.05);
-        let p50 = select_quantile_u64(&mut runs, 0.50);
-        let p95 = select_quantile_u64(&mut runs, 0.95);
-        Some((p05, p50, p95))
+            let p05 = select_quantile_u64(&mut runs, 0.05);
+            let p50 = select_quantile_u64(&mut runs, 0.50);
+            let p95 = select_quantile_u64(&mut runs, 0.95);
+            Some((p05, p50, p95))
+        })
     }
 
     #[inline]
@@ -433,6 +448,47 @@ impl PerRouteCache {
             .as_ref()
             .and_then(|storage| storage.ring.front().map(|s| s.ts_ns))
             .unwrap_or(0)
+    }
+
+    fn sweep_expired(&mut self, now_ns: u64) -> (u64, bool) {
+        let cutoff = now_ns.saturating_sub(self.cfg.window_ns);
+        let mut expired = 0u64;
+        let mut should_clear_storage = false;
+
+        if let Some(storage) = self.storage.as_mut() {
+            while let Some(front) = storage.ring.front() {
+                if front.ts_ns < cutoff {
+                    storage.ring.pop_front();
+                    expired = expired.saturating_add(1);
+                } else {
+                    break;
+                }
+            }
+
+            if expired > 0 {
+                storage.entry_hist.reset();
+                storage.exit_hist.reset();
+                for s in &storage.ring {
+                    let _ = storage.entry_hist.record(s.entry_bucket as u64);
+                    let _ = storage.exit_hist.record(s.exit_bucket as u64);
+                }
+                self.last_rebuild_ns = now_ns;
+                self.n_observations = storage
+                    .ring
+                    .len()
+                    .saturating_mul(self.cfg.decimation.max(1) as usize)
+                    as u64;
+            }
+            should_clear_storage = storage.ring.is_empty();
+        }
+
+        if should_clear_storage {
+            self.storage = None;
+            self.n_observations = 0;
+        }
+
+        let route_expired = now_ns.saturating_sub(self.last_update_ns) > self.cfg.window_ns;
+        (expired, self.storage.is_none() && route_expired)
     }
 }
 
@@ -582,6 +638,25 @@ impl HotQueryCache {
                 .retained_ticks
                 .saturating_add(cache.sampled_observations());
         }
+        stats
+    }
+
+    pub fn sweep_expired(&self, now_ns: u64) -> HotCacheSweepStats {
+        let mut guard = self.routes.write();
+        let mut stats = HotCacheSweepStats::default();
+        guard.retain(|_, cache| {
+            let (expired, remove_route) = cache.sweep_expired(now_ns);
+            if expired > 0 {
+                stats.ticks_expired = stats.ticks_expired.saturating_add(expired);
+                stats.routes_rebuilt = stats.routes_rebuilt.saturating_add(1);
+            }
+            if remove_route {
+                stats.routes_removed = stats.routes_removed.saturating_add(1);
+                false
+            } else {
+                true
+            }
+        });
         stats
     }
 }
@@ -845,6 +920,50 @@ mod tests {
             p50 >= 4.8 && p50 <= 5.2,
             "histograma não pode manter samples expirados; p50={p50}"
         );
+    }
+
+    #[test]
+    fn sweep_expired_removes_route_after_window_without_new_observation() {
+        let cfg = CacheConfig {
+            decimation: 1,
+            window_ns: 1_000,
+            rebuild_interval_ns: u64::MAX,
+            ring_initial_capacity: 64,
+        };
+        let cache = HotQueryCache::with_config(cfg);
+        let route = mk_route(1);
+        cache.observe(route, 2.0, -1.0, 0);
+
+        let stats = cache.sweep_expired(1_001);
+
+        assert_eq!(stats.ticks_expired, 1);
+        assert_eq!(stats.routes_rebuilt, 1);
+        assert_eq!(stats.routes_removed, 1);
+        assert_eq!(cache.routes_tracked(), 0);
+        assert_eq!(cache.n_observations(route), 0);
+        assert_eq!(cache.quantile_entry(route, 0.50), None);
+    }
+
+    #[test]
+    fn sweep_expired_preserves_boundary_sample_inside_window() {
+        let cfg = CacheConfig {
+            decimation: 1,
+            window_ns: 1_000,
+            rebuild_interval_ns: u64::MAX,
+            ring_initial_capacity: 64,
+        };
+        let cache = HotQueryCache::with_config(cfg);
+        let route = mk_route(1);
+        cache.observe(route, 2.0, -1.0, 0);
+
+        let stats = cache.sweep_expired(1_000);
+
+        assert_eq!(stats.ticks_expired, 0);
+        assert_eq!(stats.routes_rebuilt, 0);
+        assert_eq!(stats.routes_removed, 0);
+        assert_eq!(cache.routes_tracked(), 1);
+        assert_eq!(cache.n_observations(route), 1);
+        assert!(cache.quantile_entry(route, 0.50).is_some());
     }
 
     #[test]

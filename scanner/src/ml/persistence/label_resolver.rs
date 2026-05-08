@@ -30,6 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ahash::AHashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::ml::contract::RouteId;
 use crate::ml::persistence::labeled_trade::{
@@ -110,7 +111,7 @@ pub struct PendingHorizon {
     pub best_exit_ts_ns_so_far: Option<u64>,
     pub first_exit_ge_floor_ts_ns: Option<u64>,
     pub first_exit_ge_floor_pct: Option<f32>,
-    pub floor_hits: Vec<PendingFloorHit>,
+    pub floor_hits: SmallVec<[PendingFloorHit; 8]>,
     pub observed_until_ns: u64,
     pub n_clean_future_samples: u32,
     pub closed: bool,
@@ -213,16 +214,16 @@ struct PendingLabelState {
     route_id: RouteId,
     entry_locked_pct: f32,
     label_floor_pct: f32,
-    horizons: Vec<PendingHorizon>,
+    horizons: Vec<Option<PendingHorizon>>,
 }
 
 impl PendingLabelState {
     fn all_closed(&self) -> bool {
-        self.horizons.iter().all(|h| h.closed)
+        self.horizons.iter().all(Option::is_none)
     }
 
     fn open_horizon_count(&self) -> u64 {
-        self.horizons.iter().filter(|h| !h.closed).count() as u64
+        self.horizons.iter().filter(|h| h.is_some()).count() as u64
     }
 }
 
@@ -234,6 +235,14 @@ enum PendingMetaRef {
         offset: u64,
         len: u32,
     },
+}
+
+#[derive(Debug)]
+struct ClosedHorizonWrite {
+    meta_ref: PendingMetaRef,
+    route_id: RouteId,
+    horizon: PendingHorizon,
+    censor_reason: Option<CensorReason>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -501,7 +510,10 @@ impl Default for ResolverConfig {
 }
 
 const META_SPOOL_MAGIC: &[u8; 8] = b"LRMETA01";
+#[cfg(not(test))]
 const META_SPOOL_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(test)]
+const META_SPOOL_SEGMENT_MAX_BYTES: u64 = 1024;
 
 struct PendingMetaStore {
     backend: PendingMetaBackend,
@@ -1148,7 +1160,7 @@ impl LabelResolver {
             route_id,
             entry_locked_pct,
             label_floor_pct,
-            horizons,
+            horizons: horizons.into_iter().map(Some).collect(),
         };
 
         let mut released_meta: Option<PendingMetaRef> = None;
@@ -1219,7 +1231,7 @@ impl LabelResolver {
             &self.metrics.on_observation_ns_total,
             &self.metrics.on_observation_ops_total,
         );
-        let mut to_write: Vec<(Arc<PendingLabelState>, usize, Option<CensorReason>)> = Vec::new();
+        let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
         let mut released_meta: Vec<PendingMetaRef> = Vec::new();
         {
             let mut inner = self.inner.lock();
@@ -1232,84 +1244,98 @@ impl LabelResolver {
                 let t_emit = pending.ts_emit_ns;
                 let entry_locked = pending.entry_locked_pct;
                 let label_floor = pending.label_floor_pct;
-                let mut closed_idx: Vec<(usize, Option<CensorReason>)> = Vec::new();
-                for (idx, slot) in pending.horizons.iter_mut().enumerate() {
-                    if slot.closed {
+                let mut closed_horizons: Vec<(PendingHorizon, Option<CensorReason>)> = Vec::new();
+                for slot_opt in pending.horizons.iter_mut() {
+                    if slot_opt.is_none() {
                         continue;
                     }
-                    let deadline = t_emit + (slot.horizon_s as u64) * 1_000_000_000;
-                    if now_ns == deadline {
-                        slot.observed_until_ns = deadline;
-                        slot.n_clean_future_samples = slot.n_clean_future_samples.saturating_add(1);
-                        let is_better = slot
-                            .best_exit_pct_so_far
-                            .map(|b| exit_spread > b)
-                            .unwrap_or(true);
-                        if is_better {
-                            slot.best_exit_pct_so_far = Some(exit_spread);
-                            slot.best_exit_ts_ns_so_far = Some(now_ns);
-                        }
-                        let gross = entry_locked + exit_spread;
-                        if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
-                            slot.first_exit_ge_floor_ts_ns = Some(now_ns);
-                            slot.first_exit_ge_floor_pct = Some(exit_spread);
-                        }
-                        for hit in slot.floor_hits.iter_mut() {
-                            if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none() {
-                                hit.first_exit_ge_floor_ts_ns = Some(now_ns);
-                                hit.first_exit_ge_floor_pct = Some(exit_spread);
+                    let mut close_reason: Option<Option<CensorReason>> = None;
+                    {
+                        let slot = slot_opt.as_mut().expect("checked Some");
+                        let deadline = t_emit + (slot.horizon_s as u64) * 1_000_000_000;
+                        if now_ns == deadline {
+                            slot.observed_until_ns = deadline;
+                            slot.n_clean_future_samples =
+                                slot.n_clean_future_samples.saturating_add(1);
+                            let is_better = slot
+                                .best_exit_pct_so_far
+                                .map(|b| exit_spread > b)
+                                .unwrap_or(true);
+                            if is_better {
+                                slot.best_exit_pct_so_far = Some(exit_spread);
+                                slot.best_exit_ts_ns_so_far = Some(now_ns);
+                            }
+                            let gross = entry_locked + exit_spread;
+                            if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
+                                slot.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                slot.first_exit_ge_floor_pct = Some(exit_spread);
+                            }
+                            for hit in slot.floor_hits.iter_mut() {
+                                if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none()
+                                {
+                                    hit.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                    hit.first_exit_ge_floor_pct = Some(exit_spread);
+                                }
+                            }
+                            slot.closed = true;
+                            close_reason = Some(None);
+                        } else if now_ns > deadline {
+                            let gap_to_deadline = deadline.saturating_sub(slot.observed_until_ns);
+                            let window_observed_close_enough = slot.n_clean_future_samples > 0
+                                && gap_to_deadline <= self.cfg.close_slack_ns;
+                            if window_observed_close_enough {
+                                slot.observed_until_ns = deadline;
+                                slot.closed = true;
+                                close_reason = Some(None);
+                            } else {
+                                slot.closed = true;
+                                close_reason = Some(Some(CensorReason::IncompleteWindow));
+                            }
+                        } else {
+                            slot.observed_until_ns = now_ns;
+                            slot.n_clean_future_samples =
+                                slot.n_clean_future_samples.saturating_add(1);
+                            let is_better = slot
+                                .best_exit_pct_so_far
+                                .map(|b| exit_spread > b)
+                                .unwrap_or(true);
+                            if is_better {
+                                slot.best_exit_pct_so_far = Some(exit_spread);
+                                slot.best_exit_ts_ns_so_far = Some(now_ns);
+                            }
+                            let gross = entry_locked + exit_spread;
+                            if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
+                                slot.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                slot.first_exit_ge_floor_pct = Some(exit_spread);
+                            }
+                            for hit in slot.floor_hits.iter_mut() {
+                                if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none()
+                                {
+                                    hit.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                    hit.first_exit_ge_floor_pct = Some(exit_spread);
+                                }
                             }
                         }
-                        slot.closed = true;
-                        closed_idx.push((idx, None));
-                        continue;
                     }
-                    if now_ns > deadline {
-                        let gap_to_deadline = deadline.saturating_sub(slot.observed_until_ns);
-                        let window_observed_close_enough = slot.n_clean_future_samples > 0
-                            && gap_to_deadline <= self.cfg.close_slack_ns;
-                        if window_observed_close_enough {
-                            slot.observed_until_ns = deadline;
-                            slot.closed = true;
-                            closed_idx.push((idx, None));
-                        } else {
-                            slot.closed = true;
-                            closed_idx.push((idx, Some(CensorReason::IncompleteWindow)));
-                        }
-                        continue;
-                    }
-                    slot.observed_until_ns = now_ns;
-                    slot.n_clean_future_samples = slot.n_clean_future_samples.saturating_add(1);
-                    let is_better = slot
-                        .best_exit_pct_so_far
-                        .map(|b| exit_spread > b)
-                        .unwrap_or(true);
-                    if is_better {
-                        slot.best_exit_pct_so_far = Some(exit_spread);
-                        slot.best_exit_ts_ns_so_far = Some(now_ns);
-                    }
-                    let gross = entry_locked + exit_spread;
-                    if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
-                        slot.first_exit_ge_floor_ts_ns = Some(now_ns);
-                        slot.first_exit_ge_floor_pct = Some(exit_spread);
-                    }
-                    for hit in slot.floor_hits.iter_mut() {
-                        if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none() {
-                            hit.first_exit_ge_floor_ts_ns = Some(now_ns);
-                            hit.first_exit_ge_floor_pct = Some(exit_spread);
-                        }
+                    if let Some(reason) = close_reason {
+                        let horizon = slot_opt.take().expect("closed horizon still present");
+                        closed_horizons.push((horizon, reason));
                     }
                 }
-                if !closed_idx.is_empty() {
+                if !closed_horizons.is_empty() {
                     self.metrics
                         .pending_horizons_current
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_sub(closed_idx.len() as u64))
+                            Some(v.saturating_sub(closed_horizons.len() as u64))
                         })
                         .ok();
-                    let snapshot = Arc::new(pending.clone());
-                    for (idx, reason) in closed_idx {
-                        to_write.push((Arc::clone(&snapshot), idx, reason));
+                    for (horizon, reason) in closed_horizons {
+                        to_write.push(ClosedHorizonWrite {
+                            meta_ref: pending.meta_ref.clone(),
+                            route_id: pending.route_id,
+                            horizon,
+                            censor_reason: reason,
+                        });
                     }
                 }
             }
@@ -1335,21 +1361,18 @@ impl LabelResolver {
                 inner.pending_by_route.remove(&route_id);
             }
         }
-        for meta_ref in &released_meta {
-            self.meta_store.release(meta_ref);
-        }
-
-        for (pending_state, idx, reason) in to_write {
-            let Some(pending) = self.materialize_pending(pending_state.as_ref()) else {
-                continue;
-            };
-            let outcome = LabelOutcome::from_pending(&pending, idx);
+        for item in to_write {
+            let meta = self.materialize_meta(&item.meta_ref, item.route_id);
+            let outcome = LabelOutcome::from_horizon(meta.ts_emit_ns, &item.horizon);
             let reason = if matches!(outcome, LabelOutcome::Censored) {
-                reason.or(Some(CensorReason::IncompleteWindow))
+                item.censor_reason.or(Some(CensorReason::IncompleteWindow))
             } else {
                 None
             };
-            self.write_closed_horizon_with_reason(&pending, idx, now_ns, outcome, reason);
+            self.write_closed_horizon_with_reason(&meta, &item.horizon, now_ns, outcome, reason);
+        }
+        for meta_ref in &released_meta {
+            self.meta_store.release(meta_ref);
         }
     }
 
@@ -1359,18 +1382,19 @@ impl LabelResolver {
     pub fn sweep(&self, now_ns: u64) -> u64 {
         let _timing =
             ResolverOpTiming::new(&self.metrics.sweep_ns_total, &self.metrics.sweep_ops_total);
-        let mut to_write: Vec<(Arc<PendingLabelState>, usize, Option<CensorReason>)> = Vec::new();
+        let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
         let mut released_meta: Vec<PendingMetaRef> = Vec::new();
         {
             let mut inner = self.inner.lock();
             for (_route, queue) in inner.pending_by_route.iter_mut() {
                 for pending in queue.iter_mut() {
                     let t_emit = pending.ts_emit_ns;
-                    let mut closed_this_sweep: Vec<(usize, Option<CensorReason>)> = Vec::new();
-                    for (idx, slot) in pending.horizons.iter_mut().enumerate() {
-                        if slot.closed {
+                    let mut closed_horizons: Vec<(PendingHorizon, Option<CensorReason>)> =
+                        Vec::new();
+                    for slot_opt in pending.horizons.iter_mut() {
+                        let Some(slot) = slot_opt.as_mut() else {
                             continue;
-                        }
+                        };
                         let deadline = t_emit + (slot.horizon_s as u64) * 1_000_000_000;
                         let idle_for = now_ns.saturating_sub(slot.observed_until_ns);
                         // distingue Dormant (ilíquidez transitória) de
@@ -1379,30 +1403,38 @@ impl LabelResolver {
                         let dormant = idle_for >= self.cfg.route_vanish_idle_ns;
                         let delisted = idle_for >= self.cfg.route_delisted_idle_ns;
                         let expired = now_ns >= deadline.saturating_add(self.cfg.close_slack_ns);
-                        if expired {
+                        let close_reason = if expired {
                             slot.closed = true;
-                            // Outcome será determinado pós-loop a partir do snapshot.
-                            closed_this_sweep.push((idx, None));
+                            Some(None)
                         } else if dormant && now_ns < deadline {
                             slot.closed = true;
-                            let reason = if delisted {
+                            Some(Some(if delisted {
                                 CensorReason::RouteDelisted
                             } else {
                                 CensorReason::RouteDormant
-                            };
-                            closed_this_sweep.push((idx, Some(reason)));
+                            }))
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = close_reason {
+                            let horizon = slot_opt.take().expect("closed horizon still present");
+                            closed_horizons.push((horizon, reason));
                         }
                     }
-                    if !closed_this_sweep.is_empty() {
+                    if !closed_horizons.is_empty() {
                         self.metrics
                             .pending_horizons_current
                             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                                Some(v.saturating_sub(closed_this_sweep.len() as u64))
+                                Some(v.saturating_sub(closed_horizons.len() as u64))
                             })
                             .ok();
-                        let snap = Arc::new(pending.clone());
-                        for (idx, reason) in closed_this_sweep {
-                            to_write.push((Arc::clone(&snap), idx, reason));
+                        for (horizon, reason) in closed_horizons {
+                            to_write.push(ClosedHorizonWrite {
+                                meta_ref: pending.meta_ref.clone(),
+                                route_id: pending.route_id,
+                                horizon,
+                                censor_reason: reason,
+                            });
                         }
                     }
                 }
@@ -1428,30 +1460,27 @@ impl LabelResolver {
             }
             inner.pending_by_route.retain(|_, q| !q.is_empty());
         }
-        for meta_ref in &released_meta {
-            self.meta_store.release(meta_ref);
-        }
-
         let n = to_write.len() as u64;
-        for (pending_state, idx, reason) in to_write {
-            let Some(pending) = self.materialize_pending(pending_state.as_ref()) else {
-                continue;
-            };
+        for item in to_write {
+            let meta = self.materialize_meta(&item.meta_ref, item.route_id);
             // Hit dentro da janela vence qualquer fechamento posterior por
             // sweep. Forcar Censored aqui sobrescrevia realizacoes ja observadas.
-            let final_outcome = LabelOutcome::from_pending(&pending, idx);
+            let final_outcome = LabelOutcome::from_horizon(meta.ts_emit_ns, &item.horizon);
             let final_reason = if matches!(final_outcome, LabelOutcome::Censored) {
-                reason.or(Some(CensorReason::IncompleteWindow))
+                item.censor_reason.or(Some(CensorReason::IncompleteWindow))
             } else {
                 None
             };
             self.write_closed_horizon_with_reason(
-                &pending,
-                idx,
+                &meta,
+                &item.horizon,
                 now_ns,
                 final_outcome,
                 final_reason,
             );
+        }
+        for meta_ref in &released_meta {
+            self.meta_store.release(meta_ref);
         }
         n
     }
@@ -1463,30 +1492,30 @@ impl LabelResolver {
     /// `first_exit_ge_floor_ts_ns.is_some()` (Realized) ou que já haviam
     /// passado do deadline sem hit (Miss). Isso subestimava `P_hit` empírico
     /// no dataset supervisionado. A lógica correta é a mesma do `sweep`:
-    /// chamar `LabelOutcome::from_pending()` e só atribuir `Shutdown` quando
+    /// derivar o outcome do horizonte fechado e só atribuir `Shutdown` quando
     /// o outcome for de fato `Censored` (incomplete window).
     pub async fn shutdown_flush(&self, now_ns: u64) -> ShutdownFlushStats {
         let _timing = ResolverOpTiming::new(
             &self.metrics.shutdown_flush_ns_total,
             &self.metrics.shutdown_flush_ops_total,
         );
-        let mut to_write: Vec<(Arc<PendingLabelState>, usize, Option<CensorReason>)> = Vec::new();
+        let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
         {
             let mut inner = self.inner.lock();
             for (_route, queue) in inner.pending_by_route.iter_mut() {
                 for pending in queue.iter_mut() {
-                    let mut closed_idx: Vec<usize> = Vec::new();
-                    for (idx, slot) in pending.horizons.iter_mut().enumerate() {
-                        if !slot.closed {
-                            slot.closed = true;
-                            closed_idx.push(idx);
-                        }
-                    }
-                    if !closed_idx.is_empty() {
-                        let snap = Arc::new(pending.clone());
-                        for idx in closed_idx {
-                            to_write.push((Arc::clone(&snap), idx, Some(CensorReason::Shutdown)));
-                        }
+                    for slot_opt in pending.horizons.iter_mut() {
+                        let Some(slot) = slot_opt.as_mut() else {
+                            continue;
+                        };
+                        slot.closed = true;
+                        let horizon = slot_opt.take().expect("closed horizon still present");
+                        to_write.push(ClosedHorizonWrite {
+                            meta_ref: pending.meta_ref.clone(),
+                            route_id: pending.route_id,
+                            horizon,
+                            censor_reason: Some(CensorReason::Shutdown),
+                        });
                     }
                 }
             }
@@ -1503,13 +1532,11 @@ impl LabelResolver {
             closed_total: to_write.len() as u64,
             ..ShutdownFlushStats::default()
         };
-        for (pending_state, idx, shutdown_reason) in to_write {
-            let Some(pending) = self.materialize_pending(pending_state.as_ref()) else {
-                continue;
-            };
-            let outcome = LabelOutcome::from_pending(&pending, idx);
+        for item in to_write {
+            let meta = self.materialize_meta(&item.meta_ref, item.route_id);
+            let outcome = LabelOutcome::from_horizon(meta.ts_emit_ns, &item.horizon);
             let reason = match outcome {
-                LabelOutcome::Censored => shutdown_reason,
+                LabelOutcome::Censored => item.censor_reason,
                 _ => None,
             };
             // Métrica conta apenas labels realmente "perdidos" — Realized e
@@ -1520,7 +1547,8 @@ impl LabelResolver {
                     .shutdown_lost_pending_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            let label = self.build_closed_horizon_label(&pending, idx, now_ns, outcome, reason);
+            let label =
+                self.build_closed_horizon_label(&meta, &item.horizon, now_ns, outcome, reason);
             match self.writer.send(label).await {
                 Ok(()) => {
                     stats.sent_total = stats.sent_total.saturating_add(1);
@@ -1546,54 +1574,35 @@ impl LabelResolver {
         stats
     }
 
-    fn materialize_pending(&self, state: &PendingLabelState) -> Option<PendingLabel> {
-        match self.meta_store.load(&state.meta_ref) {
-            Ok(meta) => Some(PendingLabel {
-                sample_id: meta.sample_id,
-                sample_decision: meta.sample_decision,
-                ts_emit_ns: meta.ts_emit_ns,
-                cycle_seq: meta.cycle_seq,
-                route_id: meta.route_id,
-                symbol_name: meta.symbol_name,
-                entry_locked_pct: meta.entry_locked_pct,
-                exit_start_pct: meta.exit_start_pct,
-                features_t0: meta.features_t0,
-                label_floor_pct: meta.label_floor_pct,
-                label_floors_pct: meta.label_floors_pct,
-                policy_metadata: meta.policy_metadata,
-                sampling_tier: meta.sampling_tier,
-                sampling_probability: meta.sampling_probability,
-                horizons: state.horizons.clone(),
-                cluster_id: meta.cluster_id,
-                cluster_size: meta.cluster_size,
-                cluster_rank: meta.cluster_rank,
-                runtime_config_hash: meta.runtime_config_hash,
-                priority_set_generation_id: meta.priority_set_generation_id,
-                priority_set_updated_at_ns: meta.priority_set_updated_at_ns,
-            }),
+    fn materialize_meta(&self, meta_ref: &PendingMetaRef, route_id: RouteId) -> PendingLabelMeta {
+        match self.meta_store.load(meta_ref) {
+            Ok(meta) => meta,
             Err(e) => {
                 self.metrics
                     .meta_spool_errors_total
                     .fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     error = %e,
-                    route = ?state.route_id,
-                    "label_resolver failed to load pending metadata; closed horizon skipped"
+                    route = ?route_id,
+                    "label_resolver failed to load pending metadata; aborting strict-lossless label path"
                 );
-                None
+                panic!(
+                    "label_resolver strict-lossless violation: failed to load pending metadata for route {:?}: {e}",
+                    route_id
+                );
             }
         }
     }
 
     fn write_closed_horizon_with_reason(
         &self,
-        pending: &PendingLabel,
-        idx: usize,
+        meta: &PendingLabelMeta,
+        horizon: &PendingHorizon,
         now_ns: u64,
         outcome: LabelOutcome,
         censor_reason: Option<CensorReason>,
     ) {
-        let label = self.build_closed_horizon_label(pending, idx, now_ns, outcome, censor_reason);
+        let label = self.build_closed_horizon_label(meta, horizon, now_ns, outcome, censor_reason);
         match self.writer.try_send(label) {
             Ok(()) => {
                 self.bump_written_metrics(outcome);
@@ -1613,28 +1622,25 @@ impl LabelResolver {
 
     fn build_closed_horizon_label(
         &self,
-        pending: &PendingLabel,
-        idx: usize,
+        meta: &PendingLabelMeta,
+        slot: &PendingHorizon,
         now_ns: u64,
         outcome: LabelOutcome,
         censor_reason: Option<CensorReason>,
     ) -> LabeledTrade {
-        let slot = &pending.horizons[idx];
-        let best_gross = slot
-            .best_exit_pct_so_far
-            .map(|e| pending.entry_locked_pct + e);
+        let best_gross = slot.best_exit_pct_so_far.map(|e| meta.entry_locked_pct + e);
         let t_to_best = slot.best_exit_ts_ns_so_far.map(|ts| {
-            ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000).min(u32::MAX as u64) as u32
+            ((ts.saturating_sub(meta.ts_emit_ns)) / 1_000_000_000).min(u32::MAX as u64) as u32
         });
         let t_to_first_hit = slot.first_exit_ge_floor_ts_ns.map(|ts| {
-            ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000).min(u32::MAX as u64) as u32
+            ((ts.saturating_sub(meta.ts_emit_ns)) / 1_000_000_000).min(u32::MAX as u64) as u32
         });
         let label_floor_hits = slot
             .floor_hits
             .iter()
             .map(|hit| {
                 let t_to_first_hit_s = hit.first_exit_ge_floor_ts_ns.map(|ts| {
-                    ((ts.saturating_sub(pending.ts_emit_ns)) / 1_000_000_000).min(u32::MAX as u64)
+                    ((ts.saturating_sub(meta.ts_emit_ns)) / 1_000_000_000).min(u32::MAX as u64)
                         as u32
                 });
                 FloorHitLabel {
@@ -1647,44 +1653,42 @@ impl LabelResolver {
             })
             .collect();
 
-        let mut policy = pending.policy_metadata.clone();
+        let mut policy = meta.policy_metadata.clone();
         policy.effective_stride_s = effective_stride_for_horizon(
-            pending.policy_metadata.label_stride_s,
+            meta.policy_metadata.label_stride_s,
             slot.horizon_s,
             N_EVENTS_TARGET_PER_HORIZON,
         );
-        if !policy.label_sampling_probability.is_finite()
-            && pending.sampling_probability.is_finite()
-        {
-            policy.label_sampling_probability = pending.sampling_probability;
+        if !policy.label_sampling_probability.is_finite() && meta.sampling_probability.is_finite() {
+            policy.label_sampling_probability = meta.sampling_probability;
         }
 
         LabeledTrade {
-            sample_id: pending.sample_id.clone(),
-            sample_decision: pending.sample_decision,
+            sample_id: meta.sample_id.clone(),
+            sample_decision: meta.sample_decision,
             horizon_s: slot.horizon_s,
-            ts_emit_ns: pending.ts_emit_ns,
-            cycle_seq: pending.cycle_seq,
+            ts_emit_ns: meta.ts_emit_ns,
+            cycle_seq: meta.cycle_seq,
             schema_version: LABELED_TRADE_SCHEMA_VERSION,
             scanner_version: SCANNER_VERSION,
-            cluster_id: pending.cluster_id.clone(),
-            cluster_size: pending.cluster_size,
-            cluster_rank: pending.cluster_rank,
-            runtime_config_hash: pending.runtime_config_hash.clone(),
-            priority_set_generation_id: pending.priority_set_generation_id,
-            priority_set_updated_at_ns: pending.priority_set_updated_at_ns,
-            route_id: pending.route_id,
-            symbol_name: pending.symbol_name.clone(),
-            entry_locked_pct: pending.entry_locked_pct,
-            exit_start_pct: pending.exit_start_pct,
-            features_t0: pending.features_t0.clone(),
+            cluster_id: meta.cluster_id.clone(),
+            cluster_size: meta.cluster_size,
+            cluster_rank: meta.cluster_rank,
+            runtime_config_hash: meta.runtime_config_hash.clone(),
+            priority_set_generation_id: meta.priority_set_generation_id,
+            priority_set_updated_at_ns: meta.priority_set_updated_at_ns,
+            route_id: meta.route_id,
+            symbol_name: meta.symbol_name.clone(),
+            entry_locked_pct: meta.entry_locked_pct,
+            exit_start_pct: meta.exit_start_pct,
+            features_t0: meta.features_t0.clone(),
             // renomes protetores aplicados.
             audit_hindsight_best_exit_pct: slot.best_exit_pct_so_far,
             audit_hindsight_best_exit_ts_ns: slot.best_exit_ts_ns_so_far,
             audit_hindsight_best_gross_pct: best_gross,
             audit_hindsight_t_to_best_s: t_to_best,
             n_clean_future_samples: slot.n_clean_future_samples,
-            label_floor_pct: pending.label_floor_pct,
+            label_floor_pct: meta.label_floor_pct,
             first_exit_ge_label_floor_ts_ns: slot.first_exit_ge_floor_ts_ns,
             first_exit_ge_label_floor_pct: slot.first_exit_ge_floor_pct,
             t_to_first_hit_s: t_to_first_hit,
@@ -1692,7 +1696,7 @@ impl LabelResolver {
             outcome,
             censor_reason,
             observed_until_ns: slot.observed_until_ns,
-            label_window_closed_at_ns: pending
+            label_window_closed_at_ns: meta
                 .ts_emit_ns
                 .saturating_add((slot.horizon_s as u64).saturating_mul(1_000_000_000)),
             closed_ts_ns: now_ns,
@@ -1701,11 +1705,9 @@ impl LabelResolver {
             // override semanticamente distingue os dois timestamps.
             written_ts_ns: now_ns,
             policy_metadata: policy,
-            sampling_tier: pending.sampling_tier,
-            sampling_probability: pending.sampling_probability,
-            sampling_probability_kind: sampling_probability_kind_for_tier_label(
-                pending.sampling_tier,
-            ),
+            sampling_tier: meta.sampling_tier,
+            sampling_probability: meta.sampling_probability,
+            sampling_probability_kind: sampling_probability_kind_for_tier_label(meta.sampling_tier),
         }
     }
 
@@ -1731,9 +1733,8 @@ impl LabelResolver {
 }
 
 impl LabelOutcome {
-    fn from_pending(pending: &PendingLabel, idx: usize) -> LabelOutcome {
-        let slot = &pending.horizons[idx];
-        let deadline = pending.ts_emit_ns + (slot.horizon_s as u64) * 1_000_000_000;
+    fn from_horizon(ts_emit_ns: u64, slot: &PendingHorizon) -> LabelOutcome {
+        let deadline = ts_emit_ns + (slot.horizon_s as u64) * 1_000_000_000;
         if slot.first_exit_ge_floor_ts_ns.is_some() {
             LabelOutcome::Realized
         } else if slot.observed_until_ns >= deadline {
@@ -1807,6 +1808,14 @@ mod tests {
             symbol_id: SymbolId(7),
             buy_venue: Venue::MexcFut,
             sell_venue: Venue::BingxFut,
+        }
+    }
+
+    fn mk_alt_route() -> RouteId {
+        RouteId {
+            symbol_id: SymbolId(8),
+            buy_venue: Venue::BinanceFut,
+            sell_venue: Venue::BitgetFut,
         }
     }
 
@@ -2016,6 +2025,184 @@ mod tests {
             v["policy_metadata"]["prediction_calibration_status"],
             "degraded"
         );
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn closed_horizons_are_evicted_before_longest_horizon_closes() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![2, 4],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t_emit = 1_000_000_000u64;
+
+        assert!(resolver.on_accepted(
+            "sid_multi_horizon".into(),
+            t_emit,
+            7,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "priority",
+            1.0,
+            0,
+        ));
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_horizons_current
+                .load(Ordering::Relaxed),
+            2
+        );
+
+        resolver.on_clean_observation(mk_route(), t_emit + 2_000_000_000, 2.0, -1.0);
+
+        {
+            let inner = resolver.inner.lock();
+            let queue = inner.pending_by_route.get(&mk_route()).unwrap();
+            assert_eq!(queue.len(), 1);
+            let pending = queue.front().unwrap();
+            let open_horizons: Vec<_> = pending
+                .horizons
+                .iter()
+                .filter_map(|slot| slot.as_ref())
+                .collect();
+            assert_eq!(open_horizons.len(), 1);
+            assert_eq!(open_horizons[0].horizon_s, 4);
+        }
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_candidates_current
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_horizons_current
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            resolver
+                .metrics()
+                .labels_written_total
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        resolver.on_clean_observation(mk_route(), t_emit + 4_000_000_000, 2.0, -1.0);
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_candidates_current
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            resolver
+                .metrics()
+                .pending_horizons_current
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            resolver
+                .metrics()
+                .labels_written_total
+                .load(Ordering::Relaxed),
+            2
+        );
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn disk_spool_keeps_sealed_segment_until_closed_label_is_materialized() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![2],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver_with_spool(cfg).await;
+        let t_emit = 1_000_000_000u64;
+
+        assert!(resolver.on_accepted(
+            "sid_old_segment".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "priority",
+            1.0,
+            0,
+        ));
+        assert!(resolver.on_accepted(
+            "sid_new_segment".into(),
+            t_emit,
+            2,
+            mk_alt_route(),
+            "ETH-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "priority",
+            1.0,
+            0,
+        ));
+        let spool_segments = std::fs::read_dir(tmp.path().join("spool"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .ok()
+                    .and_then(|entry| {
+                        entry
+                            .path()
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("spool")
+            })
+            .count();
+        assert!(
+            spool_segments >= 2,
+            "teste precisa forcar rotacao do spool para cobrir segmento selado"
+        );
+
+        resolver.on_clean_observation(mk_route(), t_emit + 2_000_000_000, 2.0, -1.0);
+        sleep(Duration::from_millis(150)).await;
+
+        let m = resolver.metrics();
+        assert_eq!(m.meta_spool_errors_total.load(Ordering::Relaxed), 0);
+        assert_eq!(m.labels_written_total.load(Ordering::Relaxed), 1);
+        let v = first_labeled_json(&tmp);
+        assert_eq!(v["sample_id"], "sid_old_segment");
+        assert!(m.meta_spool_read_ops_total.load(Ordering::Relaxed) >= 1);
+
         drop(resolver);
         drop(tmp);
     }
@@ -2476,8 +2663,13 @@ mod tests {
         let queue = inner.pending_by_route.get(&mk_route()).unwrap();
         assert_eq!(queue.len(), 2);
         let second = queue.back().unwrap();
-        assert_eq!(second.horizons.len(), 1);
-        assert_eq!(second.horizons[0].horizon_s, 60);
+        let open_horizons: Vec<_> = second
+            .horizons
+            .iter()
+            .filter_map(|slot| slot.as_ref())
+            .collect();
+        assert_eq!(open_horizons.len(), 1);
+        assert_eq!(open_horizons[0].horizon_s, 60);
         drop(inner);
         drop(resolver);
         drop(tmp);

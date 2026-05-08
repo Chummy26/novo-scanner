@@ -39,6 +39,8 @@ logs/
 .tmp/*.parquet
 .tmp/**/*.parquet
 .tmp/*.pid
+.tmp/*.prom
+.tmp/**/*.prom
 .tmp/*.txt
 
 # ML data outputs
