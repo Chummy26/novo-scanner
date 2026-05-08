@@ -40,7 +40,7 @@ use crate::ml::contract::{
 };
 use crate::ml::economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome};
 use crate::ml::eval::{verify_tradesetup, InvariantError};
-use crate::ml::feature_store::{CacheConfig, HotQueryCache};
+use crate::ml::feature_store::{CacheConfig, HotCacheStats, HotQueryCache};
 use crate::ml::listing_history::{ListingHistory, RouteLifecycle};
 use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
 use crate::ml::persistence::sample_id::sample_id_of;
@@ -948,6 +948,18 @@ impl MlServer {
 
     pub fn cycles_started(&self) -> u64 {
         self.cycle_seq.load(Ordering::Relaxed)
+    }
+
+    pub fn cache_stats_24h(&self) -> HotCacheStats {
+        self.baseline.cache().stats()
+    }
+
+    pub fn cache_stats_1h(&self) -> HotCacheStats {
+        self.feature_cache_1h.stats()
+    }
+
+    pub fn cache_stats_7d(&self) -> HotCacheStats {
+        self.feature_cache_7d.stats()
     }
 
     fn observe_clean_spread(

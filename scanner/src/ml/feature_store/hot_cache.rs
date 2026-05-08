@@ -124,6 +124,13 @@ pub struct CacheConfig {
     pub ring_initial_capacity: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HotCacheStats {
+    pub routes_tracked: usize,
+    pub materialized_routes: usize,
+    pub retained_ticks: u64,
+}
+
 impl Default for CacheConfig {
     fn default() -> Self {
         Self {
@@ -558,6 +565,24 @@ impl HotQueryCache {
 
     pub fn routes_tracked(&self) -> usize {
         self.routes.read().len()
+    }
+
+    pub fn stats(&self) -> HotCacheStats {
+        let guard = self.routes.read();
+        let mut stats = HotCacheStats {
+            routes_tracked: guard.len(),
+            materialized_routes: 0,
+            retained_ticks: 0,
+        };
+        for cache in guard.values() {
+            if cache.storage.is_some() {
+                stats.materialized_routes += 1;
+            }
+            stats.retained_ticks = stats
+                .retained_ticks
+                .saturating_add(cache.sampled_observations());
+        }
+        stats
     }
 }
 

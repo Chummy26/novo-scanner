@@ -29,10 +29,11 @@
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use prometheus::{Gauge, IntCounter, IntCounterVec, IntGauge, Opts, Registry};
+use prometheus::{Gauge, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
 
 use crate::ml::broadcast::{BroadcasterMetrics, RecommendationBroadcaster};
 use crate::ml::economic::EconomicMetrics;
+use crate::ml::feature_store::HotCacheStats;
 use crate::ml::persistence::ResolverMetrics;
 use crate::ml::serving::{MlServer, ServerMetrics};
 
@@ -50,6 +51,9 @@ pub struct MlPrometheusMetrics {
     sample_decisions_total: IntCounterVec,
     recommendations_total: IntCounterVec,
     cache_routes_tracked: IntGauge,
+    cache_routes_tracked_by_window: IntGaugeVec,
+    cache_materialized_routes_by_window: IntGaugeVec,
+    cache_retained_ticks_by_window: IntGaugeVec,
 
     // Wave T extensions — raw samples, broadcaster, economic.
     raw_samples_emitted_total: IntCounter,
@@ -83,6 +87,23 @@ pub struct MlPrometheusMetrics {
     labels_dropped_writer_total: IntCounterVec,
     labels_dropped_capacity_total: IntCounter,
     shutdown_lost_pending_total: IntCounter,
+    pending_candidates_current: IntGauge,
+    pending_horizons_current: IntGauge,
+    meta_spool_bytes_current: IntGauge,
+    meta_spool_records_total: IntCounter,
+    meta_spool_write_ns_total: IntCounter,
+    meta_spool_write_ops_total: IntCounter,
+    meta_spool_read_ns_total: IntCounter,
+    meta_spool_read_ops_total: IntCounter,
+    meta_spool_errors_total: IntCounter,
+    resolver_on_candidate_ns_total: IntCounter,
+    resolver_on_candidate_ops_total: IntCounter,
+    resolver_on_observation_ns_total: IntCounter,
+    resolver_on_observation_ops_total: IntCounter,
+    resolver_sweep_ns_total: IntCounter,
+    resolver_sweep_ops_total: IntCounter,
+    resolver_shutdown_flush_ns_total: IntCounter,
+    resolver_shutdown_flush_ops_total: IntCounter,
 
     // Snapshots do último update (para computar delta → Counter.inc_by).
     last_seen: ServerMetricsSnapshot,
@@ -102,6 +123,20 @@ struct ResolverSnapshot {
     dropped_channel_closed: u64,
     dropped_capacity_overflow: u64,
     shutdown_lost: u64,
+    meta_spool_records: u64,
+    meta_spool_write_ns: u64,
+    meta_spool_write_ops: u64,
+    meta_spool_read_ns: u64,
+    meta_spool_read_ops: u64,
+    meta_spool_errors: u64,
+    resolver_on_candidate_ns: u64,
+    resolver_on_candidate_ops: u64,
+    resolver_on_observation_ns: u64,
+    resolver_on_observation_ops: u64,
+    resolver_sweep_ns: u64,
+    resolver_sweep_ops: u64,
+    resolver_shutdown_flush_ns: u64,
+    resolver_shutdown_flush_ops: u64,
 }
 
 #[derive(Default)]
@@ -176,6 +211,27 @@ impl MlPrometheusMetrics {
             "ml_cache_routes_tracked",
             "Rotas distintas no HotQueryCache (n_obs ≥ 1)",
         ))?;
+        let cache_routes_tracked_by_window = IntGaugeVec::new(
+            Opts::new(
+                "ml_cache_routes_tracked_by_window",
+                "Rotas distintas em cada HotQueryCache por janela estatística",
+            ),
+            &["window"],
+        )?;
+        let cache_materialized_routes_by_window = IntGaugeVec::new(
+            Opts::new(
+                "ml_cache_materialized_routes_by_window",
+                "Rotas com ring/histograma materializado em cada HotQueryCache",
+            ),
+            &["window"],
+        )?;
+        let cache_retained_ticks_by_window = IntGaugeVec::new(
+            Opts::new(
+                "ml_cache_retained_ticks_by_window",
+                "Ticks decimados retidos no ring de cada HotQueryCache",
+            ),
+            &["window"],
+        )?;
 
         // Wave T — raw samples (ADR-025).
         let raw_samples_emitted_total = IntCounter::with_opts(Opts::new(
@@ -292,11 +348,82 @@ impl MlPrometheusMetrics {
             "ml_shutdown_lost_pending_total",
             "PendingLabels forçados censored{shutdown} ao encerrar",
         ))?;
+        let pending_candidates_current = IntGauge::with_opts(Opts::new(
+            "ml_pending_candidates_current",
+            "Pending labels vivos no LabelResolver",
+        ))?;
+        let pending_horizons_current = IntGauge::with_opts(Opts::new(
+            "ml_pending_horizons_current",
+            "Horizontes ainda abertos no LabelResolver",
+        ))?;
+        let meta_spool_bytes_current = IntGauge::with_opts(Opts::new(
+            "ml_label_meta_spool_bytes_current",
+            "Bytes escritos no spool temporario de metadata imutavel de labels",
+        ))?;
+        let meta_spool_records_total = IntCounter::with_opts(Opts::new(
+            "ml_label_meta_spool_records_total",
+            "Records de metadata de label persistidos no spool/memory-store",
+        ))?;
+        let meta_spool_write_ns_total = IntCounter::with_opts(Opts::new(
+            "ml_label_meta_spool_write_ns_total",
+            "Nanosegundos acumulados escrevendo metadata no spool",
+        ))?;
+        let meta_spool_write_ops_total = IntCounter::with_opts(Opts::new(
+            "ml_label_meta_spool_write_ops_total",
+            "Operacoes de escrita de metadata no spool",
+        ))?;
+        let meta_spool_read_ns_total = IntCounter::with_opts(Opts::new(
+            "ml_label_meta_spool_read_ns_total",
+            "Nanosegundos acumulados lendo metadata do spool",
+        ))?;
+        let meta_spool_read_ops_total = IntCounter::with_opts(Opts::new(
+            "ml_label_meta_spool_read_ops_total",
+            "Operacoes de leitura de metadata do spool",
+        ))?;
+        let meta_spool_errors_total = IntCounter::with_opts(Opts::new(
+            "ml_label_meta_spool_errors_total",
+            "Erros de spool/load da metadata de labels",
+        ))?;
+        let resolver_on_candidate_ns_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_on_candidate_ns_total",
+            "Nanosegundos acumulados em LabelResolver::on_candidate",
+        ))?;
+        let resolver_on_candidate_ops_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_on_candidate_ops_total",
+            "Chamadas a LabelResolver::on_candidate",
+        ))?;
+        let resolver_on_observation_ns_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_on_observation_ns_total",
+            "Nanosegundos acumulados em LabelResolver::on_clean_observation",
+        ))?;
+        let resolver_on_observation_ops_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_on_observation_ops_total",
+            "Chamadas a LabelResolver::on_clean_observation",
+        ))?;
+        let resolver_sweep_ns_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_sweep_ns_total",
+            "Nanosegundos acumulados em LabelResolver::sweep",
+        ))?;
+        let resolver_sweep_ops_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_sweep_ops_total",
+            "Chamadas a LabelResolver::sweep",
+        ))?;
+        let resolver_shutdown_flush_ns_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_shutdown_flush_ns_total",
+            "Nanosegundos acumulados em LabelResolver::shutdown_flush",
+        ))?;
+        let resolver_shutdown_flush_ops_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_shutdown_flush_ops_total",
+            "Chamadas a LabelResolver::shutdown_flush",
+        ))?;
 
         registry.register(Box::new(opportunities_seen_total.clone()))?;
         registry.register(Box::new(sample_decisions_total.clone()))?;
         registry.register(Box::new(recommendations_total.clone()))?;
         registry.register(Box::new(cache_routes_tracked.clone()))?;
+        registry.register(Box::new(cache_routes_tracked_by_window.clone()))?;
+        registry.register(Box::new(cache_materialized_routes_by_window.clone()))?;
+        registry.register(Box::new(cache_retained_ticks_by_window.clone()))?;
         registry.register(Box::new(raw_samples_emitted_total.clone()))?;
         registry.register(Box::new(raw_samples_emitted_by_tier_total.clone()))?;
         registry.register(Box::new(raw_samples_dropped_total.clone()))?;
@@ -320,6 +447,23 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(labels_dropped_writer_total.clone()))?;
         registry.register(Box::new(labels_dropped_capacity_total.clone()))?;
         registry.register(Box::new(shutdown_lost_pending_total.clone()))?;
+        registry.register(Box::new(pending_candidates_current.clone()))?;
+        registry.register(Box::new(pending_horizons_current.clone()))?;
+        registry.register(Box::new(meta_spool_bytes_current.clone()))?;
+        registry.register(Box::new(meta_spool_records_total.clone()))?;
+        registry.register(Box::new(meta_spool_write_ns_total.clone()))?;
+        registry.register(Box::new(meta_spool_write_ops_total.clone()))?;
+        registry.register(Box::new(meta_spool_read_ns_total.clone()))?;
+        registry.register(Box::new(meta_spool_read_ops_total.clone()))?;
+        registry.register(Box::new(meta_spool_errors_total.clone()))?;
+        registry.register(Box::new(resolver_on_candidate_ns_total.clone()))?;
+        registry.register(Box::new(resolver_on_candidate_ops_total.clone()))?;
+        registry.register(Box::new(resolver_on_observation_ns_total.clone()))?;
+        registry.register(Box::new(resolver_on_observation_ops_total.clone()))?;
+        registry.register(Box::new(resolver_sweep_ns_total.clone()))?;
+        registry.register(Box::new(resolver_sweep_ops_total.clone()))?;
+        registry.register(Box::new(resolver_shutdown_flush_ns_total.clone()))?;
+        registry.register(Box::new(resolver_shutdown_flush_ops_total.clone()))?;
 
         // Pre-touch todos os labels — garante que aparecem em `gather()`
         // desde o primeiro scrape Prometheus, mesmo sem incrementos ainda.
@@ -376,12 +520,26 @@ impl MlPrometheusMetrics {
                 .with_label_values(&[reason])
                 .inc_by(0);
         }
+        for window in &["24h", "1h", "7d"] {
+            cache_routes_tracked_by_window
+                .with_label_values(&[window])
+                .set(0);
+            cache_materialized_routes_by_window
+                .with_label_values(&[window])
+                .set(0);
+            cache_retained_ticks_by_window
+                .with_label_values(&[window])
+                .set(0);
+        }
 
         Ok(Self {
             opportunities_seen_total,
             sample_decisions_total,
             recommendations_total,
             cache_routes_tracked,
+            cache_routes_tracked_by_window,
+            cache_materialized_routes_by_window,
+            cache_retained_ticks_by_window,
             raw_samples_emitted_total,
             raw_samples_emitted_by_tier_total,
             raw_samples_dropped_total,
@@ -403,6 +561,23 @@ impl MlPrometheusMetrics {
             labels_dropped_writer_total,
             labels_dropped_capacity_total,
             shutdown_lost_pending_total,
+            pending_candidates_current,
+            pending_horizons_current,
+            meta_spool_bytes_current,
+            meta_spool_records_total,
+            meta_spool_write_ns_total,
+            meta_spool_write_ops_total,
+            meta_spool_read_ns_total,
+            meta_spool_read_ops_total,
+            meta_spool_errors_total,
+            resolver_on_candidate_ns_total,
+            resolver_on_candidate_ops_total,
+            resolver_on_observation_ns_total,
+            resolver_on_observation_ops_total,
+            resolver_sweep_ns_total,
+            resolver_sweep_ops_total,
+            resolver_shutdown_flush_ns_total,
+            resolver_shutdown_flush_ops_total,
             last_seen: ServerMetricsSnapshot::default(),
             last_broadcaster: BroadcasterSnapshot::default(),
             last_economic: EconomicSnapshot::default(),
@@ -471,6 +646,9 @@ impl MlPrometheusMetrics {
 
         self.cache_routes_tracked
             .set(server.baseline().cache().routes_tracked() as i64);
+        self.set_cache_window("24h", server.cache_stats_24h());
+        self.set_cache_window("1h", server.cache_stats_1h());
+        self.set_cache_window("7d", server.cache_stats_7d());
 
         // Raw samples do ServerMetrics.
         self.raw_samples_emitted_total
@@ -531,6 +709,18 @@ impl MlPrometheusMetrics {
         }
     }
 
+    fn set_cache_window(&self, window: &str, stats: HotCacheStats) {
+        self.cache_routes_tracked_by_window
+            .with_label_values(&[window])
+            .set(stats.routes_tracked as i64);
+        self.cache_materialized_routes_by_window
+            .with_label_values(&[window])
+            .set(stats.materialized_routes as i64);
+        self.cache_retained_ticks_by_window
+            .with_label_values(&[window])
+            .set(stats.retained_ticks.min(i64::MAX as u64) as i64);
+    }
+
     /// (removed) atualiza métricas do `LabelResolver`.
     pub fn update_from_resolver(&mut self, rm: &ResolverMetrics) {
         let pending = rm.pending_created_total.load(Ordering::Relaxed);
@@ -547,6 +737,23 @@ impl MlPrometheusMetrics {
             .labels_dropped_capacity_overflow_total
             .load(Ordering::Relaxed);
         let shutdown = rm.shutdown_lost_pending_total.load(Ordering::Relaxed);
+        let pending_candidates = rm.pending_candidates_current.load(Ordering::Relaxed);
+        let pending_horizons = rm.pending_horizons_current.load(Ordering::Relaxed);
+        let spool_bytes = rm.meta_spool_bytes_current.load(Ordering::Relaxed);
+        let spool_records = rm.meta_spool_records_total.load(Ordering::Relaxed);
+        let spool_write_ns = rm.meta_spool_write_ns_total.load(Ordering::Relaxed);
+        let spool_write_ops = rm.meta_spool_write_ops_total.load(Ordering::Relaxed);
+        let spool_read_ns = rm.meta_spool_read_ns_total.load(Ordering::Relaxed);
+        let spool_read_ops = rm.meta_spool_read_ops_total.load(Ordering::Relaxed);
+        let spool_errors = rm.meta_spool_errors_total.load(Ordering::Relaxed);
+        let resolver_on_candidate_ns = rm.on_candidate_ns_total.load(Ordering::Relaxed);
+        let resolver_on_candidate_ops = rm.on_candidate_ops_total.load(Ordering::Relaxed);
+        let resolver_on_observation_ns = rm.on_observation_ns_total.load(Ordering::Relaxed);
+        let resolver_on_observation_ops = rm.on_observation_ops_total.load(Ordering::Relaxed);
+        let resolver_sweep_ns = rm.sweep_ns_total.load(Ordering::Relaxed);
+        let resolver_sweep_ops = rm.sweep_ops_total.load(Ordering::Relaxed);
+        let resolver_shutdown_flush_ns = rm.shutdown_flush_ns_total.load(Ordering::Relaxed);
+        let resolver_shutdown_flush_ops = rm.shutdown_flush_ops_total.load(Ordering::Relaxed);
 
         self.labels_created_total
             .inc_by(pending.saturating_sub(self.last_resolver.pending_created));
@@ -571,6 +778,50 @@ impl MlPrometheusMetrics {
             .inc_by(drop_cap.saturating_sub(self.last_resolver.dropped_capacity_overflow));
         self.shutdown_lost_pending_total
             .inc_by(shutdown.saturating_sub(self.last_resolver.shutdown_lost));
+        self.pending_candidates_current
+            .set(pending_candidates.min(i64::MAX as u64) as i64);
+        self.pending_horizons_current
+            .set(pending_horizons.min(i64::MAX as u64) as i64);
+        self.meta_spool_bytes_current
+            .set(spool_bytes.min(i64::MAX as u64) as i64);
+        self.meta_spool_records_total
+            .inc_by(spool_records.saturating_sub(self.last_resolver.meta_spool_records));
+        self.meta_spool_write_ns_total
+            .inc_by(spool_write_ns.saturating_sub(self.last_resolver.meta_spool_write_ns));
+        self.meta_spool_write_ops_total
+            .inc_by(spool_write_ops.saturating_sub(self.last_resolver.meta_spool_write_ops));
+        self.meta_spool_read_ns_total
+            .inc_by(spool_read_ns.saturating_sub(self.last_resolver.meta_spool_read_ns));
+        self.meta_spool_read_ops_total
+            .inc_by(spool_read_ops.saturating_sub(self.last_resolver.meta_spool_read_ops));
+        self.meta_spool_errors_total
+            .inc_by(spool_errors.saturating_sub(self.last_resolver.meta_spool_errors));
+        self.resolver_on_candidate_ns_total.inc_by(
+            resolver_on_candidate_ns.saturating_sub(self.last_resolver.resolver_on_candidate_ns),
+        );
+        self.resolver_on_candidate_ops_total.inc_by(
+            resolver_on_candidate_ops.saturating_sub(self.last_resolver.resolver_on_candidate_ops),
+        );
+        self.resolver_on_observation_ns_total.inc_by(
+            resolver_on_observation_ns
+                .saturating_sub(self.last_resolver.resolver_on_observation_ns),
+        );
+        self.resolver_on_observation_ops_total.inc_by(
+            resolver_on_observation_ops
+                .saturating_sub(self.last_resolver.resolver_on_observation_ops),
+        );
+        self.resolver_sweep_ns_total
+            .inc_by(resolver_sweep_ns.saturating_sub(self.last_resolver.resolver_sweep_ns));
+        self.resolver_sweep_ops_total
+            .inc_by(resolver_sweep_ops.saturating_sub(self.last_resolver.resolver_sweep_ops));
+        self.resolver_shutdown_flush_ns_total.inc_by(
+            resolver_shutdown_flush_ns
+                .saturating_sub(self.last_resolver.resolver_shutdown_flush_ns),
+        );
+        self.resolver_shutdown_flush_ops_total.inc_by(
+            resolver_shutdown_flush_ops
+                .saturating_sub(self.last_resolver.resolver_shutdown_flush_ops),
+        );
 
         self.last_resolver = ResolverSnapshot {
             pending_created: pending,
@@ -582,6 +833,20 @@ impl MlPrometheusMetrics {
             dropped_channel_closed: drop_closed,
             dropped_capacity_overflow: drop_cap,
             shutdown_lost: shutdown,
+            meta_spool_records: spool_records,
+            meta_spool_write_ns: spool_write_ns,
+            meta_spool_write_ops: spool_write_ops,
+            meta_spool_read_ns: spool_read_ns,
+            meta_spool_read_ops: spool_read_ops,
+            meta_spool_errors: spool_errors,
+            resolver_on_candidate_ns,
+            resolver_on_candidate_ops,
+            resolver_on_observation_ns,
+            resolver_on_observation_ops,
+            resolver_sweep_ns,
+            resolver_sweep_ops,
+            resolver_shutdown_flush_ns,
+            resolver_shutdown_flush_ops,
         };
     }
 
@@ -749,6 +1014,9 @@ mod tests {
         assert!(names.contains(&"ml_sample_decisions_total".to_string()));
         assert!(names.contains(&"ml_recommendations_total".to_string()));
         assert!(names.contains(&"ml_cache_routes_tracked".to_string()));
+        assert!(names.contains(&"ml_cache_routes_tracked_by_window".to_string()));
+        assert!(names.contains(&"ml_cache_materialized_routes_by_window".to_string()));
+        assert!(names.contains(&"ml_cache_retained_ticks_by_window".to_string()));
         assert!(names.contains(&"ml_raw_samples_emitted_by_tier_total".to_string()));
         let rec_family = families
             .iter()
@@ -761,6 +1029,17 @@ mod tests {
         }));
         // F2-R4
         assert!(names.contains(&"ml_premature_recommendation_rate".to_string()));
+        assert!(names.contains(&"ml_pending_candidates_current".to_string()));
+        assert!(names.contains(&"ml_pending_horizons_current".to_string()));
+        assert!(names.contains(&"ml_label_meta_spool_bytes_current".to_string()));
+        assert!(names.contains(&"ml_label_meta_spool_records_total".to_string()));
+        assert!(names.contains(&"ml_label_meta_spool_write_ns_total".to_string()));
+        assert!(names.contains(&"ml_label_meta_spool_read_ns_total".to_string()));
+        assert!(names.contains(&"ml_label_meta_spool_errors_total".to_string()));
+        assert!(names.contains(&"ml_label_resolver_on_candidate_ns_total".to_string()));
+        assert!(names.contains(&"ml_label_resolver_on_observation_ns_total".to_string()));
+        assert!(names.contains(&"ml_label_resolver_sweep_ns_total".to_string()));
+        assert!(names.contains(&"ml_label_resolver_shutdown_flush_ns_total".to_string()));
     }
 
     #[test]

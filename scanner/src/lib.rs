@@ -331,7 +331,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         sweeper_interval: Duration::from_secs(cfg.ml.label_sweeper_interval_s),
         ..ResolverConfig::default()
     };
-    let label_resolver = Arc::new(LabelResolver::new(resolver_cfg, labeled_handle));
+    let label_resolver = Arc::new(LabelResolver::new_with_spool_dir(
+        resolver_cfg,
+        labeled_handle,
+        Some(labeled_writer_abs.join("_pending_spool")),
+    ));
 
     // Ranker rolling — 24h de buckets × 15 min.
     let ranker = Arc::new(RouteRanking::new(

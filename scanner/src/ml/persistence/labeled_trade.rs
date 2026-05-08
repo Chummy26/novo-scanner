@@ -118,7 +118,7 @@ impl CensorReason {
 ///
 /// Fix B1 + B2 + B4 + B8 + C7: schema v6 adiciona features que respondem
 /// literalmente aos Testes 1 e 2 da skill §4.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FeaturesT0 {
     // --- Baseline estrutural instantâneo (skill mãe §2) -------------------
     /// Meio-spread da perna de compra, normalizado pelo ask de compra em t0.

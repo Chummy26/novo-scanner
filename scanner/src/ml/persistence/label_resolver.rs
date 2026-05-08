@@ -20,12 +20,16 @@
 //! determinados; apenas janelas incompletas viram `censored { shutdown }`.
 
 use std::collections::VecDeque;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ahash::AHashMap;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 
 use crate::ml::contract::RouteId;
 use crate::ml::persistence::labeled_trade::{
@@ -35,6 +39,7 @@ use crate::ml::persistence::labeled_trade::{
 use crate::ml::persistence::labeled_writer::{LabeledWriterHandle, LabeledWriterSendError};
 use crate::ml::persistence::raw_sample::sampling_probability_kind_for_tier_label;
 use crate::ml::SCANNER_VERSION;
+use crate::types::{SymbolId, Venue};
 
 /// Padrões de horizonte (s) — fix A7.
 ///
@@ -172,6 +177,304 @@ impl PendingLabel {
     }
 }
 
+/// Parte imutável de `PendingLabel`, congelada em t0.
+///
+/// Produção grava este bloco em spool append-only e mantém em RAM apenas
+/// `PendingLabelState`. Isso preserva 100% da semântica do label fechado,
+/// mas evita reter features, policy metadata e strings durante horas.
+#[derive(Debug, Clone)]
+struct PendingLabelMeta {
+    sample_id: String,
+    sample_decision: &'static str,
+    ts_emit_ns: u64,
+    cycle_seq: u32,
+    route_id: RouteId,
+    symbol_name: String,
+    entry_locked_pct: f32,
+    exit_start_pct: f32,
+    features_t0: FeaturesT0,
+    label_floor_pct: f32,
+    label_floors_pct: Vec<f32>,
+    policy_metadata: PolicyMetadata,
+    sampling_tier: &'static str,
+    sampling_probability: f32,
+    cluster_id: String,
+    cluster_size: u32,
+    cluster_rank: u32,
+    runtime_config_hash: String,
+    priority_set_generation_id: u32,
+    priority_set_updated_at_ns: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLabelState {
+    meta_ref: PendingMetaRef,
+    ts_emit_ns: u64,
+    route_id: RouteId,
+    entry_locked_pct: f32,
+    label_floor_pct: f32,
+    horizons: Vec<PendingHorizon>,
+}
+
+impl PendingLabelState {
+    fn all_closed(&self) -> bool {
+        self.horizons.iter().all(|h| h.closed)
+    }
+
+    fn open_horizon_count(&self) -> u64 {
+        self.horizons.iter().filter(|h| !h.closed).count() as u64
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PendingMetaRef {
+    Memory(usize),
+    Disk {
+        segment_id: u64,
+        offset: u64,
+        len: u32,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingLabelMetaDto {
+    sample_id: String,
+    sample_decision: String,
+    ts_emit_ns: u64,
+    cycle_seq: u32,
+    symbol_id: u32,
+    buy_venue_idx: u8,
+    sell_venue_idx: u8,
+    symbol_name: String,
+    entry_locked_pct: f32,
+    exit_start_pct: f32,
+    features_t0: FeaturesT0,
+    label_floor_pct: f32,
+    label_floors_pct: Vec<f32>,
+    policy_metadata: PolicyMetadataDto,
+    sampling_tier: String,
+    sampling_probability: f32,
+    cluster_id: String,
+    cluster_size: u32,
+    cluster_rank: u32,
+    runtime_config_hash: String,
+    priority_set_generation_id: u32,
+    priority_set_updated_at_ns: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PolicyMetadataDto {
+    baseline_model_version: String,
+    baseline_recommended: bool,
+    recommendation_kind: String,
+    abstain_reason: Option<String>,
+    prediction_source_kind: String,
+    prediction_model_version: String,
+    prediction_emitted_at_ns: Option<u64>,
+    prediction_valid_until_ns: Option<u64>,
+    prediction_entry_now: Option<f32>,
+    prediction_exit_target: Option<f32>,
+    prediction_gross_profit_target: Option<f32>,
+    prediction_p_hit: Option<f32>,
+    prediction_p_hit_ci_lo: Option<f32>,
+    prediction_p_hit_ci_hi: Option<f32>,
+    prediction_exit_q25: Option<f32>,
+    prediction_exit_q50: Option<f32>,
+    prediction_exit_q75: Option<f32>,
+    prediction_t_hit_p25_s: Option<u32>,
+    prediction_t_hit_median_s: Option<u32>,
+    prediction_t_hit_p75_s: Option<u32>,
+    prediction_p_censor: Option<f32>,
+    prediction_calibration_status: String,
+    baseline_historical_base_rate_24h: Option<f32>,
+    baseline_derived_enter_at_min: Option<f32>,
+    baseline_derived_exit_at_min: Option<f32>,
+    baseline_floor_pct: f32,
+    label_stride_s: u32,
+    effective_stride_s: u32,
+    label_sampling_probability: f32,
+    candidates_in_route_last_24h: u32,
+    accepts_in_route_last_24h: u32,
+    ci_method: String,
+}
+
+impl From<&PendingLabelMeta> for PendingLabelMetaDto {
+    fn from(meta: &PendingLabelMeta) -> Self {
+        Self {
+            sample_id: meta.sample_id.clone(),
+            sample_decision: meta.sample_decision.to_string(),
+            ts_emit_ns: meta.ts_emit_ns,
+            cycle_seq: meta.cycle_seq,
+            symbol_id: meta.route_id.symbol_id.0,
+            buy_venue_idx: meta.route_id.buy_venue as u8,
+            sell_venue_idx: meta.route_id.sell_venue as u8,
+            symbol_name: meta.symbol_name.clone(),
+            entry_locked_pct: meta.entry_locked_pct,
+            exit_start_pct: meta.exit_start_pct,
+            features_t0: meta.features_t0.clone(),
+            label_floor_pct: meta.label_floor_pct,
+            label_floors_pct: meta.label_floors_pct.clone(),
+            policy_metadata: PolicyMetadataDto::from(&meta.policy_metadata),
+            sampling_tier: meta.sampling_tier.to_string(),
+            sampling_probability: meta.sampling_probability,
+            cluster_id: meta.cluster_id.clone(),
+            cluster_size: meta.cluster_size,
+            cluster_rank: meta.cluster_rank,
+            runtime_config_hash: meta.runtime_config_hash.clone(),
+            priority_set_generation_id: meta.priority_set_generation_id,
+            priority_set_updated_at_ns: meta.priority_set_updated_at_ns,
+        }
+    }
+}
+
+impl PendingLabelMetaDto {
+    fn into_meta(self) -> anyhow::Result<PendingLabelMeta> {
+        let buy_venue = Venue::ALL
+            .get(self.buy_venue_idx as usize)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("invalid buy venue idx {}", self.buy_venue_idx))?;
+        let sell_venue = Venue::ALL
+            .get(self.sell_venue_idx as usize)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("invalid sell venue idx {}", self.sell_venue_idx))?;
+        Ok(PendingLabelMeta {
+            sample_id: self.sample_id,
+            sample_decision: intern_static_label(self.sample_decision),
+            ts_emit_ns: self.ts_emit_ns,
+            cycle_seq: self.cycle_seq,
+            route_id: RouteId {
+                symbol_id: SymbolId(self.symbol_id),
+                buy_venue,
+                sell_venue,
+            },
+            symbol_name: self.symbol_name,
+            entry_locked_pct: self.entry_locked_pct,
+            exit_start_pct: self.exit_start_pct,
+            features_t0: self.features_t0,
+            label_floor_pct: self.label_floor_pct,
+            label_floors_pct: self.label_floors_pct,
+            policy_metadata: self.policy_metadata.into_policy(),
+            sampling_tier: intern_static_label(self.sampling_tier),
+            sampling_probability: self.sampling_probability,
+            cluster_id: self.cluster_id,
+            cluster_size: self.cluster_size,
+            cluster_rank: self.cluster_rank,
+            runtime_config_hash: self.runtime_config_hash,
+            priority_set_generation_id: self.priority_set_generation_id,
+            priority_set_updated_at_ns: self.priority_set_updated_at_ns,
+        })
+    }
+}
+
+impl From<&PolicyMetadata> for PolicyMetadataDto {
+    fn from(p: &PolicyMetadata) -> Self {
+        Self {
+            baseline_model_version: p.baseline_model_version.clone(),
+            baseline_recommended: p.baseline_recommended,
+            recommendation_kind: p.recommendation_kind.to_string(),
+            abstain_reason: p.abstain_reason.map(str::to_string),
+            prediction_source_kind: p.prediction_source_kind.to_string(),
+            prediction_model_version: p.prediction_model_version.clone(),
+            prediction_emitted_at_ns: p.prediction_emitted_at_ns,
+            prediction_valid_until_ns: p.prediction_valid_until_ns,
+            prediction_entry_now: p.prediction_entry_now,
+            prediction_exit_target: p.prediction_exit_target,
+            prediction_gross_profit_target: p.prediction_gross_profit_target,
+            prediction_p_hit: p.prediction_p_hit,
+            prediction_p_hit_ci_lo: p.prediction_p_hit_ci_lo,
+            prediction_p_hit_ci_hi: p.prediction_p_hit_ci_hi,
+            prediction_exit_q25: p.prediction_exit_q25,
+            prediction_exit_q50: p.prediction_exit_q50,
+            prediction_exit_q75: p.prediction_exit_q75,
+            prediction_t_hit_p25_s: p.prediction_t_hit_p25_s,
+            prediction_t_hit_median_s: p.prediction_t_hit_median_s,
+            prediction_t_hit_p75_s: p.prediction_t_hit_p75_s,
+            prediction_p_censor: p.prediction_p_censor,
+            prediction_calibration_status: p.prediction_calibration_status.to_string(),
+            baseline_historical_base_rate_24h: p.baseline_historical_base_rate_24h,
+            baseline_derived_enter_at_min: p.baseline_derived_enter_at_min,
+            baseline_derived_exit_at_min: p.baseline_derived_exit_at_min,
+            baseline_floor_pct: p.baseline_floor_pct,
+            label_stride_s: p.label_stride_s,
+            effective_stride_s: p.effective_stride_s,
+            label_sampling_probability: p.label_sampling_probability,
+            candidates_in_route_last_24h: p.candidates_in_route_last_24h,
+            accepts_in_route_last_24h: p.accepts_in_route_last_24h,
+            ci_method: p.ci_method.to_string(),
+        }
+    }
+}
+
+impl PolicyMetadataDto {
+    fn into_policy(self) -> PolicyMetadata {
+        PolicyMetadata {
+            baseline_model_version: self.baseline_model_version,
+            baseline_recommended: self.baseline_recommended,
+            recommendation_kind: intern_static_label(self.recommendation_kind),
+            abstain_reason: self.abstain_reason.map(intern_static_label),
+            prediction_source_kind: intern_static_label(self.prediction_source_kind),
+            prediction_model_version: self.prediction_model_version,
+            prediction_emitted_at_ns: self.prediction_emitted_at_ns,
+            prediction_valid_until_ns: self.prediction_valid_until_ns,
+            prediction_entry_now: self.prediction_entry_now,
+            prediction_exit_target: self.prediction_exit_target,
+            prediction_gross_profit_target: self.prediction_gross_profit_target,
+            prediction_p_hit: self.prediction_p_hit,
+            prediction_p_hit_ci_lo: self.prediction_p_hit_ci_lo,
+            prediction_p_hit_ci_hi: self.prediction_p_hit_ci_hi,
+            prediction_exit_q25: self.prediction_exit_q25,
+            prediction_exit_q50: self.prediction_exit_q50,
+            prediction_exit_q75: self.prediction_exit_q75,
+            prediction_t_hit_p25_s: self.prediction_t_hit_p25_s,
+            prediction_t_hit_median_s: self.prediction_t_hit_median_s,
+            prediction_t_hit_p75_s: self.prediction_t_hit_p75_s,
+            prediction_p_censor: self.prediction_p_censor,
+            prediction_calibration_status: intern_static_label(self.prediction_calibration_status),
+            baseline_historical_base_rate_24h: self.baseline_historical_base_rate_24h,
+            baseline_derived_enter_at_min: self.baseline_derived_enter_at_min,
+            baseline_derived_exit_at_min: self.baseline_derived_exit_at_min,
+            baseline_floor_pct: self.baseline_floor_pct,
+            label_stride_s: self.label_stride_s,
+            effective_stride_s: self.effective_stride_s,
+            label_sampling_probability: self.label_sampling_probability,
+            candidates_in_route_last_24h: self.candidates_in_route_last_24h,
+            accepts_in_route_last_24h: self.accepts_in_route_last_24h,
+            ci_method: intern_static_label(self.ci_method),
+        }
+    }
+}
+
+fn intern_static_label(value: String) -> &'static str {
+    match value.as_str() {
+        "accept" => "accept",
+        "low_volume" => "low_volume",
+        "insufficient_history" => "insufficient_history",
+        "below_tail" => "below_tail",
+        "allowlist" => "allowlist",
+        "priority" => "priority",
+        "decimated_uniform" => "decimated_uniform",
+        "accepted_full_capture" => "accepted_full_capture",
+        "foreground_full_capture" => "foreground_full_capture",
+        "trade" => "trade",
+        "abstain" => "abstain",
+        "baseline" => "baseline",
+        "model" => "model",
+        "none" => "none",
+        "ok" => "ok",
+        "degraded" => "degraded",
+        "suspended" => "suspended",
+        "not_applicable" => "not_applicable",
+        "NO_OPPORTUNITY" => "NO_OPPORTUNITY",
+        "INSUFFICIENT_DATA" => "INSUFFICIENT_DATA",
+        "LOW_CONFIDENCE" => "LOW_CONFIDENCE",
+        "LONG_TAIL" => "LONG_TAIL",
+        "COOLDOWN" => "COOLDOWN",
+        "wilson_marginal" => "wilson_marginal",
+        "conformal_split" => "conformal_split",
+        other => Box::leak(other.to_owned().into_boxed_str()),
+    }
+}
+
 /// Config do resolvedor.
 #[derive(Debug, Clone)]
 pub struct ResolverConfig {
@@ -194,6 +497,377 @@ impl Default for ResolverConfig {
             max_pending_per_route: MAX_PENDING_PER_ROUTE,
             sweeper_interval: Duration::from_secs(10),
         }
+    }
+}
+
+const META_SPOOL_MAGIC: &[u8; 8] = b"LRMETA01";
+const META_SPOOL_SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+struct PendingMetaStore {
+    backend: PendingMetaBackend,
+    metrics: Arc<ResolverMetrics>,
+}
+
+enum PendingMetaBackend {
+    Memory(Mutex<Vec<PendingLabelMeta>>),
+    Disk(Mutex<PendingMetaSpool>),
+}
+
+struct PendingMetaSpool {
+    dir: PathBuf,
+    prefix: String,
+    current_segment_id: u64,
+    write_file: File,
+    segments: AHashMap<u64, PendingMetaSegment>,
+}
+
+struct PendingMetaSegment {
+    path: PathBuf,
+    read_file: File,
+    bytes: u64,
+    live_records: u64,
+    sealed: bool,
+}
+
+impl PendingMetaStore {
+    fn new(spool_dir: Option<PathBuf>, metrics: Arc<ResolverMetrics>) -> Self {
+        let backend = match spool_dir {
+            Some(dir) => match PendingMetaSpool::open(dir) {
+                Ok(spool) => {
+                    let path = spool.current_path_display();
+                    tracing::info!(
+                        path = %path,
+                        "label_resolver pending metadata spool enabled"
+                    );
+                    PendingMetaBackend::Disk(Mutex::new(spool))
+                }
+                Err(e) => {
+                    metrics
+                        .meta_spool_errors_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    panic!("label_resolver pending metadata spool unavailable: {e}");
+                }
+            },
+            None => PendingMetaBackend::Memory(Mutex::new(Vec::new())),
+        };
+        Self { backend, metrics }
+    }
+
+    fn insert(&self, meta: PendingLabelMeta) -> anyhow::Result<PendingMetaRef> {
+        match &self.backend {
+            PendingMetaBackend::Memory(items) => {
+                let mut items = items.lock();
+                let idx = items.len();
+                items.push(meta);
+                self.metrics
+                    .meta_spool_records_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(PendingMetaRef::Memory(idx))
+            }
+            PendingMetaBackend::Disk(spool) => {
+                let start = SystemTime::now();
+                let dto = PendingLabelMetaDto::from(&meta);
+                let bytes = serde_json::to_vec(&dto)?;
+                let mut spool = spool.lock();
+                let meta_ref = spool.append(&bytes)?;
+                self.metrics
+                    .meta_spool_records_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .meta_spool_bytes_current
+                    .store(spool.total_bytes(), Ordering::Relaxed);
+                self.metrics
+                    .meta_spool_write_ops_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .meta_spool_write_ns_total
+                    .fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+                Ok(meta_ref)
+            }
+        }
+    }
+
+    fn load(&self, meta_ref: &PendingMetaRef) -> anyhow::Result<PendingLabelMeta> {
+        match (meta_ref, &self.backend) {
+            (PendingMetaRef::Memory(idx), PendingMetaBackend::Memory(items)) => items
+                .lock()
+                .get(*idx)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("pending meta memory ref {idx} missing")),
+            (
+                PendingMetaRef::Disk {
+                    segment_id,
+                    offset,
+                    len,
+                },
+                PendingMetaBackend::Disk(spool),
+            ) => {
+                let start = SystemTime::now();
+                let mut spool = spool.lock();
+                let bytes = spool.read_at(*segment_id, *offset, *len)?;
+                self.metrics
+                    .meta_spool_read_ops_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics
+                    .meta_spool_read_ns_total
+                    .fetch_add(elapsed_ns_since(start), Ordering::Relaxed);
+                let dto: PendingLabelMetaDto = serde_json::from_slice(&bytes)?;
+                dto.into_meta()
+            }
+            _ => Err(anyhow::anyhow!("pending meta backend/ref mismatch")),
+        }
+    }
+
+    fn release(&self, meta_ref: &PendingMetaRef) {
+        if let (PendingMetaRef::Disk { segment_id, .. }, PendingMetaBackend::Disk(spool)) =
+            (meta_ref, &self.backend)
+        {
+            let mut spool = spool.lock();
+            if let Err(e) = spool.release(*segment_id) {
+                self.metrics
+                    .meta_spool_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %e, segment_id, "failed to release pending meta segment ref");
+            }
+            self.metrics
+                .meta_spool_bytes_current
+                .store(spool.total_bytes(), Ordering::Relaxed);
+        }
+    }
+
+    fn cleanup_all(&self) {
+        if let PendingMetaBackend::Disk(spool) = &self.backend {
+            let mut spool = spool.lock();
+            if let Err(e) = spool.cleanup_all() {
+                self.metrics
+                    .meta_spool_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %e, "failed to cleanup pending meta spool");
+            }
+            self.metrics
+                .meta_spool_bytes_current
+                .store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+impl PendingMetaSpool {
+    fn open(dir: PathBuf) -> anyhow::Result<Self> {
+        fs::create_dir_all(&dir)?;
+        let started_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let prefix = format!("label-pending-{}-{}", std::process::id(), started_ns);
+        let path = segment_path(&dir, &prefix, 0);
+        let mut write_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        write_file.write_all(META_SPOOL_MAGIC)?;
+        let read_file = OpenOptions::new().read(true).open(&path)?;
+        let mut segments = AHashMap::with_capacity(8);
+        segments.insert(
+            0,
+            PendingMetaSegment {
+                path,
+                read_file,
+                bytes: META_SPOOL_MAGIC.len() as u64,
+                live_records: 0,
+                sealed: false,
+            },
+        );
+        Ok(Self {
+            dir,
+            prefix,
+            current_segment_id: 0,
+            write_file,
+            segments,
+        })
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> anyhow::Result<PendingMetaRef> {
+        if bytes.len() > u32::MAX as usize {
+            anyhow::bail!("pending meta payload too large: {} bytes", bytes.len());
+        }
+        let len = bytes.len() as u32;
+        let record_bytes = 4u64.saturating_add(len as u64);
+        let current_bytes = self
+            .segments
+            .get(&self.current_segment_id)
+            .map(|s| s.bytes)
+            .unwrap_or(META_SPOOL_MAGIC.len() as u64);
+        if current_bytes > META_SPOOL_MAGIC.len() as u64
+            && current_bytes.saturating_add(record_bytes) > META_SPOOL_SEGMENT_MAX_BYTES
+        {
+            self.rotate_segment()?;
+        }
+        let segment_id = self.current_segment_id;
+        let segment = self
+            .segments
+            .get_mut(&segment_id)
+            .ok_or_else(|| anyhow::anyhow!("current segment {segment_id} missing"))?;
+        let offset = segment.bytes;
+        self.write_file.write_all(&len.to_le_bytes())?;
+        self.write_file.write_all(bytes)?;
+        segment.bytes = segment.bytes.saturating_add(record_bytes);
+        segment.live_records = segment.live_records.saturating_add(1);
+        Ok(PendingMetaRef::Disk {
+            segment_id,
+            offset,
+            len,
+        })
+    }
+
+    fn read_at(&mut self, segment_id: u64, offset: u64, len: u32) -> anyhow::Result<Vec<u8>> {
+        let segment = self
+            .segments
+            .get_mut(&segment_id)
+            .ok_or_else(|| anyhow::anyhow!("pending meta segment {segment_id} missing"))?;
+        segment.read_file.seek(SeekFrom::Start(offset))?;
+        let mut len_buf = [0u8; 4];
+        segment.read_file.read_exact(&mut len_buf)?;
+        let actual_len = u32::from_le_bytes(len_buf);
+        if actual_len != len {
+            anyhow::bail!("pending meta len mismatch: ref={len}, file={actual_len}");
+        }
+        let mut bytes = vec![0u8; len as usize];
+        segment.read_file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn release(&mut self, segment_id: u64) -> anyhow::Result<()> {
+        let Some(segment) = self.segments.get_mut(&segment_id) else {
+            return Ok(());
+        };
+        segment.live_records = segment.live_records.saturating_sub(1);
+        self.cleanup_released_segments()
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.segments
+            .values()
+            .fold(0u64, |acc, segment| acc.saturating_add(segment.bytes))
+    }
+
+    fn current_path_display(&self) -> String {
+        self.segments
+            .get(&self.current_segment_id)
+            .map(|s| s.path.display().to_string())
+            .unwrap_or_else(|| self.dir.display().to_string())
+    }
+
+    fn rotate_segment(&mut self) -> anyhow::Result<()> {
+        self.write_file.flush()?;
+        if let Some(segment) = self.segments.get_mut(&self.current_segment_id) {
+            segment.sealed = true;
+        }
+        self.cleanup_released_segments()?;
+        let next_id = self.current_segment_id.saturating_add(1);
+        let path = segment_path(&self.dir, &self.prefix, next_id);
+        let mut write_file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)?;
+        write_file.write_all(META_SPOOL_MAGIC)?;
+        let read_file = OpenOptions::new().read(true).open(&path)?;
+        self.segments.insert(
+            next_id,
+            PendingMetaSegment {
+                path,
+                read_file,
+                bytes: META_SPOOL_MAGIC.len() as u64,
+                live_records: 0,
+                sealed: false,
+            },
+        );
+        self.current_segment_id = next_id;
+        self.write_file = write_file;
+        Ok(())
+    }
+
+    fn cleanup_released_segments(&mut self) -> anyhow::Result<()> {
+        let current = self.current_segment_id;
+        let removable: Vec<u64> = self
+            .segments
+            .iter()
+            .filter_map(|(segment_id, segment)| {
+                if *segment_id != current && segment.sealed && segment.live_records == 0 {
+                    Some(*segment_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for segment_id in removable {
+            if let Some(segment) = self.segments.remove(&segment_id) {
+                drop(segment.read_file);
+                fs::remove_file(&segment.path)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup_all(&mut self) -> anyhow::Result<()> {
+        self.write_file.flush()?;
+        let cleanup_sink = self.dir.join(format!("{}-cleanup-sink.tmp", self.prefix));
+        let replacement = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&cleanup_sink)?;
+        let old_write = std::mem::replace(&mut self.write_file, replacement);
+        drop(old_write);
+        let segments = std::mem::take(&mut self.segments);
+        for (_segment_id, segment) in segments {
+            drop(segment.read_file);
+            match fs::remove_file(&segment.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        let _ = fs::remove_file(cleanup_sink);
+        Ok(())
+    }
+}
+
+fn segment_path(dir: &std::path::Path, prefix: &str, segment_id: u64) -> PathBuf {
+    dir.join(format!("{prefix}-seg-{segment_id:06}.spool"))
+}
+
+fn elapsed_ns_since(start: SystemTime) -> u64 {
+    start
+        .elapsed()
+        .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
+fn elapsed_instant_ns(start: Instant) -> u64 {
+    start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+struct ResolverOpTiming<'a> {
+    ns_total: &'a AtomicU64,
+    ops_total: &'a AtomicU64,
+    started: Instant,
+}
+
+impl<'a> ResolverOpTiming<'a> {
+    fn new(ns_total: &'a AtomicU64, ops_total: &'a AtomicU64) -> Self {
+        Self {
+            ns_total,
+            ops_total,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ResolverOpTiming<'_> {
+    fn drop(&mut self) {
+        self.ops_total.fetch_add(1, Ordering::Relaxed);
+        self.ns_total
+            .fetch_add(elapsed_instant_ns(self.started), Ordering::Relaxed);
     }
 }
 
@@ -231,6 +905,29 @@ pub struct ResolverMetrics {
     pub labels_dropped_capacity_overflow_total: AtomicU64,
     /// Shutdown — labels forçados como `censored{shutdown}`.
     pub shutdown_lost_pending_total: AtomicU64,
+    /// Pendings vivos no resolver, após stride e antes de todos horizontes fecharem.
+    pub pending_candidates_current: AtomicU64,
+    /// Horizontes ainda abertos entre todos os pendings vivos.
+    pub pending_horizons_current: AtomicU64,
+    /// Bytes escritos no spool temporário de metadados imutáveis.
+    pub meta_spool_bytes_current: AtomicU64,
+    /// Records de metadata persistidos no spool/memory-store.
+    pub meta_spool_records_total: AtomicU64,
+    /// Latência agregada de escrita de metadata em ns.
+    pub meta_spool_write_ns_total: AtomicU64,
+    pub meta_spool_write_ops_total: AtomicU64,
+    /// Latência agregada de leitura de metadata em ns.
+    pub meta_spool_read_ns_total: AtomicU64,
+    pub meta_spool_read_ops_total: AtomicU64,
+    pub meta_spool_errors_total: AtomicU64,
+    pub on_candidate_ns_total: AtomicU64,
+    pub on_candidate_ops_total: AtomicU64,
+    pub on_observation_ns_total: AtomicU64,
+    pub on_observation_ops_total: AtomicU64,
+    pub sweep_ns_total: AtomicU64,
+    pub sweep_ops_total: AtomicU64,
+    pub shutdown_flush_ns_total: AtomicU64,
+    pub shutdown_flush_ops_total: AtomicU64,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -246,13 +943,14 @@ pub struct LabelResolver {
     cfg: ResolverConfig,
     inner: Mutex<ResolverInner>,
     metrics: Arc<ResolverMetrics>,
+    meta_store: PendingMetaStore,
     writer: LabeledWriterHandle,
 }
 
 struct ResolverInner {
     /// Pending labels por rota. Em overflow, labels antigos podem ser
     /// descartados para preservar representatividade do regime atual.
-    pending_by_route: AHashMap<RouteId, VecDeque<PendingLabel>>,
+    pending_by_route: AHashMap<RouteId, VecDeque<PendingLabelState>>,
     /// Último `ts_ns` em que um label foi criado por `(rota, horizonte)`.
     /// Stride por horizonte evita sobreposição extrema em horizontes longos.
     last_label_ts_by_horizon: AHashMap<(RouteId, u32), u64>,
@@ -260,13 +958,24 @@ struct ResolverInner {
 
 impl LabelResolver {
     pub fn new(cfg: ResolverConfig, writer: LabeledWriterHandle) -> Self {
+        Self::new_with_spool_dir(cfg, writer, None)
+    }
+
+    pub fn new_with_spool_dir(
+        cfg: ResolverConfig,
+        writer: LabeledWriterHandle,
+        spool_dir: Option<PathBuf>,
+    ) -> Self {
+        let metrics = Arc::new(ResolverMetrics::default());
+        let meta_store = PendingMetaStore::new(spool_dir, Arc::clone(&metrics));
         Self {
             cfg,
             inner: Mutex::new(ResolverInner {
                 pending_by_route: AHashMap::with_capacity(4096),
                 last_label_ts_by_horizon: AHashMap::with_capacity(4096),
             }),
-            metrics: Arc::new(ResolverMetrics::default()),
+            metrics,
+            meta_store,
             writer,
         }
     }
@@ -351,28 +1060,37 @@ impl LabelResolver {
         priority_set_generation_id: u32,
         priority_set_updated_at_ns: u64,
     ) -> bool {
+        let _timing = ResolverOpTiming::new(
+            &self.metrics.on_candidate_ns_total,
+            &self.metrics.on_candidate_ops_total,
+        );
         let floors = normalized_floors(label_floor_pct, label_floors_pct);
-        let mut inner = self.inner.lock();
 
-        let mut horizons = Vec::with_capacity(self.cfg.horizons_s.len());
-        for &horizon_s in &self.cfg.horizons_s {
-            if label_stride_s > 0 {
-                let effective_stride_s = effective_stride_for_horizon(
-                    label_stride_s,
-                    horizon_s,
-                    N_EVENTS_TARGET_PER_HORIZON,
-                );
-                let stride_ns = (effective_stride_s as u64) * 1_000_000_000;
-                let key = (route_id, horizon_s);
-                if let Some(prev) = inner.last_label_ts_by_horizon.get(&key) {
-                    if ts_emit_ns < prev.saturating_add(stride_ns) {
-                        continue;
+        let (horizons, stride_keys) = {
+            let mut inner = self.inner.lock();
+            let mut horizons = Vec::with_capacity(self.cfg.horizons_s.len());
+            let mut stride_keys = Vec::with_capacity(self.cfg.horizons_s.len());
+            for &horizon_s in &self.cfg.horizons_s {
+                if label_stride_s > 0 {
+                    let effective_stride_s = effective_stride_for_horizon(
+                        label_stride_s,
+                        horizon_s,
+                        N_EVENTS_TARGET_PER_HORIZON,
+                    );
+                    let stride_ns = (effective_stride_s as u64) * 1_000_000_000;
+                    let key = (route_id, horizon_s);
+                    if let Some(prev) = inner.last_label_ts_by_horizon.get(&key) {
+                        if ts_emit_ns < prev.saturating_add(stride_ns) {
+                            continue;
+                        }
                     }
+                    inner.last_label_ts_by_horizon.insert(key, ts_emit_ns);
+                    stride_keys.push(key);
                 }
-                inner.last_label_ts_by_horizon.insert(key, ts_emit_ns);
+                horizons.push(PendingHorizon::new(horizon_s, ts_emit_ns, &floors));
             }
-            horizons.push(PendingHorizon::new(horizon_s, ts_emit_ns, &floors));
-        }
+            (horizons, stride_keys)
+        };
 
         if horizons.is_empty() {
             self.metrics
@@ -381,7 +1099,8 @@ impl LabelResolver {
             return false;
         }
 
-        let pending = PendingLabel {
+        let horizon_count = horizons.len() as u64;
+        let meta = PendingLabelMeta {
             sample_id,
             sample_decision,
             ts_emit_ns,
@@ -396,7 +1115,6 @@ impl LabelResolver {
             policy_metadata,
             sampling_tier,
             sampling_probability,
-            horizons,
             cluster_id,
             cluster_size,
             cluster_rank,
@@ -404,30 +1122,86 @@ impl LabelResolver {
             priority_set_generation_id,
             priority_set_updated_at_ns,
         };
+        let meta_ref = match self.meta_store.insert(meta) {
+            Ok(meta_ref) => meta_ref,
+            Err(e) => {
+                self.metrics
+                    .meta_spool_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    error = %e,
+                    route = ?route_id,
+                    "label_resolver failed to persist pending metadata; candidate skipped"
+                );
+                let mut inner = self.inner.lock();
+                for key in stride_keys {
+                    if inner.last_label_ts_by_horizon.get(&key).copied() == Some(ts_emit_ns) {
+                        inner.last_label_ts_by_horizon.remove(&key);
+                    }
+                }
+                return false;
+            }
+        };
+        let pending = PendingLabelState {
+            meta_ref,
+            ts_emit_ns,
+            route_id,
+            entry_locked_pct,
+            label_floor_pct,
+            horizons,
+        };
 
-        let queue = inner
-            .pending_by_route
-            .entry(route_id)
-            .or_insert_with(|| VecDeque::with_capacity(128));
-        if queue.len() >= self.cfg.max_pending_per_route {
-            // política invertida — drop oldest em vez de reject novo.
-            // Regime atual é mais relevante para calibração em t0 do que
-            // labels antigos já próximos de resolver. Contador mantido com
-            // o mesmo nome por compat de dashboards, mas semântica é
-            // "labels antigos dropados para preservar representatividade".
-            queue.pop_front();
-            self.metrics
-                .labels_dropped_capacity_overflow_total
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                route = ?route_id,
-                "pending_labels overflow: dropped oldest (regime atual preservado)"
-            );
+        let mut released_meta: Option<PendingMetaRef> = None;
+        {
+            let mut inner = self.inner.lock();
+            let queue = inner
+                .pending_by_route
+                .entry(route_id)
+                .or_insert_with(|| VecDeque::with_capacity(128));
+            if queue.len() >= self.cfg.max_pending_per_route {
+                // política invertida — drop oldest em vez de reject novo.
+                // Regime atual é mais relevante para calibração em t0 do que
+                // labels antigos já próximos de resolver. Contador mantido com
+                // o mesmo nome por compat de dashboards, mas semântica é
+                // "labels antigos dropados para preservar representatividade".
+                if let Some(dropped) = queue.pop_front() {
+                    released_meta = Some(dropped.meta_ref.clone());
+                    self.metrics
+                        .pending_candidates_current
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(1))
+                        })
+                        .ok();
+                    let open = dropped.open_horizon_count();
+                    self.metrics
+                        .pending_horizons_current
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(open))
+                        })
+                        .ok();
+                }
+                self.metrics
+                    .labels_dropped_capacity_overflow_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    route = ?route_id,
+                    "pending_labels overflow: dropped oldest (regime atual preservado)"
+                );
+            }
+            queue.push_back(pending);
         }
-        queue.push_back(pending);
+        if let Some(meta_ref) = released_meta {
+            self.meta_store.release(&meta_ref);
+        }
         self.metrics
             .pending_created_total
             .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .pending_candidates_current
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .pending_horizons_current
+            .fetch_add(horizon_count, Ordering::Relaxed);
         true
     }
 
@@ -441,7 +1215,12 @@ impl LabelResolver {
         _entry_spread: f32,
         exit_spread: f32,
     ) {
-        let mut to_write: Vec<(Arc<PendingLabel>, usize, Option<CensorReason>)> = Vec::new();
+        let _timing = ResolverOpTiming::new(
+            &self.metrics.on_observation_ns_total,
+            &self.metrics.on_observation_ops_total,
+        );
+        let mut to_write: Vec<(Arc<PendingLabelState>, usize, Option<CensorReason>)> = Vec::new();
+        let mut released_meta: Vec<PendingMetaRef> = Vec::new();
         {
             let mut inner = self.inner.lock();
             let Some(queue) = inner.pending_by_route.get_mut(&route_id) else {
@@ -522,26 +1301,55 @@ impl LabelResolver {
                     }
                 }
                 if !closed_idx.is_empty() {
+                    self.metrics
+                        .pending_horizons_current
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(closed_idx.len() as u64))
+                        })
+                        .ok();
                     let snapshot = Arc::new(pending.clone());
                     for (idx, reason) in closed_idx {
                         to_write.push((Arc::clone(&snapshot), idx, reason));
                     }
                 }
             }
-            queue.retain(|p| !p.all_closed());
+            let mut kept = VecDeque::with_capacity(queue.len());
+            while let Some(pending) = queue.pop_front() {
+                if pending.all_closed() {
+                    released_meta.push(pending.meta_ref.clone());
+                } else {
+                    kept.push_back(pending);
+                }
+            }
+            let removed = released_meta.len() as u64;
+            *queue = kept;
+            if removed > 0 {
+                self.metrics
+                    .pending_candidates_current
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(removed))
+                    })
+                    .ok();
+            }
             if queue.is_empty() {
                 inner.pending_by_route.remove(&route_id);
             }
         }
+        for meta_ref in &released_meta {
+            self.meta_store.release(meta_ref);
+        }
 
-        for (pending, idx, reason) in to_write {
-            let outcome = LabelOutcome::from_pending(pending.as_ref(), idx);
+        for (pending_state, idx, reason) in to_write {
+            let Some(pending) = self.materialize_pending(pending_state.as_ref()) else {
+                continue;
+            };
+            let outcome = LabelOutcome::from_pending(&pending, idx);
             let reason = if matches!(outcome, LabelOutcome::Censored) {
                 reason.or(Some(CensorReason::IncompleteWindow))
             } else {
                 None
             };
-            self.write_closed_horizon_with_reason(pending.as_ref(), idx, now_ns, outcome, reason);
+            self.write_closed_horizon_with_reason(&pending, idx, now_ns, outcome, reason);
         }
     }
 
@@ -549,15 +1357,16 @@ impl LabelResolver {
     /// Fecha horizontes vencidos (mesmo sem observações) e censura rotas
     /// sumidas. Retorna número de horizontes fechados nesta passagem.
     pub fn sweep(&self, now_ns: u64) -> u64 {
-        let mut to_write: Vec<(Arc<PendingLabel>, usize, LabelOutcome, Option<CensorReason>)> =
-            Vec::new();
+        let _timing =
+            ResolverOpTiming::new(&self.metrics.sweep_ns_total, &self.metrics.sweep_ops_total);
+        let mut to_write: Vec<(Arc<PendingLabelState>, usize, Option<CensorReason>)> = Vec::new();
+        let mut released_meta: Vec<PendingMetaRef> = Vec::new();
         {
             let mut inner = self.inner.lock();
             for (_route, queue) in inner.pending_by_route.iter_mut() {
                 for pending in queue.iter_mut() {
                     let t_emit = pending.ts_emit_ns;
-                    let mut closed_this_sweep: Vec<(usize, LabelOutcome, Option<CensorReason>)> =
-                        Vec::new();
+                    let mut closed_this_sweep: Vec<(usize, Option<CensorReason>)> = Vec::new();
                     for (idx, slot) in pending.horizons.iter_mut().enumerate() {
                         if slot.closed {
                             continue;
@@ -573,7 +1382,7 @@ impl LabelResolver {
                         if expired {
                             slot.closed = true;
                             // Outcome será determinado pós-loop a partir do snapshot.
-                            closed_this_sweep.push((idx, LabelOutcome::Miss, None));
+                            closed_this_sweep.push((idx, None));
                         } else if dormant && now_ns < deadline {
                             slot.closed = true;
                             let reason = if delisted {
@@ -581,38 +1390,68 @@ impl LabelResolver {
                             } else {
                                 CensorReason::RouteDormant
                             };
-                            closed_this_sweep.push((idx, LabelOutcome::Censored, Some(reason)));
+                            closed_this_sweep.push((idx, Some(reason)));
                         }
                     }
                     if !closed_this_sweep.is_empty() {
+                        self.metrics
+                            .pending_horizons_current
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                Some(v.saturating_sub(closed_this_sweep.len() as u64))
+                            })
+                            .ok();
                         let snap = Arc::new(pending.clone());
-                        for (idx, _outcome_hint, reason) in closed_this_sweep {
-                            // Hit dentro da janela vence qualquer fechamento
-                            // posterior por sweep. Forcar Censored aqui
-                            // sobrescrevia realizacoes ja observadas quando
-                            // a rota ficava dormente antes do deadline.
-                            let final_outcome = LabelOutcome::from_pending(snap.as_ref(), idx);
-                            // Expirado sem cobertura ate o deadline nao e miss
-                            // falsificavel; marca IncompleteWindow. Dormant e
-                            // Delisted so entram quando o gate de idle fechou
-                            // antes do deadline.
-                            let final_reason = if matches!(final_outcome, LabelOutcome::Censored) {
-                                reason.or(Some(CensorReason::IncompleteWindow))
-                            } else {
-                                None
-                            };
-                            to_write.push((Arc::clone(&snap), idx, final_outcome, final_reason));
+                        for (idx, reason) in closed_this_sweep {
+                            to_write.push((Arc::clone(&snap), idx, reason));
                         }
                     }
                 }
-                queue.retain(|p| !p.all_closed());
+                let before_released = released_meta.len();
+                let mut kept = VecDeque::with_capacity(queue.len());
+                while let Some(pending) = queue.pop_front() {
+                    if pending.all_closed() {
+                        released_meta.push(pending.meta_ref.clone());
+                    } else {
+                        kept.push_back(pending);
+                    }
+                }
+                let removed = released_meta.len().saturating_sub(before_released) as u64;
+                *queue = kept;
+                if removed > 0 {
+                    self.metrics
+                        .pending_candidates_current
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(removed))
+                        })
+                        .ok();
+                }
             }
             inner.pending_by_route.retain(|_, q| !q.is_empty());
         }
+        for meta_ref in &released_meta {
+            self.meta_store.release(meta_ref);
+        }
 
         let n = to_write.len() as u64;
-        for (pending, idx, outcome, reason) in to_write {
-            self.write_closed_horizon_with_reason(pending.as_ref(), idx, now_ns, outcome, reason);
+        for (pending_state, idx, reason) in to_write {
+            let Some(pending) = self.materialize_pending(pending_state.as_ref()) else {
+                continue;
+            };
+            // Hit dentro da janela vence qualquer fechamento posterior por
+            // sweep. Forcar Censored aqui sobrescrevia realizacoes ja observadas.
+            let final_outcome = LabelOutcome::from_pending(&pending, idx);
+            let final_reason = if matches!(final_outcome, LabelOutcome::Censored) {
+                reason.or(Some(CensorReason::IncompleteWindow))
+            } else {
+                None
+            };
+            self.write_closed_horizon_with_reason(
+                &pending,
+                idx,
+                now_ns,
+                final_outcome,
+                final_reason,
+            );
         }
         n
     }
@@ -627,8 +1466,11 @@ impl LabelResolver {
     /// chamar `LabelOutcome::from_pending()` e só atribuir `Shutdown` quando
     /// o outcome for de fato `Censored` (incomplete window).
     pub async fn shutdown_flush(&self, now_ns: u64) -> ShutdownFlushStats {
-        let mut to_write: Vec<(Arc<PendingLabel>, usize, LabelOutcome, Option<CensorReason>)> =
-            Vec::new();
+        let _timing = ResolverOpTiming::new(
+            &self.metrics.shutdown_flush_ns_total,
+            &self.metrics.shutdown_flush_ops_total,
+        );
+        let mut to_write: Vec<(Arc<PendingLabelState>, usize, Option<CensorReason>)> = Vec::new();
         {
             let mut inner = self.inner.lock();
             for (_route, queue) in inner.pending_by_route.iter_mut() {
@@ -643,24 +1485,33 @@ impl LabelResolver {
                     if !closed_idx.is_empty() {
                         let snap = Arc::new(pending.clone());
                         for idx in closed_idx {
-                            let outcome = LabelOutcome::from_pending(snap.as_ref(), idx);
-                            let reason = match outcome {
-                                LabelOutcome::Censored => Some(CensorReason::Shutdown),
-                                _ => None,
-                            };
-                            to_write.push((Arc::clone(&snap), idx, outcome, reason));
+                            to_write.push((Arc::clone(&snap), idx, Some(CensorReason::Shutdown)));
                         }
                     }
                 }
             }
             inner.pending_by_route.clear();
             inner.last_label_ts_by_horizon.clear();
+            self.metrics
+                .pending_candidates_current
+                .store(0, Ordering::Relaxed);
+            self.metrics
+                .pending_horizons_current
+                .store(0, Ordering::Relaxed);
         }
         let mut stats = ShutdownFlushStats {
             closed_total: to_write.len() as u64,
             ..ShutdownFlushStats::default()
         };
-        for (pending, idx, outcome, reason) in to_write {
+        for (pending_state, idx, shutdown_reason) in to_write {
+            let Some(pending) = self.materialize_pending(pending_state.as_ref()) else {
+                continue;
+            };
+            let outcome = LabelOutcome::from_pending(&pending, idx);
+            let reason = match outcome {
+                LabelOutcome::Censored => shutdown_reason,
+                _ => None,
+            };
             // Métrica conta apenas labels realmente "perdidos" — Realized e
             // Miss são outcomes válidos, não perdas.
             if matches!(outcome, LabelOutcome::Censored) {
@@ -669,8 +1520,7 @@ impl LabelResolver {
                     .shutdown_lost_pending_total
                     .fetch_add(1, Ordering::Relaxed);
             }
-            let label =
-                self.build_closed_horizon_label(pending.as_ref(), idx, now_ns, outcome, reason);
+            let label = self.build_closed_horizon_label(&pending, idx, now_ns, outcome, reason);
             match self.writer.send(label).await {
                 Ok(()) => {
                     stats.sent_total = stats.sent_total.saturating_add(1);
@@ -692,7 +1542,47 @@ impl LabelResolver {
                 }
             }
         }
+        self.meta_store.cleanup_all();
         stats
+    }
+
+    fn materialize_pending(&self, state: &PendingLabelState) -> Option<PendingLabel> {
+        match self.meta_store.load(&state.meta_ref) {
+            Ok(meta) => Some(PendingLabel {
+                sample_id: meta.sample_id,
+                sample_decision: meta.sample_decision,
+                ts_emit_ns: meta.ts_emit_ns,
+                cycle_seq: meta.cycle_seq,
+                route_id: meta.route_id,
+                symbol_name: meta.symbol_name,
+                entry_locked_pct: meta.entry_locked_pct,
+                exit_start_pct: meta.exit_start_pct,
+                features_t0: meta.features_t0,
+                label_floor_pct: meta.label_floor_pct,
+                label_floors_pct: meta.label_floors_pct,
+                policy_metadata: meta.policy_metadata,
+                sampling_tier: meta.sampling_tier,
+                sampling_probability: meta.sampling_probability,
+                horizons: state.horizons.clone(),
+                cluster_id: meta.cluster_id,
+                cluster_size: meta.cluster_size,
+                cluster_rank: meta.cluster_rank,
+                runtime_config_hash: meta.runtime_config_hash,
+                priority_set_generation_id: meta.priority_set_generation_id,
+                priority_set_updated_at_ns: meta.priority_set_updated_at_ns,
+            }),
+            Err(e) => {
+                self.metrics
+                    .meta_spool_errors_total
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    error = %e,
+                    route = ?state.route_id,
+                    "label_resolver failed to load pending metadata; closed horizon skipped"
+                );
+                None
+            }
+        }
     }
 
     fn write_closed_horizon_with_reason(
@@ -1021,6 +1911,36 @@ mod tests {
         (resolver, tmp, task)
     }
 
+    async fn setup_resolver_with_spool(
+        cfg: ResolverConfig,
+    ) -> (
+        Arc<LabelResolver>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let wcfg = LabeledWriterConfig {
+            data_dir: tmp.path().join("labels"),
+            channel_capacity: 1024,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(50),
+            file_prefix: "lrtest".into(),
+            rotation_interval: Duration::from_secs(3600),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
+        };
+        let (writer, handle) = LabeledJsonlWriter::create(wcfg);
+        let task = tokio::spawn(writer.run());
+        let resolver = Arc::new(LabelResolver::new_with_spool_dir(
+            cfg,
+            handle,
+            Some(tmp.path().join("spool")),
+        ));
+        (resolver, tmp, task)
+    }
+
     fn first_labeled_json(tmp: &tempfile::TempDir) -> serde_json::Value {
         let mut stack = vec![tmp.path().to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -1036,6 +1956,136 @@ mod tests {
             }
         }
         panic!("no labeled jsonl found");
+    }
+
+    #[tokio::test]
+    async fn disk_spool_preserves_metadata_when_label_closes() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![2],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver_with_spool(cfg).await;
+        let t_emit = 1_000_000_000u64;
+        let mut features = mk_features();
+        features.entry_p50_24h = Some(1.23);
+        features.route_n_snapshots = Some(42);
+        let mut policy = mk_policy();
+        policy.baseline_recommended = true;
+        policy.recommendation_kind = "trade";
+        policy.prediction_calibration_status = "degraded";
+
+        assert!(resolver.on_accepted(
+            "sid_spool".into(),
+            t_emit,
+            7,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            features,
+            0.8,
+            policy,
+            "priority",
+            1.0,
+            0,
+        ));
+        resolver.on_clean_observation(mk_route(), t_emit + 2_000_000_000, 1.8, -1.0);
+        sleep(Duration::from_millis(150)).await;
+
+        let m = resolver.metrics();
+        assert_eq!(m.pending_candidates_current.load(Ordering::Relaxed), 0);
+        assert_eq!(m.pending_horizons_current.load(Ordering::Relaxed), 0);
+        assert!(m.meta_spool_bytes_current.load(Ordering::Relaxed) > META_SPOOL_MAGIC.len() as u64);
+        assert_eq!(m.meta_spool_write_ops_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.meta_spool_read_ops_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.meta_spool_errors_total.load(Ordering::Relaxed), 0);
+
+        let v = first_labeled_json(&tmp);
+        assert_eq!(v["sample_id"], "sid_spool");
+        assert_eq!(v["cycle_seq"], 7);
+        assert_eq!(v["symbol_name"], "BTC-USDT");
+        assert_eq!(v["sampling_tier"], "priority");
+        assert_eq!(v["features_t0"]["entry_p50_24h"], 1.23);
+        assert_eq!(v["features_t0"]["route_n_snapshots"], 42);
+        assert_eq!(v["policy_metadata"]["recommendation_kind"], "trade");
+        assert_eq!(
+            v["policy_metadata"]["prediction_calibration_status"],
+            "degraded"
+        );
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn disk_spool_is_removed_after_shutdown_flush() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![900],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver_with_spool(cfg).await;
+        let spool_dir = tmp.path().join("spool");
+        let t_emit = 1_000_000_000u64;
+        assert!(resolver.on_accepted(
+            "sid_shutdown_spool".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
+        ));
+        assert!(
+            std::fs::read_dir(&spool_dir).unwrap().any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                == Some("spool")),
+            "spool deve existir enquanto ha pending vivo"
+        );
+
+        let closed = resolver.shutdown_flush(t_emit + 1_000_000_000).await;
+        assert_eq!(closed.closed_total, 1);
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            resolver
+                .metrics()
+                .meta_spool_errors_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            resolver
+                .metrics()
+                .meta_spool_bytes_current
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(
+            !std::fs::read_dir(&spool_dir).unwrap().any(|entry| entry
+                .unwrap()
+                .path()
+                .extension()
+                .and_then(|e| e.to_str())
+                == Some("spool")),
+            "shutdown_flush deve remover spool temporario"
+        );
+        drop(resolver);
+        drop(tmp);
     }
 
     #[tokio::test]
