@@ -381,7 +381,7 @@ impl MlPrometheusMetrics {
         )?;
         let labels_dropped_capacity_total = IntCounter::with_opts(Opts::new(
             "ml_labels_dropped_capacity_total",
-            "PendingLabels descartados por overflow do cap por rota",
+            "Violações strict-lossless por overflow do cap por rota",
         ))?;
         let shutdown_lost_pending_total = IntCounter::with_opts(Opts::new(
             "ml_shutdown_lost_pending_total",

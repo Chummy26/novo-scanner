@@ -221,10 +221,6 @@ impl PendingLabelState {
     fn all_closed(&self) -> bool {
         self.horizons.iter().all(Option::is_none)
     }
-
-    fn open_horizon_count(&self) -> u64 {
-        self.horizons.iter().filter(|h| h.is_some()).count() as u64
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -966,8 +962,12 @@ pub struct LabelResolver {
 }
 
 struct ResolverInner {
-    /// Pending labels por rota. Em overflow, labels antigos podem ser
-    /// descartados para preservar representatividade do regime atual.
+    /// Pending labels por rota.
+    ///
+    /// Em strict-lossless, overflow de pending é falha operacional: depois que
+    /// um candidato entrou na população supervisionada, descartá-lo enviesaria
+    /// treino/auditoria. O cap existe como tripwire, não como política de
+    /// sampling.
     pending_by_route: AHashMap<RouteId, VecDeque<PendingLabelState>>,
     /// Último `ts_ns` em que um label foi criado por `(rota, horizonte)`.
     /// Stride por horizonte evita sobreposição extrema em horizontes longos.
@@ -1171,6 +1171,40 @@ impl LabelResolver {
                 }
                 horizons.push(PendingHorizon::new(horizon_s, ts_emit_ns, &floors));
             }
+            if inner
+                .pending_by_route
+                .get(&route_id)
+                .map(|queue| queue.len() >= self.cfg.max_pending_per_route)
+                .unwrap_or(false)
+            {
+                for key in &stride_keys {
+                    if inner
+                        .last_label_ts_by_horizon
+                        .get(key)
+                        .map(|prev| prev.ts_emit_ns == ts_emit_ns)
+                        .unwrap_or(false)
+                    {
+                        inner.last_label_ts_by_horizon.remove(key);
+                    }
+                }
+                self.metrics
+                    .labels_dropped_capacity_overflow_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.metrics.stride_index_entries_current.store(
+                    inner.last_label_ts_by_horizon.len() as u64,
+                    Ordering::Relaxed,
+                );
+                tracing::error!(
+                    route = ?route_id,
+                    max_pending_per_route = self.cfg.max_pending_per_route,
+                    "pending_labels overflow: strict-lossless abort before spooling metadata"
+                );
+                panic!(
+                    "label_resolver strict-lossless violation: max_pending_per_route={} exceeded for route {:?}",
+                    self.cfg.max_pending_per_route,
+                    route_id
+                );
+            }
             (horizons, stride_keys)
         };
 
@@ -1242,47 +1276,13 @@ impl LabelResolver {
             horizons: horizons.into_iter().map(Some).collect(),
         };
 
-        let mut released_meta: Option<PendingMetaRef> = None;
         {
             let mut inner = self.inner.lock();
             let queue = inner
                 .pending_by_route
                 .entry(route_id)
                 .or_insert_with(|| VecDeque::with_capacity(128));
-            if queue.len() >= self.cfg.max_pending_per_route {
-                // política invertida — drop oldest em vez de reject novo.
-                // Regime atual é mais relevante para calibração em t0 do que
-                // labels antigos já próximos de resolver. Contador mantido com
-                // o mesmo nome por compat de dashboards, mas semântica é
-                // "labels antigos dropados para preservar representatividade".
-                if let Some(dropped) = queue.pop_front() {
-                    released_meta = Some(dropped.meta_ref.clone());
-                    self.metrics
-                        .pending_candidates_current
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_sub(1))
-                        })
-                        .ok();
-                    let open = dropped.open_horizon_count();
-                    self.metrics
-                        .pending_horizons_current
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_sub(open))
-                        })
-                        .ok();
-                }
-                self.metrics
-                    .labels_dropped_capacity_overflow_total
-                    .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(
-                    route = ?route_id,
-                    "pending_labels overflow: dropped oldest (regime atual preservado)"
-                );
-            }
             queue.push_back(pending);
-        }
-        if let Some(meta_ref) = released_meta {
-            self.meta_store.release(&meta_ref);
         }
         self.metrics
             .pending_created_total
@@ -1330,6 +1330,7 @@ impl LabelResolver {
             let Some(queue) = inner.pending_by_route.get_mut(&route_id) else {
                 return;
             };
+            let mut route_closed_any = false;
             for pending in queue.iter_mut() {
                 // Snapshot dos escalares imutáveis para usar sem empréstimo
                 // conflitante durante o iter_mut sobre horizons.
@@ -1415,6 +1416,7 @@ impl LabelResolver {
                     }
                 }
                 if !closed_horizons.is_empty() {
+                    route_closed_any = true;
                     self.metrics
                         .pending_horizons_current
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -1431,30 +1433,34 @@ impl LabelResolver {
                     }
                 }
             }
-            let mut kept = VecDeque::with_capacity(queue.len());
-            while let Some(pending) = queue.pop_front() {
-                if pending.all_closed() {
-                    released_meta.push(pending.meta_ref.clone());
-                } else {
-                    kept.push_back(pending);
+            let mut remove_route = false;
+            if route_closed_any {
+                let before_released = released_meta.len();
+                queue.retain(|pending| {
+                    if pending.all_closed() {
+                        released_meta.push(pending.meta_ref.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let removed = released_meta.len().saturating_sub(before_released) as u64;
+                if removed > 0 {
+                    self.metrics
+                        .pending_candidates_current
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                            Some(v.saturating_sub(removed))
+                        })
+                        .ok();
                 }
+                remove_route = queue.is_empty();
             }
-            let removed = released_meta.len() as u64;
-            *queue = kept;
-            if removed > 0 {
-                self.metrics
-                    .pending_candidates_current
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(removed))
-                    })
-                    .ok();
-            }
-            if queue.is_empty() {
+            if remove_route {
                 inner.pending_by_route.remove(&route_id);
+                self.metrics
+                    .pending_routes_current
+                    .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
             }
-            self.metrics
-                .pending_routes_current
-                .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
         }
         for item in to_write {
             let meta = self.materialize_meta(&item.meta_ref, item.route_id);
@@ -1481,7 +1487,9 @@ impl LabelResolver {
         let mut released_meta: Vec<PendingMetaRef> = Vec::new();
         {
             let mut inner = self.inner.lock();
+            let mut any_queue_removed = false;
             for (_route, queue) in inner.pending_by_route.iter_mut() {
+                let mut route_closed_any = false;
                 for pending in queue.iter_mut() {
                     let t_emit = pending.ts_emit_ns;
                     let mut closed_horizons: Vec<(PendingHorizon, Option<CensorReason>)> =
@@ -1517,6 +1525,7 @@ impl LabelResolver {
                         }
                     }
                     if !closed_horizons.is_empty() {
+                        route_closed_any = true;
                         self.metrics
                             .pending_horizons_current
                             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -1533,30 +1542,34 @@ impl LabelResolver {
                         }
                     }
                 }
-                let before_released = released_meta.len();
-                let mut kept = VecDeque::with_capacity(queue.len());
-                while let Some(pending) = queue.pop_front() {
-                    if pending.all_closed() {
-                        released_meta.push(pending.meta_ref.clone());
-                    } else {
-                        kept.push_back(pending);
+                if route_closed_any {
+                    let before_released = released_meta.len();
+                    queue.retain(|pending| {
+                        if pending.all_closed() {
+                            released_meta.push(pending.meta_ref.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                    let removed = released_meta.len().saturating_sub(before_released) as u64;
+                    if removed > 0 {
+                        any_queue_removed = true;
+                        self.metrics
+                            .pending_candidates_current
+                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                Some(v.saturating_sub(removed))
+                            })
+                            .ok();
                     }
                 }
-                let removed = released_meta.len().saturating_sub(before_released) as u64;
-                *queue = kept;
-                if removed > 0 {
-                    self.metrics
-                        .pending_candidates_current
-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                            Some(v.saturating_sub(removed))
-                        })
-                        .ok();
-                }
             }
-            inner.pending_by_route.retain(|_, q| !q.is_empty());
-            self.metrics
-                .pending_routes_current
-                .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
+            if any_queue_removed {
+                inner.pending_by_route.retain(|_, q| !q.is_empty());
+                self.metrics
+                    .pending_routes_current
+                    .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
+            }
             let before_stride = inner.last_label_ts_by_horizon.len();
             inner
                 .last_label_ts_by_horizon
@@ -3110,9 +3123,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backpressure_drops_oldest_when_cap_exceeded() {
-        // política invertida — drop oldest, não reject novo.
-        // Regime atual é preservado em rotas quentes.
+    #[should_panic(expected = "strict-lossless violation")]
+    async fn pending_overflow_fails_high_instead_of_dropping_labels() {
+        // Depois que um candidate entra na população supervisionada, removê-lo
+        // por pressão de RAM cria viés. O cap é tripwire operacional: falha
+        // alto antes de descartar qualquer label.
         let cfg = ResolverConfig {
             horizons_s: vec![60, 120, 180],
             close_slack_ns: 1_000_000_000,
@@ -3121,7 +3136,7 @@ mod tests {
             max_pending_per_route: 3,
             sweeper_interval: Duration::from_secs(10),
         };
-        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let (resolver, _tmp, _task) = setup_resolver(cfg).await;
         for i in 0..5u32 {
             resolver.on_accepted(
                 format!("sid{}", i),
@@ -3139,21 +3154,6 @@ mod tests {
                 0, // sem stride
             );
         }
-        let m = resolver.metrics();
-        // 5 candidates, cap=3 → 2 drops (de oldest); 5 created total.
-        assert_eq!(
-            m.labels_dropped_capacity_overflow_total
-                .load(Ordering::Relaxed),
-            2,
-            "2 drops esperados (cap=3 com 5 insertions)"
-        );
-        assert_eq!(
-            m.pending_created_total.load(Ordering::Relaxed),
-            5,
-            "todos 5 labels foram aceitos; 2 oldest foram descartados para dar espaço"
-        );
-        drop(resolver);
-        drop(tmp);
     }
 
     #[test]
