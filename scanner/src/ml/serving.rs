@@ -40,7 +40,9 @@ use crate::ml::contract::{
 };
 use crate::ml::economic::{EconomicAccumulator, EconomicEvent, EconomicMetrics, TradeOutcome};
 use crate::ml::eval::{verify_tradesetup, InvariantError};
-use crate::ml::feature_store::{CacheConfig, HotCacheStats, HotCacheSweepStats, HotQueryCache};
+use crate::ml::feature_store::{
+    CacheConfig, HotCacheStats, HotCacheSweepStats, HotQueryCache, HOT_CACHE_POLICY_VERSION,
+};
 use crate::ml::listing_history::{ListingHistory, RouteLifecycle};
 use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
 use crate::ml::persistence::sample_id::sample_id_of;
@@ -355,7 +357,8 @@ fn compute_supervised_config_hash(
             "label_allowlist_symbols=[{}]|label_priority_target_coverage={:.6}|",
             "label_priority_rerank_interval_s={}|",
             "recommendation_cooldown_ns={}|",
-            "feature_windows_s=[3600,86400,604800]|opportunity_alive_threshold_pct={:.6}"
+            "feature_windows_s=[3600,86400,604800]|opportunity_alive_threshold_pct={:.6}|",
+            "hot_cache_policy={}"
         ),
         crate::ml::SCANNER_VERSION,
         trigger.n_min,
@@ -374,6 +377,7 @@ fn compute_supervised_config_hash(
         label_priority_rerank_interval_s,
         recommendation_cooldown_ns,
         opportunity_alive_threshold_pct,
+        HOT_CACHE_POLICY_VERSION,
     );
     format!("{:016x}", crate::ml::util::fnv1a_64(config_blob.as_bytes()))
 }
