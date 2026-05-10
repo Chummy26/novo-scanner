@@ -272,7 +272,6 @@ impl From<DecisionResult> for LabelCandidateSnapshot {
 /// serializadas pelo write lock interno.
 pub struct MlServer {
     baseline: BaselineA3,
-    feature_cache_1h: HotQueryCache,
     feature_cache_7d: HotQueryCache,
     trigger: SamplingTrigger,
     listing: ListingHistory,
@@ -706,10 +705,6 @@ impl MlServer {
         let raw_persistence_config_hash =
             compute_raw_persistence_config_hash(&runtime_config_hash, raw_decimator.modulus());
         let cache_24h_cfg = baseline.cache().config();
-        let feature_cache_1h = HotQueryCache::with_config(CacheConfig {
-            window_ns: FEATURE_WINDOW_1H_NS,
-            ..cache_24h_cfg
-        });
         let seven_day_decimation = if cache_24h_cfg.decimation <= 1 {
             cache_24h_cfg.decimation
         } else {
@@ -725,7 +720,6 @@ impl MlServer {
         });
         Self {
             baseline,
-            feature_cache_1h,
             feature_cache_7d,
             trigger,
             listing: ListingHistory::new(),
@@ -955,7 +949,9 @@ impl MlServer {
     }
 
     pub fn cache_stats_1h(&self) -> HotCacheStats {
-        self.feature_cache_1h.stats()
+        // A janela curta é derivada sob demanda do ring 24h para não duplicar
+        // ticks em RAM. Portanto não há HotQueryCache 1h dedicado.
+        HotCacheStats::default()
     }
 
     pub fn cache_stats_7d(&self) -> HotCacheStats {
@@ -968,7 +964,7 @@ impl MlServer {
     ) -> (HotCacheSweepStats, HotCacheSweepStats, HotCacheSweepStats) {
         (
             self.baseline.cache().sweep_expired(now_ns),
-            self.feature_cache_1h.sweep_expired(now_ns),
+            HotCacheSweepStats::default(),
             self.feature_cache_7d.sweep_expired(now_ns),
         )
     }
@@ -982,8 +978,6 @@ impl MlServer {
     ) {
         self.baseline
             .cache()
-            .observe(route, entry_spread, exit_spread, now_ns);
-        self.feature_cache_1h
             .observe(route, entry_spread, exit_spread, now_ns);
         self.feature_cache_7d
             .observe(route, entry_spread, exit_spread, now_ns);
@@ -1075,13 +1069,20 @@ impl MlServer {
             .cache()
             .probability_exit_ge(route, exit_threshold_for_primary_floor)
             .map(|(p, _, _)| p);
-        let entry_p50_1h_pre_observe = self.feature_cache_1h.quantile_entry(route, 0.50);
-        let entry_rank_1h_pre_observe = self
-            .feature_cache_1h
-            .entry_rank_percentile(route, entry_spread);
+        let one_hour_cutoff_ns = now_ns.saturating_sub(FEATURE_WINDOW_1H_NS);
+        let entry_p50_1h_pre_observe =
+            self.baseline
+                .cache()
+                .quantile_entry_since(route, 0.50, one_hour_cutoff_ns);
+        let entry_rank_1h_pre_observe = self.baseline.cache().entry_rank_percentile_since(
+            route,
+            entry_spread,
+            one_hour_cutoff_ns,
+        );
         let p_exit_ge_floor_1h_pre = self
-            .feature_cache_1h
-            .probability_exit_ge(route, exit_threshold_for_primary_floor)
+            .baseline
+            .cache()
+            .probability_exit_ge_since(route, exit_threshold_for_primary_floor, one_hour_cutoff_ns)
             .map(|(p, _, _)| p);
         let entry_p50_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.50);
         let entry_p95_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.95);
@@ -1158,6 +1159,28 @@ impl MlServer {
             self.label_decimator
                 .decide_for_sample(route, now_ns, cycle_seq),
         )
+    }
+
+    fn should_materialize_label_candidate(
+        &self,
+        resolver: Option<&Arc<LabelResolver>>,
+        selected: bool,
+        clean: bool,
+        route: RouteId,
+        now_ns: u64,
+    ) -> bool {
+        if !clean || !selected {
+            return false;
+        }
+        let Some(resolver) = resolver else {
+            return false;
+        };
+        if resolver.candidate_stride_eligible(route, now_ns, self.label_stride_s) {
+            true
+        } else {
+            resolver.record_stride_skipped();
+            false
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1442,7 +1465,13 @@ impl MlServer {
             lifecycle,
         );
 
-        let should_label_background = clean && label_snapshot.selected;
+        let should_label_background = self.should_materialize_label_candidate(
+            self.label_resolver.as_ref(),
+            label_snapshot.selected,
+            clean,
+            route,
+            now_ns,
+        );
 
         // Background abaixo do threshold visual alimenta histórico PIT e
         // resolve labels existentes. Para não explodir cardinalidade,
@@ -1746,69 +1775,27 @@ impl MlServer {
         );
         let rec = self.apply_trade_cooldown(route, now_ns, n_observations, rec);
         self.bump_rec_metric(&rec);
-        let entry_p25_pre_observe = self.baseline.cache().quantile_entry(route, 0.25);
-        let entry_p50_pre_observe = self.baseline.cache().quantile_entry(route, 0.50);
-        let entry_p75_pre_observe = self.baseline.cache().quantile_entry(route, 0.75);
-        let entry_p95_pre_observe = self.baseline.cache().quantile_entry(route, 0.95);
-        let exit_p25_pre_observe = self.baseline.cache().quantile_exit(route, 0.25);
-        let exit_p50_pre_observe = self.baseline.cache().quantile_exit(route, 0.50);
-        let exit_p75_pre_observe = self.baseline.cache().quantile_exit(route, 0.75);
-        let exit_p95_pre_observe = self.baseline.cache().quantile_exit(route, 0.95);
-        // percentil empírico de entry_now na ECDF 24h (Teste 1 literal).
-        let entry_rank_pre_observe = self
-            .baseline
-            .cache()
-            .entry_rank_percentile(route, entry_spread);
-        // magnitude e escala robusta para z-score downstream.
-        let entry_minus_p50_pre = entry_p50_pre_observe.map(|p50| entry_spread - p50);
-        let entry_mad_pre = self.baseline.cache().entry_mad_robust(route);
-        // frequência empírica P_hist(exit ≥ floor − entry_now) (Teste 2).
-        let exit_threshold_for_primary_floor = self.label_floor_pct - entry_spread;
-        let p_exit_ge_floor_pre = self
-            .baseline
-            .cache()
-            .probability_exit_ge(route, exit_threshold_for_primary_floor)
-            .map(|(p, _, _)| p);
-        let entry_p50_1h_pre_observe = self.feature_cache_1h.quantile_entry(route, 0.50);
-        let entry_rank_1h_pre_observe = self
-            .feature_cache_1h
-            .entry_rank_percentile(route, entry_spread);
-        let p_exit_ge_floor_1h_pre = self
-            .feature_cache_1h
-            .probability_exit_ge(route, exit_threshold_for_primary_floor)
-            .map(|(p, _, _)| p);
-        let entry_p50_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.50);
-        let entry_p95_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.95);
-        let p_exit_ge_floor_7d_pre = self
-            .feature_cache_7d
-            .probability_exit_ge(route, exit_threshold_for_primary_floor)
-            .map(|(p, _, _)| p);
-        // PIT: duração histórica dos runs em que a saída teria satisfeito
-        // o floor primário dado o entry travado AGORA.
-        //
-        // Não use `entry(t)+exit(t)` simultâneo aqui: pela identidade da
-        // skill §2 isso é estruturalmente negativo e tornava `gross_run_*`
-        // nulo em massa. O threshold correto para o histórico de saída é:
-        //     exit >= label_floor - entry_locked(t0)
-        let (gross_run_p05_pre_observe, gross_run_p50_pre_observe, gross_run_p95_pre_observe) =
-            self.baseline
-                .cache()
-                .exit_run_duration_quantiles(route, exit_threshold_for_primary_floor)
-                .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
-                .unwrap_or((None, None, None));
-        // run condicional em exit_p50_24h (sem condicionamento em entry atual).
-        let exit_excess_run_pre = exit_p50_pre_observe.and_then(|threshold| {
-            self.baseline
-                .cache()
-                .exit_run_duration_quantiles(route, threshold)
-                .map(|(_, p50, _)| p50)
-        });
-        let listing_age_days_pre_observe = self.listing.listing_age_days(route, now_ns);
-        // tail ratio com safeguard para buckets colapsados.
-        let tail_ratio_pre_observe = self.baseline.cache().tail_ratio_p99_p95(route);
-        // estado PIT do cache em t0 para reconstrutibilidade offline.
-        let n_cache_obs_pre = self.baseline.cache().n_observations(route) as u32;
-        let oldest_cache_ts_pre = self.baseline.cache().oldest_observation_ns(route);
+        let should_label_foreground = self.should_materialize_label_candidate(
+            self.label_resolver.as_ref(),
+            label_snapshot.selected,
+            clean,
+            route,
+            now_ns,
+        );
+        let features_t0 = if should_label_foreground {
+            let mut features = self.build_features_t0(
+                route,
+                entry_spread,
+                now_ns,
+                lifecycle,
+                half_spread_buy_now,
+                half_spread_sell_now,
+            );
+            features.time_alive_at_t0_s = time_alive_at_t0_s;
+            Some(features)
+        } else {
+            None
+        };
         if clean {
             self.observe_clean_spread(route, entry_spread, exit_spread, now_ns);
             self.economic
@@ -1866,45 +1853,13 @@ impl MlServer {
             if !clean {
                 return (rec, sample_dec, accepted);
             }
+            let Some(features_t0) = features_t0 else {
+                return (rec, sample_dec, accepted);
+            };
             // Persistencia usa o snapshot pre-gate para shadow-mode: A3/modelo
             // podem produzir um proxy auditavel mesmo quando o contrato publico
             // e rebaixado para LowConfidence.
             let rec_meta = recommendation_persistence(&prediction_rec);
-            let features_t0 = FeaturesT0 {
-                half_spread_buy_now,
-                half_spread_sell_now,
-                tail_ratio_p99_p95: tail_ratio_pre_observe,
-                entry_p25_24h: entry_p25_pre_observe,
-                entry_p50_24h: entry_p50_pre_observe,
-                entry_p75_24h: entry_p75_pre_observe,
-                entry_p95_24h: entry_p95_pre_observe,
-                entry_rank_percentile_24h: entry_rank_pre_observe,
-                entry_minus_p50_24h: entry_minus_p50_pre,
-                entry_mad_robust_24h: entry_mad_pre,
-                exit_p25_24h: exit_p25_pre_observe,
-                exit_p50_24h: exit_p50_pre_observe,
-                exit_p75_24h: exit_p75_pre_observe,
-                exit_p95_24h: exit_p95_pre_observe,
-                p_exit_ge_label_floor_minus_entry_24h: p_exit_ge_floor_pre,
-                entry_p50_1h: entry_p50_1h_pre_observe,
-                entry_rank_percentile_1h: entry_rank_1h_pre_observe,
-                p_exit_ge_label_floor_minus_entry_1h: p_exit_ge_floor_1h_pre,
-                entry_p50_7d: entry_p50_7d_pre_observe,
-                entry_p95_7d: entry_p95_7d_pre_observe,
-                p_exit_ge_label_floor_minus_entry_7d: p_exit_ge_floor_7d_pre,
-                gross_run_p05_s: gross_run_p05_pre_observe,
-                gross_run_p50_s: gross_run_p50_pre_observe,
-                gross_run_p95_s: gross_run_p95_pre_observe,
-                exit_excess_run_s: exit_excess_run_pre,
-                n_cache_observations_at_t0: n_cache_obs_pre,
-                oldest_cache_ts_ns: oldest_cache_ts_pre,
-                time_alive_at_t0_s,
-                listing_age_days: listing_age_days_pre_observe,
-                route_first_seen_ns: lifecycle.map(|lc| lc.first_seen_ns),
-                route_last_seen_ns: lifecycle.map(|lc| lc.last_seen_ns),
-                route_active_until_ns: lifecycle.and_then(|lc| lc.active_until_ns),
-                route_n_snapshots: lifecycle.map(|lc| lc.n_snapshots),
-            };
             // Foreground limpo é candidatado integralmente; o stride temporal
             // por horizonte é determinístico e fica versionado em
             // effective_stride_s no label fechado.

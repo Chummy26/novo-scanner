@@ -320,6 +320,27 @@ impl PerRouteCache {
     }
 
     #[inline]
+    fn quantile_entry_since(&self, cutoff_ns: u64, q: f64) -> Option<f32> {
+        let storage = self.storage.as_ref()?;
+        RUN_DURATION_SCRATCH.with(|scratch| {
+            let mut values = scratch.borrow_mut();
+            values.clear();
+            values.extend(
+                storage
+                    .ring
+                    .iter()
+                    .filter(|s| s.ts_ns >= cutoff_ns)
+                    .map(|s| s.entry_bucket as u64),
+            );
+            if values.is_empty() {
+                return None;
+            }
+            let bucket = select_quantile_u64(&mut values, q);
+            Some(from_bucket(bucket as u64))
+        })
+    }
+
+    #[inline]
     fn probability_entry_ge(&self, threshold: f32) -> Option<(f32, u64, u64)> {
         let storage = self.storage.as_ref()?;
         let total = self.sampled_observations();
@@ -344,6 +365,24 @@ impl PerRouteCache {
         let bucket = to_bucket(spread_pct);
         // Count de amostras com entry_bucket <= bucket (inclui o próprio).
         let below = storage.entry_hist.count_between(1, bucket);
+        Some(below as f32 / total as f32)
+    }
+
+    #[inline]
+    fn entry_rank_percentile_since(&self, spread_pct: f32, cutoff_ns: u64) -> Option<f32> {
+        let storage = self.storage.as_ref()?;
+        let bucket = to_bucket(spread_pct) as u32;
+        let mut total = 0u64;
+        let mut below = 0u64;
+        for sample in storage.ring.iter().filter(|s| s.ts_ns >= cutoff_ns) {
+            total = total.saturating_add(1);
+            if sample.entry_bucket <= bucket {
+                below = below.saturating_add(1);
+            }
+        }
+        if total == 0 {
+            return None;
+        }
         Some(below as f32 / total as f32)
     }
 
@@ -400,6 +439,24 @@ impl PerRouteCache {
         let successes = storage.exit_hist.count_between(low, BUCKET_MAX);
         let p = successes as f32 / total as f32;
         Some((p, successes, total))
+    }
+
+    #[inline]
+    fn probability_exit_ge_since(&self, threshold: f32, cutoff_ns: u64) -> Option<(f32, u64, u64)> {
+        let storage = self.storage.as_ref()?;
+        let low = to_bucket(threshold) as u32;
+        let mut total = 0u64;
+        let mut successes = 0u64;
+        for sample in storage.ring.iter().filter(|s| s.ts_ns >= cutoff_ns) {
+            total = total.saturating_add(1);
+            if sample.exit_bucket >= low {
+                successes = successes.saturating_add(1);
+            }
+        }
+        if total == 0 {
+            return None;
+        }
+        Some((successes as f32 / total as f32, successes, total))
     }
 
     #[inline]
@@ -543,6 +600,11 @@ impl HotQueryCache {
         guard.get(&route)?.quantile_exit(q)
     }
 
+    pub fn quantile_entry_since(&self, route: RouteId, q: f64, cutoff_ns: u64) -> Option<f32> {
+        let guard = self.routes.read();
+        guard.get(&route)?.quantile_entry_since(cutoff_ns, q)
+    }
+
     pub fn n_observations(&self, route: RouteId) -> u64 {
         let guard = self.routes.read();
         guard.get(&route).map(|c| c.n_observations).unwrap_or(0)
@@ -566,11 +628,37 @@ impl HotQueryCache {
         guard.get(&route)?.probability_exit_ge(threshold)
     }
 
+    pub fn probability_exit_ge_since(
+        &self,
+        route: RouteId,
+        threshold: f32,
+        cutoff_ns: u64,
+    ) -> Option<(f32, u64, u64)> {
+        let guard = self.routes.read();
+        guard
+            .get(&route)?
+            .probability_exit_ge_since(threshold, cutoff_ns)
+    }
+
     /// percentil empírico de `spread_pct` na ECDF 24h de entry.
     /// Retorna `P_hist(entry ≤ spread_pct)` em [0,1] — Teste 1 literal.
     pub fn entry_rank_percentile(&self, route: RouteId, spread_pct: f32) -> Option<f32> {
         let guard = self.routes.read();
         guard.get(&route)?.entry_rank_percentile(spread_pct)
+    }
+
+    /// Percentil empírico dentro de uma subjanela da mesma amostra decimada
+    /// mantida pelo cache. Isso evita duplicar o ring 24h só para features 1h.
+    pub fn entry_rank_percentile_since(
+        &self,
+        route: RouteId,
+        spread_pct: f32,
+        cutoff_ns: u64,
+    ) -> Option<f32> {
+        let guard = self.routes.read();
+        guard
+            .get(&route)?
+            .entry_rank_percentile_since(spread_pct, cutoff_ns)
     }
 
     /// MAD robusto de entry (via IQR consistente com normal).

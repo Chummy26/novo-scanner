@@ -996,6 +996,44 @@ impl LabelResolver {
         Arc::clone(&self.metrics)
     }
 
+    /// Checagem barata para evitar materializar `FeaturesT0`/metadata quando
+    /// nenhum horizonte passaria pelo stride determinístico.
+    ///
+    /// Não altera estado. `on_candidate()` continua sendo a fonte canônica que
+    /// grava `last_label_ts_by_horizon` quando o candidato é efetivamente
+    /// criado.
+    pub fn candidate_stride_eligible(
+        &self,
+        route_id: RouteId,
+        ts_emit_ns: u64,
+        label_stride_s: u32,
+    ) -> bool {
+        if label_stride_s == 0 {
+            return !self.cfg.horizons_s.is_empty();
+        }
+        let inner = self.inner.lock();
+        self.cfg.horizons_s.iter().any(|&horizon_s| {
+            let effective_stride_s = effective_stride_for_horizon(
+                label_stride_s,
+                horizon_s,
+                N_EVENTS_TARGET_PER_HORIZON,
+            );
+            let stride_ns = (effective_stride_s as u64) * 1_000_000_000;
+            let key = (route_id, horizon_s);
+            inner
+                .last_label_ts_by_horizon
+                .get(&key)
+                .map(|prev| ts_emit_ns >= prev.saturating_add(stride_ns))
+                .unwrap_or(true)
+        })
+    }
+
+    pub fn record_stride_skipped(&self) {
+        self.metrics
+            .stride_skipped_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn horizons(&self) -> &[u32] {
         &self.cfg.horizons_s
     }
@@ -1611,11 +1649,17 @@ impl LabelResolver {
                 self.metrics
                     .labels_dropped_channel_full_total
                     .fetch_add(1, Ordering::Relaxed);
+                panic!(
+                    "label_resolver strict-lossless violation: labeled writer channel full while closing horizon"
+                );
             }
             Err(LabeledWriterSendError::ChannelClosed) => {
                 self.metrics
                     .labels_dropped_channel_closed_total
                     .fetch_add(1, Ordering::Relaxed);
+                panic!(
+                    "label_resolver strict-lossless violation: labeled writer channel closed while closing horizon"
+                );
             }
         }
     }
@@ -2575,6 +2619,7 @@ mod tests {
         );
         assert!(created_a);
         // 30s depois — dentro do stride → skip.
+        assert!(!resolver.candidate_stride_eligible(mk_route(), t0 + 30_000_000_000, 60));
         let created_b = resolver.on_accepted(
             "sid2".into(),
             t0 + 30_000_000_000,
@@ -2594,6 +2639,7 @@ mod tests {
         let m = resolver.metrics();
         assert_eq!(m.stride_skipped_total.load(Ordering::Relaxed), 1);
         // 91s depois — menor horizonte default tem stride efetivo 90s.
+        assert!(resolver.candidate_stride_eligible(mk_route(), t0 + 91_000_000_000, 60));
         let created_c = resolver.on_accepted(
             "sid3".into(),
             t0 + 91_000_000_000,

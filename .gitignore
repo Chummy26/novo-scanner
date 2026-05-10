@@ -31,6 +31,7 @@ logs/
 
 # Local runtime artifacts
 .tmp/validation-*/
+.tmp/collect-*/
 .tmp/collect-*.toml
 .tmp/*.json
 .tmp/**/*.json
@@ -42,6 +43,7 @@ logs/
 .tmp/*.prom
 .tmp/**/*.prom
 .tmp/*.txt
+.tmp/**/*.txt
 
 # ML data outputs
 **/data/ml/
