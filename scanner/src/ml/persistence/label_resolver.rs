@@ -919,6 +919,8 @@ pub struct ResolverMetrics {
     pub shutdown_lost_pending_total: AtomicU64,
     /// Pendings vivos no resolver, após stride e antes de todos horizontes fecharem.
     pub pending_candidates_current: AtomicU64,
+    /// Rotas com pelo menos um pending label vivo.
+    pub pending_routes_current: AtomicU64,
     /// Horizontes ainda abertos entre todos os pendings vivos.
     pub pending_horizons_current: AtomicU64,
     /// Bytes escritos no spool temporário de metadados imutáveis.
@@ -938,6 +940,10 @@ pub struct ResolverMetrics {
     pub on_observation_ops_total: AtomicU64,
     pub sweep_ns_total: AtomicU64,
     pub sweep_ops_total: AtomicU64,
+    /// Entradas vivas no índice de stride `(rota, horizonte)`.
+    pub stride_index_entries_current: AtomicU64,
+    /// Entradas de stride removidas por já terem expirado.
+    pub stride_index_pruned_total: AtomicU64,
     pub shutdown_flush_ns_total: AtomicU64,
     pub shutdown_flush_ops_total: AtomicU64,
 }
@@ -965,7 +971,33 @@ struct ResolverInner {
     pending_by_route: AHashMap<RouteId, VecDeque<PendingLabelState>>,
     /// Último `ts_ns` em que um label foi criado por `(rota, horizonte)`.
     /// Stride por horizonte evita sobreposição extrema em horizontes longos.
-    last_label_ts_by_horizon: AHashMap<(RouteId, u32), u64>,
+    last_label_ts_by_horizon: AHashMap<(RouteId, u32), LastLabelStride>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LastLabelStride {
+    ts_emit_ns: u64,
+    effective_stride_s: u32,
+}
+
+impl LastLabelStride {
+    fn new(ts_emit_ns: u64, effective_stride_s: u32) -> Self {
+        Self {
+            ts_emit_ns,
+            effective_stride_s,
+        }
+    }
+
+    fn is_blocking_with(&self, ts_emit_ns: u64, current_effective_stride_s: u32) -> bool {
+        let effective_stride_s = self.effective_stride_s.max(current_effective_stride_s);
+        let stride_ns = (effective_stride_s as u64).saturating_mul(1_000_000_000);
+        ts_emit_ns < self.ts_emit_ns.saturating_add(stride_ns)
+    }
+
+    fn expired_at(&self, now_ns: u64) -> bool {
+        let stride_ns = (self.effective_stride_s as u64).saturating_mul(1_000_000_000);
+        now_ns >= self.ts_emit_ns.saturating_add(stride_ns)
+    }
 }
 
 impl LabelResolver {
@@ -1018,12 +1050,11 @@ impl LabelResolver {
                 horizon_s,
                 N_EVENTS_TARGET_PER_HORIZON,
             );
-            let stride_ns = (effective_stride_s as u64) * 1_000_000_000;
             let key = (route_id, horizon_s);
             inner
                 .last_label_ts_by_horizon
                 .get(&key)
-                .map(|prev| ts_emit_ns >= prev.saturating_add(stride_ns))
+                .map(|prev| !prev.is_blocking_with(ts_emit_ns, effective_stride_s))
                 .unwrap_or(true)
         })
     }
@@ -1127,14 +1158,15 @@ impl LabelResolver {
                         horizon_s,
                         N_EVENTS_TARGET_PER_HORIZON,
                     );
-                    let stride_ns = (effective_stride_s as u64) * 1_000_000_000;
                     let key = (route_id, horizon_s);
                     if let Some(prev) = inner.last_label_ts_by_horizon.get(&key) {
-                        if ts_emit_ns < prev.saturating_add(stride_ns) {
+                        if prev.is_blocking_with(ts_emit_ns, effective_stride_s) {
                             continue;
                         }
                     }
-                    inner.last_label_ts_by_horizon.insert(key, ts_emit_ns);
+                    inner
+                        .last_label_ts_by_horizon
+                        .insert(key, LastLabelStride::new(ts_emit_ns, effective_stride_s));
                     stride_keys.push(key);
                 }
                 horizons.push(PendingHorizon::new(horizon_s, ts_emit_ns, &floors));
@@ -1185,10 +1217,19 @@ impl LabelResolver {
                 );
                 let mut inner = self.inner.lock();
                 for key in stride_keys {
-                    if inner.last_label_ts_by_horizon.get(&key).copied() == Some(ts_emit_ns) {
+                    if inner
+                        .last_label_ts_by_horizon
+                        .get(&key)
+                        .map(|prev| prev.ts_emit_ns == ts_emit_ns)
+                        .unwrap_or(false)
+                    {
                         inner.last_label_ts_by_horizon.remove(&key);
                     }
                 }
+                self.metrics.stride_index_entries_current.store(
+                    inner.last_label_ts_by_horizon.len() as u64,
+                    Ordering::Relaxed,
+                );
                 return false;
             }
         };
@@ -1252,6 +1293,19 @@ impl LabelResolver {
         self.metrics
             .pending_horizons_current
             .fetch_add(horizon_count, Ordering::Relaxed);
+        let (pending_routes, stride_entries) = {
+            let inner = self.inner.lock();
+            (
+                inner.pending_by_route.len() as u64,
+                inner.last_label_ts_by_horizon.len() as u64,
+            )
+        };
+        self.metrics
+            .pending_routes_current
+            .store(pending_routes, Ordering::Relaxed);
+        self.metrics
+            .stride_index_entries_current
+            .store(stride_entries, Ordering::Relaxed);
         true
     }
 
@@ -1398,6 +1452,9 @@ impl LabelResolver {
             if queue.is_empty() {
                 inner.pending_by_route.remove(&route_id);
             }
+            self.metrics
+                .pending_routes_current
+                .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
         }
         for item in to_write {
             let meta = self.materialize_meta(&item.meta_ref, item.route_id);
@@ -1497,6 +1554,23 @@ impl LabelResolver {
                 }
             }
             inner.pending_by_route.retain(|_, q| !q.is_empty());
+            self.metrics
+                .pending_routes_current
+                .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
+            let before_stride = inner.last_label_ts_by_horizon.len();
+            inner
+                .last_label_ts_by_horizon
+                .retain(|_, last| !last.expired_at(now_ns));
+            let after_stride = inner.last_label_ts_by_horizon.len();
+            let pruned = before_stride.saturating_sub(after_stride) as u64;
+            if pruned > 0 {
+                self.metrics
+                    .stride_index_pruned_total
+                    .fetch_add(pruned, Ordering::Relaxed);
+            }
+            self.metrics
+                .stride_index_entries_current
+                .store(after_stride as u64, Ordering::Relaxed);
         }
         let n = to_write.len() as u64;
         for item in to_write {
@@ -1563,7 +1637,13 @@ impl LabelResolver {
                 .pending_candidates_current
                 .store(0, Ordering::Relaxed);
             self.metrics
+                .pending_routes_current
+                .store(0, Ordering::Relaxed);
+            self.metrics
                 .pending_horizons_current
+                .store(0, Ordering::Relaxed);
+            self.metrics
+                .stride_index_entries_current
                 .store(0, Ordering::Relaxed);
         }
         let mut stats = ShutdownFlushStats {
@@ -2656,6 +2736,52 @@ mod tests {
             60,
         );
         assert!(created_c);
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn sweep_prunes_expired_stride_index_without_closing_open_horizon() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![900],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 10,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t0 = 1_000_000_000u64;
+
+        assert!(resolver.on_accepted(
+            "sid_stride_prune".into(),
+            t0,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            60,
+        ));
+
+        let m = resolver.metrics();
+        assert_eq!(m.stride_index_entries_current.load(Ordering::Relaxed), 1);
+        assert_eq!(m.pending_candidates_current.load(Ordering::Relaxed), 1);
+
+        // h=900 com target 10 => effective_stride=90s. Depois disso,
+        // remover a chave de stride e manter o pending aberto é equivalente:
+        // um novo candidato já estaria elegível de qualquer forma.
+        assert_eq!(resolver.sweep(t0 + 90_000_000_000), 0);
+
+        assert_eq!(m.stride_index_entries_current.load(Ordering::Relaxed), 0);
+        assert_eq!(m.stride_index_pruned_total.load(Ordering::Relaxed), 1);
+        assert_eq!(m.pending_candidates_current.load(Ordering::Relaxed), 1);
+
         drop(resolver);
         drop(tmp);
     }

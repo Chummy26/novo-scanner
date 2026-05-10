@@ -260,6 +260,11 @@ impl ListingHistory {
         guard.values().filter(|lc| lc.is_active()).count()
     }
 
+    /// Número total de rotas conhecidas no lifecycle tracker.
+    pub fn total_routes(&self) -> usize {
+        self.routes.read().len()
+    }
+
     /// Rotas ativas do mesmo símbolo canônico, ordenadas de forma estável
     /// por venue. Usado para materializar cluster estrutural PIT em labels
     /// sem depender de detector offline.

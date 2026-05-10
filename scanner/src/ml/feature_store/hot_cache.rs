@@ -36,12 +36,15 @@
 //! Ring buffer pop-front samples com `ts_ns < now_ns - WINDOW_NS`.
 //! Histograma é **reconstruído imediatamente quando há expiração** a partir
 //! do ring atual. `hdrhistogram` não suporta decremento incremental; rebuild
-//! imediato preserva quantis point-in-time sem carregar amostras vencidas.
-//! Para evitar crescimento linear de RAM durante coletas longas, samples
-//! antigos fora da janela protegida de 1h são compactados por pares: o ring
-//! mantém um representante com `weight = soma dos pesos`, e o histograma
-//! continua contando o peso lógico via `record_n`. Isso preserva a população
-//! supervisionada; apenas limita a representação estatística do cache online.
+//! imediato evita manter representantes físicos totalmente vencidos.
+//! Para evitar crescimento linear de RAM durante coletas longas, o ring mantém
+//! uma cauda recente exata e compacta o prefixo antigo por pares: o ring mantém
+//! um representante com `weight = soma dos pesos` e intervalo temporal
+//! `[start_ts_ns, end_ts_ns]`. Queries de subjanela usam apenas a fração do
+//! representante que cruza o cutoff, evitando tratar todo peso antigo como
+//! recente. Isso não remove raw/accepted/labels nem altera o resolver
+//! supervisionado; como as features e decisões derivadas do cache podem mudar,
+//! a política é versionada no `runtime_config_hash`.
 //!
 //! # Encoding de spread em u64
 //!
@@ -72,15 +75,17 @@ use crate::ml::contract::RouteId;
 const BUCKET_SHIFT: i64 = 100_000;
 const BUCKET_SCALE: f32 = 10_000.0;
 const BUCKET_MAX: u64 = 200_000;
-const MAX_SAMPLED_OBSERVATIONS_PER_ROUTE: usize = 4096;
-const COMPACTION_PROTECTED_WINDOW_NS: u64 = 3600 * 1_000_000_000;
+const MAX_PHYSICAL_TICKS_PER_ROUTE: usize = 512;
+const RECENT_EXACT_TICKS_PER_ROUTE: usize = 256;
+const COMPACTED_PREFIX_TICKS_PER_ROUTE: usize =
+    MAX_PHYSICAL_TICKS_PER_ROUTE - RECENT_EXACT_TICKS_PER_ROUTE;
 
 /// Fingerprint da política de representação do cache usada em `FeaturesT0`.
 ///
 /// Qualquer alteração aqui deve fragmentar `runtime_config_hash`, porque as
 /// features PIT derivadas do cache podem mudar mesmo com labels idênticos.
 pub const HOT_CACHE_POLICY_VERSION: &str =
-    "weighted_ring_v1:max_sampled_per_route=4096:protected_window_s=3600";
+    "weighted_ring_v3:max_physical_ticks_per_route=512:recent_exact_ticks=256:interval_weighted";
 
 #[inline]
 fn to_bucket(spread_pct: f32) -> u64 {
@@ -211,7 +216,8 @@ impl CacheConfig {
 /// após compactação. A decimação bruta continua separada em `CacheConfig`.
 #[derive(Debug, Clone, Copy)]
 struct SampleTick {
-    ts_ns: u64,
+    start_ts_ns: u64,
+    end_ts_ns: u64,
     entry_bucket: u32,
     exit_bucket: u32,
     weight: u32,
@@ -264,60 +270,116 @@ fn rebuild_histograms(storage: &mut PerRouteStorage) {
 }
 
 #[inline]
+fn merge_bucket(older_bucket: u32, older_weight: u32, newer_bucket: u32, newer_weight: u32) -> u32 {
+    let total = (older_weight as u64)
+        .saturating_add(newer_weight as u64)
+        .max(1);
+    let weighted = (older_bucket as u64)
+        .saturating_mul(older_weight as u64)
+        .saturating_add((newer_bucket as u64).saturating_mul(newer_weight as u64))
+        .saturating_add(total / 2)
+        / total;
+    weighted.clamp(1, BUCKET_MAX) as u32
+}
+
+#[inline]
 fn merge_ticks(older: SampleTick, newer: SampleTick) -> SampleTick {
+    let weight = older.weight.saturating_add(newer.weight).max(1);
     SampleTick {
-        ts_ns: newer.ts_ns,
-        entry_bucket: newer.entry_bucket,
-        exit_bucket: newer.exit_bucket,
-        weight: older.weight.saturating_add(newer.weight).max(1),
+        start_ts_ns: older.start_ts_ns.min(newer.start_ts_ns),
+        end_ts_ns: older.end_ts_ns.max(newer.end_ts_ns),
+        entry_bucket: merge_bucket(
+            older.entry_bucket,
+            older.weight,
+            newer.entry_bucket,
+            newer.weight,
+        ),
+        exit_bucket: merge_bucket(
+            older.exit_bucket,
+            older.weight,
+            newer.exit_bucket,
+            newer.weight,
+        ),
+        weight,
     }
 }
 
-fn compact_ring_if_needed(storage: &mut PerRouteStorage, now_ns: u64) -> bool {
-    let mut compacted = false;
-    while storage.ring.len() > MAX_SAMPLED_OBSERVATIONS_PER_ROUTE {
-        let protected_cutoff = now_ns.saturating_sub(COMPACTION_PROTECTED_WINDOW_NS);
-        let old_len = storage
-            .ring
-            .iter()
-            .position(|s| s.ts_ns >= protected_cutoff)
-            .unwrap_or(storage.ring.len());
-        let compact_len = if old_len >= 2 {
-            old_len
+#[inline]
+fn proportional_weight(sample: &SampleTick, cutoff_ns: u64) -> u64 {
+    if sample.end_ts_ns < cutoff_ns {
+        return 0;
+    }
+    let weight = sample.weight as u64;
+    if sample.start_ts_ns >= cutoff_ns || weight <= 1 {
+        return weight;
+    }
+    let total_span = sample
+        .end_ts_ns
+        .saturating_sub(sample.start_ts_ns)
+        .saturating_add(1)
+        .max(1);
+    let kept_span = sample
+        .end_ts_ns
+        .saturating_sub(cutoff_ns)
+        .saturating_add(1)
+        .min(total_span);
+    weight
+        .saturating_mul(kept_span)
+        .saturating_add(total_span - 1)
+        / total_span
+}
+
+#[inline]
+fn trim_front_sample_to_cutoff(storage: &mut PerRouteStorage, cutoff_ns: u64) -> bool {
+    let Some(front) = storage.ring.front_mut() else {
+        return false;
+    };
+    if front.start_ts_ns >= cutoff_ns || front.end_ts_ns < cutoff_ns {
+        return false;
+    }
+    let kept = proportional_weight(front, cutoff_ns)
+        .max(1)
+        .min(front.weight as u64) as u32;
+    let changed = kept != front.weight || front.start_ts_ns != cutoff_ns;
+    front.weight = kept;
+    front.start_ts_ns = cutoff_ns;
+    changed
+}
+
+fn compact_prefix_once(prefix: Vec<SampleTick>) -> Vec<SampleTick> {
+    let mut compacted = Vec::with_capacity((prefix.len() / 2).saturating_add(prefix.len() % 2));
+    let mut iter = prefix.into_iter();
+    while let Some(first) = iter.next() {
+        if let Some(second) = iter.next() {
+            compacted.push(merge_ticks(first, second));
         } else {
-            storage.ring.len()
-        };
-        if compact_len < 2 {
-            break;
+            compacted.push(first);
         }
-
-        let mut merged_prefix =
-            Vec::with_capacity((compact_len / 2).saturating_add(compact_len % 2));
-        let mut consumed = 0usize;
-        while consumed < compact_len {
-            let first = match storage.ring.pop_front() {
-                Some(sample) => sample,
-                None => break,
-            };
-            consumed += 1;
-            if consumed < compact_len {
-                if let Some(second) = storage.ring.pop_front() {
-                    consumed += 1;
-                    merged_prefix.push(merge_ticks(first, second));
-                } else {
-                    merged_prefix.push(first);
-                }
-            } else {
-                merged_prefix.push(first);
-            }
-        }
-
-        for sample in merged_prefix.into_iter().rev() {
-            storage.ring.push_front(sample);
-        }
-        compacted = true;
     }
     compacted
+}
+
+fn compact_ring_if_needed(storage: &mut PerRouteStorage) -> bool {
+    if storage.ring.len() <= MAX_PHYSICAL_TICKS_PER_ROUTE {
+        return false;
+    }
+
+    let recent_exact_len = RECENT_EXACT_TICKS_PER_ROUTE.min(storage.ring.len());
+    let prefix_len = storage.ring.len().saturating_sub(recent_exact_len);
+    if prefix_len < 2 {
+        return false;
+    }
+
+    let recent_tail = storage.ring.split_off(prefix_len);
+    let mut prefix = storage.ring.drain(..).collect::<Vec<_>>();
+    while prefix.len() > COMPACTED_PREFIX_TICKS_PER_ROUTE && prefix.len() >= 2 {
+        prefix = compact_prefix_once(prefix);
+    }
+
+    storage.ring = VecDeque::with_capacity(MAX_PHYSICAL_TICKS_PER_ROUTE);
+    storage.ring.extend(prefix);
+    storage.ring.extend(recent_tail);
+    true
 }
 
 struct PerRouteCache {
@@ -365,7 +427,8 @@ impl PerRouteCache {
         let retained_len = {
             let storage = self.storage_mut();
             storage.ring.push_back(SampleTick {
-                ts_ns,
+                start_ts_ns: ts_ns,
+                end_ts_ns: ts_ns,
                 entry_bucket: eb as u32,
                 exit_bucket: xb as u32,
                 weight: 1,
@@ -374,12 +437,15 @@ impl PerRouteCache {
             let cutoff = ts_ns.saturating_sub(cfg.window_ns);
             let mut expired = 0u64;
             while let Some(front) = storage.ring.front() {
-                if front.ts_ns < cutoff {
+                if front.end_ts_ns < cutoff {
                     storage.ring.pop_front();
                     expired += 1;
                 } else {
                     break;
                 }
+            }
+            if trim_front_sample_to_cutoff(storage, cutoff) {
+                rebuilt = true;
             }
 
             // `hdrhistogram` não decrementa. Se houve expiração, rebuild
@@ -391,7 +457,7 @@ impl PerRouteCache {
                 let _ = storage.exit_hist.record(xb);
             }
 
-            if compact_ring_if_needed(storage, ts_ns) {
+            if compact_ring_if_needed(storage) {
                 rebuilt = true;
             }
 
@@ -454,13 +520,10 @@ impl PerRouteCache {
         WEIGHTED_BUCKET_SCRATCH.with(|scratch| {
             let mut values = scratch.borrow_mut();
             values.clear();
-            values.extend(
-                storage
-                    .ring
-                    .iter()
-                    .filter(|s| s.ts_ns >= cutoff_ns)
-                    .map(|s| (s.entry_bucket, s.weight as u64)),
-            );
+            values.extend(storage.ring.iter().filter_map(|s| {
+                let weight = proportional_weight(s, cutoff_ns);
+                (weight > 0).then_some((s.entry_bucket, weight))
+            }));
             if values.is_empty() {
                 return None;
             }
@@ -503,8 +566,11 @@ impl PerRouteCache {
         let bucket = to_bucket(spread_pct) as u32;
         let mut total = 0u64;
         let mut below = 0u64;
-        for sample in storage.ring.iter().filter(|s| s.ts_ns >= cutoff_ns) {
-            let weight = sample.weight as u64;
+        for sample in storage.ring.iter() {
+            let weight = proportional_weight(sample, cutoff_ns);
+            if weight == 0 {
+                continue;
+            }
             total = total.saturating_add(weight);
             if sample.entry_bucket <= bucket {
                 below = below.saturating_add(weight);
@@ -577,8 +643,11 @@ impl PerRouteCache {
         let low = to_bucket(threshold) as u32;
         let mut total = 0u64;
         let mut successes = 0u64;
-        for sample in storage.ring.iter().filter(|s| s.ts_ns >= cutoff_ns) {
-            let weight = sample.weight as u64;
+        for sample in storage.ring.iter() {
+            let weight = proportional_weight(sample, cutoff_ns);
+            if weight == 0 {
+                continue;
+            }
             total = total.saturating_add(weight);
             if sample.exit_bucket >= low {
                 successes = successes.saturating_add(weight);
@@ -605,13 +674,13 @@ impl PerRouteCache {
             let mut last_ts: Option<u64> = None;
 
             for s in &storage.ring {
-                last_ts = Some(s.ts_ns);
+                last_ts = Some(s.end_ts_ns);
                 if s.exit_bucket >= threshold_bucket {
                     if active_start.is_none() {
-                        active_start = Some(s.ts_ns);
+                        active_start = Some(s.start_ts_ns);
                     }
                 } else if let Some(start) = active_start.take() {
-                    runs.push((s.ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000);
+                    runs.push((s.start_ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000);
                 }
             }
 
@@ -634,7 +703,7 @@ impl PerRouteCache {
     fn oldest_observation_ns(&self) -> u64 {
         self.storage
             .as_ref()
-            .and_then(|storage| storage.ring.front().map(|s| s.ts_ns))
+            .and_then(|storage| storage.ring.front().map(|s| s.start_ts_ns))
             .unwrap_or(0)
     }
 
@@ -645,15 +714,16 @@ impl PerRouteCache {
 
         if let Some(storage) = self.storage.as_mut() {
             while let Some(front) = storage.ring.front() {
-                if front.ts_ns < cutoff {
+                if front.end_ts_ns < cutoff {
                     storage.ring.pop_front();
                     expired = expired.saturating_add(1);
                 } else {
                     break;
                 }
             }
+            let trimmed = trim_front_sample_to_cutoff(storage, cutoff);
 
-            if expired > 0 {
+            if expired > 0 || trimmed {
                 rebuild_histograms(storage);
                 self.last_rebuild_ns = now_ns;
                 self.n_observations = logical_sampled_observations(storage)
@@ -1191,7 +1261,7 @@ mod tests {
         };
         let cache = HotQueryCache::with_config(cfg);
         let route = mk_route(1);
-        let total = MAX_SAMPLED_OBSERVATIONS_PER_ROUTE + 2_048;
+        let total = MAX_PHYSICAL_TICKS_PER_ROUTE + 2_048;
 
         for i in 0..total {
             let entry = 0.5 + ((i % 100) as f32 / 100.0);
@@ -1199,7 +1269,7 @@ mod tests {
         }
 
         assert!(
-            cache.sampled_observations(route) <= MAX_SAMPLED_OBSERVATIONS_PER_ROUTE as u64,
+            cache.sampled_observations(route) <= MAX_PHYSICAL_TICKS_PER_ROUTE as u64,
             "ring físico deve ficar limitado por rota"
         );
         assert_eq!(
@@ -1215,7 +1285,35 @@ mod tests {
     }
 
     #[test]
-    fn compaction_preserves_recent_one_hour_features_exactly() {
+    fn weighted_compaction_bounds_aggregate_stats_across_many_routes() {
+        let cfg = CacheConfig {
+            decimation: 1,
+            window_ns: u64::MAX,
+            rebuild_interval_ns: u64::MAX,
+            ring_initial_capacity: 64,
+        };
+        let cache = HotQueryCache::with_config(cfg);
+        let n_routes = 64u32;
+        let samples_per_route = MAX_PHYSICAL_TICKS_PER_ROUTE + 1_024;
+
+        for route_id in 0..n_routes {
+            let route = mk_route(route_id);
+            for i in 0..samples_per_route {
+                cache.observe(route, 0.5 + (i % 10) as f32, -1.0, i as u64);
+            }
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.routes_tracked, n_routes as usize);
+        assert!(
+            stats.retained_ticks <= n_routes as u64 * MAX_PHYSICAL_TICKS_PER_ROUTE as u64,
+            "cache físico agregado deve respeitar cap por rota; retained={}",
+            stats.retained_ticks
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_recent_tail_for_since_features() {
         let cfg = CacheConfig {
             decimation: 1,
             window_ns: u64::MAX,
@@ -1224,7 +1322,7 @@ mod tests {
         };
         let cache = HotQueryCache::with_config(cfg);
         let route = mk_route(1);
-        let old_total = MAX_SAMPLED_OBSERVATIONS_PER_ROUTE + 2_048;
+        let old_total = MAX_PHYSICAL_TICKS_PER_ROUTE + 2_048;
 
         for i in 0..old_total {
             cache.observe(route, 0.1, -1.0, i as u64 * 1_000_000_000);
@@ -1244,8 +1342,23 @@ mod tests {
             .expect("subjanela recente deve permanecer materializada");
         assert!(
             p50 >= 2.3,
-            "features 1h recentes não devem ser diluídas por samples antigos compactados; p50={p50}"
+            "features since-cutoff recentes não devem ser diluídas por prefixo compactado; p50={p50}"
         );
+    }
+
+    #[test]
+    fn proportional_weight_counts_only_overlap_after_cutoff() {
+        let sample = SampleTick {
+            start_ts_ns: 0,
+            end_ts_ns: 100,
+            entry_bucket: to_bucket(1.0) as u32,
+            exit_bucket: to_bucket(-1.0) as u32,
+            weight: 101,
+        };
+
+        assert_eq!(proportional_weight(&sample, 0), 101);
+        assert_eq!(proportional_weight(&sample, 50), 51);
+        assert_eq!(proportional_weight(&sample, 101), 0);
     }
 
     #[test]

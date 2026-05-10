@@ -490,16 +490,25 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let (s24h, s1h, s7d) = server_clone.cache_sweep_expired(now_ns());
+                let now = now_ns();
+                let state = server_clone.state_sweep(now);
+                let (s24h, s1h, s7d) = server_clone.cache_sweep_expired(now);
                 if s24h.routes_removed
                     + s1h.routes_removed
                     + s7d.routes_removed
                     + s24h.routes_rebuilt
                     + s1h.routes_rebuilt
                     + s7d.routes_rebuilt
+                    + state.listing_newly_delisted
+                    + state.cooldown_entries_removed
+                    + state.alive_entries_removed
                     > 0
                 {
                     tracing::debug!(
+                        listing_active_routes = state.listing_active_routes,
+                        listing_newly_delisted = state.listing_newly_delisted,
+                        cooldown_entries_removed = state.cooldown_entries_removed,
+                        alive_entries_removed = state.alive_entries_removed,
                         removed_24h = s24h.routes_removed,
                         removed_1h = s1h.routes_removed,
                         removed_7d = s7d.routes_removed,

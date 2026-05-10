@@ -54,6 +54,13 @@ pub struct MlPrometheusMetrics {
     cache_routes_tracked_by_window: IntGaugeVec,
     cache_materialized_routes_by_window: IntGaugeVec,
     cache_retained_ticks_by_window: IntGaugeVec,
+    state_listing_routes_total: IntGauge,
+    state_listing_active_routes: IntGauge,
+    state_listing_delisted_routes: IntGauge,
+    state_cooldown_entries: IntGauge,
+    state_alive_entries: IntGauge,
+    state_economic_pending_routes: IntGauge,
+    state_economic_pending_trades: IntGauge,
 
     // Wave T extensions — raw samples, broadcaster, economic.
     raw_samples_emitted_total: IntCounter,
@@ -88,6 +95,7 @@ pub struct MlPrometheusMetrics {
     labels_dropped_capacity_total: IntCounter,
     shutdown_lost_pending_total: IntCounter,
     pending_candidates_current: IntGauge,
+    pending_routes_current: IntGauge,
     pending_horizons_current: IntGauge,
     meta_spool_bytes_current: IntGauge,
     meta_spool_records_total: IntCounter,
@@ -102,6 +110,8 @@ pub struct MlPrometheusMetrics {
     resolver_on_observation_ops_total: IntCounter,
     resolver_sweep_ns_total: IntCounter,
     resolver_sweep_ops_total: IntCounter,
+    resolver_stride_index_entries_current: IntGauge,
+    resolver_stride_index_pruned_total: IntCounter,
     resolver_shutdown_flush_ns_total: IntCounter,
     resolver_shutdown_flush_ops_total: IntCounter,
 
@@ -135,6 +145,7 @@ struct ResolverSnapshot {
     resolver_on_observation_ops: u64,
     resolver_sweep_ns: u64,
     resolver_sweep_ops: u64,
+    resolver_stride_index_pruned: u64,
     resolver_shutdown_flush_ns: u64,
     resolver_shutdown_flush_ops: u64,
 }
@@ -232,6 +243,34 @@ impl MlPrometheusMetrics {
             ),
             &["window"],
         )?;
+        let state_listing_routes_total = IntGauge::with_opts(Opts::new(
+            "ml_state_listing_routes_total",
+            "Rotas conhecidas no ListingHistory em RAM",
+        ))?;
+        let state_listing_active_routes = IntGauge::with_opts(Opts::new(
+            "ml_state_listing_active_routes",
+            "Rotas ativas no ListingHistory em RAM",
+        ))?;
+        let state_listing_delisted_routes = IntGauge::with_opts(Opts::new(
+            "ml_state_listing_delisted_routes",
+            "Rotas marcadas como delisted no ListingHistory em RAM",
+        ))?;
+        let state_cooldown_entries = IntGauge::with_opts(Opts::new(
+            "ml_state_cooldown_entries",
+            "Entradas vivas no mapa auxiliar de cooldown por rota",
+        ))?;
+        let state_alive_entries = IntGauge::with_opts(Opts::new(
+            "ml_state_alive_entries",
+            "Entradas vivas no mapa auxiliar de time_alive por rota",
+        ))?;
+        let state_economic_pending_routes = IntGauge::with_opts(Opts::new(
+            "ml_state_economic_pending_routes",
+            "Rotas com trades economicos pendentes em RAM",
+        ))?;
+        let state_economic_pending_trades = IntGauge::with_opts(Opts::new(
+            "ml_state_economic_pending_trades",
+            "Trades economicos pendentes em RAM",
+        ))?;
 
         // Wave T — raw samples (ADR-025).
         let raw_samples_emitted_total = IntCounter::with_opts(Opts::new(
@@ -352,6 +391,10 @@ impl MlPrometheusMetrics {
             "ml_pending_candidates_current",
             "Pending labels vivos no LabelResolver",
         ))?;
+        let pending_routes_current = IntGauge::with_opts(Opts::new(
+            "ml_pending_routes_current",
+            "Rotas com pending labels vivos no LabelResolver",
+        ))?;
         let pending_horizons_current = IntGauge::with_opts(Opts::new(
             "ml_pending_horizons_current",
             "Horizontes ainda abertos no LabelResolver",
@@ -408,6 +451,14 @@ impl MlPrometheusMetrics {
             "ml_label_resolver_sweep_ops_total",
             "Chamadas a LabelResolver::sweep",
         ))?;
+        let resolver_stride_index_entries_current = IntGauge::with_opts(Opts::new(
+            "ml_label_stride_index_entries_current",
+            "Entradas vivas no indice de stride de labels por (rota,horizonte)",
+        ))?;
+        let resolver_stride_index_pruned_total = IntCounter::with_opts(Opts::new(
+            "ml_label_stride_index_pruned_total",
+            "Entradas do indice de stride removidas apos expirarem semanticamente",
+        ))?;
         let resolver_shutdown_flush_ns_total = IntCounter::with_opts(Opts::new(
             "ml_label_resolver_shutdown_flush_ns_total",
             "Nanosegundos acumulados em LabelResolver::shutdown_flush",
@@ -424,6 +475,13 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(cache_routes_tracked_by_window.clone()))?;
         registry.register(Box::new(cache_materialized_routes_by_window.clone()))?;
         registry.register(Box::new(cache_retained_ticks_by_window.clone()))?;
+        registry.register(Box::new(state_listing_routes_total.clone()))?;
+        registry.register(Box::new(state_listing_active_routes.clone()))?;
+        registry.register(Box::new(state_listing_delisted_routes.clone()))?;
+        registry.register(Box::new(state_cooldown_entries.clone()))?;
+        registry.register(Box::new(state_alive_entries.clone()))?;
+        registry.register(Box::new(state_economic_pending_routes.clone()))?;
+        registry.register(Box::new(state_economic_pending_trades.clone()))?;
         registry.register(Box::new(raw_samples_emitted_total.clone()))?;
         registry.register(Box::new(raw_samples_emitted_by_tier_total.clone()))?;
         registry.register(Box::new(raw_samples_dropped_total.clone()))?;
@@ -448,6 +506,7 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(labels_dropped_capacity_total.clone()))?;
         registry.register(Box::new(shutdown_lost_pending_total.clone()))?;
         registry.register(Box::new(pending_candidates_current.clone()))?;
+        registry.register(Box::new(pending_routes_current.clone()))?;
         registry.register(Box::new(pending_horizons_current.clone()))?;
         registry.register(Box::new(meta_spool_bytes_current.clone()))?;
         registry.register(Box::new(meta_spool_records_total.clone()))?;
@@ -462,6 +521,8 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(resolver_on_observation_ops_total.clone()))?;
         registry.register(Box::new(resolver_sweep_ns_total.clone()))?;
         registry.register(Box::new(resolver_sweep_ops_total.clone()))?;
+        registry.register(Box::new(resolver_stride_index_entries_current.clone()))?;
+        registry.register(Box::new(resolver_stride_index_pruned_total.clone()))?;
         registry.register(Box::new(resolver_shutdown_flush_ns_total.clone()))?;
         registry.register(Box::new(resolver_shutdown_flush_ops_total.clone()))?;
 
@@ -540,6 +601,13 @@ impl MlPrometheusMetrics {
             cache_routes_tracked_by_window,
             cache_materialized_routes_by_window,
             cache_retained_ticks_by_window,
+            state_listing_routes_total,
+            state_listing_active_routes,
+            state_listing_delisted_routes,
+            state_cooldown_entries,
+            state_alive_entries,
+            state_economic_pending_routes,
+            state_economic_pending_trades,
             raw_samples_emitted_total,
             raw_samples_emitted_by_tier_total,
             raw_samples_dropped_total,
@@ -562,6 +630,7 @@ impl MlPrometheusMetrics {
             labels_dropped_capacity_total,
             shutdown_lost_pending_total,
             pending_candidates_current,
+            pending_routes_current,
             pending_horizons_current,
             meta_spool_bytes_current,
             meta_spool_records_total,
@@ -576,6 +645,8 @@ impl MlPrometheusMetrics {
             resolver_on_observation_ops_total,
             resolver_sweep_ns_total,
             resolver_sweep_ops_total,
+            resolver_stride_index_entries_current,
+            resolver_stride_index_pruned_total,
             resolver_shutdown_flush_ns_total,
             resolver_shutdown_flush_ops_total,
             last_seen: ServerMetricsSnapshot::default(),
@@ -649,6 +720,7 @@ impl MlPrometheusMetrics {
         self.set_cache_window("24h", server.cache_stats_24h());
         self.set_cache_window("1h", server.cache_stats_1h());
         self.set_cache_window("7d", server.cache_stats_7d());
+        self.set_state_stats(server.state_stats());
 
         // Raw samples do ServerMetrics.
         self.raw_samples_emitted_total
@@ -721,6 +793,22 @@ impl MlPrometheusMetrics {
             .set(stats.retained_ticks.min(i64::MAX as u64) as i64);
     }
 
+    fn set_state_stats(&self, stats: crate::ml::serving::MlStateStats) {
+        self.state_listing_routes_total
+            .set(stats.listing_routes_total as i64);
+        self.state_listing_active_routes
+            .set(stats.listing_active_routes as i64);
+        self.state_listing_delisted_routes
+            .set(stats.listing_delisted_routes as i64);
+        self.state_cooldown_entries
+            .set(stats.cooldown_entries as i64);
+        self.state_alive_entries.set(stats.alive_entries as i64);
+        self.state_economic_pending_routes
+            .set(stats.economic_pending_routes as i64);
+        self.state_economic_pending_trades
+            .set(stats.economic_pending_trades as i64);
+    }
+
     /// (removed) atualiza métricas do `LabelResolver`.
     pub fn update_from_resolver(&mut self, rm: &ResolverMetrics) {
         let pending = rm.pending_created_total.load(Ordering::Relaxed);
@@ -738,6 +826,7 @@ impl MlPrometheusMetrics {
             .load(Ordering::Relaxed);
         let shutdown = rm.shutdown_lost_pending_total.load(Ordering::Relaxed);
         let pending_candidates = rm.pending_candidates_current.load(Ordering::Relaxed);
+        let pending_routes = rm.pending_routes_current.load(Ordering::Relaxed);
         let pending_horizons = rm.pending_horizons_current.load(Ordering::Relaxed);
         let spool_bytes = rm.meta_spool_bytes_current.load(Ordering::Relaxed);
         let spool_records = rm.meta_spool_records_total.load(Ordering::Relaxed);
@@ -752,6 +841,8 @@ impl MlPrometheusMetrics {
         let resolver_on_observation_ops = rm.on_observation_ops_total.load(Ordering::Relaxed);
         let resolver_sweep_ns = rm.sweep_ns_total.load(Ordering::Relaxed);
         let resolver_sweep_ops = rm.sweep_ops_total.load(Ordering::Relaxed);
+        let resolver_stride_index_entries = rm.stride_index_entries_current.load(Ordering::Relaxed);
+        let resolver_stride_index_pruned = rm.stride_index_pruned_total.load(Ordering::Relaxed);
         let resolver_shutdown_flush_ns = rm.shutdown_flush_ns_total.load(Ordering::Relaxed);
         let resolver_shutdown_flush_ops = rm.shutdown_flush_ops_total.load(Ordering::Relaxed);
 
@@ -780,6 +871,8 @@ impl MlPrometheusMetrics {
             .inc_by(shutdown.saturating_sub(self.last_resolver.shutdown_lost));
         self.pending_candidates_current
             .set(pending_candidates.min(i64::MAX as u64) as i64);
+        self.pending_routes_current
+            .set(pending_routes.min(i64::MAX as u64) as i64);
         self.pending_horizons_current
             .set(pending_horizons.min(i64::MAX as u64) as i64);
         self.meta_spool_bytes_current
@@ -814,6 +907,12 @@ impl MlPrometheusMetrics {
             .inc_by(resolver_sweep_ns.saturating_sub(self.last_resolver.resolver_sweep_ns));
         self.resolver_sweep_ops_total
             .inc_by(resolver_sweep_ops.saturating_sub(self.last_resolver.resolver_sweep_ops));
+        self.resolver_stride_index_entries_current
+            .set(resolver_stride_index_entries.min(i64::MAX as u64) as i64);
+        self.resolver_stride_index_pruned_total.inc_by(
+            resolver_stride_index_pruned
+                .saturating_sub(self.last_resolver.resolver_stride_index_pruned),
+        );
         self.resolver_shutdown_flush_ns_total.inc_by(
             resolver_shutdown_flush_ns
                 .saturating_sub(self.last_resolver.resolver_shutdown_flush_ns),
@@ -845,6 +944,7 @@ impl MlPrometheusMetrics {
             resolver_on_observation_ops,
             resolver_sweep_ns,
             resolver_sweep_ops,
+            resolver_stride_index_pruned,
             resolver_shutdown_flush_ns,
             resolver_shutdown_flush_ops,
         };
@@ -1017,6 +1117,10 @@ mod tests {
         assert!(names.contains(&"ml_cache_routes_tracked_by_window".to_string()));
         assert!(names.contains(&"ml_cache_materialized_routes_by_window".to_string()));
         assert!(names.contains(&"ml_cache_retained_ticks_by_window".to_string()));
+        assert!(names.contains(&"ml_state_listing_routes_total".to_string()));
+        assert!(names.contains(&"ml_state_cooldown_entries".to_string()));
+        assert!(names.contains(&"ml_state_alive_entries".to_string()));
+        assert!(names.contains(&"ml_state_economic_pending_trades".to_string()));
         assert!(names.contains(&"ml_raw_samples_emitted_by_tier_total".to_string()));
         let rec_family = families
             .iter()
@@ -1030,6 +1134,7 @@ mod tests {
         // F2-R4
         assert!(names.contains(&"ml_premature_recommendation_rate".to_string()));
         assert!(names.contains(&"ml_pending_candidates_current".to_string()));
+        assert!(names.contains(&"ml_pending_routes_current".to_string()));
         assert!(names.contains(&"ml_pending_horizons_current".to_string()));
         assert!(names.contains(&"ml_label_meta_spool_bytes_current".to_string()));
         assert!(names.contains(&"ml_label_meta_spool_records_total".to_string()));
@@ -1039,6 +1144,8 @@ mod tests {
         assert!(names.contains(&"ml_label_resolver_on_candidate_ns_total".to_string()));
         assert!(names.contains(&"ml_label_resolver_on_observation_ns_total".to_string()));
         assert!(names.contains(&"ml_label_resolver_sweep_ns_total".to_string()));
+        assert!(names.contains(&"ml_label_stride_index_entries_current".to_string()));
+        assert!(names.contains(&"ml_label_stride_index_pruned_total".to_string()));
         assert!(names.contains(&"ml_label_resolver_shutdown_flush_ns_total".to_string()));
     }
 

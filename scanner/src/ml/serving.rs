@@ -43,7 +43,9 @@ use crate::ml::eval::{verify_tradesetup, InvariantError};
 use crate::ml::feature_store::{
     CacheConfig, HotCacheStats, HotCacheSweepStats, HotQueryCache, HOT_CACHE_POLICY_VERSION,
 };
-use crate::ml::listing_history::{ListingHistory, RouteLifecycle};
+use crate::ml::listing_history::{
+    ListingHistory, RouteLifecycle, DEFAULT_DELISTING_DETECTION_WINDOW_NS,
+};
 use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
 use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::persistence::{
@@ -493,6 +495,25 @@ pub struct ServerMetrics {
     pub accepted_samples_dropped_channel_closed: AtomicU64,
 }
 
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlStateSweepStats {
+    pub listing_active_routes: usize,
+    pub listing_newly_delisted: usize,
+    pub cooldown_entries_removed: usize,
+    pub alive_entries_removed: usize,
+}
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlStateStats {
+    pub listing_routes_total: usize,
+    pub listing_active_routes: usize,
+    pub listing_delisted_routes: usize,
+    pub cooldown_entries: usize,
+    pub alive_entries: usize,
+    pub economic_pending_routes: usize,
+    pub economic_pending_trades: usize,
+}
+
 #[derive(Debug, Clone)]
 struct PendingEconomicTrade {
     setup: TradeSetup,
@@ -588,6 +609,16 @@ impl EconomicTracker {
 
     fn metrics(&self) -> Arc<EconomicMetrics> {
         self.accumulator.metrics()
+    }
+
+    fn pending_stats(&self) -> (usize, usize) {
+        let pending_routes = self.pending_by_route.len();
+        let pending_trades = self
+            .pending_by_route
+            .values()
+            .map(VecDeque::len)
+            .sum::<usize>();
+        (pending_routes, pending_trades)
     }
 
     fn process(
@@ -903,6 +934,73 @@ impl MlServer {
         self.economic.lock().sweep(now_ns)
     }
 
+    pub fn state_stats(&self) -> MlStateStats {
+        let (economic_pending_routes, economic_pending_trades) =
+            self.economic.lock().pending_stats();
+        MlStateStats {
+            listing_routes_total: self.listing.total_routes(),
+            listing_active_routes: self.listing.active_routes(),
+            listing_delisted_routes: self.listing.delisted_routes(),
+            cooldown_entries: self.last_trade_emit_by_route.lock().len(),
+            alive_entries: self.alive_since_by_route.lock().len(),
+            economic_pending_routes,
+            economic_pending_trades,
+        }
+    }
+
+    /// Varre estados auxiliares que não são fonte de verdade supervisionada.
+    ///
+    /// Não remove raw/accepted/labeled, não fecha labels e não altera floors
+    /// ou horizontes. Remove apenas entradas cujo efeito operacional ja
+    /// expirou: cooldown vencido e rotas "alive" que sumiram por mais que a
+    /// janela conservadora de delisting.
+    pub fn state_sweep(&self, now_ns: u64) -> MlStateSweepStats {
+        let (listing_active_routes, listing_newly_delisted) = self.listing.sweep_inactive(now_ns);
+        let cooldown_entries_removed = self.sweep_cooldown_index(now_ns);
+        let alive_entries_removed = self.sweep_alive_index(now_ns);
+        MlStateSweepStats {
+            listing_active_routes,
+            listing_newly_delisted,
+            cooldown_entries_removed,
+            alive_entries_removed,
+        }
+    }
+
+    fn sweep_cooldown_index(&self, now_ns: u64) -> usize {
+        let mut last_by_route = self.last_trade_emit_by_route.lock();
+        let before = last_by_route.len();
+        if self.recommendation_cooldown_ns == 0 {
+            last_by_route.clear();
+        } else {
+            let cooldown_ns = self.recommendation_cooldown_ns;
+            last_by_route
+                .retain(|_, last_emit_ns| now_ns < last_emit_ns.saturating_add(cooldown_ns));
+        }
+        let removed = before.saturating_sub(last_by_route.len());
+        if removed > 0 {
+            last_by_route.shrink_to_fit();
+        }
+        removed
+    }
+
+    fn sweep_alive_index(&self, now_ns: u64) -> usize {
+        let mut alive = self.alive_since_by_route.lock();
+        let before = alive.len();
+        alive.retain(|route, _| {
+            self.listing
+                .last_seen(*route)
+                .map(|last_seen_ns| {
+                    now_ns.saturating_sub(last_seen_ns) <= DEFAULT_DELISTING_DETECTION_WINDOW_NS
+                })
+                .unwrap_or(false)
+        });
+        let removed = before.saturating_sub(alive.len());
+        if removed > 0 {
+            alive.shrink_to_fit();
+        }
+        removed
+    }
+
     fn apply_trade_cooldown(
         &self,
         route: RouteId,
@@ -914,7 +1012,6 @@ impl MlServer {
             return rec;
         };
         if self.recommendation_cooldown_ns == 0 {
-            self.last_trade_emit_by_route.lock().insert(route, now_ns);
             return Recommendation::Trade(setup);
         }
         let mut last_by_route = self.last_trade_emit_by_route.lock();
@@ -2132,6 +2229,26 @@ mod tests {
             server.feature_cache_7d.config().decimation,
             base_decimation * FEATURE_WINDOW_7D_DECIMATION_MULTIPLIER
         );
+    }
+
+    #[test]
+    fn state_sweep_removes_only_expired_auxiliary_entries() {
+        let server = mk_server()
+            .with_recommendation_cooldown_s(60)
+            .with_opportunity_alive_threshold_pct(1.0);
+        let route = mk_route();
+        let t0 = 1_000_000_000u64;
+        server.listing.record_seen(route, t0);
+        server.last_trade_emit_by_route.lock().insert(route, t0);
+        server.alive_since_by_route.lock().insert(route, t0);
+
+        let stats = server.state_sweep(t0 + 3_700_000_000_000);
+
+        assert_eq!(stats.cooldown_entries_removed, 1);
+        assert_eq!(stats.alive_entries_removed, 1);
+        assert_eq!(stats.listing_newly_delisted, 1);
+        assert!(server.last_trade_emit_by_route.lock().is_empty());
+        assert!(server.alive_since_by_route.lock().is_empty());
     }
 
     #[test]
