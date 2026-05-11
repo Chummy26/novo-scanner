@@ -32,9 +32,10 @@ use crate::ml::feature_store::HotQueryCache;
 use crate::ml::metrics::MlPrometheusMetrics;
 use crate::ml::persistence::{
     compact_existing_jsonl_in_tree, write_run_audit, DatasetKind, JsonlWriter, LabelResolver,
-    LabelShutdownAudit, LabeledJsonlWriter, LabeledWriterConfig, ParquetCompactionConfig,
-    RawSampleWriter, RawWriterConfig, ResolverConfig, RouteDecimator, RouteRanking, RunAuditInput,
-    RunAuditVerdict, WriterAudit, WriterConfig, WriterHandle, WriterSendError,
+    LabelResolverAsyncHandle, LabelShutdownAudit, LabeledJsonlWriter, LabeledWriterConfig,
+    ParquetCompactionConfig, RawSampleWriter, RawWriterConfig, ResolverConfig, RouteDecimator,
+    RouteRanking, RunAuditInput, RunAuditVerdict, WriterAudit, WriterConfig, WriterHandle,
+    WriterSendError,
 };
 use crate::ml::retention::{
     sweep_datasets, DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy,
@@ -336,6 +337,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         labeled_handle,
         Some(labeled_writer_abs.join("_pending_spool")),
     ));
+    let label_observer = LabelResolverAsyncHandle::spawn(
+        Arc::clone(&label_resolver),
+        cfg.ml.label_observation_channel_capacity,
+    );
 
     // Ranker rolling — 24h de buckets × 15 min.
     let ranker = Arc::new(RouteRanking::new(
@@ -355,6 +360,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .with_raw_writer(ml_raw_writer_handle)
             .with_route_ranking(Arc::clone(&ranker))
             .with_label_resolver(Arc::clone(&label_resolver))
+            .with_label_observer(label_observer.clone())
             .with_label_config(
                 cfg.ml.label_stride_s,
                 cfg.ml.label_floor_pct,
@@ -443,16 +449,21 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     // Task sweeper do label resolver.
     let label_sweeper_task = {
-        let resolver_clone = Arc::clone(&label_resolver);
+        let observer = label_observer.clone();
         let sweeper_interval = Duration::from_secs(cfg.ml.label_sweeper_interval_s.max(1));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(sweeper_interval);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let n = resolver_clone.sweep(now_ns());
-                if n > 0 {
-                    tracing::debug!(n_closed = n, "label_resolver sweep");
+                match observer.sweep(now_ns()).await {
+                    Ok(n) if n > 0 => {
+                        tracing::debug!(n_closed = n, "label_resolver sweep");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::error!(error = ?e, "label_resolver async sweep failed");
+                    }
                 }
             }
         })
@@ -735,6 +746,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         }
 
+        if let Err(e) = label_observer.flush().await {
+            warn!(
+                error = ?e,
+                "shutdown: falha ao drenar fila assíncrona do label resolver"
+            );
+        }
         let label_stats = label_resolver_shutdown.shutdown_flush(now_ns()).await;
         info!(
             reason,

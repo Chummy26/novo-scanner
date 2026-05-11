@@ -31,6 +31,7 @@ use ahash::AHashMap;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::ml::contract::RouteId;
 use crate::ml::persistence::labeled_trade::{
@@ -940,6 +941,193 @@ pub struct ResolverMetrics {
     pub stride_index_pruned_total: AtomicU64,
     pub shutdown_flush_ns_total: AtomicU64,
     pub shutdown_flush_ops_total: AtomicU64,
+    pub async_queue_depth_current: AtomicU64,
+    pub async_queue_full_total: AtomicU64,
+    pub async_queue_closed_total: AtomicU64,
+    pub async_observation_enqueued_total: AtomicU64,
+    pub async_observation_processed_total: AtomicU64,
+    pub async_sweep_enqueued_total: AtomicU64,
+    pub async_sweep_processed_total: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelResolverAsyncError {
+    QueueFull,
+    QueueClosed,
+}
+
+#[derive(Debug)]
+enum LabelResolverAsyncCommand {
+    CleanObservation {
+        route_id: RouteId,
+        now_ns: u64,
+        entry_spread: f32,
+        exit_spread: f32,
+    },
+    Sweep {
+        now_ns: u64,
+        reply: oneshot::Sender<u64>,
+    },
+    Flush {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+#[derive(Clone)]
+pub struct LabelResolverAsyncHandle {
+    tx: mpsc::Sender<LabelResolverAsyncCommand>,
+    metrics: Arc<ResolverMetrics>,
+}
+
+impl LabelResolverAsyncHandle {
+    pub fn spawn(resolver: Arc<LabelResolver>, capacity: usize) -> Self {
+        let (tx, mut rx) = mpsc::channel(capacity.max(1));
+        let metrics = resolver.metrics();
+        let worker_metrics = Arc::clone(&metrics);
+        tokio::spawn(async move {
+            while let Some(cmd) = rx.recv().await {
+                worker_metrics
+                    .async_queue_depth_current
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
+                match cmd {
+                    LabelResolverAsyncCommand::CleanObservation {
+                        route_id,
+                        now_ns,
+                        entry_spread,
+                        exit_spread,
+                    } => {
+                        resolver.on_clean_observation(route_id, now_ns, entry_spread, exit_spread);
+                        worker_metrics
+                            .async_observation_processed_total
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    LabelResolverAsyncCommand::Sweep { now_ns, reply } => {
+                        let n = resolver.sweep(now_ns);
+                        worker_metrics
+                            .async_sweep_processed_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        let _ = reply.send(n);
+                    }
+                    LabelResolverAsyncCommand::Flush { reply } => {
+                        let _ = reply.send(());
+                    }
+                }
+            }
+        });
+        Self { tx, metrics }
+    }
+
+    pub fn try_observe_clean(
+        &self,
+        route_id: RouteId,
+        now_ns: u64,
+        entry_spread: f32,
+        exit_spread: f32,
+    ) -> Result<(), LabelResolverAsyncError> {
+        let cmd = LabelResolverAsyncCommand::CleanObservation {
+            route_id,
+            now_ns,
+            entry_spread,
+            exit_spread,
+        };
+        self.metrics
+            .async_queue_depth_current
+            .fetch_add(1, Ordering::Relaxed);
+        match self.tx.try_send(cmd) {
+            Ok(()) => {
+                self.metrics
+                    .async_observation_enqueued_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics
+                    .async_queue_depth_current
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
+                self.metrics
+                    .async_queue_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(LabelResolverAsyncError::QueueFull)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics
+                    .async_queue_depth_current
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
+                self.metrics
+                    .async_queue_closed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(LabelResolverAsyncError::QueueClosed)
+            }
+        }
+    }
+
+    pub async fn sweep(&self, now_ns: u64) -> Result<u64, LabelResolverAsyncError> {
+        let (reply, rx) = oneshot::channel();
+        self.metrics
+            .async_queue_depth_current
+            .fetch_add(1, Ordering::Relaxed);
+        self.tx
+            .send(LabelResolverAsyncCommand::Sweep { now_ns, reply })
+            .await
+            .map_err(|_| {
+                self.metrics
+                    .async_queue_depth_current
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
+                self.metrics
+                    .async_queue_closed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                LabelResolverAsyncError::QueueClosed
+            })?;
+        self.metrics
+            .async_sweep_enqueued_total
+            .fetch_add(1, Ordering::Relaxed);
+        rx.await.map_err(|_| {
+            self.metrics
+                .async_queue_closed_total
+                .fetch_add(1, Ordering::Relaxed);
+            LabelResolverAsyncError::QueueClosed
+        })
+    }
+
+    pub async fn flush(&self) -> Result<(), LabelResolverAsyncError> {
+        let (reply, rx) = oneshot::channel();
+        self.metrics
+            .async_queue_depth_current
+            .fetch_add(1, Ordering::Relaxed);
+        self.tx
+            .send(LabelResolverAsyncCommand::Flush { reply })
+            .await
+            .map_err(|_| {
+                self.metrics
+                    .async_queue_depth_current
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
+                self.metrics
+                    .async_queue_closed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                LabelResolverAsyncError::QueueClosed
+            })?;
+        rx.await.map_err(|_| {
+            self.metrics
+                .async_queue_closed_total
+                .fetch_add(1, Ordering::Relaxed);
+            LabelResolverAsyncError::QueueClosed
+        })
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1364,6 +1552,12 @@ impl LabelResolver {
             };
             let mut route_closed_any = false;
             for pending in queue.iter_mut() {
+                // Observações podem ser entregues por worker assíncrono após
+                // a criação síncrona de um candidate do mesmo ciclo. O label
+                // é PIT: t0 não pode contar como futuro do próprio sample.
+                if pending.ts_emit_ns >= now_ns {
+                    continue;
+                }
                 // Snapshot dos escalares imutáveis para usar sem empréstimo
                 // conflitante durante o iter_mut sobre horizons.
                 let t_emit = pending.ts_emit_ns;
@@ -2170,6 +2364,50 @@ mod tests {
             v["policy_metadata"]["prediction_calibration_status"],
             "degraded"
         );
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn same_timestamp_observation_does_not_update_new_candidate() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![2],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver(cfg).await;
+        let t_emit = 1_000_000_000u64;
+
+        assert!(resolver.on_accepted(
+            "sid_no_same_tick_hit".into(),
+            t_emit,
+            7,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "priority",
+            1.0,
+            0,
+        ));
+        resolver.on_clean_observation(mk_route(), t_emit, 2.0, 99.0);
+        resolver.on_clean_observation(mk_route(), t_emit + 2_000_000_000, 2.0, -2.0);
+        sleep(Duration::from_millis(150)).await;
+
+        let v = first_labeled_json(&tmp);
+        assert_eq!(v["sample_id"], "sid_no_same_tick_hit");
+        assert_eq!(v["outcome"], "miss");
+        assert_eq!(
+            v["first_exit_ge_label_floor_ts_ns"],
+            serde_json::Value::Null
+        );
+        assert_eq!(v["n_clean_future_samples"], 1);
         drop(resolver);
         drop(tmp);
     }

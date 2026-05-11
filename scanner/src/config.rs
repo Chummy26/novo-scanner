@@ -98,6 +98,11 @@ pub struct MlConfig {
     #[serde(default = "default_label_sweeper_interval_s")]
     pub label_sweeper_interval_s: u64,
 
+    /// Capacidade da fila assíncrona de observações limpas do LabelResolver.
+    /// Fila cheia é violação strict-lossless e aborta o run; não há drop.
+    #[serde(default = "default_label_observation_channel_capacity")]
+    pub label_observation_channel_capacity: usize,
+
     /// Floor percentual bruto usado pelo baseline A3 + labels derivados.
     /// Default 0.8% — filtro sobre LUCRO BRUTO COTADO (fees/funding ficam
     /// fora, fronteira ML explícita).
@@ -144,6 +149,7 @@ impl Default for MlConfig {
             label_stride_s: default_label_stride_s(),
             label_horizons_s: default_label_horizons_s(),
             label_sweeper_interval_s: default_label_sweeper_interval_s(),
+            label_observation_channel_capacity: default_label_observation_channel_capacity(),
             label_floor_pct: default_label_floor_pct(),
             label_floors_pct: default_label_floors_pct(),
             recommendation_cooldown_s: default_recommendation_cooldown_s(),
@@ -302,6 +308,9 @@ fn default_label_horizons_s() -> Vec<u32> {
 }
 fn default_label_sweeper_interval_s() -> u64 {
     10
+}
+fn default_label_observation_channel_capacity() -> usize {
+    500_000
 }
 fn default_label_floor_pct() -> f32 {
     0.8
@@ -573,6 +582,7 @@ mod tests {
         assert!(cfg.ml.parquet.strict_lossless);
         assert_eq!(cfg.ml.windows.train_window_days, 90);
         assert_eq!(cfg.ml.label_background_decimation_mod, 10);
+        assert_eq!(cfg.ml.label_observation_channel_capacity, 500_000);
     }
 
     #[test]
@@ -612,6 +622,7 @@ kucoin       = true
 [ml]
 raw_decimation_mod = 7
 label_background_decimation_mod = 11
+label_observation_channel_capacity = 12345
 
 [ml.retention]
 enabled = true
@@ -635,6 +646,7 @@ archive_reference_days = 500
         let cfg: Config = toml::from_str(t).expect("parse");
         assert_eq!(cfg.ml.raw_decimation_mod, 7);
         assert_eq!(cfg.ml.label_background_decimation_mod, 11);
+        assert_eq!(cfg.ml.label_observation_channel_capacity, 12345);
         assert_eq!(cfg.ml.retention.raw_retention_days, 14);
         assert_eq!(cfg.ml.retention.accepted_retention_days, 21);
         assert_eq!(cfg.ml.retention.labeled_retention_days, 400);

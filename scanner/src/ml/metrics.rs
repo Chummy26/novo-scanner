@@ -114,6 +114,13 @@ pub struct MlPrometheusMetrics {
     resolver_stride_index_pruned_total: IntCounter,
     resolver_shutdown_flush_ns_total: IntCounter,
     resolver_shutdown_flush_ops_total: IntCounter,
+    resolver_async_queue_depth_current: IntGauge,
+    resolver_async_queue_full_total: IntCounter,
+    resolver_async_queue_closed_total: IntCounter,
+    resolver_async_observation_enqueued_total: IntCounter,
+    resolver_async_observation_processed_total: IntCounter,
+    resolver_async_sweep_enqueued_total: IntCounter,
+    resolver_async_sweep_processed_total: IntCounter,
 
     // Snapshots do último update (para computar delta → Counter.inc_by).
     last_seen: ServerMetricsSnapshot,
@@ -148,6 +155,12 @@ struct ResolverSnapshot {
     resolver_stride_index_pruned: u64,
     resolver_shutdown_flush_ns: u64,
     resolver_shutdown_flush_ops: u64,
+    resolver_async_queue_full: u64,
+    resolver_async_queue_closed: u64,
+    resolver_async_observation_enqueued: u64,
+    resolver_async_observation_processed: u64,
+    resolver_async_sweep_enqueued: u64,
+    resolver_async_sweep_processed: u64,
 }
 
 #[derive(Default)]
@@ -467,6 +480,34 @@ impl MlPrometheusMetrics {
             "ml_label_resolver_shutdown_flush_ops_total",
             "Chamadas a LabelResolver::shutdown_flush",
         ))?;
+        let resolver_async_queue_depth_current = IntGauge::with_opts(Opts::new(
+            "ml_label_resolver_async_queue_depth_current",
+            "Comandos pendentes na fila assíncrona do LabelResolver",
+        ))?;
+        let resolver_async_queue_full_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_async_queue_full_total",
+            "Falhas strict-lossless por fila assíncrona cheia",
+        ))?;
+        let resolver_async_queue_closed_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_async_queue_closed_total",
+            "Falhas strict-lossless por fila assíncrona fechada",
+        ))?;
+        let resolver_async_observation_enqueued_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_async_observation_enqueued_total",
+            "Observações limpas enfileiradas para LabelResolver assíncrono",
+        ))?;
+        let resolver_async_observation_processed_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_async_observation_processed_total",
+            "Observações limpas processadas pelo LabelResolver assíncrono",
+        ))?;
+        let resolver_async_sweep_enqueued_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_async_sweep_enqueued_total",
+            "Sweeps enfileirados para preservar ordem após observações",
+        ))?;
+        let resolver_async_sweep_processed_total = IntCounter::with_opts(Opts::new(
+            "ml_label_resolver_async_sweep_processed_total",
+            "Sweeps processados pelo LabelResolver assíncrono",
+        ))?;
 
         registry.register(Box::new(opportunities_seen_total.clone()))?;
         registry.register(Box::new(sample_decisions_total.clone()))?;
@@ -525,6 +566,13 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(resolver_stride_index_pruned_total.clone()))?;
         registry.register(Box::new(resolver_shutdown_flush_ns_total.clone()))?;
         registry.register(Box::new(resolver_shutdown_flush_ops_total.clone()))?;
+        registry.register(Box::new(resolver_async_queue_depth_current.clone()))?;
+        registry.register(Box::new(resolver_async_queue_full_total.clone()))?;
+        registry.register(Box::new(resolver_async_queue_closed_total.clone()))?;
+        registry.register(Box::new(resolver_async_observation_enqueued_total.clone()))?;
+        registry.register(Box::new(resolver_async_observation_processed_total.clone()))?;
+        registry.register(Box::new(resolver_async_sweep_enqueued_total.clone()))?;
+        registry.register(Box::new(resolver_async_sweep_processed_total.clone()))?;
 
         // Pre-touch todos os labels — garante que aparecem em `gather()`
         // desde o primeiro scrape Prometheus, mesmo sem incrementos ainda.
@@ -649,6 +697,13 @@ impl MlPrometheusMetrics {
             resolver_stride_index_pruned_total,
             resolver_shutdown_flush_ns_total,
             resolver_shutdown_flush_ops_total,
+            resolver_async_queue_depth_current,
+            resolver_async_queue_full_total,
+            resolver_async_queue_closed_total,
+            resolver_async_observation_enqueued_total,
+            resolver_async_observation_processed_total,
+            resolver_async_sweep_enqueued_total,
+            resolver_async_sweep_processed_total,
             last_seen: ServerMetricsSnapshot::default(),
             last_broadcaster: BroadcasterSnapshot::default(),
             last_economic: EconomicSnapshot::default(),
@@ -845,6 +900,15 @@ impl MlPrometheusMetrics {
         let resolver_stride_index_pruned = rm.stride_index_pruned_total.load(Ordering::Relaxed);
         let resolver_shutdown_flush_ns = rm.shutdown_flush_ns_total.load(Ordering::Relaxed);
         let resolver_shutdown_flush_ops = rm.shutdown_flush_ops_total.load(Ordering::Relaxed);
+        let resolver_async_queue_depth = rm.async_queue_depth_current.load(Ordering::Relaxed);
+        let resolver_async_queue_full = rm.async_queue_full_total.load(Ordering::Relaxed);
+        let resolver_async_queue_closed = rm.async_queue_closed_total.load(Ordering::Relaxed);
+        let resolver_async_observation_enqueued =
+            rm.async_observation_enqueued_total.load(Ordering::Relaxed);
+        let resolver_async_observation_processed =
+            rm.async_observation_processed_total.load(Ordering::Relaxed);
+        let resolver_async_sweep_enqueued = rm.async_sweep_enqueued_total.load(Ordering::Relaxed);
+        let resolver_async_sweep_processed = rm.async_sweep_processed_total.load(Ordering::Relaxed);
 
         self.labels_created_total
             .inc_by(pending.saturating_sub(self.last_resolver.pending_created));
@@ -921,6 +985,31 @@ impl MlPrometheusMetrics {
             resolver_shutdown_flush_ops
                 .saturating_sub(self.last_resolver.resolver_shutdown_flush_ops),
         );
+        self.resolver_async_queue_depth_current
+            .set(resolver_async_queue_depth.min(i64::MAX as u64) as i64);
+        self.resolver_async_queue_full_total.inc_by(
+            resolver_async_queue_full.saturating_sub(self.last_resolver.resolver_async_queue_full),
+        );
+        self.resolver_async_queue_closed_total.inc_by(
+            resolver_async_queue_closed
+                .saturating_sub(self.last_resolver.resolver_async_queue_closed),
+        );
+        self.resolver_async_observation_enqueued_total.inc_by(
+            resolver_async_observation_enqueued
+                .saturating_sub(self.last_resolver.resolver_async_observation_enqueued),
+        );
+        self.resolver_async_observation_processed_total.inc_by(
+            resolver_async_observation_processed
+                .saturating_sub(self.last_resolver.resolver_async_observation_processed),
+        );
+        self.resolver_async_sweep_enqueued_total.inc_by(
+            resolver_async_sweep_enqueued
+                .saturating_sub(self.last_resolver.resolver_async_sweep_enqueued),
+        );
+        self.resolver_async_sweep_processed_total.inc_by(
+            resolver_async_sweep_processed
+                .saturating_sub(self.last_resolver.resolver_async_sweep_processed),
+        );
 
         self.last_resolver = ResolverSnapshot {
             pending_created: pending,
@@ -947,6 +1036,12 @@ impl MlPrometheusMetrics {
             resolver_stride_index_pruned,
             resolver_shutdown_flush_ns,
             resolver_shutdown_flush_ops,
+            resolver_async_queue_full,
+            resolver_async_queue_closed,
+            resolver_async_observation_enqueued,
+            resolver_async_observation_processed,
+            resolver_async_sweep_enqueued,
+            resolver_async_sweep_processed,
         };
     }
 
@@ -1147,6 +1242,8 @@ mod tests {
         assert!(names.contains(&"ml_label_stride_index_entries_current".to_string()));
         assert!(names.contains(&"ml_label_stride_index_pruned_total".to_string()));
         assert!(names.contains(&"ml_label_resolver_shutdown_flush_ns_total".to_string()));
+        assert!(names.contains(&"ml_label_resolver_async_queue_depth_current".to_string()));
+        assert!(names.contains(&"ml_label_resolver_async_queue_full_total".to_string()));
     }
 
     #[test]

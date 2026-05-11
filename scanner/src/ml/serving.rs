@@ -46,6 +46,7 @@ use crate::ml::feature_store::{
 use crate::ml::listing_history::{
     ListingHistory, RouteLifecycle, DEFAULT_DELISTING_DETECTION_WINDOW_NS,
 };
+use crate::ml::persistence::label_resolver::{LabelResolverAsyncError, LabelResolverAsyncHandle};
 use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
 use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::persistence::{
@@ -300,6 +301,7 @@ pub struct MlServer {
     // `None` = label disabled (tests legados). Usa `Arc` porque o sweeper
     // task também segura uma cópia.
     label_resolver: Option<Arc<LabelResolver>>,
+    label_observer: Option<LabelResolverAsyncHandle>,
     // �� parâmetros de labeling (stride, floor).
     label_stride_s: u32,
     label_floor_pct: f32,
@@ -766,6 +768,7 @@ impl MlServer {
             raw_writer: None,
             route_ranking: None,
             label_resolver: None,
+            label_observer: None,
             label_stride_s: 60,
             label_floor_pct: 0.8,
             label_floors_pct,
@@ -877,6 +880,11 @@ impl MlServer {
         self.label_horizons_s = resolver.horizons().to_vec();
         self.label_resolver = Some(resolver);
         self.refresh_runtime_config_hash();
+        self
+    }
+
+    pub fn with_label_observer(mut self, observer: LabelResolverAsyncHandle) -> Self {
+        self.label_observer = Some(observer);
         self
     }
 
@@ -1082,6 +1090,36 @@ impl MlServer {
             .observe(route, entry_spread, exit_spread, now_ns);
         self.feature_cache_7d
             .observe(route, entry_spread, exit_spread, now_ns);
+    }
+
+    fn dispatch_clean_label_observation(
+        &self,
+        route: RouteId,
+        now_ns: u64,
+        entry_spread: f32,
+        exit_spread: f32,
+    ) {
+        let Some(resolver) = self.label_resolver.as_ref() else {
+            return;
+        };
+        if let Some(observer) = self.label_observer.as_ref() {
+            if let Err(err) = observer.try_observe_clean(route, now_ns, entry_spread, exit_spread) {
+                match err {
+                    LabelResolverAsyncError::QueueFull => {
+                        panic!(
+                            "label_resolver strict-lossless violation: async observation queue full"
+                        );
+                    }
+                    LabelResolverAsyncError::QueueClosed => {
+                        panic!(
+                            "label_resolver strict-lossless violation: async observation queue closed"
+                        );
+                    }
+                }
+            }
+        } else {
+            resolver.on_clean_observation(route, now_ns, entry_spread, exit_spread);
+        }
     }
 
     fn time_alive_snapshot(&self, route: RouteId, entry_spread: f32, now_ns: u64) -> Option<u32> {
@@ -1599,9 +1637,7 @@ impl MlServer {
             // O resolvedor de LabeledTrade recebe APENAS observações
             // com volume 24h mínimo; best_exit supervisionado fica no domínio
             // de spread bruto e não recebe diagnósticos operacionais.
-            if let Some(resolver) = self.label_resolver.as_ref() {
-                resolver.on_clean_observation(route, now_ns, entry_spread, exit_spread);
-            }
+            self.dispatch_clean_label_observation(route, now_ns, entry_spread, exit_spread);
         }
 
         if clean {
@@ -1903,9 +1939,7 @@ impl MlServer {
                 .lock()
                 .process(route, entry_spread, exit_spread, now_ns, &rec);
             // �� resolvedor supervisionado consome obs limpa.
-            if let Some(resolver) = self.label_resolver.as_ref() {
-                resolver.on_clean_observation(route, now_ns, entry_spread, exit_spread);
-            }
+            self.dispatch_clean_label_observation(route, now_ns, entry_spread, exit_spread);
         }
 
         // 4. **C4** — emite `AcceptedSample` se o trigger aceitou.

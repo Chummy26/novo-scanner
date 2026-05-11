@@ -1,0 +1,1030 @@
+commit 2cda935715a4081f93a0ded06435ea116cfa6c88
+Author: Chummy26 <nicolas26rocha@gmail.com>
+Date:   Sun May 10 18:38:23 2026 -0300
+
+    Reduce label resolver hot-path churn
+
+diff --git a/scanner/src/ml/persistence/label_resolver.rs b/scanner/src/ml/persistence/label_resolver.rs
+index 1f02741..38235b9 100644
+--- a/scanner/src/ml/persistence/label_resolver.rs
++++ b/scanner/src/ml/persistence/label_resolver.rs
+@@ -164,124 +164,120 @@ pub struct PendingLabel {
+     // Fix C3
+     pub cluster_id: String,
+     pub cluster_size: u32,
+     pub cluster_rank: u32,
+     // Fix C13
+     pub runtime_config_hash: String,
+     // Fix C2
+     pub priority_set_generation_id: u32,
+     pub priority_set_updated_at_ns: u64,
+ }
+ 
+ impl PendingLabel {
+     pub fn all_closed(&self) -> bool {
+         self.horizons.iter().all(|h| h.closed)
+     }
+ }
+ 
+ /// Parte imutável de `PendingLabel`, congelada em t0.
+ ///
+ /// Produção grava este bloco em spool append-only e mantém em RAM apenas
+ /// `PendingLabelState`. Isso preserva 100% da semântica do label fechado,
+ /// mas evita reter features, policy metadata e strings durante horas.
+ #[derive(Debug, Clone)]
+ struct PendingLabelMeta {
+     sample_id: String,
+     sample_decision: &'static str,
+     ts_emit_ns: u64,
+     cycle_seq: u32,
+     route_id: RouteId,
+     symbol_name: String,
+     entry_locked_pct: f32,
+     exit_start_pct: f32,
+     features_t0: FeaturesT0,
+     label_floor_pct: f32,
+     label_floors_pct: Vec<f32>,
+     policy_metadata: PolicyMetadata,
+     sampling_tier: &'static str,
+     sampling_probability: f32,
+     cluster_id: String,
+     cluster_size: u32,
+     cluster_rank: u32,
+     runtime_config_hash: String,
+     priority_set_generation_id: u32,
+     priority_set_updated_at_ns: u64,
+ }
+ 
+ #[derive(Debug, Clone)]
+ struct PendingLabelState {
+     meta_ref: PendingMetaRef,
+     ts_emit_ns: u64,
+     route_id: RouteId,
+     entry_locked_pct: f32,
+     label_floor_pct: f32,
+     horizons: Vec<Option<PendingHorizon>>,
+ }
+ 
+ impl PendingLabelState {
+     fn all_closed(&self) -> bool {
+         self.horizons.iter().all(Option::is_none)
+     }
+-
+-    fn open_horizon_count(&self) -> u64 {
+-        self.horizons.iter().filter(|h| h.is_some()).count() as u64
+-    }
+ }
+ 
+ #[derive(Debug, Clone)]
+ enum PendingMetaRef {
+     Memory(usize),
+     Disk {
+         segment_id: u64,
+         offset: u64,
+         len: u32,
+     },
+ }
+ 
+ #[derive(Debug)]
+ struct ClosedHorizonWrite {
+     meta_ref: PendingMetaRef,
+     route_id: RouteId,
+     horizon: PendingHorizon,
+     censor_reason: Option<CensorReason>,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize)]
+ struct PendingLabelMetaDto {
+     sample_id: String,
+     sample_decision: String,
+     ts_emit_ns: u64,
+     cycle_seq: u32,
+     symbol_id: u32,
+     buy_venue_idx: u8,
+     sell_venue_idx: u8,
+     symbol_name: String,
+     entry_locked_pct: f32,
+     exit_start_pct: f32,
+     features_t0: FeaturesT0,
+     label_floor_pct: f32,
+     label_floors_pct: Vec<f32>,
+     policy_metadata: PolicyMetadataDto,
+     sampling_tier: String,
+     sampling_probability: f32,
+     cluster_id: String,
+     cluster_size: u32,
+     cluster_rank: u32,
+     runtime_config_hash: String,
+     priority_set_generation_id: u32,
+     priority_set_updated_at_ns: u64,
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize)]
+ struct PolicyMetadataDto {
+     baseline_model_version: String,
+     baseline_recommended: bool,
+     recommendation_kind: String,
+     abstain_reason: Option<String>,
+     prediction_source_kind: String,
+     prediction_model_version: String,
+     prediction_emitted_at_ns: Option<u64>,
+     prediction_valid_until_ns: Option<u64>,
+     prediction_entry_now: Option<f32>,
+     prediction_exit_target: Option<f32>,
+     prediction_gross_profit_target: Option<f32>,
+     prediction_p_hit: Option<f32>,
+@@ -909,122 +905,126 @@ pub struct ResolverMetrics {
+     /// Records escritos (1 por horizonte fechado).
+     pub labels_written_total: AtomicU64,
+     pub labels_written_realized_total: AtomicU64,
+     pub labels_written_miss_total: AtomicU64,
+     pub labels_written_censored_total: AtomicU64,
+     pub labels_dropped_channel_full_total: AtomicU64,
+     pub labels_dropped_channel_closed_total: AtomicU64,
+     /// Descartes por backpressure interno (cap por rota).
+     pub labels_dropped_capacity_overflow_total: AtomicU64,
+     /// Shutdown — labels forçados como `censored{shutdown}`.
+     pub shutdown_lost_pending_total: AtomicU64,
+     /// Pendings vivos no resolver, após stride e antes de todos horizontes fecharem.
+     pub pending_candidates_current: AtomicU64,
+     /// Rotas com pelo menos um pending label vivo.
+     pub pending_routes_current: AtomicU64,
+     /// Horizontes ainda abertos entre todos os pendings vivos.
+     pub pending_horizons_current: AtomicU64,
+     /// Bytes escritos no spool temporário de metadados imutáveis.
+     pub meta_spool_bytes_current: AtomicU64,
+     /// Records de metadata persistidos no spool/memory-store.
+     pub meta_spool_records_total: AtomicU64,
+     /// Latência agregada de escrita de metadata em ns.
+     pub meta_spool_write_ns_total: AtomicU64,
+     pub meta_spool_write_ops_total: AtomicU64,
+     /// Latência agregada de leitura de metadata em ns.
+     pub meta_spool_read_ns_total: AtomicU64,
+     pub meta_spool_read_ops_total: AtomicU64,
+     pub meta_spool_errors_total: AtomicU64,
+     pub on_candidate_ns_total: AtomicU64,
+     pub on_candidate_ops_total: AtomicU64,
+     pub on_observation_ns_total: AtomicU64,
+     pub on_observation_ops_total: AtomicU64,
+     pub sweep_ns_total: AtomicU64,
+     pub sweep_ops_total: AtomicU64,
+     /// Entradas vivas no índice de stride `(rota, horizonte)`.
+     pub stride_index_entries_current: AtomicU64,
+     /// Entradas de stride removidas por já terem expirado.
+     pub stride_index_pruned_total: AtomicU64,
+     pub shutdown_flush_ns_total: AtomicU64,
+     pub shutdown_flush_ops_total: AtomicU64,
+ }
+ 
+ #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+ pub struct ShutdownFlushStats {
+     pub closed_total: u64,
+     pub sent_total: u64,
+     pub censored_total: u64,
+     pub dropped_channel_closed_total: u64,
+ }
+ 
+ /// Resolver compartilhado. Thread-safe via interior mutability.
+ pub struct LabelResolver {
+     cfg: ResolverConfig,
+     inner: Mutex<ResolverInner>,
+     metrics: Arc<ResolverMetrics>,
+     meta_store: PendingMetaStore,
+     writer: LabeledWriterHandle,
+ }
+ 
+ struct ResolverInner {
+-    /// Pending labels por rota. Em overflow, labels antigos podem ser
+-    /// descartados para preservar representatividade do regime atual.
++    /// Pending labels por rota.
++    ///
++    /// Em strict-lossless, overflow de pending é falha operacional: depois que
++    /// um candidato entrou na população supervisionada, descartá-lo enviesaria
++    /// treino/auditoria. O cap existe como tripwire, não como política de
++    /// sampling.
+     pending_by_route: AHashMap<RouteId, VecDeque<PendingLabelState>>,
+     /// Último `ts_ns` em que um label foi criado por `(rota, horizonte)`.
+     /// Stride por horizonte evita sobreposição extrema em horizontes longos.
+     last_label_ts_by_horizon: AHashMap<(RouteId, u32), LastLabelStride>,
+ }
+ 
+ #[derive(Debug, Clone, Copy)]
+ struct LastLabelStride {
+     ts_emit_ns: u64,
+     effective_stride_s: u32,
+ }
+ 
+ impl LastLabelStride {
+     fn new(ts_emit_ns: u64, effective_stride_s: u32) -> Self {
+         Self {
+             ts_emit_ns,
+             effective_stride_s,
+         }
+     }
+ 
+     fn is_blocking_with(&self, ts_emit_ns: u64, current_effective_stride_s: u32) -> bool {
+         let effective_stride_s = self.effective_stride_s.max(current_effective_stride_s);
+         let stride_ns = (effective_stride_s as u64).saturating_mul(1_000_000_000);
+         ts_emit_ns < self.ts_emit_ns.saturating_add(stride_ns)
+     }
+ 
+     fn expired_at(&self, now_ns: u64) -> bool {
+         let stride_ns = (self.effective_stride_s as u64).saturating_mul(1_000_000_000);
+         now_ns >= self.ts_emit_ns.saturating_add(stride_ns)
+     }
+ }
+ 
+ impl LabelResolver {
+     pub fn new(cfg: ResolverConfig, writer: LabeledWriterHandle) -> Self {
+         Self::new_with_spool_dir(cfg, writer, None)
+     }
+ 
+     pub fn new_with_spool_dir(
+         cfg: ResolverConfig,
+         writer: LabeledWriterHandle,
+         spool_dir: Option<PathBuf>,
+     ) -> Self {
+         let metrics = Arc::new(ResolverMetrics::default());
+         let meta_store = PendingMetaStore::new(spool_dir, Arc::clone(&metrics));
+         Self {
+             cfg,
+             inner: Mutex::new(ResolverInner {
+                 pending_by_route: AHashMap::with_capacity(4096),
+                 last_label_ts_by_horizon: AHashMap::with_capacity(4096),
+             }),
+             metrics,
+             meta_store,
+             writer,
+         }
+     }
+ 
+     pub fn metrics(&self) -> Arc<ResolverMetrics> {
+         Arc::clone(&self.metrics)
+     }
+ 
+@@ -1114,506 +1114,519 @@ impl LabelResolver {
+         )
+     }
+ 
+     /// Cria `PendingLabel` para um candidate limpo em t0, respeitando stride.
+     /// Retorna `true` se criou, `false` se pulou por stride.
+     #[allow(clippy::too_many_arguments)]
+     pub fn on_candidate(
+         &self,
+         sample_id: String,
+         sample_decision: &'static str,
+         ts_emit_ns: u64,
+         cycle_seq: u32,
+         route_id: RouteId,
+         symbol_name: String,
+         entry_locked_pct: f32,
+         exit_start_pct: f32,
+         features_t0: FeaturesT0,
+         label_floor_pct: f32,
+         label_floors_pct: Vec<f32>,
+         policy_metadata: PolicyMetadata,
+         sampling_tier: &'static str,
+         sampling_probability: f32,
+         label_stride_s: u32,
+         cluster_id: String,
+         cluster_size: u32,
+         cluster_rank: u32,
+         runtime_config_hash: String,
+         priority_set_generation_id: u32,
+         priority_set_updated_at_ns: u64,
+     ) -> bool {
+         let _timing = ResolverOpTiming::new(
+             &self.metrics.on_candidate_ns_total,
+             &self.metrics.on_candidate_ops_total,
+         );
+         let floors = normalized_floors(label_floor_pct, label_floors_pct);
+ 
+         let (horizons, stride_keys) = {
+             let mut inner = self.inner.lock();
+             let mut horizons = Vec::with_capacity(self.cfg.horizons_s.len());
+             let mut stride_keys = Vec::with_capacity(self.cfg.horizons_s.len());
+             for &horizon_s in &self.cfg.horizons_s {
+                 if label_stride_s > 0 {
+                     let effective_stride_s = effective_stride_for_horizon(
+                         label_stride_s,
+                         horizon_s,
+                         N_EVENTS_TARGET_PER_HORIZON,
+                     );
+                     let key = (route_id, horizon_s);
+                     if let Some(prev) = inner.last_label_ts_by_horizon.get(&key) {
+                         if prev.is_blocking_with(ts_emit_ns, effective_stride_s) {
+                             continue;
+                         }
+                     }
+                     inner
+                         .last_label_ts_by_horizon
+                         .insert(key, LastLabelStride::new(ts_emit_ns, effective_stride_s));
+                     stride_keys.push(key);
+                 }
+                 horizons.push(PendingHorizon::new(horizon_s, ts_emit_ns, &floors));
+             }
++            if inner
++                .pending_by_route
++                .get(&route_id)
++                .map(|queue| queue.len() >= self.cfg.max_pending_per_route)
++                .unwrap_or(false)
++            {
++                for key in &stride_keys {
++                    if inner
++                        .last_label_ts_by_horizon
++                        .get(key)
++                        .map(|prev| prev.ts_emit_ns == ts_emit_ns)
++                        .unwrap_or(false)
++                    {
++                        inner.last_label_ts_by_horizon.remove(key);
++                    }
++                }
++                self.metrics
++                    .labels_dropped_capacity_overflow_total
++                    .fetch_add(1, Ordering::Relaxed);
++                self.metrics.stride_index_entries_current.store(
++                    inner.last_label_ts_by_horizon.len() as u64,
++                    Ordering::Relaxed,
++                );
++                tracing::error!(
++                    route = ?route_id,
++                    max_pending_per_route = self.cfg.max_pending_per_route,
++                    "pending_labels overflow: strict-lossless abort before spooling metadata"
++                );
++                panic!(
++                    "label_resolver strict-lossless violation: max_pending_per_route={} exceeded for route {:?}",
++                    self.cfg.max_pending_per_route,
++                    route_id
++                );
++            }
+             (horizons, stride_keys)
+         };
+ 
+         if horizons.is_empty() {
+             self.metrics
+                 .stride_skipped_total
+                 .fetch_add(1, Ordering::Relaxed);
+             return false;
+         }
+ 
+         let horizon_count = horizons.len() as u64;
+         let meta = PendingLabelMeta {
+             sample_id,
+             sample_decision,
+             ts_emit_ns,
+             cycle_seq,
+             route_id,
+             symbol_name,
+             entry_locked_pct,
+             exit_start_pct,
+             features_t0,
+             label_floor_pct,
+             label_floors_pct: floors,
+             policy_metadata,
+             sampling_tier,
+             sampling_probability,
+             cluster_id,
+             cluster_size,
+             cluster_rank,
+             runtime_config_hash,
+             priority_set_generation_id,
+             priority_set_updated_at_ns,
+         };
+         let meta_ref = match self.meta_store.insert(meta) {
+             Ok(meta_ref) => meta_ref,
+             Err(e) => {
+                 self.metrics
+                     .meta_spool_errors_total
+                     .fetch_add(1, Ordering::Relaxed);
+                 tracing::error!(
+                     error = %e,
+                     route = ?route_id,
+                     "label_resolver failed to persist pending metadata; candidate skipped"
+                 );
+                 let mut inner = self.inner.lock();
+                 for key in stride_keys {
+                     if inner
+                         .last_label_ts_by_horizon
+                         .get(&key)
+                         .map(|prev| prev.ts_emit_ns == ts_emit_ns)
+                         .unwrap_or(false)
+                     {
+                         inner.last_label_ts_by_horizon.remove(&key);
+                     }
+                 }
+                 self.metrics.stride_index_entries_current.store(
+                     inner.last_label_ts_by_horizon.len() as u64,
+                     Ordering::Relaxed,
+                 );
+                 return false;
+             }
+         };
+         let pending = PendingLabelState {
+             meta_ref,
+             ts_emit_ns,
+             route_id,
+             entry_locked_pct,
+             label_floor_pct,
+             horizons: horizons.into_iter().map(Some).collect(),
+         };
+ 
+-        let mut released_meta: Option<PendingMetaRef> = None;
+         {
+             let mut inner = self.inner.lock();
+             let queue = inner
+                 .pending_by_route
+                 .entry(route_id)
+                 .or_insert_with(|| VecDeque::with_capacity(128));
+-            if queue.len() >= self.cfg.max_pending_per_route {
+-                // política invertida — drop oldest em vez de reject novo.
+-                // Regime atual é mais relevante para calibração em t0 do que
+-                // labels antigos já próximos de resolver. Contador mantido com
+-                // o mesmo nome por compat de dashboards, mas semântica é
+-                // "labels antigos dropados para preservar representatividade".
+-                if let Some(dropped) = queue.pop_front() {
+-                    released_meta = Some(dropped.meta_ref.clone());
+-                    self.metrics
+-                        .pending_candidates_current
+-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+-                            Some(v.saturating_sub(1))
+-                        })
+-                        .ok();
+-                    let open = dropped.open_horizon_count();
+-                    self.metrics
+-                        .pending_horizons_current
+-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+-                            Some(v.saturating_sub(open))
+-                        })
+-                        .ok();
+-                }
+-                self.metrics
+-                    .labels_dropped_capacity_overflow_total
+-                    .fetch_add(1, Ordering::Relaxed);
+-                tracing::warn!(
+-                    route = ?route_id,
+-                    "pending_labels overflow: dropped oldest (regime atual preservado)"
+-                );
+-            }
+             queue.push_back(pending);
+         }
+-        if let Some(meta_ref) = released_meta {
+-            self.meta_store.release(&meta_ref);
+-        }
+         self.metrics
+             .pending_created_total
+             .fetch_add(1, Ordering::Relaxed);
+         self.metrics
+             .pending_candidates_current
+             .fetch_add(1, Ordering::Relaxed);
+         self.metrics
+             .pending_horizons_current
+             .fetch_add(horizon_count, Ordering::Relaxed);
+         let (pending_routes, stride_entries) = {
+             let inner = self.inner.lock();
+             (
+                 inner.pending_by_route.len() as u64,
+                 inner.last_label_ts_by_horizon.len() as u64,
+             )
+         };
+         self.metrics
+             .pending_routes_current
+             .store(pending_routes, Ordering::Relaxed);
+         self.metrics
+             .stride_index_entries_current
+             .store(stride_entries, Ordering::Relaxed);
+         true
+     }
+ 
+     /// Observa uma observação limpa da rota (`is_clean_data == true`)
+     /// atualizando os `PendingHorizon` em aberto. Horizontes vencidos
+     /// são fechados+escritos imediatamente.
+     pub fn on_clean_observation(
+         &self,
+         route_id: RouteId,
+         now_ns: u64,
+         _entry_spread: f32,
+         exit_spread: f32,
+     ) {
+         let _timing = ResolverOpTiming::new(
+             &self.metrics.on_observation_ns_total,
+             &self.metrics.on_observation_ops_total,
+         );
+         let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
+         let mut released_meta: Vec<PendingMetaRef> = Vec::new();
+         {
+             let mut inner = self.inner.lock();
+             let Some(queue) = inner.pending_by_route.get_mut(&route_id) else {
+                 return;
+             };
++            let mut route_closed_any = false;
+             for pending in queue.iter_mut() {
+                 // Snapshot dos escalares imutáveis para usar sem empréstimo
+                 // conflitante durante o iter_mut sobre horizons.
+                 let t_emit = pending.ts_emit_ns;
+                 let entry_locked = pending.entry_locked_pct;
+                 let label_floor = pending.label_floor_pct;
+                 let mut closed_horizons: Vec<(PendingHorizon, Option<CensorReason>)> = Vec::new();
+                 for slot_opt in pending.horizons.iter_mut() {
+                     if slot_opt.is_none() {
+                         continue;
+                     }
+                     let mut close_reason: Option<Option<CensorReason>> = None;
+                     {
+                         let slot = slot_opt.as_mut().expect("checked Some");
+                         let deadline = t_emit + (slot.horizon_s as u64) * 1_000_000_000;
+                         if now_ns == deadline {
+                             slot.observed_until_ns = deadline;
+                             slot.n_clean_future_samples =
+                                 slot.n_clean_future_samples.saturating_add(1);
+                             let is_better = slot
+                                 .best_exit_pct_so_far
+                                 .map(|b| exit_spread > b)
+                                 .unwrap_or(true);
+                             if is_better {
+                                 slot.best_exit_pct_so_far = Some(exit_spread);
+                                 slot.best_exit_ts_ns_so_far = Some(now_ns);
+                             }
+                             let gross = entry_locked + exit_spread;
+                             if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
+                                 slot.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                 slot.first_exit_ge_floor_pct = Some(exit_spread);
+                             }
+                             for hit in slot.floor_hits.iter_mut() {
+                                 if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none()
+                                 {
+                                     hit.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                     hit.first_exit_ge_floor_pct = Some(exit_spread);
+                                 }
+                             }
+                             slot.closed = true;
+                             close_reason = Some(None);
+                         } else if now_ns > deadline {
+                             let gap_to_deadline = deadline.saturating_sub(slot.observed_until_ns);
+                             let window_observed_close_enough = slot.n_clean_future_samples > 0
+                                 && gap_to_deadline <= self.cfg.close_slack_ns;
+                             if window_observed_close_enough {
+                                 slot.observed_until_ns = deadline;
+                                 slot.closed = true;
+                                 close_reason = Some(None);
+                             } else {
+                                 slot.closed = true;
+                                 close_reason = Some(Some(CensorReason::IncompleteWindow));
+                             }
+                         } else {
+                             slot.observed_until_ns = now_ns;
+                             slot.n_clean_future_samples =
+                                 slot.n_clean_future_samples.saturating_add(1);
+                             let is_better = slot
+                                 .best_exit_pct_so_far
+                                 .map(|b| exit_spread > b)
+                                 .unwrap_or(true);
+                             if is_better {
+                                 slot.best_exit_pct_so_far = Some(exit_spread);
+                                 slot.best_exit_ts_ns_so_far = Some(now_ns);
+                             }
+                             let gross = entry_locked + exit_spread;
+                             if gross >= label_floor && slot.first_exit_ge_floor_ts_ns.is_none() {
+                                 slot.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                 slot.first_exit_ge_floor_pct = Some(exit_spread);
+                             }
+                             for hit in slot.floor_hits.iter_mut() {
+                                 if gross >= hit.floor_pct && hit.first_exit_ge_floor_ts_ns.is_none()
+                                 {
+                                     hit.first_exit_ge_floor_ts_ns = Some(now_ns);
+                                     hit.first_exit_ge_floor_pct = Some(exit_spread);
+                                 }
+                             }
+                         }
+                     }
+                     if let Some(reason) = close_reason {
+                         let horizon = slot_opt.take().expect("closed horizon still present");
+                         closed_horizons.push((horizon, reason));
+                     }
+                 }
+                 if !closed_horizons.is_empty() {
++                    route_closed_any = true;
+                     self.metrics
+                         .pending_horizons_current
+                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                             Some(v.saturating_sub(closed_horizons.len() as u64))
+                         })
+                         .ok();
+                     for (horizon, reason) in closed_horizons {
+                         to_write.push(ClosedHorizonWrite {
+                             meta_ref: pending.meta_ref.clone(),
+                             route_id: pending.route_id,
+                             horizon,
+                             censor_reason: reason,
+                         });
+                     }
+                 }
+             }
+-            let mut kept = VecDeque::with_capacity(queue.len());
+-            while let Some(pending) = queue.pop_front() {
+-                if pending.all_closed() {
+-                    released_meta.push(pending.meta_ref.clone());
+-                } else {
+-                    kept.push_back(pending);
++            let mut remove_route = false;
++            if route_closed_any {
++                let before_released = released_meta.len();
++                queue.retain(|pending| {
++                    if pending.all_closed() {
++                        released_meta.push(pending.meta_ref.clone());
++                        false
++                    } else {
++                        true
++                    }
++                });
++                let removed = released_meta.len().saturating_sub(before_released) as u64;
++                if removed > 0 {
++                    self.metrics
++                        .pending_candidates_current
++                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
++                            Some(v.saturating_sub(removed))
++                        })
++                        .ok();
+                 }
++                remove_route = queue.is_empty();
+             }
+-            let removed = released_meta.len() as u64;
+-            *queue = kept;
+-            if removed > 0 {
+-                self.metrics
+-                    .pending_candidates_current
+-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+-                        Some(v.saturating_sub(removed))
+-                    })
+-                    .ok();
+-            }
+-            if queue.is_empty() {
++            if remove_route {
+                 inner.pending_by_route.remove(&route_id);
++                self.metrics
++                    .pending_routes_current
++                    .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
+             }
+-            self.metrics
+-                .pending_routes_current
+-                .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
+         }
+         for item in to_write {
+             let meta = self.materialize_meta(&item.meta_ref, item.route_id);
+             let outcome = LabelOutcome::from_horizon(meta.ts_emit_ns, &item.horizon);
+             let reason = if matches!(outcome, LabelOutcome::Censored) {
+                 item.censor_reason.or(Some(CensorReason::IncompleteWindow))
+             } else {
+                 None
+             };
+             self.write_closed_horizon_with_reason(&meta, &item.horizon, now_ns, outcome, reason);
+         }
+         for meta_ref in &released_meta {
+             self.meta_store.release(meta_ref);
+         }
+     }
+ 
+     /// Sweeper global — chamado por task tokio em interval.
+     /// Fecha horizontes vencidos (mesmo sem observações) e censura rotas
+     /// sumidas. Retorna número de horizontes fechados nesta passagem.
+     pub fn sweep(&self, now_ns: u64) -> u64 {
+         let _timing =
+             ResolverOpTiming::new(&self.metrics.sweep_ns_total, &self.metrics.sweep_ops_total);
+         let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
+         let mut released_meta: Vec<PendingMetaRef> = Vec::new();
+         {
+             let mut inner = self.inner.lock();
++            let mut any_queue_removed = false;
+             for (_route, queue) in inner.pending_by_route.iter_mut() {
++                let mut route_closed_any = false;
+                 for pending in queue.iter_mut() {
+                     let t_emit = pending.ts_emit_ns;
+                     let mut closed_horizons: Vec<(PendingHorizon, Option<CensorReason>)> =
+                         Vec::new();
+                     for slot_opt in pending.horizons.iter_mut() {
+                         let Some(slot) = slot_opt.as_mut() else {
+                             continue;
+                         };
+                         let deadline = t_emit + (slot.horizon_s as u64) * 1_000_000_000;
+                         let idle_for = now_ns.saturating_sub(slot.observed_until_ns);
+                         // distingue Dormant (ilíquidez transitória) de
+                         // Delisted (evento estrutural). Kaplan-Meier exige essa
+                         // separação para preservar independência de censura.
+                         let dormant = idle_for >= self.cfg.route_vanish_idle_ns;
+                         let delisted = idle_for >= self.cfg.route_delisted_idle_ns;
+                         let expired = now_ns >= deadline.saturating_add(self.cfg.close_slack_ns);
+                         let close_reason = if expired {
+                             slot.closed = true;
+                             Some(None)
+                         } else if dormant && now_ns < deadline {
+                             slot.closed = true;
+                             Some(Some(if delisted {
+                                 CensorReason::RouteDelisted
+                             } else {
+                                 CensorReason::RouteDormant
+                             }))
+                         } else {
+                             None
+                         };
+                         if let Some(reason) = close_reason {
+                             let horizon = slot_opt.take().expect("closed horizon still present");
+                             closed_horizons.push((horizon, reason));
+                         }
+                     }
+                     if !closed_horizons.is_empty() {
++                        route_closed_any = true;
+                         self.metrics
+                             .pending_horizons_current
+                             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                                 Some(v.saturating_sub(closed_horizons.len() as u64))
+                             })
+                             .ok();
+                         for (horizon, reason) in closed_horizons {
+                             to_write.push(ClosedHorizonWrite {
+                                 meta_ref: pending.meta_ref.clone(),
+                                 route_id: pending.route_id,
+                                 horizon,
+                                 censor_reason: reason,
+                             });
+                         }
+                     }
+                 }
+-                let before_released = released_meta.len();
+-                let mut kept = VecDeque::with_capacity(queue.len());
+-                while let Some(pending) = queue.pop_front() {
+-                    if pending.all_closed() {
+-                        released_meta.push(pending.meta_ref.clone());
+-                    } else {
+-                        kept.push_back(pending);
++                if route_closed_any {
++                    let before_released = released_meta.len();
++                    queue.retain(|pending| {
++                        if pending.all_closed() {
++                            released_meta.push(pending.meta_ref.clone());
++                            false
++                        } else {
++                            true
++                        }
++                    });
++                    let removed = released_meta.len().saturating_sub(before_released) as u64;
++                    if removed > 0 {
++                        any_queue_removed = true;
++                        self.metrics
++                            .pending_candidates_current
++                            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
++                                Some(v.saturating_sub(removed))
++                            })
++                            .ok();
+                     }
+                 }
+-                let removed = released_meta.len().saturating_sub(before_released) as u64;
+-                *queue = kept;
+-                if removed > 0 {
+-                    self.metrics
+-                        .pending_candidates_current
+-                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+-                            Some(v.saturating_sub(removed))
+-                        })
+-                        .ok();
+-                }
+             }
+-            inner.pending_by_route.retain(|_, q| !q.is_empty());
+-            self.metrics
+-                .pending_routes_current
+-                .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
++            if any_queue_removed {
++                inner.pending_by_route.retain(|_, q| !q.is_empty());
++                self.metrics
++                    .pending_routes_current
++                    .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
++            }
+             let before_stride = inner.last_label_ts_by_horizon.len();
+             inner
+                 .last_label_ts_by_horizon
+                 .retain(|_, last| !last.expired_at(now_ns));
+             let after_stride = inner.last_label_ts_by_horizon.len();
+             let pruned = before_stride.saturating_sub(after_stride) as u64;
+             if pruned > 0 {
+                 self.metrics
+                     .stride_index_pruned_total
+                     .fetch_add(pruned, Ordering::Relaxed);
+             }
+             self.metrics
+                 .stride_index_entries_current
+                 .store(after_stride as u64, Ordering::Relaxed);
+         }
+         let n = to_write.len() as u64;
+         for item in to_write {
+             let meta = self.materialize_meta(&item.meta_ref, item.route_id);
+             // Hit dentro da janela vence qualquer fechamento posterior por
+             // sweep. Forcar Censored aqui sobrescrevia realizacoes ja observadas.
+             let final_outcome = LabelOutcome::from_horizon(meta.ts_emit_ns, &item.horizon);
+             let final_reason = if matches!(final_outcome, LabelOutcome::Censored) {
+                 item.censor_reason.or(Some(CensorReason::IncompleteWindow))
+             } else {
+                 None
+             };
+             self.write_closed_horizon_with_reason(
+                 &meta,
+                 &item.horizon,
+                 now_ns,
+                 final_outcome,
+                 final_reason,
+             );
+         }
+         for meta_ref in &released_meta {
+             self.meta_store.release(meta_ref);
+         }
+         n
+     }
+ 
+     /// Em shutdown limpo, fecha pendings abertos preservando o outcome real.
+     ///
+     /// versão anterior forçava `Censored{Shutdown}`
+     /// em todos os horizontes abertos, sobrescrevendo labels que já tinham
+     /// `first_exit_ge_floor_ts_ns.is_some()` (Realized) ou que já haviam
+     /// passado do deadline sem hit (Miss). Isso subestimava `P_hit` empírico
+     /// no dataset supervisionado. A lógica correta é a mesma do `sweep`:
+     /// derivar o outcome do horizonte fechado e só atribuir `Shutdown` quando
+     /// o outcome for de fato `Censored` (incomplete window).
+     pub async fn shutdown_flush(&self, now_ns: u64) -> ShutdownFlushStats {
+         let _timing = ResolverOpTiming::new(
+             &self.metrics.shutdown_flush_ns_total,
+             &self.metrics.shutdown_flush_ops_total,
+         );
+         let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
+         {
+             let mut inner = self.inner.lock();
+             for (_route, queue) in inner.pending_by_route.iter_mut() {
+                 for pending in queue.iter_mut() {
+                     for slot_opt in pending.horizons.iter_mut() {
+@@ -3053,164 +3066,151 @@ mod tests {
+             m.shutdown_lost_pending_total.load(Ordering::Relaxed),
+             0,
+             "métrica shutdown_lost_pending só conta Censored de verdade"
+         );
+         drop(resolver);
+         drop(tmp);
+     }
+ 
+     #[tokio::test]
+     async fn shutdown_emits_miss_when_deadline_passed_without_hit() {
+         // Caso de borda: horizonte vencido mas ainda aberto (não foi
+         // fechado pelo sweep ainda). Shutdown deve emitir Miss, não
+         // Censored, porque observed_until >= deadline.
+         let cfg = ResolverConfig {
+             horizons_s: vec![2, 4, 6],
+             close_slack_ns: 5_000_000_000, // slack grande — sweep não fecharia ainda
+             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+             route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+             max_pending_per_route: 100,
+             sweeper_interval: Duration::from_secs(10),
+         };
+         let (resolver, tmp, _task) = setup_resolver(cfg).await;
+         let t0 = 1_000_000_000u64;
+         resolver.on_accepted(
+             "sid_miss".into(),
+             t0,
+             1,
+             mk_route(),
+             "BTC-USDT".into(),
+             2.0,
+             -1.0,
+             mk_features(),
+             10.0, // floor inalcançável → nunca hita
+             mk_policy(),
+             "allowlist",
+             1.0,
+             0,
+         );
+         // Observações continuam chegando (rota não sumiu) até além do último
+         // deadline (6s), mas nunca hitam o floor de 10%.
+         for i in 1..=7u64 {
+             resolver.on_clean_observation(mk_route(), t0 + i * 1_000_000_000, 1.9, -2.0);
+         }
+         // Shutdown em t0+7s — slot 900s/1800s/2h (no config test: 2/4/6s)
+         // todos têm observed_until >= deadline → Miss, não Censored.
+         resolver.shutdown_flush(t0 + 7_000_000_000).await;
+         sleep(Duration::from_millis(150)).await;
+         let m = resolver.metrics();
+         assert_eq!(
+             m.labels_written_miss_total.load(Ordering::Relaxed),
+             3,
+             "3 horizontes expiraram observados sem hit → Miss"
+         );
+         assert_eq!(m.labels_written_censored_total.load(Ordering::Relaxed), 0);
+         assert_eq!(m.shutdown_lost_pending_total.load(Ordering::Relaxed), 0);
+         drop(resolver);
+         drop(tmp);
+     }
+ 
+     #[tokio::test]
+-    async fn backpressure_drops_oldest_when_cap_exceeded() {
+-        // política invertida — drop oldest, não reject novo.
+-        // Regime atual é preservado em rotas quentes.
++    #[should_panic(expected = "strict-lossless violation")]
++    async fn pending_overflow_fails_high_instead_of_dropping_labels() {
++        // Depois que um candidate entra na população supervisionada, removê-lo
++        // por pressão de RAM cria viés. O cap é tripwire operacional: falha
++        // alto antes de descartar qualquer label.
+         let cfg = ResolverConfig {
+             horizons_s: vec![60, 120, 180],
+             close_slack_ns: 1_000_000_000,
+             route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+             route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+             max_pending_per_route: 3,
+             sweeper_interval: Duration::from_secs(10),
+         };
+-        let (resolver, tmp, _task) = setup_resolver(cfg).await;
++        let (resolver, _tmp, _task) = setup_resolver(cfg).await;
+         for i in 0..5u32 {
+             resolver.on_accepted(
+                 format!("sid{}", i),
+                 1_000_000_000 + (i as u64) * 1_000_000_000,
+                 i,
+                 mk_route(),
+                 "BTC-USDT".into(),
+                 2.5,
+                 -1.2,
+                 mk_features(),
+                 0.8,
+                 mk_policy(),
+                 "allowlist",
+                 1.0,
+                 0, // sem stride
+             );
+         }
+-        let m = resolver.metrics();
+-        // 5 candidates, cap=3 → 2 drops (de oldest); 5 created total.
+-        assert_eq!(
+-            m.labels_dropped_capacity_overflow_total
+-                .load(Ordering::Relaxed),
+-            2,
+-            "2 drops esperados (cap=3 com 5 insertions)"
+-        );
+-        assert_eq!(
+-            m.pending_created_total.load(Ordering::Relaxed),
+-            5,
+-            "todos 5 labels foram aceitos; 2 oldest foram descartados para dar espaço"
+-        );
+-        drop(resolver);
+-        drop(tmp);
+     }
+ 
+     #[test]
+     fn normalized_floors_places_primary_in_head_position() {
+         // primary_floor sempre em hits[0] mesmo quando não-monotônico.
+         let floors = normalized_floors(0.8, vec![0.3, 0.5, 1.2, 2.0]);
+         assert_eq!(floors[0], 0.8, "primary deve estar em hits[0]");
+         assert!(floors.len() == 5);
+         // dedup com tolerância 1e-4.
+         let dedup = normalized_floors(0.800001, vec![0.8, 0.5]);
+         assert_eq!(dedup.len(), 2, "0.8 e 0.800001 dedupam; primary permanece");
+         assert_eq!(dedup[0], 0.800001);
+     }
+ 
+     #[test]
+     fn effective_stride_scales_with_horizon() {
+         // stride por horizonte evita overlap massivo em h longo.
+         // h=900 com N=10: 90s > base 60 ⇒ 90s.
+         assert_eq!(effective_stride_for_horizon(60, 900, 10), 90);
+         // h=28800 com N=10: 2880s.
+         assert_eq!(effective_stride_for_horizon(60, 28800, 10), 2880);
+     }
+ 
+     #[test]
+     fn cluster_id_deterministic_and_symbol_window_sensitive() {
+         // cluster_id derivável deterministicamente.
+         use crate::types::{SymbolId, Venue};
+         let r1 = RouteId {
+             symbol_id: SymbolId(1),
+             buy_venue: Venue::MexcFut,
+             sell_venue: Venue::BingxFut,
+         };
+         let r_same_symbol = RouteId {
+             symbol_id: SymbolId(1),
+             buy_venue: Venue::BinanceFut,
+             sell_venue: Venue::MexcFut,
+         };
+         let r2 = RouteId {
+             symbol_id: SymbolId(2),
+             buy_venue: Venue::MexcFut,
+             sell_venue: Venue::BingxFut,
+         };
+         let t = 0u64;
+         assert_eq!(derive_cluster_id(r1, t), derive_cluster_id(r1, t));
+         assert_eq!(
+             derive_cluster_id(r1, t),
+             derive_cluster_id(r_same_symbol, t)
+         );
+         assert_ne!(derive_cluster_id(r1, t), derive_cluster_id(r2, t));
+         // Mesma janela do horizonte máximo default (8h) → mesmo cluster.
+         assert_eq!(
+             derive_cluster_id(r1, t),
+             derive_cluster_id(r1, t + 16 * 60 * 1_000_000_000)
+         );
+         // Janela seguinte ao horizonte máximo → cluster distinto.
+         assert_ne!(
+             derive_cluster_id(r1, t),
+             derive_cluster_id(r1, t + 8 * 60 * 60 * 1_000_000_000)
+         );
+     }
