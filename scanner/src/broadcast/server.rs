@@ -125,7 +125,7 @@ impl BroadcastState {
     }
 
     /// Called by the spread-engine driver after each scan cycle.
-    pub fn publish(&self, ops: Vec<Opportunity>) {
+    pub fn publish(&self, ops: &[Opportunity]) {
         let dtos: Vec<OpportunityDto> = ops.iter().map(OpportunityDto::from).collect();
         {
             let mut w = self.latest.write();
@@ -783,9 +783,10 @@ async fn notifications_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
     })
 }
 
-async fn rest_metrics() -> impl IntoResponse {
+async fn rest_metrics(State(state): State<BroadcastState>) -> impl IntoResponse {
     use prometheus::Encoder;
     let metrics = crate::obs::Metrics::init();
+    metrics.refresh_process_memory();
     let encoder = prometheus::TextEncoder::new();
     let mut buf = Vec::new();
     let mf = metrics.registry.gather();
@@ -851,6 +852,21 @@ async fn rest_metrics() -> impl IntoResponse {
             ));
         }
     }
+    let history_stats = state.history.read().stats();
+    extra.push_str(&format!(
+        "# HELP scanner_broadcast_history_symbols Symbols retained in the UI opportunity history store\n\
+         # TYPE scanner_broadcast_history_symbols gauge\n\
+         scanner_broadcast_history_symbols {}\n\
+         # HELP scanner_broadcast_history_retained_opportunities Opportunity DTOs retained in the UI history store\n\
+         # TYPE scanner_broadcast_history_retained_opportunities gauge\n\
+         scanner_broadcast_history_retained_opportunities {}\n\
+         # HELP scanner_broadcast_history_capacity_per_symbol Ring capacity per symbol in the UI history store\n\
+         # TYPE scanner_broadcast_history_capacity_per_symbol gauge\n\
+         scanner_broadcast_history_capacity_per_symbol {}\n",
+        history_stats.symbols,
+        history_stats.retained_opportunities,
+        history_stats.capacity_per_symbol
+    ));
     let body = String::from_utf8_lossy(&buf).into_owned() + &extra;
     (http::StatusCode::OK, body).into_response()
 }

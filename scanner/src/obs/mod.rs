@@ -9,7 +9,7 @@
 use hdrhistogram::Histogram;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
-use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
+use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
 
 use crate::types::{Venue, VENUE_COUNT};
 
@@ -20,9 +20,12 @@ pub struct Metrics {
     pub stale_drops_total: IntCounterVec,
     pub asym_drops_total: IntCounterVec,
     pub opportunities_total: IntCounter,
+    pub hist_record_dropped_total: IntCounterVec,
     pub ml_dataset_compactions_total: IntCounterVec,
     pub ml_dataset_compaction_rows_total: IntCounterVec,
     pub ml_dataset_compaction_bytes_total: IntCounterVec,
+    pub ml_dataset_compaction_active_current: IntGaugeVec,
+    pub ml_dataset_compaction_waiting_current: IntGaugeVec,
     /// Per-venue ingest-latency histograms (frame decode + book write), ns.
     pub ingest_hist: [Mutex<Histogram<u64>>; VENUE_COUNT],
     /// Spread-engine scan latency histogram, ns. Nome Prometheus legado:
@@ -34,6 +37,24 @@ pub struct Metrics {
     pub ml_foreground_hist: Mutex<Histogram<u64>>,
     /// Background ML/cache pass over below-threshold observations, ns.
     pub ml_background_hist: Mutex<Histogram<u64>>,
+    /// Last full spread loop processing latency, excluding scheduler sleep, ns.
+    pub full_cycle_last_ns: IntGauge,
+    /// Max full spread loop processing latency observed in this process, ns.
+    pub full_cycle_max_ns: IntGauge,
+    /// Configured full-cycle latency budget, ns.
+    pub full_cycle_budget_ns: IntGauge,
+    /// Full cycles whose processing latency exceeded the configured budget.
+    pub full_cycle_over_budget_total: IntCounter,
+    /// Last background ML/cache pass latency, ns.
+    pub ml_background_last_ns: IntGauge,
+    /// Max background ML/cache pass latency observed in this process, ns.
+    pub ml_background_max_ns: IntGauge,
+    /// Background ML/cache passes whose latency exceeded the configured budget.
+    pub ml_background_over_budget_total: IntCounter,
+    /// Current process working set, bytes. Populated on scrape when available.
+    pub process_working_set_bytes: IntGauge,
+    /// Current process private/commit memory, bytes. Populated on scrape when available.
+    pub process_private_bytes: IntGauge,
 }
 
 static METRICS: OnceCell<Metrics> = OnceCell::new();
@@ -62,6 +83,14 @@ impl Metrics {
                 "Opportunities emitted to clients",
             )
             .expect("register opportunities_total");
+            let hist_record_dropped_total = IntCounterVec::new(
+                Opts::new(
+                    "scanner_hist_record_dropped_total",
+                    "Latency samples skipped because the HdrHistogram lock was busy",
+                ),
+                &["histogram"],
+            )
+            .expect("register hist_record_dropped_total");
             let ml_dataset_compactions_total = IntCounterVec::new(
                 Opts::new(
                     "ml_dataset_compactions_total",
@@ -86,6 +115,67 @@ impl Metrics {
                 &["dataset", "direction", "status"],
             )
             .expect("register ml_dataset_compaction_bytes_total");
+            let ml_dataset_compaction_active_current = IntGaugeVec::new(
+                Opts::new(
+                    "ml_dataset_compaction_active_current",
+                    "ML dataset compactions currently running under the global compaction gate",
+                ),
+                &["dataset"],
+            )
+            .expect("register ml_dataset_compaction_active_current");
+            let ml_dataset_compaction_waiting_current = IntGaugeVec::new(
+                Opts::new(
+                    "ml_dataset_compaction_waiting_current",
+                    "ML dataset compactions waiting for the global compaction gate",
+                ),
+                &["dataset"],
+            )
+            .expect("register ml_dataset_compaction_waiting_current");
+            let full_cycle_last_ns = IntGauge::new(
+                "scanner_spread_full_cycle_last_ns",
+                "Last full spread loop processing latency, excluding scheduler sleep, ns",
+            )
+            .expect("register full_cycle_last_ns");
+            let full_cycle_max_ns = IntGauge::new(
+                "scanner_spread_full_cycle_max_ns",
+                "Max full spread loop processing latency observed in this process, ns",
+            )
+            .expect("register full_cycle_max_ns");
+            let full_cycle_budget_ns = IntGauge::new(
+                "scanner_spread_full_cycle_budget_ns",
+                "Configured full spread loop processing budget, ns",
+            )
+            .expect("register full_cycle_budget_ns");
+            let full_cycle_over_budget_total = IntCounter::new(
+                "scanner_spread_full_cycle_over_budget_total",
+                "Full spread loop cycles whose processing latency exceeded budget",
+            )
+            .expect("register full_cycle_over_budget_total");
+            let ml_background_last_ns = IntGauge::new(
+                "scanner_ml_background_last_ns",
+                "Last background ML/cache pass latency, ns",
+            )
+            .expect("register ml_background_last_ns");
+            let ml_background_max_ns = IntGauge::new(
+                "scanner_ml_background_max_ns",
+                "Max background ML/cache pass latency observed in this process, ns",
+            )
+            .expect("register ml_background_max_ns");
+            let ml_background_over_budget_total = IntCounter::new(
+                "scanner_ml_background_over_budget_total",
+                "Background ML/cache passes whose latency exceeded budget",
+            )
+            .expect("register ml_background_over_budget_total");
+            let process_working_set_bytes = IntGauge::new(
+                "scanner_process_working_set_bytes",
+                "Current process working set, bytes",
+            )
+            .expect("register process_working_set_bytes");
+            let process_private_bytes = IntGauge::new(
+                "scanner_process_private_bytes",
+                "Current process private/commit memory, bytes",
+            )
+            .expect("register process_private_bytes");
 
             registry
                 .register(Box::new(ws_frames_total.clone()))
@@ -100,6 +190,9 @@ impl Metrics {
                 .register(Box::new(opportunities_total.clone()))
                 .expect("reg");
             registry
+                .register(Box::new(hist_record_dropped_total.clone()))
+                .expect("reg");
+            registry
                 .register(Box::new(ml_dataset_compactions_total.clone()))
                 .expect("reg");
             registry
@@ -108,8 +201,47 @@ impl Metrics {
             registry
                 .register(Box::new(ml_dataset_compaction_bytes_total.clone()))
                 .expect("reg");
+            registry
+                .register(Box::new(ml_dataset_compaction_active_current.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_dataset_compaction_waiting_current.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(full_cycle_last_ns.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(full_cycle_max_ns.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(full_cycle_budget_ns.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(full_cycle_over_budget_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_background_last_ns.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_background_max_ns.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_background_over_budget_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(process_working_set_bytes.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(process_private_bytes.clone()))
+                .expect("reg");
 
             for dataset in &["raw_samples", "accepted_samples", "labeled_trades"] {
+                ml_dataset_compaction_active_current
+                    .with_label_values(&[dataset])
+                    .set(0);
+                ml_dataset_compaction_waiting_current
+                    .with_label_values(&[dataset])
+                    .set(0);
                 for status in &["success", "failure"] {
                     ml_dataset_compactions_total
                         .with_label_values(&[dataset, status])
@@ -123,6 +255,17 @@ impl Metrics {
                             .inc_by(0);
                     }
                 }
+            }
+            for histogram in &[
+                "ingest",
+                "spread_cycle",
+                "spread_full_cycle",
+                "ml_foreground",
+                "ml_background",
+            ] {
+                hist_record_dropped_total
+                    .with_label_values(&[histogram])
+                    .inc_by(0);
             }
 
             // HdrHistogram: track 1ns..10s with 3 sig figs. Per-venue instance
@@ -140,25 +283,38 @@ impl Metrics {
                 stale_drops_total,
                 asym_drops_total,
                 opportunities_total,
+                hist_record_dropped_total,
                 ml_dataset_compactions_total,
                 ml_dataset_compaction_rows_total,
                 ml_dataset_compaction_bytes_total,
+                ml_dataset_compaction_active_current,
+                ml_dataset_compaction_waiting_current,
                 ingest_hist,
                 cycle_hist,
                 full_cycle_hist,
                 ml_foreground_hist,
                 ml_background_hist,
+                full_cycle_last_ns,
+                full_cycle_max_ns,
+                full_cycle_budget_ns,
+                full_cycle_over_budget_total,
+                ml_background_last_ns,
+                ml_background_max_ns,
+                ml_background_over_budget_total,
+                process_working_set_bytes,
+                process_private_bytes,
             }
         })
     }
 
     #[inline]
     pub fn record_ingest(&self, venue: Venue, ns: u64) {
-        if let Some(mut h) = self.ingest_hist[venue.idx()].try_lock() {
-            // Bounded by histogram range; saturate rather than panic.
-            let v = ns.min(10_000_000_000);
-            let _ = h.record(v.max(1));
-        }
+        record_hist(
+            &self.ingest_hist[venue.idx()],
+            ns,
+            &self.hist_record_dropped_total,
+            "ingest",
+        );
         self.ws_frames_total
             .with_label_values(&[venue.as_str()])
             .inc();
@@ -166,22 +322,61 @@ impl Metrics {
 
     #[inline]
     pub fn record_cycle(&self, ns: u64) {
-        record_hist(&self.cycle_hist, ns);
+        record_hist(
+            &self.cycle_hist,
+            ns,
+            &self.hist_record_dropped_total,
+            "spread_cycle",
+        );
     }
 
     #[inline]
     pub fn record_full_cycle(&self, ns: u64) {
-        record_hist(&self.full_cycle_hist, ns);
+        self.record_full_cycle_with_budget(ns, 0);
+    }
+
+    #[inline]
+    pub fn record_full_cycle_with_budget(&self, ns: u64, budget_ns: u64) {
+        record_hist(
+            &self.full_cycle_hist,
+            ns,
+            &self.hist_record_dropped_total,
+            "spread_full_cycle",
+        );
+        record_last_max(&self.full_cycle_last_ns, &self.full_cycle_max_ns, ns);
+        self.full_cycle_budget_ns.set(gauge_value(budget_ns));
+        if budget_ns > 0 && ns > budget_ns {
+            self.full_cycle_over_budget_total.inc();
+        }
     }
 
     #[inline]
     pub fn record_ml_foreground(&self, ns: u64) {
-        record_hist(&self.ml_foreground_hist, ns);
+        record_hist(
+            &self.ml_foreground_hist,
+            ns,
+            &self.hist_record_dropped_total,
+            "ml_foreground",
+        );
     }
 
     #[inline]
     pub fn record_ml_background(&self, ns: u64) {
-        record_hist(&self.ml_background_hist, ns);
+        self.record_ml_background_with_budget(ns, 0);
+    }
+
+    #[inline]
+    pub fn record_ml_background_with_budget(&self, ns: u64, budget_ns: u64) {
+        record_hist(
+            &self.ml_background_hist,
+            ns,
+            &self.hist_record_dropped_total,
+            "ml_background",
+        );
+        record_last_max(&self.ml_background_last_ns, &self.ml_background_max_ns, ns);
+        if budget_ns > 0 && ns > budget_ns {
+            self.ml_background_over_budget_total.inc();
+        }
     }
 
     #[inline]
@@ -206,19 +401,110 @@ impl Metrics {
             .with_label_values(&[dataset, "parquet", status])
             .inc_by(parquet_bytes);
     }
+
+    pub fn refresh_process_memory(&self) {
+        if let Some(snapshot) = process_memory_snapshot() {
+            self.process_working_set_bytes
+                .set(gauge_value(snapshot.working_set_bytes));
+            self.process_private_bytes
+                .set(gauge_value(snapshot.private_bytes));
+        }
+    }
 }
 
 #[inline]
-fn record_hist(hist: &Mutex<Histogram<u64>>, ns: u64) {
+fn record_hist(hist: &Mutex<Histogram<u64>>, ns: u64, dropped: &IntCounterVec, name: &str) {
     if let Some(mut h) = hist.try_lock() {
         let v = ns.min(10_000_000_000);
         let _ = h.record(v.max(1));
+    } else {
+        dropped.with_label_values(&[name]).inc();
     }
+}
+
+#[inline]
+fn record_last_max(last: &IntGauge, max: &IntGauge, ns: u64) {
+    let value = gauge_value(ns);
+    last.set(value);
+    if value > max.get() {
+        max.set(value);
+    }
+}
+
+#[inline]
+fn gauge_value(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }
 
 fn new_hist() -> Histogram<u64> {
     // 1 ns to 10 s, 3 significant figures.
     Histogram::<u64>::new_with_bounds(1, 10_000_000_000, 3).expect("hdrhist")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessMemorySnapshot {
+    working_set_bytes: u64,
+    private_bytes: u64,
+}
+
+#[cfg(windows)]
+fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    windows_process_memory::snapshot()
+}
+
+#[cfg(not(windows))]
+fn process_memory_snapshot() -> Option<ProcessMemorySnapshot> {
+    None
+}
+
+#[cfg(windows)]
+mod windows_process_memory {
+    use super::ProcessMemorySnapshot;
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCounters,
+            size: u32,
+        ) -> i32;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+    }
+
+    pub(super) fn snapshot() -> Option<ProcessMemorySnapshot> {
+        unsafe {
+            let mut counters: ProcessMemoryCounters = zeroed();
+            counters.cb = size_of::<ProcessMemoryCounters>() as u32;
+            let ok = GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb);
+            if ok == 0 {
+                return None;
+            }
+            Some(ProcessMemorySnapshot {
+                working_set_bytes: counters.working_set_size as u64,
+                private_bytes: counters.pagefile_usage as u64,
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +546,35 @@ mod tests {
             .with_label_values(&["raw_samples", "success"])
             .get();
         assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn record_full_cycle_tracks_budget_and_max() {
+        let m = Metrics::init();
+        let before = m.full_cycle_over_budget_total.get();
+        m.record_full_cycle_with_budget(100, 150);
+        assert_eq!(m.full_cycle_last_ns.get(), 100);
+        assert!(m.full_cycle_max_ns.get() >= 100);
+        assert_eq!(m.full_cycle_over_budget_total.get(), before);
+
+        m.record_full_cycle_with_budget(200, 150);
+        assert_eq!(m.full_cycle_last_ns.get(), 200);
+        assert!(m.full_cycle_max_ns.get() >= 200);
+        assert_eq!(m.full_cycle_over_budget_total.get(), before + 1);
+    }
+
+    #[test]
+    fn record_ml_background_tracks_budget_and_max() {
+        let m = Metrics::init();
+        let before = m.ml_background_over_budget_total.get();
+        m.record_ml_background_with_budget(90, 100);
+        assert_eq!(m.ml_background_last_ns.get(), 90);
+        assert!(m.ml_background_max_ns.get() >= 90);
+        assert_eq!(m.ml_background_over_budget_total.get(), before);
+
+        m.record_ml_background_with_budget(120, 100);
+        assert_eq!(m.ml_background_last_ns.get(), 120);
+        assert!(m.ml_background_max_ns.get() >= 120);
+        assert_eq!(m.ml_background_over_budget_total.get(), before + 1);
     }
 }

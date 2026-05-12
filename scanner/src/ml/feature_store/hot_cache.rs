@@ -2,23 +2,19 @@
 //!
 //! Implementa a **Camada 1b** da arquitetura de feature store (ADR-012).
 //! Cache em RAM com janela rolante **24h real** (Fase 0 C6 fix), baseado
-//! em `hdrhistogram` para queries O(log range) + ring buffer decimado
-//! 1-em-10 para expiração de samples antigos.
+//! em ring buffer decimado 1-em-10 com pesos para expiração de samples
+//! antigos e queries exatas sobre a representação retida.
 //!
 //! # Arquitetura
 //!
 //! Cada `PerRouteCache` mantém:
 //!
-//! - `entry_hist` / `exit_hist` — `Histogram<u64>` (hdrhistogram 7.x).
-//! - `gross_hist` — histograma do lucro bruto pareado `entry + exit`.
 //! - `ring` — `VecDeque<SampleTick>` decimada 1-em-10 e compactada por peso.
 //!   Contém representantes dentro da janela de 24h.
 //! - `decimation_counter` — contador sequencial; só guarda no ring
 //!   quando `counter % DECIMATION == 0`.
 //! - `n_observations` — contagem efetiva de observações limpas na janela,
-//!   compensada pela decimação. O histograma usa o ring decimado ponderado.
-//! - `last_rebuild_ns` — timestamp do último rebuild completo do
-//!   histograma a partir do ring.
+//!   compensada pela decimação. Queries usam o ring decimado ponderado.
 //!
 //! # Decimação (por que 1-em-10)
 //!
@@ -34,9 +30,6 @@
 //! # Janela rolante 24h real
 //!
 //! Ring buffer pop-front samples com `ts_ns < now_ns - WINDOW_NS`.
-//! Histograma é **reconstruído imediatamente quando há expiração** a partir
-//! do ring atual. `hdrhistogram` não suporta decremento incremental; rebuild
-//! imediato evita manter representantes físicos totalmente vencidos.
 //! Para evitar crescimento linear de RAM durante coletas longas, o ring mantém
 //! uma cauda recente exata e compacta o prefixo antigo por pares: o ring mantém
 //! um representante com `weight = soma dos pesos` e intervalo temporal
@@ -55,15 +48,13 @@
 //! Range `[-10%, +10%]` (bucket `[1, 200_000]`) cobre folgadamente o
 //! regime cripto longtail. Valores fora são clampeados.
 //!
-//! Precisão com `sigfig=2` + `median_equivalent` → bucket effective
-//! ≈ 0.01% em spreads típicos.
+//! Precisão de bucket: 0.01% em spreads típicos.
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use hdrhistogram::Histogram;
 use parking_lot::RwLock;
 
 use crate::ml::contract::RouteId;
@@ -85,7 +76,7 @@ const COMPACTED_PREFIX_TICKS_PER_ROUTE: usize =
 /// Qualquer alteração aqui deve fragmentar `runtime_config_hash`, porque as
 /// features PIT derivadas do cache podem mudar mesmo com labels idênticos.
 pub const HOT_CACHE_POLICY_VERSION: &str =
-    "weighted_ring_v3:max_physical_ticks_per_route=512:recent_exact_ticks=256:interval_weighted";
+    "weighted_ring_v4:ring_only:max_physical_ticks_per_route=512:recent_exact_ticks=256:interval_weighted";
 
 #[inline]
 fn to_bucket(spread_pct: f32) -> u64 {
@@ -121,6 +112,12 @@ fn select_quantile_u64(values: &mut [u64], q: f64) -> u32 {
 fn select_weighted_quantile_u32(values: &mut [(u32, u64)], q: f64) -> u32 {
     debug_assert!(!values.is_empty());
     values.sort_unstable_by_key(|(bucket, _)| *bucket);
+    select_weighted_quantile_sorted_u32(values, q)
+}
+
+#[inline]
+fn select_weighted_quantile_sorted_u32(values: &[(u32, u64)], q: f64) -> u32 {
+    debug_assert!(!values.is_empty());
     let total = values
         .iter()
         .fold(0u64, |acc, (_, w)| acc.saturating_add(*w));
@@ -178,9 +175,40 @@ pub struct HotCacheSweepStats {
     pub ticks_expired: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HotCacheFeatureStats {
+    pub entry_p25: Option<f32>,
+    pub entry_p50: Option<f32>,
+    pub entry_p75: Option<f32>,
+    pub entry_p95: Option<f32>,
+    pub exit_p25: Option<f32>,
+    pub exit_p50: Option<f32>,
+    pub exit_p75: Option<f32>,
+    pub exit_p95: Option<f32>,
+    pub entry_rank_percentile: Option<f32>,
+    pub entry_mad_robust: Option<f32>,
+    pub p_exit_ge_threshold: Option<f32>,
+    pub tail_ratio_p99_p95: Option<f32>,
+    pub gross_run_p05_s: Option<u32>,
+    pub gross_run_p50_s: Option<u32>,
+    pub gross_run_p95_s: Option<u32>,
+    pub exit_excess_run_s: Option<u32>,
+    pub n_observations: u64,
+    pub oldest_observation_ns: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HotCacheWindowStats {
+    pub entry_p50: Option<f32>,
+    pub entry_p95: Option<f32>,
+    pub entry_rank_percentile: Option<f32>,
+    pub p_exit_ge_threshold: Option<f32>,
+}
+
 thread_local! {
     static RUN_DURATION_SCRATCH: RefCell<Vec<u64>> = RefCell::new(Vec::new());
     static WEIGHTED_BUCKET_SCRATCH: RefCell<Vec<(u32, u64)>> = RefCell::new(Vec::new());
+    static WEIGHTED_BUCKET_SCRATCH_2: RefCell<Vec<(u32, u64)>> = RefCell::new(Vec::new());
 }
 
 impl Default for CacheConfig {
@@ -224,23 +252,12 @@ struct SampleTick {
 }
 
 struct PerRouteStorage {
-    entry_hist: Histogram<u64>,
-    exit_hist: Histogram<u64>,
     ring: VecDeque<SampleTick>,
 }
 
 impl PerRouteStorage {
     fn new(cfg: CacheConfig) -> Self {
-        // Range [1, 200_000] cobre spread ∈ [-10%, +10%]. sigfig=2 com
-        // median_equivalent em queries → bucket effective ≈ 0.01% em
-        // spreads típicos.
-        let entry_hist =
-            Histogram::<u64>::new_with_bounds(1, BUCKET_MAX, 2).expect("hdrhistogram init");
-        let exit_hist =
-            Histogram::<u64>::new_with_bounds(1, BUCKET_MAX, 2).expect("hdrhistogram init");
         Self {
-            entry_hist,
-            exit_hist,
             ring: VecDeque::with_capacity(cfg.ring_initial_capacity),
         }
     }
@@ -255,18 +272,39 @@ fn logical_sampled_observations(storage: &PerRouteStorage) -> u64 {
 }
 
 #[inline]
-fn rebuild_histograms(storage: &mut PerRouteStorage) {
-    storage.entry_hist.reset();
-    storage.exit_hist.reset();
-    for sample in &storage.ring {
-        let weight = sample.weight as u64;
-        let _ = storage
-            .entry_hist
-            .record_n(sample.entry_bucket as u64, weight);
-        let _ = storage
-            .exit_hist
-            .record_n(sample.exit_bucket as u64, weight);
-    }
+fn weighted_quantile_entry(storage: &PerRouteStorage, q: f64) -> Option<u32> {
+    WEIGHTED_BUCKET_SCRATCH.with(|scratch| {
+        let mut values = scratch.borrow_mut();
+        values.clear();
+        values.extend(
+            storage
+                .ring
+                .iter()
+                .map(|sample| (sample.entry_bucket, sample.weight as u64)),
+        );
+        if values.is_empty() {
+            return None;
+        }
+        Some(select_weighted_quantile_u32(&mut values, q))
+    })
+}
+
+#[inline]
+fn weighted_quantile_exit(storage: &PerRouteStorage, q: f64) -> Option<u32> {
+    WEIGHTED_BUCKET_SCRATCH.with(|scratch| {
+        let mut values = scratch.borrow_mut();
+        values.clear();
+        values.extend(
+            storage
+                .ring
+                .iter()
+                .map(|sample| (sample.exit_bucket, sample.weight as u64)),
+        );
+        if values.is_empty() {
+            return None;
+        }
+        Some(select_weighted_quantile_u32(&mut values, q))
+    })
 }
 
 #[inline]
@@ -382,6 +420,47 @@ fn compact_ring_if_needed(storage: &mut PerRouteStorage) -> bool {
     true
 }
 
+#[inline]
+fn exit_run_duration_quantiles_from_storage(
+    storage: &PerRouteStorage,
+    threshold_bucket: u32,
+) -> Option<(u32, u32, u32)> {
+    if storage.ring.is_empty() {
+        return None;
+    }
+
+    RUN_DURATION_SCRATCH.with(|scratch| {
+        let mut runs = scratch.borrow_mut();
+        runs.clear();
+        let mut active_start: Option<u64> = None;
+        let mut last_ts: Option<u64> = None;
+
+        for sample in &storage.ring {
+            last_ts = Some(sample.end_ts_ns);
+            if sample.exit_bucket >= threshold_bucket {
+                if active_start.is_none() {
+                    active_start = Some(sample.start_ts_ns);
+                }
+            } else if let Some(start) = active_start.take() {
+                runs.push((sample.start_ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000);
+            }
+        }
+
+        if let (Some(start), Some(end)) = (active_start, last_ts) {
+            runs.push((end.saturating_sub(start) + 999_999_999) / 1_000_000_000);
+        }
+
+        if runs.is_empty() {
+            return None;
+        }
+
+        let p05 = select_quantile_u64(&mut runs, 0.05);
+        let p50 = select_quantile_u64(&mut runs, 0.50);
+        let p95 = select_quantile_u64(&mut runs, 0.95);
+        Some((p05, p50, p95))
+    })
+}
+
 struct PerRouteCache {
     storage: Option<PerRouteStorage>,
     /// Wrap seguro por ~34×10⁹ anos em 17k RPS.
@@ -390,7 +469,6 @@ struct PerRouteCache {
     /// decimação. Usado para `n_min` gate pelo trigger/baseline.
     n_observations: u64,
     last_update_ns: u64,
-    last_rebuild_ns: u64,
     cfg: CacheConfig,
 }
 
@@ -401,7 +479,6 @@ impl PerRouteCache {
             decimation_counter: 0,
             n_observations: 0,
             last_update_ns: 0,
-            last_rebuild_ns: 0,
             cfg,
         }
     }
@@ -423,7 +500,6 @@ impl PerRouteCache {
         let xb = to_bucket(exit);
         let cfg = self.cfg;
 
-        let mut rebuilt = false;
         let retained_len = {
             let storage = self.storage_mut();
             storage.ring.push_back(SampleTick {
@@ -435,42 +511,18 @@ impl PerRouteCache {
             });
 
             let cutoff = ts_ns.saturating_sub(cfg.window_ns);
-            let mut expired = 0u64;
             while let Some(front) = storage.ring.front() {
                 if front.end_ts_ns < cutoff {
                     storage.ring.pop_front();
-                    expired += 1;
                 } else {
                     break;
                 }
             }
-            if trim_front_sample_to_cutoff(storage, cutoff) {
-                rebuilt = true;
-            }
-
-            // `hdrhistogram` não decrementa. Se houve expiração, rebuild
-            // imediato evita quantis PIT contaminados por amostras fora da janela.
-            if expired > 0 {
-                rebuilt = true;
-            } else {
-                let _ = storage.entry_hist.record(eb);
-                let _ = storage.exit_hist.record(xb);
-            }
-
-            if compact_ring_if_needed(storage) {
-                rebuilt = true;
-            }
-
-            if rebuilt {
-                rebuild_histograms(storage);
-            }
+            let _ = trim_front_sample_to_cutoff(storage, cutoff);
+            let _ = compact_ring_if_needed(storage);
 
             logical_sampled_observations(storage)
         };
-
-        if rebuilt {
-            self.last_rebuild_ns = ts_ns;
-        }
 
         self.n_observations = retained_len.saturating_mul(cfg.decimation.max(1) as u64);
         self.last_update_ns = ts_ns;
@@ -498,9 +550,7 @@ impl PerRouteCache {
         if storage.ring.is_empty() {
             return None;
         }
-        let v = storage.entry_hist.value_at_quantile(q);
-        let mid = storage.entry_hist.median_equivalent(v);
-        Some(from_bucket(mid))
+        weighted_quantile_entry(storage, q).map(|bucket| from_bucket(bucket as u64))
     }
 
     #[inline]
@@ -509,9 +559,7 @@ impl PerRouteCache {
         if storage.ring.is_empty() {
             return None;
         }
-        let v = storage.exit_hist.value_at_quantile(q);
-        let mid = storage.exit_hist.median_equivalent(v);
-        Some(from_bucket(mid))
+        weighted_quantile_exit(storage, q).map(|bucket| from_bucket(bucket as u64))
     }
 
     #[inline]
@@ -539,8 +587,14 @@ impl PerRouteCache {
         if total == 0 {
             return None;
         }
-        let low = to_bucket(threshold);
-        let successes = storage.entry_hist.count_between(low, BUCKET_MAX);
+        let low = to_bucket(threshold) as u32;
+        let successes = storage.ring.iter().fold(0u64, |acc, sample| {
+            if sample.entry_bucket >= low {
+                acc.saturating_add(sample.weight as u64)
+            } else {
+                acc
+            }
+        });
         let p = successes as f32 / total as f32;
         Some((p, successes, total))
     }
@@ -556,7 +610,13 @@ impl PerRouteCache {
         }
         let bucket = to_bucket(spread_pct);
         // Count de amostras com entry_bucket <= bucket (inclui o próprio).
-        let below = storage.entry_hist.count_between(1, bucket);
+        let below = storage.ring.iter().fold(0u64, |acc, sample| {
+            if sample.entry_bucket <= bucket as u32 {
+                acc.saturating_add(sample.weight as u64)
+            } else {
+                acc
+            }
+        });
         Some(below as f32 / total as f32)
     }
 
@@ -609,15 +669,15 @@ impl PerRouteCache {
         if self.logical_sampled_observations() < 30 {
             return None;
         }
-        let p99_bucket = storage.entry_hist.value_at_quantile(0.99);
-        let p95_bucket = storage.entry_hist.value_at_quantile(0.95);
+        let p99_bucket = weighted_quantile_entry(storage, 0.99)?;
+        let p95_bucket = weighted_quantile_entry(storage, 0.95)?;
         // buckets idênticos → colapso de cauda → None.
         // Antes retornava 1.0, semanticamente "cauda fina normal" falso.
         if p99_bucket <= p95_bucket + 1 {
             return None;
         }
-        let p99 = from_bucket(storage.entry_hist.median_equivalent(p99_bucket));
-        let p95 = from_bucket(storage.entry_hist.median_equivalent(p95_bucket));
+        let p99 = from_bucket(p99_bucket as u64);
+        let p95 = from_bucket(p95_bucket as u64);
         if p95.abs() < 1e-6 {
             return None;
         }
@@ -631,8 +691,14 @@ impl PerRouteCache {
         if total == 0 {
             return None;
         }
-        let low = to_bucket(threshold);
-        let successes = storage.exit_hist.count_between(low, BUCKET_MAX);
+        let low = to_bucket(threshold) as u32;
+        let successes = storage.ring.iter().fold(0u64, |acc, sample| {
+            if sample.exit_bucket >= low {
+                acc.saturating_add(sample.weight as u64)
+            } else {
+                acc
+            }
+        });
         let p = successes as f32 / total as f32;
         Some((p, successes, total))
     }
@@ -659,44 +725,159 @@ impl PerRouteCache {
         Some((successes as f32 / total as f32, successes, total))
     }
 
+    fn feature_stats(&self, entry_spread: f32, exit_threshold: f32) -> HotCacheFeatureStats {
+        let Some(storage) = self.storage.as_ref() else {
+            return HotCacheFeatureStats::default();
+        };
+        if storage.ring.is_empty() {
+            return HotCacheFeatureStats::default();
+        }
+
+        let total = self.logical_sampled_observations();
+        let oldest_observation_ns = self.oldest_observation_ns();
+        let entry_bucket = to_bucket(entry_spread) as u32;
+        let exit_threshold_bucket = to_bucket(exit_threshold) as u32;
+
+        WEIGHTED_BUCKET_SCRATCH.with(|entry_scratch| {
+            WEIGHTED_BUCKET_SCRATCH_2.with(|exit_scratch| {
+                let mut entry_values = entry_scratch.borrow_mut();
+                let mut exit_values = exit_scratch.borrow_mut();
+                entry_values.clear();
+                exit_values.clear();
+
+                let mut entry_below = 0u64;
+                let mut exit_successes = 0u64;
+                for sample in &storage.ring {
+                    let weight = sample.weight as u64;
+                    entry_values.push((sample.entry_bucket, weight));
+                    exit_values.push((sample.exit_bucket, weight));
+                    if sample.entry_bucket <= entry_bucket {
+                        entry_below = entry_below.saturating_add(weight);
+                    }
+                    if sample.exit_bucket >= exit_threshold_bucket {
+                        exit_successes = exit_successes.saturating_add(weight);
+                    }
+                }
+
+                entry_values.sort_unstable_by_key(|(bucket, _)| *bucket);
+                exit_values.sort_unstable_by_key(|(bucket, _)| *bucket);
+
+                let entry_p25_bucket = select_weighted_quantile_sorted_u32(&entry_values, 0.25);
+                let entry_p50_bucket = select_weighted_quantile_sorted_u32(&entry_values, 0.50);
+                let entry_p75_bucket = select_weighted_quantile_sorted_u32(&entry_values, 0.75);
+                let entry_p95_bucket = select_weighted_quantile_sorted_u32(&entry_values, 0.95);
+                let entry_p99_bucket = select_weighted_quantile_sorted_u32(&entry_values, 0.99);
+                let exit_p25_bucket = select_weighted_quantile_sorted_u32(&exit_values, 0.25);
+                let exit_p50_bucket = select_weighted_quantile_sorted_u32(&exit_values, 0.50);
+                let exit_p75_bucket = select_weighted_quantile_sorted_u32(&exit_values, 0.75);
+                let exit_p95_bucket = select_weighted_quantile_sorted_u32(&exit_values, 0.95);
+
+                let entry_p25 = from_bucket(entry_p25_bucket as u64);
+                let entry_p50 = from_bucket(entry_p50_bucket as u64);
+                let entry_p75 = from_bucket(entry_p75_bucket as u64);
+                let entry_p95 = from_bucket(entry_p95_bucket as u64);
+                let exit_p50 = from_bucket(exit_p50_bucket as u64);
+                let tail_ratio_p99_p95 = if total >= 30
+                    && entry_p99_bucket > entry_p95_bucket + 1
+                    && entry_p95.abs() >= 1e-6
+                {
+                    Some(from_bucket(entry_p99_bucket as u64) / entry_p95)
+                } else {
+                    None
+                };
+                let entry_mad_robust = if total >= 30 {
+                    Some(((entry_p75 - entry_p25) / 2.0).abs() * 0.7413)
+                } else {
+                    None
+                };
+                let (gross_run_p05_s, gross_run_p50_s, gross_run_p95_s) =
+                    exit_run_duration_quantiles_from_storage(storage, exit_threshold_bucket)
+                        .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
+                        .unwrap_or((None, None, None));
+                let exit_excess_run_s =
+                    exit_run_duration_quantiles_from_storage(storage, exit_p50_bucket)
+                        .map(|(_, p50, _)| p50);
+
+                HotCacheFeatureStats {
+                    entry_p25: Some(entry_p25),
+                    entry_p50: Some(entry_p50),
+                    entry_p75: Some(entry_p75),
+                    entry_p95: Some(entry_p95),
+                    exit_p25: Some(from_bucket(exit_p25_bucket as u64)),
+                    exit_p50: Some(exit_p50),
+                    exit_p75: Some(from_bucket(exit_p75_bucket as u64)),
+                    exit_p95: Some(from_bucket(exit_p95_bucket as u64)),
+                    entry_rank_percentile: (total > 0).then_some(entry_below as f32 / total as f32),
+                    entry_mad_robust,
+                    p_exit_ge_threshold: (total > 0)
+                        .then_some(exit_successes as f32 / total as f32),
+                    tail_ratio_p99_p95,
+                    gross_run_p05_s,
+                    gross_run_p50_s,
+                    gross_run_p95_s,
+                    exit_excess_run_s,
+                    n_observations: self.n_observations,
+                    oldest_observation_ns,
+                }
+            })
+        })
+    }
+
+    fn window_stats(
+        &self,
+        entry_spread: f32,
+        exit_threshold: f32,
+        cutoff_ns: Option<u64>,
+        include_p95: bool,
+    ) -> HotCacheWindowStats {
+        let Some(storage) = self.storage.as_ref() else {
+            return HotCacheWindowStats::default();
+        };
+        let entry_bucket = to_bucket(entry_spread) as u32;
+        let exit_threshold_bucket = to_bucket(exit_threshold) as u32;
+
+        WEIGHTED_BUCKET_SCRATCH.with(|scratch| {
+            let mut values = scratch.borrow_mut();
+            values.clear();
+            let mut total = 0u64;
+            let mut below = 0u64;
+            let mut exit_successes = 0u64;
+            for sample in storage.ring.iter() {
+                let weight = cutoff_ns
+                    .map(|cutoff| proportional_weight(sample, cutoff))
+                    .unwrap_or(sample.weight as u64);
+                if weight == 0 {
+                    continue;
+                }
+                values.push((sample.entry_bucket, weight));
+                total = total.saturating_add(weight);
+                if sample.entry_bucket <= entry_bucket {
+                    below = below.saturating_add(weight);
+                }
+                if sample.exit_bucket >= exit_threshold_bucket {
+                    exit_successes = exit_successes.saturating_add(weight);
+                }
+            }
+            if values.is_empty() || total == 0 {
+                return HotCacheWindowStats::default();
+            }
+            values.sort_unstable_by_key(|(bucket, _)| *bucket);
+            let entry_p50 = from_bucket(select_weighted_quantile_sorted_u32(&values, 0.50) as u64);
+            let entry_p95 = include_p95
+                .then(|| from_bucket(select_weighted_quantile_sorted_u32(&values, 0.95) as u64));
+            HotCacheWindowStats {
+                entry_p50: Some(entry_p50),
+                entry_p95,
+                entry_rank_percentile: Some(below as f32 / total as f32),
+                p_exit_ge_threshold: Some(exit_successes as f32 / total as f32),
+            }
+        })
+    }
+
     #[inline]
     fn exit_run_duration_quantiles(&self, exit_threshold: f32) -> Option<(u32, u32, u32)> {
         let storage = self.storage.as_ref()?;
-        if storage.ring.is_empty() {
-            return None;
-        }
-
-        let threshold_bucket = to_bucket(exit_threshold) as u32;
-        RUN_DURATION_SCRATCH.with(|scratch| {
-            let mut runs = scratch.borrow_mut();
-            runs.clear();
-            let mut active_start: Option<u64> = None;
-            let mut last_ts: Option<u64> = None;
-
-            for s in &storage.ring {
-                last_ts = Some(s.end_ts_ns);
-                if s.exit_bucket >= threshold_bucket {
-                    if active_start.is_none() {
-                        active_start = Some(s.start_ts_ns);
-                    }
-                } else if let Some(start) = active_start.take() {
-                    runs.push((s.start_ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000);
-                }
-            }
-
-            if let (Some(start), Some(end)) = (active_start, last_ts) {
-                runs.push((end.saturating_sub(start) + 999_999_999) / 1_000_000_000);
-            }
-
-            if runs.is_empty() {
-                return None;
-            }
-
-            let p05 = select_quantile_u64(&mut runs, 0.05);
-            let p50 = select_quantile_u64(&mut runs, 0.50);
-            let p95 = select_quantile_u64(&mut runs, 0.95);
-            Some((p05, p50, p95))
-        })
+        exit_run_duration_quantiles_from_storage(storage, to_bucket(exit_threshold) as u32)
     }
 
     #[inline]
@@ -724,8 +905,6 @@ impl PerRouteCache {
             let trimmed = trim_front_sample_to_cutoff(storage, cutoff);
 
             if expired > 0 || trimmed {
-                rebuild_histograms(storage);
-                self.last_rebuild_ns = now_ns;
                 self.n_observations = logical_sampled_observations(storage)
                     .saturating_mul(self.cfg.decimation.max(1) as u64);
                 let min_capacity = self.cfg.ring_initial_capacity.max(storage.ring.len());
@@ -790,6 +969,34 @@ impl HotQueryCache {
     pub fn quantile_entry(&self, route: RouteId, q: f64) -> Option<f32> {
         let guard = self.routes.read();
         guard.get(&route)?.quantile_entry(q)
+    }
+
+    pub fn feature_stats(
+        &self,
+        route: RouteId,
+        entry_spread: f32,
+        exit_threshold: f32,
+    ) -> HotCacheFeatureStats {
+        let guard = self.routes.read();
+        guard
+            .get(&route)
+            .map(|cache| cache.feature_stats(entry_spread, exit_threshold))
+            .unwrap_or_default()
+    }
+
+    pub fn window_stats(
+        &self,
+        route: RouteId,
+        entry_spread: f32,
+        exit_threshold: f32,
+        cutoff_ns: Option<u64>,
+        include_p95: bool,
+    ) -> HotCacheWindowStats {
+        let guard = self.routes.read();
+        guard
+            .get(&route)
+            .map(|cache| cache.window_stats(entry_spread, exit_threshold, cutoff_ns, include_p95))
+            .unwrap_or_default()
     }
 
     pub fn quantile_exit(&self, route: RouteId, q: f64) -> Option<f32> {

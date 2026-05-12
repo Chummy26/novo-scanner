@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use arrow_array::{
@@ -11,10 +11,12 @@ use arrow_array::{
 };
 use arrow_json::reader::ReaderBuilder;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use once_cell::sync::Lazy;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
+use prometheus::IntGauge;
 use serde::{Deserialize, Serialize};
 
 use crate::ml::persistence::labeled_trade::LABELED_TRADE_SCHEMA_VERSION;
@@ -75,6 +77,61 @@ impl Default for ParquetCompactionConfig {
 }
 
 const COMPACTOR_VERSION: &str = "parquet-compactor-v2-strict-lossless";
+static GLOBAL_COMPACTION_GATE: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+struct CompactionGateGuard {
+    _lock: MutexGuard<'static, ()>,
+    active_gauge: IntGauge,
+}
+
+impl Drop for CompactionGateGuard {
+    fn drop(&mut self) {
+        self.active_gauge.dec();
+    }
+}
+
+fn enter_compaction_gate(dataset_kind: DatasetKind) -> CompactionGateGuard {
+    let metrics = crate::obs::Metrics::init();
+    let dataset = dataset_kind.as_str();
+    let waiting = metrics
+        .ml_dataset_compaction_waiting_current
+        .with_label_values(&[dataset]);
+    waiting.inc();
+    let lock = GLOBAL_COMPACTION_GATE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    waiting.dec();
+
+    set_current_compaction_thread_low_priority();
+    let active_gauge = metrics
+        .ml_dataset_compaction_active_current
+        .with_label_values(&[dataset]);
+    active_gauge.inc();
+    CompactionGateGuard {
+        _lock: lock,
+        active_gauge,
+    }
+}
+
+#[cfg(windows)]
+fn set_current_compaction_thread_low_priority() {
+    use std::ffi::c_void;
+
+    const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThread() -> *mut c_void;
+        fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
+    }
+
+    unsafe {
+        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_current_compaction_thread_low_priority() {}
 
 pub fn compact_jsonl_file(
     jsonl_path: &Path,
@@ -87,6 +144,8 @@ pub fn compact_jsonl_file(
     if jsonl_path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
         return Ok(None);
     }
+
+    let _compaction_gate = enter_compaction_gate(dataset_kind);
 
     let metadata =
         fs::metadata(jsonl_path).with_context(|| format!("metadata {}", jsonl_path.display()))?;

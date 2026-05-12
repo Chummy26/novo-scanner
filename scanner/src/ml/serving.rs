@@ -1188,91 +1188,59 @@ impl MlServer {
         half_spread_buy_now: Option<f32>,
         half_spread_sell_now: Option<f32>,
     ) -> FeaturesT0 {
-        let entry_p25_pre_observe = self.baseline.cache().quantile_entry(route, 0.25);
-        let entry_p50_pre_observe = self.baseline.cache().quantile_entry(route, 0.50);
-        let entry_p75_pre_observe = self.baseline.cache().quantile_entry(route, 0.75);
-        let entry_p95_pre_observe = self.baseline.cache().quantile_entry(route, 0.95);
-        let exit_p25_pre_observe = self.baseline.cache().quantile_exit(route, 0.25);
-        let exit_p50_pre_observe = self.baseline.cache().quantile_exit(route, 0.50);
-        let exit_p75_pre_observe = self.baseline.cache().quantile_exit(route, 0.75);
-        let exit_p95_pre_observe = self.baseline.cache().quantile_exit(route, 0.95);
-        let entry_rank_pre_observe = self
-            .baseline
-            .cache()
-            .entry_rank_percentile(route, entry_spread);
-        let entry_minus_p50_pre = entry_p50_pre_observe.map(|p50| entry_spread - p50);
-        let entry_mad_pre = self.baseline.cache().entry_mad_robust(route);
         let exit_threshold_for_primary_floor = self.label_floor_pct - entry_spread;
-        let p_exit_ge_floor_pre = self
-            .baseline
-            .cache()
-            .probability_exit_ge(route, exit_threshold_for_primary_floor)
-            .map(|(p, _, _)| p);
-        let one_hour_cutoff_ns = now_ns.saturating_sub(FEATURE_WINDOW_1H_NS);
-        let entry_p50_1h_pre_observe =
-            self.baseline
-                .cache()
-                .quantile_entry_since(route, 0.50, one_hour_cutoff_ns);
-        let entry_rank_1h_pre_observe = self.baseline.cache().entry_rank_percentile_since(
+        let stats_24h = self.baseline.cache().feature_stats(
             route,
             entry_spread,
-            one_hour_cutoff_ns,
+            exit_threshold_for_primary_floor,
         );
-        let p_exit_ge_floor_1h_pre = self
-            .baseline
-            .cache()
-            .probability_exit_ge_since(route, exit_threshold_for_primary_floor, one_hour_cutoff_ns)
-            .map(|(p, _, _)| p);
-        let entry_p50_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.50);
-        let entry_p95_7d_pre_observe = self.feature_cache_7d.quantile_entry(route, 0.95);
-        let p_exit_ge_floor_7d_pre = self
-            .feature_cache_7d
-            .probability_exit_ge(route, exit_threshold_for_primary_floor)
-            .map(|(p, _, _)| p);
-        let (gross_run_p05_pre_observe, gross_run_p50_pre_observe, gross_run_p95_pre_observe) =
-            self.baseline
-                .cache()
-                .exit_run_duration_quantiles(route, exit_threshold_for_primary_floor)
-                .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
-                .unwrap_or((None, None, None));
-        let exit_excess_run_pre = exit_p50_pre_observe.and_then(|threshold| {
-            self.baseline
-                .cache()
-                .exit_run_duration_quantiles(route, threshold)
-                .map(|(_, p50, _)| p50)
-        });
-        let tail_ratio_pre_observe = self.baseline.cache().tail_ratio_p99_p95(route);
-        let n_cache_obs_pre = self.baseline.cache().n_observations(route) as u32;
-        let oldest_cache_ts_pre = self.baseline.cache().oldest_observation_ns(route);
+        let entry_minus_p50_pre = stats_24h.entry_p50.map(|p50| entry_spread - p50);
+        let one_hour_cutoff_ns = now_ns.saturating_sub(FEATURE_WINDOW_1H_NS);
+        let stats_1h = self.baseline.cache().window_stats(
+            route,
+            entry_spread,
+            exit_threshold_for_primary_floor,
+            Some(one_hour_cutoff_ns),
+            false,
+        );
+        let stats_7d = self.feature_cache_7d.window_stats(
+            route,
+            entry_spread,
+            exit_threshold_for_primary_floor,
+            None,
+            true,
+        );
+        let n_cache_obs_pre = stats_24h.n_observations as u32;
+        let oldest_cache_ts_pre = stats_24h.oldest_observation_ns;
         let time_alive_at_t0_s = self.time_alive_snapshot(route, entry_spread, now_ns);
         let listing_age_days_pre_observe = self.listing.listing_age_days(route, now_ns);
 
         FeaturesT0 {
             half_spread_buy_now,
             half_spread_sell_now,
-            tail_ratio_p99_p95: tail_ratio_pre_observe,
-            entry_p25_24h: entry_p25_pre_observe,
-            entry_p50_24h: entry_p50_pre_observe,
-            entry_p75_24h: entry_p75_pre_observe,
-            entry_p95_24h: entry_p95_pre_observe,
-            entry_rank_percentile_24h: entry_rank_pre_observe,
+            tail_ratio_p99_p95: stats_24h.tail_ratio_p99_p95,
+            entry_p25_24h: stats_24h.entry_p25,
+            entry_p50_24h: stats_24h.entry_p50,
+            entry_p75_24h: stats_24h.entry_p75,
+            entry_p95_24h: stats_24h.entry_p95,
+            entry_rank_percentile_24h: stats_24h.entry_rank_percentile,
             entry_minus_p50_24h: entry_minus_p50_pre,
-            entry_mad_robust_24h: entry_mad_pre,
-            exit_p25_24h: exit_p25_pre_observe,
-            exit_p50_24h: exit_p50_pre_observe,
-            exit_p75_24h: exit_p75_pre_observe,
-            exit_p95_24h: exit_p95_pre_observe,
-            p_exit_ge_label_floor_minus_entry_24h: p_exit_ge_floor_pre,
-            entry_p50_1h: entry_p50_1h_pre_observe,
-            entry_rank_percentile_1h: entry_rank_1h_pre_observe,
-            p_exit_ge_label_floor_minus_entry_1h: p_exit_ge_floor_1h_pre,
-            entry_p50_7d: entry_p50_7d_pre_observe,
-            entry_p95_7d: entry_p95_7d_pre_observe,
-            p_exit_ge_label_floor_minus_entry_7d: p_exit_ge_floor_7d_pre,
-            gross_run_p05_s: gross_run_p05_pre_observe,
-            gross_run_p50_s: gross_run_p50_pre_observe,
-            gross_run_p95_s: gross_run_p95_pre_observe,
-            exit_excess_run_s: exit_excess_run_pre,
+            entry_mad_robust_24h: stats_24h.entry_mad_robust,
+            exit_p25_24h: stats_24h.exit_p25,
+            exit_p50_24h: stats_24h.exit_p50,
+            exit_p75_24h: stats_24h.exit_p75,
+            exit_p95_24h: stats_24h.exit_p95,
+            p_exit_ge_label_floor_minus_entry_24h: stats_24h.p_exit_ge_threshold,
+            entry_p50_1h: stats_1h.entry_p50,
+            entry_rank_percentile_1h: stats_1h.entry_rank_percentile,
+            p_exit_ge_label_floor_minus_entry_1h: stats_1h.p_exit_ge_threshold,
+            entry_p50_7d: stats_7d.entry_p50,
+            entry_p95_7d: stats_7d.entry_p95,
+            p_exit_ge_label_floor_minus_entry_7d: stats_7d.p_exit_ge_threshold,
+            gross_run_p05_s: stats_24h.gross_run_p05_s,
+            gross_run_p50_s: stats_24h.gross_run_p50_s,
+            gross_run_p95_s: stats_24h.gross_run_p95_s,
+            exit_excess_run_s: stats_24h.exit_excess_run_s,
             n_cache_observations_at_t0: n_cache_obs_pre,
             oldest_cache_ts_ns: oldest_cache_ts_pre,
             time_alive_at_t0_s,

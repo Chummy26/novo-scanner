@@ -21,6 +21,13 @@ pub struct HistoryStore {
     buckets: AHashMap<String, Mutex<Ring>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HistoryStats {
+    pub symbols: usize,
+    pub retained_opportunities: usize,
+    pub capacity_per_symbol: usize,
+}
+
 struct Ring {
     head: AtomicU32,
     slots: Vec<Option<OpportunityDto>>,
@@ -55,6 +62,10 @@ impl Ring {
         }
         out
     }
+
+    fn retained_len(&self) -> usize {
+        self.slots.iter().filter(|slot| slot.is_some()).count()
+    }
 }
 
 impl HistoryStore {
@@ -82,6 +93,19 @@ impl HistoryStore {
         match self.buckets.get(symbol) {
             Some(m) => m.lock().snapshot(),
             None => Vec::new(),
+        }
+    }
+
+    pub fn stats(&self) -> HistoryStats {
+        let retained_opportunities = self
+            .buckets
+            .values()
+            .map(|ring| ring.lock().retained_len())
+            .sum();
+        HistoryStats {
+            symbols: self.buckets.len(),
+            retained_opportunities,
+            capacity_per_symbol: self.capacity,
         }
     }
 }
@@ -142,5 +166,19 @@ mod tests {
         h.record_batch(&[op("BTC", 1.5)]);
         assert_eq!(h.history_of("BTC").len(), 2);
         assert_eq!(h.history_of("ETH").len(), 1);
+    }
+
+    #[test]
+    fn stats_report_bounded_retention() {
+        let mut h = HistoryStore::new(3);
+        for i in 0..10 {
+            h.record_batch(&[op("BTC", i as f64)]);
+        }
+        h.record_batch(&[op("ETH", 1.0)]);
+
+        let stats = h.stats();
+        assert_eq!(stats.symbols, 2);
+        assert_eq!(stats.retained_opportunities, 4);
+        assert_eq!(stats.capacity_per_symbol, 3);
     }
 }

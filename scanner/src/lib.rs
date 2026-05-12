@@ -1246,13 +1246,15 @@ async fn run_spread_engine(
                 enqueue_accepted_sample(&ml_server, &ml_writer, sample, false);
             }
         }
-        metrics.record_ml_background(ml_background_t0.elapsed().as_nanos() as u64);
+        let cycle_budget_ns = broadcast_ms.saturating_mul(1_000_000);
+        metrics.record_ml_background_with_budget(
+            ml_background_t0.elapsed().as_nanos() as u64,
+            cycle_budget_ns,
+        );
 
-        // Move buf contents into DTOs; reuse allocation on next cycle.
-        let snapshot: Vec<Opportunity> = std::mem::take(&mut buf);
-        buf = Vec::with_capacity(count.max(1024));
-        bstate.publish(snapshot);
-        metrics.record_full_cycle(cycle_t0.elapsed().as_nanos() as u64);
+        bstate.publish(&buf);
+        metrics
+            .record_full_cycle_with_budget(cycle_t0.elapsed().as_nanos() as u64, cycle_budget_ns);
     }
 }
 
