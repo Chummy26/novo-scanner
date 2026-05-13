@@ -98,8 +98,11 @@ pub struct MlConfig {
     #[serde(default = "default_label_sweeper_interval_s")]
     pub label_sweeper_interval_s: u64,
 
-    /// Capacidade da fila assíncrona de observações limpas do LabelResolver.
-    /// Fila cheia é violação strict-lossless e aborta o run; não há drop.
+    /// Capacidade da fila assíncrona legada do LabelResolver.
+    ///
+    /// O caminho de produção processa labels no worker ML FIFO para evitar uma
+    /// segunda fronteira `try_send` em strict-lossless. Mantido apenas para
+    /// compatibilidade de configs antigas e testes do handle assíncrono.
     #[serde(default = "default_label_observation_channel_capacity")]
     pub label_observation_channel_capacity: usize,
 

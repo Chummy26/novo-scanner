@@ -72,8 +72,8 @@ raw_rerank_interval_s = 3600
 label_stride_s = 60
 label_horizons_s = [900, 1800, 3600, 7200, 14400, 28800]
 label_sweeper_interval_s = 10
-# Clean observations are fed to the label resolver through a strict-lossless
-# async queue. Full queue aborts instead of dropping or biasing labels.
+# Legacy async LabelResolver channel capacity. Production resolves labels in
+# the ML worker FIFO so strict-lossless has one backpressure boundary.
 label_observation_channel_capacity = 32768
 label_floor_pct = 0.8
 label_floors_pct = [0.3, 0.5, 0.8, 1.2, 2.0, 3.0]

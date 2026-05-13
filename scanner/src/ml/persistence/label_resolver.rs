@@ -213,7 +213,12 @@ struct PendingLabelState {
     entry_locked_pct: f32,
     label_floor_pct: f32,
     label_floors_pct: SmallVec<[f32; 8]>,
-    horizons: SmallVec<[PendingHorizon; 6]>,
+    // Keep horizon storage heap-backed so memory can actually shrink as
+    // shorter horizons close. An inline SmallVec<[PendingHorizon; 6]> keeps
+    // six full PendingHorizon slots reserved for every live candidate until
+    // the last 8h horizon closes, which creates multi-hour RAM growth without
+    // adding training signal.
+    horizons: Vec<PendingHorizon>,
 }
 
 impl PendingLabelState {
@@ -1491,8 +1496,7 @@ impl LabelResolver {
 
         let (horizons, stride_keys) = {
             let mut inner = self.inner.lock();
-            let mut horizons: SmallVec<[PendingHorizon; 6]> =
-                SmallVec::with_capacity(self.cfg.horizons_s.len());
+            let mut horizons: Vec<PendingHorizon> = Vec::with_capacity(self.cfg.horizons_s.len());
             let mut stride_keys = Vec::with_capacity(self.cfg.horizons_s.len());
             for &horizon_s in &self.cfg.horizons_s {
                 if label_stride_s > 0 {

@@ -32,10 +32,9 @@ use crate::ml::feature_store::HotQueryCache;
 use crate::ml::metrics::MlPrometheusMetrics;
 use crate::ml::persistence::{
     compact_existing_jsonl_in_tree, write_run_audit, DatasetKind, JsonlWriter, LabelResolver,
-    LabelResolverAsyncHandle, LabelShutdownAudit, LabeledJsonlWriter, LabeledWriterConfig,
-    ParquetCompactionConfig, RawSampleWriter, RawWriterConfig, ResolverConfig, RouteDecimator,
-    RouteRanking, RunAuditInput, RunAuditVerdict, WriterAudit, WriterConfig, WriterHandle,
-    WriterSendError,
+    LabelShutdownAudit, LabeledJsonlWriter, LabeledWriterConfig, ParquetCompactionConfig,
+    RawSampleWriter, RawWriterConfig, ResolverConfig, RouteDecimator, RouteRanking, RunAuditInput,
+    RunAuditVerdict, WriterAudit, WriterConfig, WriterHandle, WriterSendError,
 };
 use crate::ml::retention::{
     sweep_datasets, DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy,
@@ -108,7 +107,7 @@ async fn run_ml_cycle_worker(
     ml_server: Arc<MlServer>,
     ml_writer: WriterHandle,
     ml_broadcaster: RecommendationBroadcaster,
-    label_observer: LabelResolverAsyncHandle,
+    label_resolver: Arc<LabelResolver>,
     mut rx: tokio::sync::mpsc::Receiver<MlCycleCommand>,
 ) {
     let metrics = obs::Metrics::init();
@@ -133,16 +132,12 @@ async fn run_ml_cycle_worker(
                 metrics.ml_cycle_batches_processed_total.inc();
                 metrics.ml_cycle_events_processed_total.inc_by(n_events);
             }
-            MlCycleCommand::LabelSweep { now_ns } => match label_observer.sweep(now_ns).await {
-                Ok(n) if n > 0 => {
+            MlCycleCommand::LabelSweep { now_ns } => {
+                let n = label_resolver.sweep(now_ns);
+                if n > 0 {
                     tracing::debug!(n_closed = n, "label_resolver sweep");
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!(error = ?e, "label_resolver async sweep failed");
-                    panic!("label_resolver strict-lossless violation: async sweep failed: {e:?}");
-                }
-            },
+            }
         }
     }
 }
@@ -488,10 +483,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         labeled_handle,
         Some(labeled_writer_abs.join("_pending_spool")),
     ));
-    let label_observer = LabelResolverAsyncHandle::spawn(
-        Arc::clone(&label_resolver),
-        cfg.ml.label_observation_channel_capacity,
-    );
 
     // Ranker rolling — 24h de buckets × 15 min.
     let ranker = Arc::new(RouteRanking::new(
@@ -511,7 +502,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             .with_raw_writer(ml_raw_writer_handle)
             .with_route_ranking(Arc::clone(&ranker))
             .with_label_resolver(Arc::clone(&label_resolver))
-            .with_label_observer(label_observer.clone())
             .with_label_config(
                 cfg.ml.label_stride_s,
                 cfg.ml.label_floor_pct,
@@ -817,7 +807,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Arc::clone(&ml_server),
         ml_writer_handle.clone(),
         ml_broadcaster.clone(),
-        label_observer.clone(),
+        Arc::clone(&label_resolver),
         ml_cycle_rx,
     ));
     let label_sweeper_task = {
@@ -939,12 +929,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             }
         }
 
-        if let Err(e) = label_observer.flush().await {
-            warn!(
-                error = ?e,
-                "shutdown: falha ao drenar fila assíncrona do label resolver"
-            );
-        }
         let label_stats = label_resolver_shutdown.shutdown_flush(now_ns()).await;
         info!(
             reason,
