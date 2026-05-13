@@ -526,6 +526,7 @@ struct PendingMetaSpool {
     current_segment_id: u64,
     write_file: File,
     segments: AHashMap<u64, PendingMetaSegment>,
+    scratch: Vec<u8>,
 }
 
 struct PendingMetaSegment {
@@ -573,10 +574,8 @@ impl PendingMetaStore {
             }
             PendingMetaBackend::Disk(spool) => {
                 let start = SystemTime::now();
-                let dto = PendingLabelMetaDto::from(&meta);
-                let bytes = serde_json::to_vec(&dto)?;
                 let mut spool = spool.lock();
-                let meta_ref = spool.append(&bytes)?;
+                let meta_ref = spool.append_meta(&meta)?;
                 self.metrics
                     .meta_spool_records_total
                     .fetch_add(1, Ordering::Relaxed);
@@ -690,14 +689,21 @@ impl PendingMetaSpool {
             current_segment_id: 0,
             write_file,
             segments,
+            scratch: Vec::with_capacity(4096),
         })
     }
 
-    fn append(&mut self, bytes: &[u8]) -> anyhow::Result<PendingMetaRef> {
-        if bytes.len() > u32::MAX as usize {
-            anyhow::bail!("pending meta payload too large: {} bytes", bytes.len());
+    fn append_meta(&mut self, meta: &PendingLabelMeta) -> anyhow::Result<PendingMetaRef> {
+        self.scratch.clear();
+        let dto = PendingLabelMetaDto::from(meta);
+        serde_json::to_writer(&mut self.scratch, &dto)?;
+        if self.scratch.len() > u32::MAX as usize {
+            anyhow::bail!(
+                "pending meta payload too large: {} bytes",
+                self.scratch.len()
+            );
         }
-        let len = bytes.len() as u32;
+        let len = self.scratch.len() as u32;
         let record_bytes = 4u64.saturating_add(len as u64);
         let current_bytes = self
             .segments
@@ -716,7 +722,7 @@ impl PendingMetaSpool {
             .ok_or_else(|| anyhow::anyhow!("current segment {segment_id} missing"))?;
         let offset = segment.bytes;
         self.write_file.write_all(&len.to_le_bytes())?;
-        self.write_file.write_all(bytes)?;
+        self.write_file.write_all(&self.scratch)?;
         segment.bytes = segment.bytes.saturating_add(record_bytes);
         segment.live_records = segment.live_records.saturating_add(1);
         Ok(PendingMetaRef::Disk {

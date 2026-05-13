@@ -48,6 +48,8 @@ use crate::spread::engine::{
 };
 use crate::types::now_ns;
 
+const ML_CYCLE_CHANNEL_CAPACITY: usize = 64;
+
 #[inline]
 fn should_mark_sample_recommended(rec: &crate::ml::contract::Recommendation) -> bool {
     matches!(rec, crate::ml::contract::Recommendation::Trade(_))
@@ -79,6 +81,143 @@ fn enqueue_accepted_sample(
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MlCycleObservation {
+    observation: RouteObservation,
+    foreground: bool,
+}
+
+#[derive(Debug)]
+struct MlCycleBatch {
+    cycle_seq: u32,
+    event_time_ns: u64,
+    cycle_budget_ns: u64,
+    observations: Vec<MlCycleObservation>,
+}
+
+#[derive(Debug)]
+enum MlCycleCommand {
+    Batch(MlCycleBatch),
+    LabelSweep { now_ns: u64 },
+}
+
+async fn run_ml_cycle_worker(
+    universe: Arc<SymbolUniverse>,
+    ml_server: Arc<MlServer>,
+    ml_writer: WriterHandle,
+    ml_broadcaster: RecommendationBroadcaster,
+    label_observer: LabelResolverAsyncHandle,
+    mut rx: tokio::sync::mpsc::Receiver<MlCycleCommand>,
+) {
+    let metrics = obs::Metrics::init();
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            MlCycleCommand::Batch(batch) => {
+                let n_events = batch.observations.len() as u64;
+                metrics.ml_cycle_queue_depth_current.dec();
+                metrics
+                    .ml_cycle_queue_events_current
+                    .sub(n_events.min(i64::MAX as u64) as i64);
+                process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, batch)
+                    .await;
+                metrics.ml_cycle_batches_processed_total.inc();
+                metrics.ml_cycle_events_processed_total.inc_by(n_events);
+            }
+            MlCycleCommand::LabelSweep { now_ns } => match label_observer.sweep(now_ns).await {
+                Ok(n) if n > 0 => {
+                    tracing::debug!(n_closed = n, "label_resolver sweep");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(error = ?e, "label_resolver async sweep failed");
+                }
+            },
+        }
+    }
+}
+
+async fn process_ml_cycle_batch(
+    universe: &SymbolUniverse,
+    ml_server: &MlServer,
+    ml_writer: &WriterHandle,
+    ml_broadcaster: &RecommendationBroadcaster,
+    batch: MlCycleBatch,
+) {
+    let metrics = obs::Metrics::init();
+    let ml_foreground_t0 = std::time::Instant::now();
+    for item in batch.observations.iter().filter(|item| item.foreground) {
+        let opp = item.observation;
+        let route = RouteId {
+            symbol_id: opp.symbol_id,
+            buy_venue: opp.buy_venue,
+            sell_venue: opp.sell_venue,
+        };
+        let symbol_name = universe.canonical_name_of(opp.symbol_id);
+        let (rec, _dec, accepted) = ml_server.on_opportunity_with_books(
+            batch.cycle_seq,
+            route,
+            &symbol_name,
+            opp.entry_spread as f32,
+            opp.exit_spread as f32,
+            opp.buy_vol24,
+            opp.sell_vol24,
+            opp.buy_bid_price,
+            opp.buy_price,
+            opp.sell_price,
+            opp.sell_ask_price,
+            batch.event_time_ns,
+        );
+        let _had_active_consumers = ml_broadcaster.publish(
+            batch.cycle_seq,
+            batch.event_time_ns,
+            route,
+            symbol_name.as_str(),
+            &rec,
+        );
+        if let Some(sample) = accepted {
+            enqueue_accepted_sample(
+                ml_server,
+                ml_writer,
+                sample,
+                should_mark_sample_recommended(&rec),
+            );
+        }
+    }
+    metrics.record_ml_foreground(ml_foreground_t0.elapsed().as_nanos() as u64);
+
+    let ml_background_t0 = std::time::Instant::now();
+    for item in batch.observations.iter().filter(|item| !item.foreground) {
+        let opp = item.observation;
+        let route = RouteId {
+            symbol_id: opp.symbol_id,
+            buy_venue: opp.buy_venue,
+            sell_venue: opp.sell_venue,
+        };
+        let symbol_id = opp.symbol_id;
+        let (_dec, accepted) = ml_server.observe_background_with_books_lazy_symbol(
+            batch.cycle_seq,
+            route,
+            || universe.canonical_name_of(symbol_id),
+            opp.entry_spread as f32,
+            opp.exit_spread as f32,
+            opp.buy_vol24,
+            opp.sell_vol24,
+            opp.buy_bid_price,
+            opp.buy_price,
+            opp.sell_price,
+            opp.sell_ask_price,
+            batch.event_time_ns,
+        );
+        if let Some(sample) = accepted {
+            enqueue_accepted_sample(ml_server, ml_writer, sample, false);
+        }
+    }
+    metrics.record_ml_background_with_budget(
+        ml_background_t0.elapsed().as_nanos() as u64,
+        batch.cycle_budget_ns,
+    );
 }
 
 fn route_decimator_from_ml_config(ml: &config::MlConfig) -> RouteDecimator {
@@ -450,27 +589,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         });
     }
 
-    // Task sweeper do label resolver.
-    let label_sweeper_task = {
-        let observer = label_observer.clone();
-        let sweeper_interval = Duration::from_secs(cfg.ml.label_sweeper_interval_s.max(1));
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(sweeper_interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                match observer.sweep(now_ns()).await {
-                    Ok(n) if n > 0 => {
-                        tracing::debug!(n_closed = n, "label_resolver sweep");
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::error!(error = ?e, "label_resolver async sweep failed");
-                    }
-                }
-            }
-        })
-    };
+    // O sweep de labels deve passar pela mesma fila FIFO do pipeline ML.
+    // Assim, se houver backlog, o sweep fica atrás das observações já
+    // capturadas e não censura janelas antes de processar o futuro observado.
+    let label_sweeper_interval = Duration::from_secs(cfg.ml.label_sweeper_interval_s.max(1));
 
     // Fix C2 — Sweeper econômico: fecha pendings cujo `valid_until` expirou
     // mesmo sem nova observação da rota (rotas que silenciam). Mesma cadência
@@ -675,6 +797,38 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }
     }
 
+    // --- ML cycle worker ---
+    // O scan loop só publica UI e enfileira observações imutáveis. Todo o
+    // trabalho variável de dataset/cache/label/recommendation roda aqui, em
+    // FIFO por ciclo, usando event_time_ns congelado para preservar PIT.
+    let (ml_cycle_tx, ml_cycle_rx) =
+        tokio::sync::mpsc::channel::<MlCycleCommand>(ML_CYCLE_CHANNEL_CAPACITY);
+    let ml_worker_task = tokio::spawn(run_ml_cycle_worker(
+        Arc::clone(&universe),
+        Arc::clone(&ml_server),
+        ml_writer_handle.clone(),
+        ml_broadcaster.clone(),
+        label_observer.clone(),
+        ml_cycle_rx,
+    ));
+    let label_sweeper_task = {
+        let tx = ml_cycle_tx.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(label_sweeper_interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                if tx
+                    .send(MlCycleCommand::LabelSweep { now_ns: now_ns() })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    };
+
     // --- Spread engine loop (150ms) ---
     let u_engine = Arc::clone(&universe);
     let s_engine = Arc::clone(&store);
@@ -686,8 +840,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let broadcast_ms = cfg.broadcast_ms;
     let c_engine = Arc::clone(&counters);
     let ml_engine = Arc::clone(&ml_server);
-    let ml_writer_engine = ml_writer_handle.clone();
-    let ml_broadcaster_engine = ml_broadcaster.clone();
+    let ml_cycle_tx_engine = ml_cycle_tx.clone();
+    drop(ml_cycle_tx);
     let label_resolver_shutdown = Arc::clone(&label_resolver);
     let mut engine_task = tokio::spawn(async move {
         run_spread_engine(
@@ -702,17 +856,28 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             broadcast_ms,
             bstate,
             ml_engine,
-            ml_writer_engine,
-            ml_broadcaster_engine,
+            ml_cycle_tx_engine,
         )
         .await;
     });
+    let mut engine_task_completed = false;
+    let mut terminal_error: Option<anyhow::Error> = None;
     let shutdown_reason = tokio::select! {
         result = &mut engine_task => {
-            if let Err(e) = result {
-                warn!(error = %e, "spread engine task terminou com erro");
+            engine_task_completed = true;
+            match result {
+                Ok(()) => {
+                    warn!("spread engine task terminou inesperadamente");
+                    terminal_error = Some(anyhow::anyhow!(
+                        "spread engine task terminated unexpectedly"
+                    ));
+                }
+                Err(e) => {
+                    warn!(error = %e, "spread engine task terminou com erro");
+                    terminal_error = Some(anyhow::anyhow!("spread engine task failed: {e}"));
+                }
             }
-            None
+            Some("engine_task")
         }
         signal = tokio::signal::ctrl_c() => {
             match signal {
@@ -736,16 +901,29 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }
     };
     if let Some(reason) = shutdown_reason {
-        engine_task.abort();
-        if let Err(e) = engine_task.await {
-            if !e.is_cancelled() {
-                warn!(error = %e, "spread engine task terminou com erro durante shutdown");
+        if !engine_task_completed {
+            engine_task.abort();
+            if let Err(e) = engine_task.await {
+                if !e.is_cancelled() {
+                    warn!(error = %e, "spread engine task terminou com erro durante shutdown");
+                }
             }
         }
         label_sweeper_task.abort();
         if let Err(e) = label_sweeper_task.await {
             if !e.is_cancelled() {
                 warn!(error = %e, "label sweeper task terminou com erro durante shutdown");
+            }
+        }
+        match ml_worker_task.await {
+            Ok(()) => {
+                info!("shutdown: ML cycle worker drenado");
+            }
+            Err(e) => {
+                warn!(error = %e, "shutdown: ML cycle worker terminou com erro");
+                terminal_error = Some(anyhow::anyhow!(
+                    "ML cycle worker failed during shutdown: {e}"
+                ));
             }
         }
 
@@ -922,6 +1100,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     return Err(e.context("ML strict_lossless: run audit failed"));
                 }
             }
+        }
+        if let Some(error) = terminal_error {
+            return Err(error.context(
+                "ML strict_lossless: spread engine terminated; shutdown flush/seal/audit completed",
+            ));
         }
     }
     Ok(())
@@ -1120,11 +1303,10 @@ async fn run_spread_engine(
     broadcast_ms: u64,
     bstate: BroadcastState,
     ml_server: Arc<MlServer>,
-    ml_writer: WriterHandle,
-    ml_broadcaster: RecommendationBroadcaster,
+    ml_cycle_tx: tokio::sync::mpsc::Sender<MlCycleCommand>,
 ) {
     let mut buf: Vec<Opportunity> = Vec::with_capacity(1024);
-    let mut ml_observations: Vec<RouteObservation> = Vec::with_capacity(4096);
+    let mut ml_observations: Vec<MlCycleObservation> = Vec::with_capacity(4096);
     let mut tick = tokio::time::interval(Duration::from_millis(broadcast_ms));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1145,9 +1327,10 @@ async fn run_spread_engine(
             &counters,
             &mut buf,
             |obs| {
-                if obs.entry_spread < threshold_pct {
-                    ml_observations.push(*obs);
-                }
+                ml_observations.push(MlCycleObservation {
+                    observation: *obs,
+                    foreground: obs.entry_spread >= threshold_pct,
+                });
             },
         );
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
@@ -1158,103 +1341,38 @@ async fn run_spread_engine(
             metrics.opportunities_total.inc_by(count as u64);
         }
 
-        // --- ML pass (M1.7 shadow mode inline) ---
-        // Alimenta HotQueryCache + aciona baseline A3 + broadcast
-        // `Recommendation` via `RecommendationBroadcaster` (pós-Wave T:
-        // resolve lacuna de `_rec` descartado). `AcceptedSample.was_recommended`
-        // preserva o sinal shadow pre-gate; entrega ao consumer é métrica
-        // separada do broadcaster.
-        //
-        // Latência ~1–5 µs por opp; para 50–200 opps por ciclo, overhead
-        // total <1 ms em budget de 150 ms.
         let now = now_ns();
         let cycle_seq = ml_server.begin_cycle();
-        let ml_foreground_t0 = std::time::Instant::now();
-        for opp in &buf {
-            let route = RouteId {
-                symbol_id: opp.symbol_id,
-                buy_venue: opp.buy_venue,
-                sell_venue: opp.sell_venue,
-            };
-            // ADR-029: resolver nome canonical ESTÁVEL (entre runs) via universe.
-            // Sem isso, SymbolId muda entre runs e dados ficam inúteis
-            // retrospectivamente.
-            let symbol_name = universe.canonical_name_of(opp.symbol_id);
-            let (rec, _dec, accepted) = ml_server.on_opportunity_with_books(
-                cycle_seq,
-                route,
-                &symbol_name,
-                opp.entry_spread as f32,
-                opp.exit_spread as f32,
-                opp.buy_vol24,
-                opp.sell_vol24,
-                opp.buy_bid_price,
-                opp.buy_price,
-                opp.sell_price,
-                opp.sell_ask_price,
-                now,
-            );
-            // Publica recomendação no canal broadcast para consumers WS /
-            // REST. Entrega ao consumer é observabilidade; o dataset não
-            // pode depender da presença de uma UI conectada.
-            let _had_active_consumers =
-                ml_broadcaster.publish(cycle_seq, now, route, symbol_name.as_str(), &rec);
-
-            // **C1 + C4 fix** — enfileira AcceptedSample para JSONL writer
-            // quando trigger aceitou, com flag `was_recommended`
-            // refletindo a emissão real de `TradeSetup`, não o estado do
-            // WebSocket/UI no instante.
-            //
-            // Fix pós-auditoria: drops do canal agora contados em métricas
-            // `accepted_samples_dropped_channel_full/closed`. Antes eram
-            // silenciosos (`let _ = ...`), causando perdas invisíveis
-            // durante bursts ou writer travado.
-            if let Some(sample) = accepted {
-                enqueue_accepted_sample(
-                    &ml_server,
-                    &ml_writer,
-                    sample,
-                    should_mark_sample_recommended(&rec),
-                );
-            }
-        }
-        metrics.record_ml_foreground(ml_foreground_t0.elapsed().as_nanos() as u64);
-
-        // Feed ML/cache with valid route observations that were below the UI
-        // opportunity threshold. This runs after the thresholded
-        // `on_opportunity` pass to preserve point-in-time behavior for
-        // recommendations emitted this cycle.
-        let ml_background_t0 = std::time::Instant::now();
-        for opp in &ml_observations {
-            let route = RouteId {
-                symbol_id: opp.symbol_id,
-                buy_venue: opp.buy_venue,
-                sell_venue: opp.sell_venue,
-            };
-            let symbol_id = opp.symbol_id;
-            let (_dec, accepted) = ml_server.observe_background_with_books_lazy_symbol(
-                cycle_seq,
-                route,
-                || universe.canonical_name_of(symbol_id),
-                opp.entry_spread as f32,
-                opp.exit_spread as f32,
-                opp.buy_vol24,
-                opp.sell_vol24,
-                opp.buy_bid_price,
-                opp.buy_price,
-                opp.sell_price,
-                opp.sell_ask_price,
-                now,
-            );
-            if let Some(sample) = accepted {
-                enqueue_accepted_sample(&ml_server, &ml_writer, sample, false);
-            }
-        }
         let cycle_budget_ns = broadcast_ms.saturating_mul(1_000_000);
-        metrics.record_ml_background_with_budget(
-            ml_background_t0.elapsed().as_nanos() as u64,
-            cycle_budget_ns,
-        );
+        if !ml_observations.is_empty() {
+            let next_capacity = ml_observations.capacity().max(4096);
+            let observations =
+                std::mem::replace(&mut ml_observations, Vec::with_capacity(next_capacity));
+            let n_events = observations.len() as u64;
+            let batch = MlCycleBatch {
+                cycle_seq,
+                event_time_ns: now,
+                cycle_budget_ns,
+                observations,
+            };
+            match ml_cycle_tx.try_send(MlCycleCommand::Batch(batch)) {
+                Ok(()) => {
+                    metrics.ml_cycle_queue_depth_current.inc();
+                    metrics
+                        .ml_cycle_queue_events_current
+                        .add(n_events.min(i64::MAX as u64) as i64);
+                    metrics.ml_cycle_batches_enqueued_total.inc();
+                    metrics.ml_cycle_events_enqueued_total.inc_by(n_events);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    metrics.ml_cycle_queue_full_total.inc();
+                    panic!("ml_cycle strict-lossless violation: async ML cycle queue full");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("ml_cycle strict-lossless violation: async ML cycle queue closed");
+                }
+            }
+        }
 
         bstate.publish(&buf);
         metrics

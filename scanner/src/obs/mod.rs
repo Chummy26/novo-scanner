@@ -37,6 +37,20 @@ pub struct Metrics {
     pub ml_foreground_hist: Mutex<Histogram<u64>>,
     /// Background ML/cache pass over below-threshold observations, ns.
     pub ml_background_hist: Mutex<Histogram<u64>>,
+    /// Batches de observações aguardando processamento ML assíncrono.
+    pub ml_cycle_queue_depth_current: IntGauge,
+    /// Eventos de rota aguardando processamento ML assíncrono.
+    pub ml_cycle_queue_events_current: IntGauge,
+    /// Batches ML aceitos pela fila assíncrona.
+    pub ml_cycle_batches_enqueued_total: IntCounter,
+    /// Batches ML processados pelo worker assíncrono.
+    pub ml_cycle_batches_processed_total: IntCounter,
+    /// Eventos de rota aceitos pela fila assíncrona.
+    pub ml_cycle_events_enqueued_total: IntCounter,
+    /// Eventos de rota processados pelo worker assíncrono.
+    pub ml_cycle_events_processed_total: IntCounter,
+    /// Tentativas de enqueue rejeitadas por fila ML cheia.
+    pub ml_cycle_queue_full_total: IntCounter,
     /// Last full spread loop processing latency, excluding scheduler sleep, ns.
     pub full_cycle_last_ns: IntGauge,
     /// Max full spread loop processing latency observed in this process, ns.
@@ -166,6 +180,41 @@ impl Metrics {
                 "Background ML/cache passes whose latency exceeded budget",
             )
             .expect("register ml_background_over_budget_total");
+            let ml_cycle_queue_depth_current = IntGauge::new(
+                "scanner_ml_cycle_queue_depth_current",
+                "ML cycle batches waiting in the asynchronous processing queue",
+            )
+            .expect("register ml_cycle_queue_depth_current");
+            let ml_cycle_queue_events_current = IntGauge::new(
+                "scanner_ml_cycle_queue_events_current",
+                "Route observations waiting in the asynchronous ML processing queue",
+            )
+            .expect("register ml_cycle_queue_events_current");
+            let ml_cycle_batches_enqueued_total = IntCounter::new(
+                "scanner_ml_cycle_batches_enqueued_total",
+                "ML cycle batches enqueued for asynchronous processing",
+            )
+            .expect("register ml_cycle_batches_enqueued_total");
+            let ml_cycle_batches_processed_total = IntCounter::new(
+                "scanner_ml_cycle_batches_processed_total",
+                "ML cycle batches processed by the asynchronous worker",
+            )
+            .expect("register ml_cycle_batches_processed_total");
+            let ml_cycle_events_enqueued_total = IntCounter::new(
+                "scanner_ml_cycle_events_enqueued_total",
+                "Route observations enqueued for asynchronous ML processing",
+            )
+            .expect("register ml_cycle_events_enqueued_total");
+            let ml_cycle_events_processed_total = IntCounter::new(
+                "scanner_ml_cycle_events_processed_total",
+                "Route observations processed by the asynchronous ML worker",
+            )
+            .expect("register ml_cycle_events_processed_total");
+            let ml_cycle_queue_full_total = IntCounter::new(
+                "scanner_ml_cycle_queue_full_total",
+                "ML cycle enqueue attempts rejected because the async queue was full",
+            )
+            .expect("register ml_cycle_queue_full_total");
             let process_working_set_bytes = IntGauge::new(
                 "scanner_process_working_set_bytes",
                 "Current process working set, bytes",
@@ -227,6 +276,27 @@ impl Metrics {
                 .expect("reg");
             registry
                 .register(Box::new(ml_background_over_budget_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_queue_depth_current.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_queue_events_current.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_batches_enqueued_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_batches_processed_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_events_enqueued_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_events_processed_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_queue_full_total.clone()))
                 .expect("reg");
             registry
                 .register(Box::new(process_working_set_bytes.clone()))
@@ -294,6 +364,13 @@ impl Metrics {
                 full_cycle_hist,
                 ml_foreground_hist,
                 ml_background_hist,
+                ml_cycle_queue_depth_current,
+                ml_cycle_queue_events_current,
+                ml_cycle_batches_enqueued_total,
+                ml_cycle_batches_processed_total,
+                ml_cycle_events_enqueued_total,
+                ml_cycle_events_processed_total,
+                ml_cycle_queue_full_total,
                 full_cycle_last_ns,
                 full_cycle_max_ns,
                 full_cycle_budget_ns,

@@ -53,6 +53,7 @@ parking_lot       = "0.12"
 crossbeam-utils   = "0.8"
 arc-swap          = "1"
 core_affinity     = "0.8"
+mimalloc          = { version = "0.1", default-features = false }
 
 # Data structures / utilities
 ahash             = "0.8"

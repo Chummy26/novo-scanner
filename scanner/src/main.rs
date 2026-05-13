@@ -3,6 +3,9 @@ use clap::Parser;
 use scanner::Config;
 use tracing::{info, warn};
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Cross-exchange price-spread scanner")]
 struct Cli {

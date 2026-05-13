@@ -197,40 +197,44 @@ impl LabeledJsonlWriter {
                     self.current_rotation_key = Some(rotation_key);
                 }
                 Err(e) => {
-                    warn!(error = %e, "labeled writer: falha ao abrir arquivo; sample descartada");
                     self.total_dropped = self.total_dropped.saturating_add(1);
-                    return;
+                    panic!("labeled writer strict-lossless violation: failed to open file: {e}");
                 }
             }
         }
         let Some(writer) = self.writer.as_mut() else {
             self.total_dropped = self.total_dropped.saturating_add(1);
-            return;
+            panic!("labeled writer strict-lossless violation: writer missing after rotation");
         };
         let line = label.to_json_line();
         if let Err(e) = writeln!(writer, "{}", line) {
-            warn!(error = %e, "labeled writer: erro ao escrever; sample descartada");
             self.total_dropped = self.total_dropped.saturating_add(1);
-            return;
+            panic!("labeled writer strict-lossless violation: failed to write sample: {e}");
         }
         self.total_written = self.total_written.saturating_add(1);
         self.lines_since_flush = self.lines_since_flush.saturating_add(1);
         if self.lines_since_flush >= self.cfg.flush_after_n {
-            let _ = writer.flush();
+            if let Err(e) = writer.flush() {
+                panic!("labeled writer strict-lossless violation: failed to flush sample: {e}");
+            }
             self.lines_since_flush = 0;
         }
     }
 
     fn periodic_flush(&mut self) {
         if let Some(w) = self.writer.as_mut() {
-            let _ = w.flush();
+            if let Err(e) = w.flush() {
+                panic!("labeled writer strict-lossless violation: periodic flush failed: {e}");
+            }
             self.lines_since_flush = 0;
         }
     }
 
     fn close_current_file(&mut self) {
         if let Some(mut w) = self.writer.take() {
-            let _ = w.flush();
+            if let Err(e) = w.flush() {
+                panic!("labeled writer strict-lossless violation: close flush failed: {e}");
+            }
         }
         let Some(path) = self.current_path.take() else {
             return;
