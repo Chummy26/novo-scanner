@@ -117,6 +117,7 @@ fn enter_compaction_gate(dataset_kind: DatasetKind) -> CompactionGateGuard {
 fn set_current_compaction_thread_low_priority() {
     use std::ffi::c_void;
 
+    const THREAD_MODE_BACKGROUND_BEGIN: i32 = 0x00010000;
     const THREAD_PRIORITY_BELOW_NORMAL: i32 = -1;
 
     #[link(name = "kernel32")]
@@ -126,7 +127,10 @@ fn set_current_compaction_thread_low_priority() {
     }
 
     unsafe {
-        let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        let thread = GetCurrentThread();
+        if SetThreadPriority(thread, THREAD_MODE_BACKGROUND_BEGIN) == 0 {
+            let _ = SetThreadPriority(thread, THREAD_PRIORITY_BELOW_NORMAL);
+        }
     }
 }
 
@@ -266,6 +270,7 @@ pub fn compact_jsonl_file(
             writer.write(&batch).with_context(|| {
                 format!("write parquet batch for {}", temp_parquet_path.display())
             })?;
+            std::thread::yield_now();
         }
         writer
             .close()

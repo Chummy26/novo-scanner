@@ -83,6 +83,27 @@ pub struct Opportunity {
     pub sell_venue: Venue,
 }
 
+/// Observação limpa de rota para o pipeline ML.
+///
+/// Diferente de `Opportunity`, esta estrutura não carrega `String`s de UI.
+/// Ela existe para o caminho quente de coleta: preservar todas as observações
+/// válidas para raw/cache/labels sem alocar/clonar nomes por rota abaixo do
+/// threshold visual.
+#[derive(Debug, Clone, Copy)]
+pub struct RouteObservation {
+    pub symbol_id: SymbolId,
+    pub buy_venue: Venue,
+    pub sell_venue: Venue,
+    pub buy_bid_price: f64,
+    pub buy_price: f64,
+    pub sell_price: f64,
+    pub sell_ask_price: f64,
+    pub entry_spread: f64,
+    pub exit_spread: f64,
+    pub buy_vol24: f64,
+    pub sell_vol24: f64,
+}
+
 /// Per-cell (venue, symbol) staleness state. Laid out as [venue][symbol] for
 /// contiguous per-venue access during scan.
 pub struct StaleTable {
@@ -157,7 +178,7 @@ pub fn scan_once_with_observer<F>(
     out: &mut Vec<Opportunity>,
     mut observe: F,
 ) where
-    F: FnMut(&Opportunity),
+    F: FnMut(&RouteObservation),
 {
     let now = now_ns();
     for (i, canonical) in universe.by_id.iter().enumerate() {
@@ -289,6 +310,29 @@ pub fn scan_once_with_observer<F>(
                     continue;
                 }
 
+                let obs = RouteObservation {
+                    symbol_id: sym_id,
+                    buy_venue: buy_v,
+                    sell_venue: sell_v,
+                    buy_bid_price: buy.bid_px.to_f64(),
+                    buy_price: buy_ask,
+                    sell_price: sell_bid,
+                    sell_ask_price: sell.ask_px.to_f64(),
+                    entry_spread,
+                    exit_spread,
+                    buy_vol24: buy_vol,
+                    sell_vol24: sell_vol,
+                };
+
+                observe(&obs);
+
+                if entry_spread < threshold_pct {
+                    counters
+                        .dropped_below_threshold
+                        .fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+
                 let opp = Opportunity {
                     symbol: canonical.base.clone(),
                     current: canonical.quote.clone(),
@@ -296,10 +340,10 @@ pub fn scan_once_with_observer<F>(
                     sell_to: sell_v.as_str(),
                     buy_type: buy_v.market().as_str(),
                     sell_type: sell_v.market().as_str(),
-                    buy_bid_price: buy.bid_px.to_f64(),
-                    buy_price: buy_ask,
-                    sell_price: sell_bid,
-                    sell_ask_price: sell.ask_px.to_f64(),
+                    buy_bid_price: obs.buy_bid_price,
+                    buy_price: obs.buy_price,
+                    sell_price: obs.sell_price,
+                    sell_ask_price: obs.sell_ask_price,
                     entry_spread,
                     exit_spread,
                     buy_vol24: buy_vol,
@@ -311,15 +355,6 @@ pub fn scan_once_with_observer<F>(
                     buy_venue: buy_v,
                     sell_venue: sell_v,
                 };
-
-                observe(&opp);
-
-                if entry_spread < threshold_pct {
-                    counters
-                        .dropped_below_threshold
-                        .fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
 
                 out.push(opp);
                 counters.emitted.fetch_add(1, Ordering::Relaxed);
@@ -529,7 +564,7 @@ mod tests {
             0.0,
             &c,
             &mut out,
-            |opp| observed.push(opp.clone()),
+            |obs| observed.push(*obs),
         );
 
         assert!(out.is_empty(), "intra-exchange route must not be emitted");
@@ -595,7 +630,7 @@ mod tests {
             0.0,
             &c,
             &mut out,
-            |opp| observed.push(opp.clone()),
+            |obs| observed.push(*obs),
         );
 
         assert!(out.is_empty(), "outlier route must not be emitted");
@@ -660,7 +695,7 @@ mod tests {
             0.0,
             &c,
             &mut out,
-            |opp| observed.push(opp.clone()),
+            |obs| observed.push(*obs),
         );
 
         assert!(
@@ -669,7 +704,7 @@ mod tests {
         );
         let op = observed
             .iter()
-            .find(|o| o.buy_type == "SPOT" && o.sell_type == "FUTURES")
+            .find(|o| o.buy_venue.market() == Market::Spot && o.sell_venue.market() == Market::Perp)
             .expect("ML observer must still see valid SPOT/FUT route");
         assert!(op.entry_spread > 0.0 && op.entry_spread < 0.3);
     }

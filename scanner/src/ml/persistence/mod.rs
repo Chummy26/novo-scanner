@@ -42,8 +42,8 @@ pub mod sample_id;
 pub mod writer;
 
 pub use label_resolver::{
-    LabelResolver, LabelResolverAsyncHandle, PendingHorizon, PendingLabel, ResolverConfig,
-    ResolverMetrics, DEFAULT_HORIZONS_S,
+    LabelCandidateCommand, LabelResolver, LabelResolverAsyncHandle, PendingHorizon, PendingLabel,
+    ResolverConfig, ResolverMetrics, DEFAULT_HORIZONS_S,
 };
 pub use labeled_trade::{
     CensorReason, FeaturesT0, LabelOutcome, LabeledTrade, PolicyMetadata,

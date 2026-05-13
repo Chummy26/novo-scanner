@@ -46,7 +46,9 @@ use crate::ml::feature_store::{
 use crate::ml::listing_history::{
     ListingHistory, RouteLifecycle, DEFAULT_DELISTING_DETECTION_WINDOW_NS,
 };
-use crate::ml::persistence::label_resolver::{LabelResolverAsyncError, LabelResolverAsyncHandle};
+use crate::ml::persistence::label_resolver::{
+    LabelCandidateCommand, LabelResolverAsyncError, LabelResolverAsyncHandle,
+};
 use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_FLOORS_PCT};
 use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::persistence::{
@@ -210,6 +212,50 @@ fn half_spreads_from_books(
         _ => None,
     };
     (half_spread_buy_now, half_spread_sell_now)
+}
+
+struct SymbolNameSource<'a, F>
+where
+    F: FnOnce() -> String,
+{
+    borrowed: Option<&'a str>,
+    lazy: Option<F>,
+    owned: Option<String>,
+}
+
+impl<'a, F> SymbolNameSource<'a, F>
+where
+    F: FnOnce() -> String,
+{
+    fn borrowed(symbol_name: &'a str) -> Self {
+        Self {
+            borrowed: Some(symbol_name),
+            lazy: None,
+            owned: None,
+        }
+    }
+
+    fn lazy(f: F) -> Self {
+        Self {
+            borrowed: None,
+            lazy: Some(f),
+            owned: None,
+        }
+    }
+
+    fn get(&mut self) -> &str {
+        if let Some(symbol_name) = self.borrowed {
+            return symbol_name;
+        }
+        if self.owned.is_none() {
+            let f = self
+                .lazy
+                .take()
+                .expect("symbol_name lazy resolver must be called at most once");
+            self.owned = Some(f());
+        }
+        self.owned.as_deref().unwrap_or("")
+    }
 }
 
 fn abstain_reason_label(reason: AbstainReason) -> &'static str {
@@ -1371,28 +1417,98 @@ impl MlServer {
             .min(u32::MAX as usize) as u32;
         let runtime_config_hash = self.runtime_config_hash.clone();
         let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
-        resolver.on_candidate(
+        let candidate = LabelCandidateCommand {
             sample_id,
-            sample_dec.reason_label(),
-            now_ns,
+            sample_decision: sample_dec.reason_label(),
+            ts_emit_ns: now_ns,
             cycle_seq,
-            route,
-            symbol_name.to_string(),
-            entry_spread,
-            exit_spread,
+            route_id: route,
+            symbol_name: symbol_name.to_string(),
+            entry_locked_pct: entry_spread,
+            exit_start_pct: exit_spread,
             features_t0,
-            self.label_floor_pct,
-            self.label_floors_pct.clone(),
-            policy,
+            label_floor_pct: self.label_floor_pct,
+            label_floors_pct: self.label_floors_pct.clone(),
+            policy_metadata: policy,
             sampling_tier,
             sampling_probability,
-            self.label_stride_s,
+            label_stride_s: self.label_stride_s,
             cluster_id,
             cluster_size,
             cluster_rank,
             runtime_config_hash,
-            priority_gen,
-            priority_updated_ns,
+            priority_set_generation_id: priority_gen,
+            priority_set_updated_at_ns: priority_updated_ns,
+        };
+        self.submit_label_candidate(resolver, candidate);
+    }
+
+    fn submit_label_candidate(
+        &self,
+        resolver: &Arc<LabelResolver>,
+        candidate: LabelCandidateCommand,
+    ) {
+        if let Some(observer) = self.label_observer.as_ref() {
+            if let Err(err) = observer.try_enqueue_candidate(candidate) {
+                match err {
+                    LabelResolverAsyncError::QueueFull => {
+                        panic!(
+                            "label_resolver strict-lossless violation: async candidate queue full"
+                        );
+                    }
+                    LabelResolverAsyncError::QueueClosed => {
+                        panic!("label_resolver strict-lossless violation: async candidate queue closed");
+                    }
+                }
+            }
+            return;
+        }
+
+        let LabelCandidateCommand {
+            sample_id,
+            sample_decision,
+            ts_emit_ns,
+            cycle_seq,
+            route_id,
+            symbol_name,
+            entry_locked_pct,
+            exit_start_pct,
+            features_t0,
+            label_floor_pct,
+            label_floors_pct,
+            policy_metadata,
+            sampling_tier,
+            sampling_probability,
+            label_stride_s,
+            cluster_id,
+            cluster_size,
+            cluster_rank,
+            runtime_config_hash,
+            priority_set_generation_id,
+            priority_set_updated_at_ns,
+        } = candidate;
+        resolver.on_candidate(
+            sample_id,
+            sample_decision,
+            ts_emit_ns,
+            cycle_seq,
+            route_id,
+            symbol_name,
+            entry_locked_pct,
+            exit_start_pct,
+            features_t0,
+            label_floor_pct,
+            label_floors_pct,
+            policy_metadata,
+            sampling_tier,
+            sampling_probability,
+            label_stride_s,
+            cluster_id,
+            cluster_size,
+            cluster_rank,
+            runtime_config_hash,
+            priority_set_generation_id,
+            priority_set_updated_at_ns,
         );
     }
 
@@ -1416,10 +1532,12 @@ impl MlServer {
         sell_vol24_usd: f64,
         now_ns: u64,
     ) -> (SampleDecision, Option<AcceptedSample>) {
+        let mut symbol_name: SymbolNameSource<'_, fn() -> String> =
+            SymbolNameSource::borrowed(symbol_name);
         self.observe_background_inner(
             cycle_seq,
             route,
-            symbol_name,
+            &mut symbol_name,
             entry_spread,
             exit_spread,
             buy_vol24_usd,
@@ -1448,10 +1566,12 @@ impl MlServer {
         sell_ask_price: f64,
         now_ns: u64,
     ) -> (SampleDecision, Option<AcceptedSample>) {
+        let mut symbol_name: SymbolNameSource<'_, fn() -> String> =
+            SymbolNameSource::borrowed(symbol_name);
         self.observe_background_inner(
             cycle_seq,
             route,
-            symbol_name,
+            &mut symbol_name,
             entry_spread,
             exit_spread,
             buy_vol24_usd,
@@ -1465,11 +1585,47 @@ impl MlServer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn observe_background_inner(
+    pub fn observe_background_with_books_lazy_symbol<F>(
         &self,
         cycle_seq: u32,
         route: RouteId,
-        symbol_name: &str,
+        symbol_name: F,
+        entry_spread: f32,
+        exit_spread: f32,
+        buy_vol24_usd: f64,
+        sell_vol24_usd: f64,
+        buy_bid_price: f64,
+        buy_ask_price: f64,
+        sell_bid_price: f64,
+        sell_ask_price: f64,
+        now_ns: u64,
+    ) -> (SampleDecision, Option<AcceptedSample>)
+    where
+        F: FnOnce() -> String,
+    {
+        let mut symbol_name = SymbolNameSource::lazy(symbol_name);
+        self.observe_background_inner(
+            cycle_seq,
+            route,
+            &mut symbol_name,
+            entry_spread,
+            exit_spread,
+            buy_vol24_usd,
+            sell_vol24_usd,
+            Some(buy_bid_price),
+            Some(buy_ask_price),
+            Some(sell_bid_price),
+            Some(sell_ask_price),
+            now_ns,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_background_inner<F>(
+        &self,
+        cycle_seq: u32,
+        route: RouteId,
+        symbol_name: &mut SymbolNameSource<'_, F>,
         entry_spread: f32,
         exit_spread: f32,
         buy_vol24_usd: f64,
@@ -1479,7 +1635,10 @@ impl MlServer {
         sell_bid_price: Option<f64>,
         sell_ask_price: Option<f64>,
         now_ns: u64,
-    ) -> (SampleDecision, Option<AcceptedSample>) {
+    ) -> (SampleDecision, Option<AcceptedSample>)
+    where
+        F: FnOnce() -> String,
+    {
         self.listing.record_seen(route, now_ns);
         let lifecycle = self.listing.snapshot_for(route);
         let (half_spread_buy_now, half_spread_sell_now) =
@@ -1513,7 +1672,7 @@ impl MlServer {
                     now_ns,
                     cycle_seq,
                     route,
-                    symbol_name,
+                    symbol_name.get(),
                     entry_spread,
                     exit_spread,
                     buy_vol24_usd,
@@ -1544,11 +1703,13 @@ impl MlServer {
                         self.metrics
                             .raw_samples_dropped_channel_full
                             .fetch_add(1, Ordering::Relaxed);
+                        panic!("raw_samples strict-lossless violation: writer channel full");
                     }
                     Err(crate::ml::persistence::RawWriterSendError::ChannelClosed) => {
                         self.metrics
                             .raw_samples_dropped_channel_closed
                             .fetch_add(1, Ordering::Relaxed);
+                        panic!("raw_samples strict-lossless violation: writer channel closed");
                     }
                 }
             }
@@ -1559,18 +1720,22 @@ impl MlServer {
         // população, ou o trainer aprende uma distribuição diferente.
         let label_snapshot = self.label_candidate_snapshot(sample_dec, route, now_ns, cycle_seq);
 
-        let accepted = self.build_accepted_sample(
-            sample_dec,
-            now_ns,
-            cycle_seq,
-            route,
-            symbol_name,
-            entry_spread,
-            exit_spread,
-            buy_vol24_usd,
-            sell_vol24_usd,
-            lifecycle,
-        );
+        let accepted = if sample_dec == SampleDecision::Accept {
+            self.build_accepted_sample(
+                sample_dec,
+                now_ns,
+                cycle_seq,
+                route,
+                symbol_name.get(),
+                entry_spread,
+                exit_spread,
+                buy_vol24_usd,
+                sell_vol24_usd,
+                lifecycle,
+            )
+        } else {
+            None
+        };
 
         let should_label_background = self.should_materialize_label_candidate(
             self.label_resolver.as_ref(),
@@ -1617,6 +1782,7 @@ impl MlServer {
                     .as_ref()
                     .map(|s| s.sample_id.clone())
                     .unwrap_or_else(|| {
+                        let symbol_name = symbol_name.get();
                         sample_id_of(
                             now_ns,
                             cycle_seq,
@@ -1627,6 +1793,7 @@ impl MlServer {
                     });
                 let rec_meta =
                     background_recommendation_persistence(self.baseline.config().model_version);
+                let symbol_name = symbol_name.get().to_string();
                 self.enqueue_label_candidate(
                     resolver,
                     label_sample_id,
@@ -1634,7 +1801,7 @@ impl MlServer {
                     now_ns,
                     cycle_seq,
                     route,
-                    symbol_name,
+                    &symbol_name,
                     entry_spread,
                     exit_spread,
                     features_t0,
@@ -1849,11 +2016,13 @@ impl MlServer {
                         self.metrics
                             .raw_samples_dropped_channel_full
                             .fetch_add(1, Ordering::Relaxed);
+                        panic!("raw_samples strict-lossless violation: writer channel full");
                     }
                     Err(crate::ml::persistence::RawWriterSendError::ChannelClosed) => {
                         self.metrics
                             .raw_samples_dropped_channel_closed
                             .fetch_add(1, Ordering::Relaxed);
+                        panic!("raw_samples strict-lossless violation: writer channel closed");
                     }
                 }
             }
@@ -2044,29 +2213,30 @@ impl MlServer {
                 .min(u32::MAX as usize) as u32;
             let runtime_config_hash = self.runtime_config_hash.clone();
             let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
-            resolver.on_candidate(
-                label_sample_id,
-                sample_dec.reason_label(),
-                now_ns,
+            let candidate = LabelCandidateCommand {
+                sample_id: label_sample_id,
+                sample_decision: sample_dec.reason_label(),
+                ts_emit_ns: now_ns,
                 cycle_seq,
-                route,
-                symbol_name.to_string(),
-                entry_spread,
-                exit_spread,
+                route_id: route,
+                symbol_name: symbol_name.to_string(),
+                entry_locked_pct: entry_spread,
+                exit_start_pct: exit_spread,
                 features_t0,
-                self.label_floor_pct,
-                self.label_floors_pct.clone(),
-                policy,
-                label_snapshot.tier,
-                label_snapshot.probability,
-                self.label_stride_s,
+                label_floor_pct: self.label_floor_pct,
+                label_floors_pct: self.label_floors_pct.clone(),
+                policy_metadata: policy,
+                sampling_tier: label_snapshot.tier,
+                sampling_probability: label_snapshot.probability,
+                label_stride_s: self.label_stride_s,
                 cluster_id,
                 cluster_size,
                 cluster_rank,
                 runtime_config_hash,
-                priority_gen,
-                priority_updated_ns,
-            );
+                priority_set_generation_id: priority_gen,
+                priority_set_updated_at_ns: priority_updated_ns,
+            };
+            self.submit_label_candidate(resolver, candidate);
         }
 
         (rec, sample_dec, accepted)

@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
 use scanner::Config;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Debug, Parser)]
 #[command(author, version, about = "Cross-exchange price-spread scanner")]
@@ -19,6 +19,8 @@ fn main() -> anyhow::Result<()> {
         )
         .with_target(false)
         .init();
+
+    prefer_latency_priority();
 
     let cli = Cli::parse();
     let cfg = match cli.config {
@@ -38,3 +40,25 @@ fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(windows)]
+fn prefer_latency_priority() {
+    use std::ffi::c_void;
+
+    const ABOVE_NORMAL_PRIORITY_CLASS: u32 = 0x00008000;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut c_void;
+        fn SetPriorityClass(process: *mut c_void, priority_class: u32) -> i32;
+    }
+
+    unsafe {
+        if SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS) == 0 {
+            warn!("failed to raise scanner process priority to ABOVE_NORMAL");
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn prefer_latency_priority() {}

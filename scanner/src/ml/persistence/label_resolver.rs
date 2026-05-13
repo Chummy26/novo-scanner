@@ -213,7 +213,7 @@ struct PendingLabelState {
     entry_locked_pct: f32,
     label_floor_pct: f32,
     label_floors_pct: SmallVec<[f32; 8]>,
-    horizons: Vec<PendingHorizon>,
+    horizons: SmallVec<[PendingHorizon; 6]>,
 }
 
 impl PendingLabelState {
@@ -964,6 +964,7 @@ enum LabelResolverAsyncCommand {
         entry_spread: f32,
         exit_spread: f32,
     },
+    Candidate(LabelCandidateCommand),
     Sweep {
         now_ns: u64,
         reply: oneshot::Sender<u64>,
@@ -971,6 +972,36 @@ enum LabelResolverAsyncCommand {
     Flush {
         reply: oneshot::Sender<()>,
     },
+}
+
+/// Candidate de label congelado em t0 para envio ordenado ao worker assíncrono.
+///
+/// Carrega os mesmos campos de `on_candidate`; a diferença é operacional:
+/// serialização/spool e inserção no índice de pending saem do loop quente do
+/// scanner, sem reduzir linhas nem mudar a semântica PIT.
+#[derive(Debug)]
+pub struct LabelCandidateCommand {
+    pub sample_id: String,
+    pub sample_decision: &'static str,
+    pub ts_emit_ns: u64,
+    pub cycle_seq: u32,
+    pub route_id: RouteId,
+    pub symbol_name: String,
+    pub entry_locked_pct: f32,
+    pub exit_start_pct: f32,
+    pub features_t0: FeaturesT0,
+    pub label_floor_pct: f32,
+    pub label_floors_pct: Vec<f32>,
+    pub policy_metadata: PolicyMetadata,
+    pub sampling_tier: &'static str,
+    pub sampling_probability: f32,
+    pub label_stride_s: u32,
+    pub cluster_id: String,
+    pub cluster_size: u32,
+    pub cluster_rank: u32,
+    pub runtime_config_hash: String,
+    pub priority_set_generation_id: u32,
+    pub priority_set_updated_at_ns: u64,
 }
 
 #[derive(Clone)]
@@ -1004,6 +1035,54 @@ impl LabelResolverAsyncHandle {
                             .async_observation_processed_total
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    LabelResolverAsyncCommand::Candidate(candidate) => {
+                        let LabelCandidateCommand {
+                            sample_id,
+                            sample_decision,
+                            ts_emit_ns,
+                            cycle_seq,
+                            route_id,
+                            symbol_name,
+                            entry_locked_pct,
+                            exit_start_pct,
+                            features_t0,
+                            label_floor_pct,
+                            label_floors_pct,
+                            policy_metadata,
+                            sampling_tier,
+                            sampling_probability,
+                            label_stride_s,
+                            cluster_id,
+                            cluster_size,
+                            cluster_rank,
+                            runtime_config_hash,
+                            priority_set_generation_id,
+                            priority_set_updated_at_ns,
+                        } = candidate;
+                        resolver.on_candidate(
+                            sample_id,
+                            sample_decision,
+                            ts_emit_ns,
+                            cycle_seq,
+                            route_id,
+                            symbol_name,
+                            entry_locked_pct,
+                            exit_start_pct,
+                            features_t0,
+                            label_floor_pct,
+                            label_floors_pct,
+                            policy_metadata,
+                            sampling_tier,
+                            sampling_probability,
+                            label_stride_s,
+                            cluster_id,
+                            cluster_size,
+                            cluster_rank,
+                            runtime_config_hash,
+                            priority_set_generation_id,
+                            priority_set_updated_at_ns,
+                        );
+                    }
                     LabelResolverAsyncCommand::Sweep { now_ns, reply } => {
                         let n = resolver.sweep(now_ns);
                         worker_metrics
@@ -1018,6 +1097,45 @@ impl LabelResolverAsyncHandle {
             }
         });
         Self { tx, metrics }
+    }
+
+    pub fn try_enqueue_candidate(
+        &self,
+        candidate: LabelCandidateCommand,
+    ) -> Result<(), LabelResolverAsyncError> {
+        self.metrics
+            .async_queue_depth_current
+            .fetch_add(1, Ordering::Relaxed);
+        match self
+            .tx
+            .try_send(LabelResolverAsyncCommand::Candidate(candidate))
+        {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.metrics
+                    .async_queue_depth_current
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
+                self.metrics
+                    .async_queue_full_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(LabelResolverAsyncError::QueueFull)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.metrics
+                    .async_queue_depth_current
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
+                self.metrics
+                    .async_queue_closed_total
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(LabelResolverAsyncError::QueueClosed)
+            }
+        }
     }
 
     pub fn try_observe_clean(
@@ -1367,7 +1485,8 @@ impl LabelResolver {
 
         let (horizons, stride_keys) = {
             let mut inner = self.inner.lock();
-            let mut horizons = Vec::with_capacity(self.cfg.horizons_s.len());
+            let mut horizons: SmallVec<[PendingHorizon; 6]> =
+                SmallVec::with_capacity(self.cfg.horizons_s.len());
             let mut stride_keys = Vec::with_capacity(self.cfg.horizons_s.len());
             for &horizon_s in &self.cfg.horizons_s {
                 if label_stride_s > 0 {

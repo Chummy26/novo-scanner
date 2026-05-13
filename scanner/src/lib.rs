@@ -43,7 +43,8 @@ use crate::ml::retention::{
 use crate::ml::serving::MlServer;
 use crate::ml::trigger::SamplingTrigger;
 use crate::spread::engine::{
-    new_stale_table, scan_once_with_observer, Opportunity, ScanCounters, StaleTable,
+    new_stale_table, scan_once_with_observer, Opportunity, RouteObservation, ScanCounters,
+    StaleTable,
 };
 use crate::types::now_ns;
 
@@ -68,11 +69,13 @@ fn enqueue_accepted_sample(
                 metrics
                     .accepted_samples_dropped_channel_full
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                panic!("accepted_samples strict-lossless violation: writer channel full");
             }
             WriterSendError::ChannelClosed => {
                 metrics
                     .accepted_samples_dropped_channel_closed
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                panic!("accepted_samples strict-lossless violation: writer channel closed");
             }
         }
     }
@@ -1121,7 +1124,7 @@ async fn run_spread_engine(
     ml_broadcaster: RecommendationBroadcaster,
 ) {
     let mut buf: Vec<Opportunity> = Vec::with_capacity(1024);
-    let mut ml_observations: Vec<Opportunity> = Vec::with_capacity(4096);
+    let mut ml_observations: Vec<RouteObservation> = Vec::with_capacity(4096);
     let mut tick = tokio::time::interval(Duration::from_millis(broadcast_ms));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1141,7 +1144,11 @@ async fn run_spread_engine(
             min_vol_usd,
             &counters,
             &mut buf,
-            |opp| ml_observations.push(opp.clone()),
+            |obs| {
+                if obs.entry_spread < threshold_pct {
+                    ml_observations.push(*obs);
+                }
+            },
         );
         let elapsed_ns = t0.elapsed().as_nanos() as u64;
         metrics.record_cycle(elapsed_ns);
@@ -1219,19 +1226,16 @@ async fn run_spread_engine(
         // recommendations emitted this cycle.
         let ml_background_t0 = std::time::Instant::now();
         for opp in &ml_observations {
-            if opp.entry_spread >= threshold_pct {
-                continue;
-            }
             let route = RouteId {
                 symbol_id: opp.symbol_id,
                 buy_venue: opp.buy_venue,
                 sell_venue: opp.sell_venue,
             };
-            let symbol_name = universe.canonical_name_of(opp.symbol_id);
-            let (_dec, accepted) = ml_server.observe_background_with_books(
+            let symbol_id = opp.symbol_id;
+            let (_dec, accepted) = ml_server.observe_background_with_books_lazy_symbol(
                 cycle_seq,
                 route,
-                &symbol_name,
+                || universe.canonical_name_of(symbol_id),
                 opp.entry_spread as f32,
                 opp.exit_spread as f32,
                 opp.buy_vol24,
