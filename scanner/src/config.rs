@@ -310,7 +310,7 @@ fn default_label_sweeper_interval_s() -> u64 {
     10
 }
 fn default_label_observation_channel_capacity() -> usize {
-    500_000
+    32_768
 }
 fn default_label_floor_pct() -> f32 {
     0.8
@@ -582,7 +582,7 @@ mod tests {
         assert!(cfg.ml.parquet.strict_lossless);
         assert_eq!(cfg.ml.windows.train_window_days, 90);
         assert_eq!(cfg.ml.label_background_decimation_mod, 10);
-        assert_eq!(cfg.ml.label_observation_channel_capacity, 500_000);
+        assert_eq!(cfg.ml.label_observation_channel_capacity, 32_768);
     }
 
     #[test]

@@ -48,7 +48,7 @@ use crate::spread::engine::{
 };
 use crate::types::now_ns;
 
-const ML_CYCLE_CHANNEL_CAPACITY: usize = 64;
+const ML_CYCLE_CHANNEL_CAPACITY: usize = 2;
 
 #[inline]
 fn should_mark_sample_recommended(rec: &crate::ml::contract::Recommendation) -> bool {
@@ -120,8 +120,16 @@ async fn run_ml_cycle_worker(
                 metrics
                     .ml_cycle_queue_events_current
                     .sub(n_events.min(i64::MAX as u64) as i64);
+                metrics.ml_cycle_batch_inflight_current.inc();
+                metrics
+                    .ml_cycle_events_inflight_current
+                    .add(n_events.min(i64::MAX as u64) as i64);
                 process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, batch)
                     .await;
+                metrics.ml_cycle_batch_inflight_current.dec();
+                metrics
+                    .ml_cycle_events_inflight_current
+                    .sub(n_events.min(i64::MAX as u64) as i64);
                 metrics.ml_cycle_batches_processed_total.inc();
                 metrics.ml_cycle_events_processed_total.inc_by(n_events);
             }
@@ -132,6 +140,7 @@ async fn run_ml_cycle_worker(
                 Ok(_) => {}
                 Err(e) => {
                     tracing::error!(error = ?e, "label_resolver async sweep failed");
+                    panic!("label_resolver strict-lossless violation: async sweep failed: {e:?}");
                 }
             },
         }
@@ -840,6 +849,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let broadcast_ms = cfg.broadcast_ms;
     let c_engine = Arc::clone(&counters);
     let ml_engine = Arc::clone(&ml_server);
+    let ml_broadcaster_engine = ml_broadcaster.clone();
     let ml_cycle_tx_engine = ml_cycle_tx.clone();
     drop(ml_cycle_tx);
     let label_resolver_shutdown = Arc::clone(&label_resolver);
@@ -856,6 +866,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             broadcast_ms,
             bstate,
             ml_engine,
+            ml_writer_handle.clone(),
+            ml_broadcaster_engine,
             ml_cycle_tx_engine,
         )
         .await;
@@ -943,6 +955,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             "shutdown: labels pendentes fechados"
         );
         let mut preexisting_issues = Vec::new();
+        if let Some(error) = terminal_error.as_ref() {
+            preexisting_issues.push(format!("terminal error before audit: {error}"));
+        }
         let labeled_writer_stats = match labeled_shutdown_handle.seal_current_file().await {
             Ok(stats) => {
                 if stats.compaction_failed > 0 {
@@ -1303,6 +1318,8 @@ async fn run_spread_engine(
     broadcast_ms: u64,
     bstate: BroadcastState,
     ml_server: Arc<MlServer>,
+    ml_writer: WriterHandle,
+    ml_broadcaster: RecommendationBroadcaster,
     ml_cycle_tx: tokio::sync::mpsc::Sender<MlCycleCommand>,
 ) {
     let mut buf: Vec<Opportunity> = Vec::with_capacity(1024);
@@ -1355,20 +1372,33 @@ async fn run_spread_engine(
                 cycle_budget_ns,
                 observations,
             };
-            match ml_cycle_tx.try_send(MlCycleCommand::Batch(batch)) {
+            metrics.ml_cycle_queue_depth_current.inc();
+            metrics
+                .ml_cycle_queue_events_current
+                .add(n_events.min(i64::MAX as u64) as i64);
+            match ml_cycle_tx.send(MlCycleCommand::Batch(batch)).await {
                 Ok(()) => {
-                    metrics.ml_cycle_queue_depth_current.inc();
-                    metrics
-                        .ml_cycle_queue_events_current
-                        .add(n_events.min(i64::MAX as u64) as i64);
                     metrics.ml_cycle_batches_enqueued_total.inc();
                     metrics.ml_cycle_events_enqueued_total.inc_by(n_events);
                 }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    metrics.ml_cycle_queue_full_total.inc();
-                    panic!("ml_cycle strict-lossless violation: async ML cycle queue full");
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                Err(err) => {
+                    metrics.ml_cycle_queue_depth_current.dec();
+                    metrics
+                        .ml_cycle_queue_events_current
+                        .sub(n_events.min(i64::MAX as u64) as i64);
+                    match err.0 {
+                        MlCycleCommand::Batch(batch) => {
+                            process_ml_cycle_batch(
+                                &universe,
+                                &ml_server,
+                                &ml_writer,
+                                &ml_broadcaster,
+                                batch,
+                            )
+                            .await;
+                        }
+                        MlCycleCommand::LabelSweep { .. } => {}
+                    }
                     panic!("ml_cycle strict-lossless violation: async ML cycle queue closed");
                 }
             }

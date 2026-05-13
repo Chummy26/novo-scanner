@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
-use std::io::BufReader;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use arrow_array::{
@@ -153,6 +154,8 @@ pub fn compact_jsonl_file(
 
     let metadata =
         fs::metadata(jsonl_path).with_context(|| format!("metadata {}", jsonl_path.display()))?;
+    let source_fingerprint = JsonlSourceFingerprint::from_metadata(&metadata)
+        .with_context(|| format!("fingerprint source {}", jsonl_path.display()))?;
     if metadata.len() == 0 {
         if cfg.delete_jsonl_after_success {
             fs::remove_file(jsonl_path)
@@ -189,6 +192,14 @@ pub fn compact_jsonl_file(
             )
         })? {
             if cfg.delete_jsonl_after_success {
+                validate_source_still_matches(jsonl_path, source_fingerprint).with_context(
+                    || {
+                        format!(
+                            "validate duplicate source before removal {}",
+                            jsonl_path.display()
+                        )
+                    },
+                )?;
                 fs::remove_file(jsonl_path).with_context(|| {
                     format!(
                         "remove duplicate source after validated existing publication {}",
@@ -353,11 +364,52 @@ pub fn compact_jsonl_file(
     publish_parquet_with_manifest(&temp_parquet_path, &parquet_path, &manifest, &manifest_path)?;
 
     if cfg.delete_jsonl_after_success {
+        if let Err(e) = validate_source_still_matches(jsonl_path, source_fingerprint) {
+            let _ = fs::remove_file(&manifest_path);
+            let _ = fs::remove_file(&parquet_path);
+            return Err(e).with_context(|| {
+                format!(
+                    "source changed during compaction; removed stale publication and preserved {}",
+                    jsonl_path.display()
+                )
+            });
+        }
         fs::remove_file(jsonl_path)
             .with_context(|| format!("remove source {}", jsonl_path.display()))?;
     }
 
     Ok(Some(parquet_path))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JsonlSourceFingerprint {
+    len: u64,
+    modified: SystemTime,
+}
+
+impl JsonlSourceFingerprint {
+    fn from_metadata(metadata: &fs::Metadata) -> Result<Self> {
+        Ok(Self {
+            len: metadata.len(),
+            modified: metadata
+                .modified()
+                .context("source modified timestamp unavailable")?,
+        })
+    }
+}
+
+fn validate_source_still_matches(path: &Path, expected: JsonlSourceFingerprint) -> Result<()> {
+    let metadata = fs::metadata(path).with_context(|| format!("metadata {}", path.display()))?;
+    let actual = JsonlSourceFingerprint::from_metadata(&metadata)?;
+    if actual != expected {
+        anyhow::bail!(
+            "source JSONL changed during compaction: path={}, initial_len={}, current_len={}",
+            path.display(),
+            expected.len,
+            actual.len
+        );
+    }
+    Ok(())
 }
 
 fn manifest_path_for(parquet_path: &Path) -> PathBuf {
@@ -1056,7 +1108,10 @@ pub fn compact_existing_jsonl_in_tree(
         return Ok(0);
     }
 
-    let mut compacted = 0usize;
+    let min_age = Duration::from_secs(120);
+    let stability_probe = Duration::from_millis(2_000);
+    let now = SystemTime::now();
+    let mut candidates = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
@@ -1069,13 +1124,152 @@ pub fn compact_existing_jsonl_in_tree(
             if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                 continue;
             }
-            if compact_jsonl_file(&path, dataset_kind, cfg)?.is_some() {
-                compacted += 1;
+            if belongs_to_live_scanner_pid(&path) {
+                continue;
             }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(fingerprint) = JsonlSourceFingerprint::from_metadata(&metadata) else {
+                continue;
+            };
+            if !is_old_enough(now, fingerprint.modified, min_age) {
+                continue;
+            }
+            candidates.push(JsonlTreeCandidate { path, fingerprint });
         }
     }
 
+    if candidates.is_empty() {
+        return Ok(0);
+    }
+    std::thread::sleep(stability_probe);
+
+    let mut compacted = 0usize;
+    for candidate in candidates {
+        if belongs_to_live_scanner_pid(&candidate.path) {
+            continue;
+        }
+        if !candidate_still_stable(&candidate, min_age, SystemTime::now()) {
+            continue;
+        }
+        let Some(_lock) = JsonlCompactionLock::try_acquire(&candidate.path)? else {
+            continue;
+        };
+        if candidate_still_stable(&candidate, min_age, SystemTime::now())
+            && compact_jsonl_file(&candidate.path, dataset_kind, cfg)?.is_some()
+        {
+            compacted += 1;
+        }
+    }
     Ok(compacted)
+}
+
+#[derive(Debug)]
+struct JsonlTreeCandidate {
+    path: PathBuf,
+    fingerprint: JsonlSourceFingerprint,
+}
+
+fn candidate_still_stable(
+    candidate: &JsonlTreeCandidate,
+    min_age: Duration,
+    now: SystemTime,
+) -> bool {
+    let Ok(metadata) = fs::metadata(&candidate.path) else {
+        return false;
+    };
+    let Ok(actual) = JsonlSourceFingerprint::from_metadata(&metadata) else {
+        return false;
+    };
+    actual == candidate.fingerprint && is_old_enough(now, actual.modified, min_age)
+}
+
+fn is_old_enough(now: SystemTime, modified: SystemTime, min_age: Duration) -> bool {
+    now.duration_since(modified)
+        .map(|age| age >= min_age)
+        .unwrap_or(false)
+}
+
+fn belongs_to_live_scanner_pid(path: &Path) -> bool {
+    scanner_pid_from_jsonl_path(path).is_some_and(process_is_running)
+}
+
+fn scanner_pid_from_jsonl_path(path: &Path) -> Option<u32> {
+    let file_name = path.file_name()?.to_str()?;
+    if !file_name.ends_with(".jsonl") {
+        return None;
+    }
+    let stem = file_name.strip_suffix(".jsonl")?;
+    let run_prefix = stem.split_once('_').map_or(stem, |(prefix, _)| prefix);
+    let scanner_prefix = run_prefix
+        .strip_prefix("raw-")
+        .or_else(|| run_prefix.strip_prefix("labeled-"))
+        .unwrap_or(run_prefix);
+    let pid_text = scanner_prefix.rsplit_once('-')?.1;
+    pid_text.parse().ok()
+}
+
+struct JsonlCompactionLock {
+    path: PathBuf,
+    _file: File,
+}
+
+impl JsonlCompactionLock {
+    fn try_acquire(jsonl_path: &Path) -> Result<Option<Self>> {
+        let lock_path = jsonl_path.with_extension("jsonl.compact.lock");
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => Ok(Some(Self {
+                path: lock_path,
+                _file: file,
+            })),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("create {}", lock_path.display())),
+        }
+    }
+}
+
+impl Drop for JsonlCompactionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(windows)]
+fn process_is_running(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x00001000;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+    }
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            false
+        } else {
+            let _ = CloseHandle(handle);
+            true
+        }
+    }
+}
+
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(any(windows, unix)))]
+fn process_is_running(_pid: u32) -> bool {
+    false
 }
 
 fn schema_for(dataset_kind: DatasetKind) -> SchemaRef {
@@ -1344,6 +1538,28 @@ mod tests {
     fn read_manifest(parquet: &Path) -> ParquetManifest {
         let file = File::open(manifest_path_for(parquet)).expect("open manifest");
         serde_json::from_reader(file).expect("manifest json")
+    }
+
+    #[test]
+    fn startup_sweep_skips_current_process_jsonl() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let root = tmp.path().join("raw_samples");
+        fs::create_dir_all(&root).expect("root");
+        let jsonl = root.join(format!(
+            "raw-scanner-{}_1_part-000000.jsonl",
+            std::process::id()
+        ));
+        write_lines(&jsonl, &[r#"{"ts_ns":1}"#]);
+
+        let compacted = compact_existing_jsonl_in_tree(
+            &root,
+            DatasetKind::RawSamples,
+            &ParquetCompactionConfig::default(),
+        )
+        .expect("sweep");
+
+        assert_eq!(compacted, 0);
+        assert!(jsonl.exists());
     }
 
     #[test]

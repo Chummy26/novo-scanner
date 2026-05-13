@@ -41,6 +41,10 @@ pub struct Metrics {
     pub ml_cycle_queue_depth_current: IntGauge,
     /// Eventos de rota aguardando processamento ML assíncrono.
     pub ml_cycle_queue_events_current: IntGauge,
+    /// Batch ML atualmente em processamento pelo worker.
+    pub ml_cycle_batch_inflight_current: IntGauge,
+    /// Eventos de rota atualmente em processamento pelo worker ML.
+    pub ml_cycle_events_inflight_current: IntGauge,
     /// Batches ML aceitos pela fila assíncrona.
     pub ml_cycle_batches_enqueued_total: IntCounter,
     /// Batches ML processados pelo worker assíncrono.
@@ -190,6 +194,16 @@ impl Metrics {
                 "Route observations waiting in the asynchronous ML processing queue",
             )
             .expect("register ml_cycle_queue_events_current");
+            let ml_cycle_batch_inflight_current = IntGauge::new(
+                "scanner_ml_cycle_batch_inflight_current",
+                "ML cycle batch currently being processed by the asynchronous worker",
+            )
+            .expect("register ml_cycle_batch_inflight_current");
+            let ml_cycle_events_inflight_current = IntGauge::new(
+                "scanner_ml_cycle_events_inflight_current",
+                "Route observations currently being processed by the asynchronous ML worker",
+            )
+            .expect("register ml_cycle_events_inflight_current");
             let ml_cycle_batches_enqueued_total = IntCounter::new(
                 "scanner_ml_cycle_batches_enqueued_total",
                 "ML cycle batches enqueued for asynchronous processing",
@@ -284,6 +298,12 @@ impl Metrics {
                 .register(Box::new(ml_cycle_queue_events_current.clone()))
                 .expect("reg");
             registry
+                .register(Box::new(ml_cycle_batch_inflight_current.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_events_inflight_current.clone()))
+                .expect("reg");
+            registry
                 .register(Box::new(ml_cycle_batches_enqueued_total.clone()))
                 .expect("reg");
             registry
@@ -366,6 +386,8 @@ impl Metrics {
                 ml_background_hist,
                 ml_cycle_queue_depth_current,
                 ml_cycle_queue_events_current,
+                ml_cycle_batch_inflight_current,
+                ml_cycle_events_inflight_current,
                 ml_cycle_batches_enqueued_total,
                 ml_cycle_batches_processed_total,
                 ml_cycle_events_enqueued_total,
