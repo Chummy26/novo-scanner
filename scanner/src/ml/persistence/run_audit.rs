@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -78,7 +79,11 @@ pub enum RunAuditVerdict {
 pub struct DatasetRunSummary {
     pub files: u64,
     pub rows: u64,
+    pub parquet_files: u64,
     pub parquet_bytes: u64,
+    pub jsonl_files: u64,
+    pub jsonl_rows: u64,
+    pub jsonl_bytes: u64,
     pub min_timestamp_ns: Option<u64>,
     pub max_timestamp_ns: Option<u64>,
     pub rows_per_min: f64,
@@ -99,6 +104,14 @@ pub struct DatasetRunSummary {
 struct ManifestWithPath {
     path: PathBuf,
     manifest: ParquetManifest,
+}
+
+#[derive(Debug, Clone)]
+struct JsonlRunFile {
+    rows: u64,
+    bytes: u64,
+    min_timestamp_ns: Option<u64>,
+    max_timestamp_ns: Option<u64>,
 }
 
 const MAX_EXACT_DUPLICATE_ROWS: u64 = 20_000_000;
@@ -173,17 +186,28 @@ fn build_run_audit(input: &RunAuditInput) -> Result<RunAuditReport> {
             collect_current_run_manifests(root, input.pid, input.started_ns, input.ended_ns)
                 .with_context(|| format!("collect manifests for {dataset}"))?;
         let mut summary = summarize_manifests(&manifests, duration_s, input.cycles_started)?;
-        if input.parquet_enabled {
-            if let Some(writer) = input.writers.iter().find(|w| w.dataset_kind == dataset) {
-                if summary.rows != writer.total_written {
-                    issues.push(format!(
-                        "{dataset} row mismatch: manifest_rows={} writer_total_written={}",
-                        summary.rows, writer.total_written
-                    ));
-                }
+        let manifested_sources = manifest_source_jsonl_file_names(&manifests);
+        let jsonl_files = collect_current_run_jsonl_files(
+            root,
+            dataset,
+            input.pid,
+            input.started_ns,
+            input.ended_ns,
+            &manifested_sources,
+        )
+        .with_context(|| format!("collect JSONLs for {dataset}"))?;
+        merge_jsonl_files(&mut summary, &jsonl_files, duration_s, input.cycles_started);
+        if let Some(writer) = input.writers.iter().find(|w| w.dataset_kind == dataset) {
+            if summary.rows != writer.total_written {
+                issues.push(format!(
+                    "{dataset} row mismatch: disk_rows={} manifest_rows={} jsonl_rows={} writer_total_written={}",
+                    summary.rows, summary.rows.saturating_sub(summary.jsonl_rows), summary.jsonl_rows, writer.total_written
+                ));
             }
         }
-        if summary.rows <= MAX_EXACT_DUPLICATE_ROWS {
+        if summary.jsonl_rows > 0 {
+            summary.duplicate_check_status = "skipped_jsonl_present".to_string();
+        } else if summary.rows <= MAX_EXACT_DUPLICATE_ROWS {
             match exact_duplicate_count(dataset, &manifests) {
                 Ok(n) => {
                     summary.duplicate_keys_exact = Some(n);
@@ -294,7 +318,8 @@ fn summarize_manifests(
     cycles_started: u64,
 ) -> Result<DatasetRunSummary> {
     let mut summary = DatasetRunSummary::default();
-    summary.files = manifests.len() as u64;
+    summary.parquet_files = manifests.len() as u64;
+    summary.files = summary.parquet_files;
     for item in manifests {
         let m = &item.manifest;
         summary.rows = summary.rows.saturating_add(m.parquet_row_count);
@@ -327,15 +352,143 @@ fn summarize_manifests(
             .label_floor_values
             .extend(m.semantic_stats.label_floor_values.iter().cloned());
     }
+    finalize_summary(&mut summary, duration_s, cycles_started);
+    Ok(summary)
+}
+
+fn merge_jsonl_files(
+    summary: &mut DatasetRunSummary,
+    jsonl_files: &[JsonlRunFile],
+    duration_s: f64,
+    cycles_started: u64,
+) {
+    for item in jsonl_files {
+        summary.files = summary.files.saturating_add(1);
+        summary.jsonl_files = summary.jsonl_files.saturating_add(1);
+        summary.jsonl_rows = summary.jsonl_rows.saturating_add(item.rows);
+        summary.jsonl_bytes = summary.jsonl_bytes.saturating_add(item.bytes);
+        summary.rows = summary.rows.saturating_add(item.rows);
+        merge_minmax(
+            &mut summary.min_timestamp_ns,
+            &mut summary.max_timestamp_ns,
+            item.min_timestamp_ns,
+            item.max_timestamp_ns,
+        );
+    }
+    finalize_summary(summary, duration_s, cycles_started);
+}
+
+fn finalize_summary(summary: &mut DatasetRunSummary, duration_s: f64, cycles_started: u64) {
     summary.rows_per_min = (summary.rows as f64) / (duration_s / 60.0).max(1.0 / 60.0);
     summary.rows_per_cycle = if cycles_started > 0 {
         (summary.rows as f64) / (cycles_started as f64)
     } else {
         0.0
     };
-    summary.projected_7d_bytes =
-        ((summary.parquet_bytes as f64) / duration_s * 604_800.0).round() as u64;
-    Ok(summary)
+    let total_bytes = summary.parquet_bytes.saturating_add(summary.jsonl_bytes);
+    summary.projected_7d_bytes = ((total_bytes as f64) / duration_s * 604_800.0).round() as u64;
+}
+
+fn manifest_source_jsonl_file_names(manifests: &[ManifestWithPath]) -> BTreeSet<String> {
+    manifests
+        .iter()
+        .filter_map(|item| {
+            item.manifest
+                .source_jsonl_path
+                .replace('\\', "/")
+                .rsplit('/')
+                .next()
+                .map(ToString::to_string)
+        })
+        .collect()
+}
+
+fn collect_current_run_jsonl_files(
+    root: &Path,
+    dataset: &str,
+    pid: u32,
+    started_ns: u64,
+    ended_ns: u64,
+    manifested_sources: &BTreeSet<String>,
+) -> Result<Vec<JsonlRunFile>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let pid_marker = format!("-{}_", pid);
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
+            let entry = entry.with_context(|| format!("read_dir entry {}", dir.display()))?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if manifested_sources.contains(name) || !name.contains(&pid_marker) {
+                continue;
+            }
+            let stats = summarize_jsonl_file(dataset, &path)
+                .with_context(|| format!("summarize {}", path.display()))?;
+            if stats.rows == 0 || jsonl_overlaps_run_window(&stats, started_ns, ended_ns) {
+                out.push(stats);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn summarize_jsonl_file(dataset: &str, path: &Path) -> Result<JsonlRunFile> {
+    let metadata = fs::metadata(path).with_context(|| format!("metadata {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let timestamp_field = timestamp_field_for_dataset(dataset);
+    let mut rows = 0u64;
+    let mut min_timestamp_ns = None;
+    let mut max_timestamp_ns = None;
+    for maybe_line in reader.lines() {
+        let line = maybe_line.with_context(|| format!("read line from {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows = rows.saturating_add(1);
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .with_context(|| format!("parse JSONL row from {}", path.display()))?;
+        let timestamp = value.get(timestamp_field).and_then(|v| v.as_u64());
+        merge_minmax(
+            &mut min_timestamp_ns,
+            &mut max_timestamp_ns,
+            timestamp,
+            timestamp,
+        );
+    }
+    Ok(JsonlRunFile {
+        rows,
+        bytes: metadata.len(),
+        min_timestamp_ns,
+        max_timestamp_ns,
+    })
+}
+
+fn timestamp_field_for_dataset(dataset: &str) -> &'static str {
+    if dataset == "labeled_trades" {
+        "ts_emit_ns"
+    } else {
+        "ts_ns"
+    }
+}
+
+fn jsonl_overlaps_run_window(stats: &JsonlRunFile, started_ns: u64, ended_ns: u64) -> bool {
+    match (stats.min_timestamp_ns, stats.max_timestamp_ns) {
+        (Some(min_ts), Some(max_ts)) => max_ts >= started_ns && min_ts <= ended_ns,
+        _ => true,
+    }
 }
 
 fn exact_duplicate_count(dataset: &str, manifests: &[ManifestWithPath]) -> Result<u64> {
@@ -447,6 +600,7 @@ fn merge_str_counts(dst: &mut BTreeMap<String, u64>, src: &BTreeMap<String, u64>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn audit_marks_mismatched_shutdown_unhealthy_without_touching_data() {
@@ -486,5 +640,55 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.contains("label shutdown mismatch")));
+    }
+
+    #[test]
+    fn audit_counts_jsonl_and_flags_writer_mismatch_when_parquet_disabled() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let raw_root = tmp.path().join("raw_samples");
+        fs::create_dir_all(&raw_root).expect("create raw root");
+        let jsonl = raw_root.join("raw-scanner-4242_10_part-000000.jsonl");
+        let mut file = File::create(&jsonl).expect("create jsonl");
+        writeln!(file, r#"{{"ts_ns":10,"sample_id":"s1"}}"#).expect("write jsonl");
+        drop(file);
+
+        let input = RunAuditInput {
+            run_id: "scanner-4242-test".to_string(),
+            pid: 4242,
+            started_ns: 1,
+            ended_ns: 100,
+            root_dir: tmp.path().join("ml"),
+            raw_root,
+            accepted_root: tmp.path().join("accepted_samples"),
+            labeled_root: tmp.path().join("labeled_trades"),
+            parquet_enabled: false,
+            strict_lossless: true,
+            cycles_started: 10,
+            label_shutdown: LabelShutdownAudit {
+                closed_total: 0,
+                sent_total: 0,
+                censored_total: 0,
+                dropped_channel_closed_total: 0,
+            },
+            writers: vec![WriterAudit {
+                dataset_kind: "raw_samples".to_string(),
+                total_written: 2,
+                total_dropped: 0,
+                compaction_succeeded: 0,
+                compaction_failed: 0,
+            }],
+            preexisting_issues: Vec::new(),
+        };
+
+        let report = write_run_audit(input).expect("audit report");
+
+        assert_eq!(report.verdict, RunAuditVerdict::Red);
+        let raw = report.datasets.get("raw_samples").expect("raw summary");
+        assert_eq!(raw.rows, 1);
+        assert_eq!(raw.jsonl_rows, 1);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.contains("raw_samples row mismatch: disk_rows=1")));
     }
 }
