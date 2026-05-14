@@ -32,7 +32,11 @@ logs/
 # Local runtime artifacts
 .tmp/validation-*/
 .tmp/collect-*/
+.tmp/*.toml
+.tmp/**/*.toml
 .tmp/collect-*.toml
+.tmp/*.ps1
+.tmp/**/*.ps1
 .tmp/*.json
 .tmp/**/*.json
 .tmp/*.jsonl
@@ -42,6 +46,8 @@ logs/
 .tmp/*.pid
 .tmp/*.prom
 .tmp/**/*.prom
+.tmp/*.tsv
+.tmp/**/*.tsv
 .tmp/*.txt
 .tmp/**/*.txt
 
