@@ -1613,6 +1613,7 @@ async fn run_spread_engine(
                             let _ = reply_tx.send(0);
                         }
                     }
+                    ml_cycle_send_failure_reason = Some("full");
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(cmd)) => {
                     metrics.ml_cycle_queue_depth_current.dec();
