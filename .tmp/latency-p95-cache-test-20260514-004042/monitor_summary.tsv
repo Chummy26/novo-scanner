@@ -1,8 +1,0 @@
-﻿elapsed_s	time_iso	pid_alive	private_mb	working_set_mb	cpu_s	health_ok	full_p99_ms	full_max_ms	full_over_budget	ml_bg_p99_ms	ml_queue_batches	ml_queue_events	ml_inflight_batches	ml_inflight_events	ml_queue_full	raw_drops	accepted_drops	label_drops	compaction_failures	process_private_metric_mb	process_ws_metric_mb
-0	2026-05-14T03:40:47.5295411Z	True	160.69	82.95	0.3	True	0.815	0.815	0	6.873	0	0	0	0	0	0	0	0	0	161.008	83.547
-60	2026-05-14T03:41:47.7411124Z	True	318.46	246.12	25.61	True	1.77	1.869	0	28.525	0	0	0	0	0	0	0	0	0	318.457	246.125
-120	2026-05-14T03:42:47.8137818Z	True	413.02	337.28	55.08	True	1.795	1.949	0	34.603	0	0	0	0	0	0	0	0	0	413.016	337.281
-180	2026-05-14T03:43:47.8837125Z	True	415.16	333.86	84.88	True	1.844	2.001	0	34.013	0	0	0	0	0	0	0	0	0	415.16	333.863
-240	2026-05-14T03:44:47.9489817Z	True	548.84	466.86	117.17	True	1.869	2.226	0	38.863	0	0	0	0	0	0	0	0	0	548.844	466.863
-301	2026-05-14T03:45:48.0271429Z	True	594.22	511.1	151.64	True	1.937	2.427	0	47.35	0	0	0	0	0	0	0	0	0	594.219	511.125
-361	2026-05-14T03:46:48.1003857Z	True	583.91	512.93	187.66	True	1.951	2.427	0	47.579	0	0	0	0	0	0	0	0	0	583.906	512.93
