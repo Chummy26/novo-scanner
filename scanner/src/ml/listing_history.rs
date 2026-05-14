@@ -276,6 +276,26 @@ impl ListingHistory {
             .unwrap_or_default()
     }
 
+    /// Tamanho e rank estável da rota dentro do cluster estrutural do símbolo.
+    ///
+    /// Caminho quente de coleta: evita clonar `Vec<RouteId>` inteiro para cada
+    /// label candidate. A semântica é idêntica a `active_routes_for_symbol()`
+    /// seguido de `len()+position()`.
+    pub fn active_cluster_position(&self, route: RouteId) -> (u32, u32) {
+        let guard = self.active_by_symbol.read();
+        let Some(routes) = guard.get(&route.symbol_id) else {
+            return (1, 1);
+        };
+        let size = routes.len().max(1).min(u32::MAX as usize) as u32;
+        let rank = routes
+            .iter()
+            .position(|candidate| *candidate == route)
+            .map(|idx| idx + 1)
+            .unwrap_or(routes.len().max(1))
+            .min(u32::MAX as usize) as u32;
+        (size, rank)
+    }
+
     /// Número de rotas delisted.
     pub fn delisted_routes(&self) -> usize {
         let guard = self.routes.read();

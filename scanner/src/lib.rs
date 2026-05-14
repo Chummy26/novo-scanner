@@ -48,6 +48,7 @@ use crate::spread::engine::{
 use crate::types::now_ns;
 
 const ML_CYCLE_CHANNEL_CAPACITY: usize = 2;
+const ML_CYCLE_BUFFER_RECYCLE_CAPACITY: usize = 4;
 
 #[inline]
 fn should_mark_sample_recommended(rec: &crate::ml::contract::Recommendation) -> bool {
@@ -109,11 +110,12 @@ async fn run_ml_cycle_worker(
     ml_broadcaster: RecommendationBroadcaster,
     label_resolver: Arc<LabelResolver>,
     mut rx: tokio::sync::mpsc::Receiver<MlCycleCommand>,
+    buffer_recycle_tx: tokio::sync::mpsc::Sender<Vec<MlCycleObservation>>,
 ) {
     let metrics = obs::Metrics::init();
     while let Some(cmd) = rx.recv().await {
         match cmd {
-            MlCycleCommand::Batch(batch) => {
+            MlCycleCommand::Batch(mut batch) => {
                 let n_events = batch.observations.len() as u64;
                 metrics.ml_cycle_queue_depth_current.dec();
                 metrics
@@ -123,8 +125,10 @@ async fn run_ml_cycle_worker(
                 metrics
                     .ml_cycle_events_inflight_current
                     .add(n_events.min(i64::MAX as u64) as i64);
-                process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, batch)
+                process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, &batch)
                     .await;
+                batch.observations.clear();
+                let _ = buffer_recycle_tx.try_send(batch.observations);
                 metrics.ml_cycle_batch_inflight_current.dec();
                 metrics
                     .ml_cycle_events_inflight_current
@@ -147,7 +151,7 @@ async fn process_ml_cycle_batch(
     ml_server: &MlServer,
     ml_writer: &WriterHandle,
     ml_broadcaster: &RecommendationBroadcaster,
-    batch: MlCycleBatch,
+    batch: &MlCycleBatch,
 ) {
     let metrics = obs::Metrics::init();
     let ml_foreground_t0 = std::time::Instant::now();
@@ -802,6 +806,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // FIFO por ciclo, usando event_time_ns congelado para preservar PIT.
     let (ml_cycle_tx, ml_cycle_rx) =
         tokio::sync::mpsc::channel::<MlCycleCommand>(ML_CYCLE_CHANNEL_CAPACITY);
+    let (ml_buffer_recycle_tx, ml_buffer_recycle_rx) =
+        tokio::sync::mpsc::channel::<Vec<MlCycleObservation>>(ML_CYCLE_BUFFER_RECYCLE_CAPACITY);
     let ml_worker_task = tokio::spawn(run_ml_cycle_worker(
         Arc::clone(&universe),
         Arc::clone(&ml_server),
@@ -809,6 +815,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         ml_broadcaster.clone(),
         Arc::clone(&label_resolver),
         ml_cycle_rx,
+        ml_buffer_recycle_tx,
     ));
     let label_sweeper_task = {
         let tx = ml_cycle_tx.clone();
@@ -859,6 +866,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             ml_writer_handle.clone(),
             ml_broadcaster_engine,
             ml_cycle_tx_engine,
+            ml_buffer_recycle_rx,
         )
         .await;
     });
@@ -1305,6 +1313,7 @@ async fn run_spread_engine(
     ml_writer: WriterHandle,
     ml_broadcaster: RecommendationBroadcaster,
     ml_cycle_tx: tokio::sync::mpsc::Sender<MlCycleCommand>,
+    mut ml_buffer_recycle_rx: tokio::sync::mpsc::Receiver<Vec<MlCycleObservation>>,
 ) {
     let mut buf: Vec<Opportunity> = Vec::with_capacity(1024);
     let mut ml_observations: Vec<MlCycleObservation> = Vec::with_capacity(4096);
@@ -1347,8 +1356,18 @@ async fn run_spread_engine(
         let cycle_budget_ns = broadcast_ms.saturating_mul(1_000_000);
         if !ml_observations.is_empty() {
             let next_capacity = ml_observations.capacity().max(4096);
-            let observations =
-                std::mem::replace(&mut ml_observations, Vec::with_capacity(next_capacity));
+            let mut next_buffer = match ml_buffer_recycle_rx.try_recv() {
+                Ok(mut recycled) => {
+                    recycled.clear();
+                    if recycled.capacity() < next_capacity {
+                        recycled.reserve(next_capacity - recycled.capacity());
+                    }
+                    recycled
+                }
+                Err(_) => Vec::with_capacity(next_capacity),
+            };
+            next_buffer.clear();
+            let observations = std::mem::replace(&mut ml_observations, next_buffer);
             let n_events = observations.len() as u64;
             let batch = MlCycleBatch {
                 cycle_seq,
@@ -1377,7 +1396,7 @@ async fn run_spread_engine(
                                 &ml_server,
                                 &ml_writer,
                                 &ml_broadcaster,
-                                batch,
+                                &batch,
                             )
                             .await;
                         }

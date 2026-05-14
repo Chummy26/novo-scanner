@@ -463,6 +463,7 @@ fn exit_run_duration_quantiles_from_storage(
 
 struct PerRouteCache {
     storage: Option<PerRouteStorage>,
+    cached_entry_p95_bucket: Option<u32>,
     /// Wrap seguro por ~34×10⁹ anos em 17k RPS.
     decimation_counter: u64,
     /// Contagem efetiva de samples limpos na janela, compensada pela
@@ -476,6 +477,7 @@ impl PerRouteCache {
     fn new(cfg: CacheConfig) -> Self {
         Self {
             storage: None,
+            cached_entry_p95_bucket: None,
             decimation_counter: 0,
             n_observations: 0,
             last_update_ns: 0,
@@ -486,6 +488,17 @@ impl PerRouteCache {
     fn storage_mut(&mut self) -> &mut PerRouteStorage {
         self.storage
             .get_or_insert_with(|| PerRouteStorage::new(self.cfg))
+    }
+
+    #[inline]
+    fn refresh_cached_common_quantiles(&mut self) {
+        self.cached_entry_p95_bucket = self.storage.as_ref().and_then(|storage| {
+            if storage.ring.is_empty() {
+                None
+            } else {
+                weighted_quantile_entry(storage, 0.95)
+            }
+        });
     }
 
     #[inline]
@@ -525,6 +538,7 @@ impl PerRouteCache {
         };
 
         self.n_observations = retained_len.saturating_mul(cfg.decimation.max(1) as u64);
+        self.refresh_cached_common_quantiles();
         self.last_update_ns = ts_ns;
     }
 
@@ -549,6 +563,11 @@ impl PerRouteCache {
         let storage = self.storage.as_ref()?;
         if storage.ring.is_empty() {
             return None;
+        }
+        if (q - 0.95).abs() < 1e-12 {
+            if let Some(bucket) = self.cached_entry_p95_bucket {
+                return Some(from_bucket(bucket as u64));
+            }
         }
         weighted_quantile_entry(storage, q).map(|bucket| from_bucket(bucket as u64))
     }
@@ -892,6 +911,7 @@ impl PerRouteCache {
         let cutoff = now_ns.saturating_sub(self.cfg.window_ns);
         let mut expired = 0u64;
         let mut should_clear_storage = false;
+        let mut cache_changed = false;
 
         if let Some(storage) = self.storage.as_mut() {
             while let Some(front) = storage.ring.front() {
@@ -905,6 +925,7 @@ impl PerRouteCache {
             let trimmed = trim_front_sample_to_cutoff(storage, cutoff);
 
             if expired > 0 || trimmed {
+                cache_changed = true;
                 self.n_observations = logical_sampled_observations(storage)
                     .saturating_mul(self.cfg.decimation.max(1) as u64);
                 let min_capacity = self.cfg.ring_initial_capacity.max(storage.ring.len());
@@ -918,6 +939,9 @@ impl PerRouteCache {
         if should_clear_storage {
             self.storage = None;
             self.n_observations = 0;
+            self.cached_entry_p95_bucket = None;
+        } else if cache_changed {
+            self.refresh_cached_common_quantiles();
         }
 
         let route_expired = now_ns.saturating_sub(self.last_update_ns) > self.cfg.window_ns;
@@ -1233,6 +1257,35 @@ mod tests {
         let p95 = cache.quantile_entry(route, 0.95).unwrap();
         assert!((p50 - 3.0).abs() < 0.35, "p50 = {p50}");
         assert!(p95 >= 4.5 && p95 <= 5.2, "p95 = {p95}");
+    }
+
+    #[test]
+    fn cached_p95_refreshes_after_window_expiration() {
+        let cfg = CacheConfig {
+            decimation: 1,
+            window_ns: 500,
+            rebuild_interval_ns: u64::MAX,
+            ring_initial_capacity: 64,
+        };
+        let cache = HotQueryCache::with_config(cfg);
+        let route = mk_route(1);
+
+        for i in 0..100 {
+            cache.observe(route, 0.5, -1.0, i);
+        }
+        let old_p95 = cache.quantile_entry(route, 0.95).unwrap();
+        assert!(
+            old_p95 <= 0.7,
+            "p95 inicial deveria refletir janela antiga baixa; p95={old_p95}"
+        );
+
+        cache.observe(route, 5.0, -1.0, 1_000);
+
+        let new_p95 = cache.quantile_entry(route, 0.95).unwrap();
+        assert!(
+            new_p95 >= 4.8,
+            "p95 cacheado deve ser reconstruido apos expiracao; p95={new_p95}"
+        );
     }
 
     #[test]
