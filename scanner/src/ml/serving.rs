@@ -369,6 +369,7 @@ pub struct MlServer {
     label_allowlist_symbols_key: String,
     label_priority_target_coverage: f64,
     label_priority_rerank_interval_s: u64,
+    ml_cycle_shards: usize,
     // geração do priority_set (incrementado em set_priority_set_and_bump).
     priority_set_generation_id: AtomicU64,
     priority_set_updated_at_ns: AtomicU64,
@@ -385,6 +386,7 @@ fn compute_supervised_config_hash(
     label_allowlist_symbols_key: &str,
     label_priority_target_coverage: f64,
     label_priority_rerank_interval_s: u64,
+    ml_cycle_shards: usize,
     recommendation_cooldown_ns: u64,
     opportunity_alive_threshold_pct: f32,
 ) -> String {
@@ -406,6 +408,7 @@ fn compute_supervised_config_hash(
             "label_horizons_s=[{}]|label_background_decimation_mod={}|",
             "label_allowlist_symbols=[{}]|label_priority_target_coverage={:.6}|",
             "label_priority_rerank_interval_s={}|",
+            "ml_cycle_shards={}|",
             "recommendation_cooldown_ns={}|",
             "feature_windows_s=[3600,86400,604800]|opportunity_alive_threshold_pct={:.6}|",
             "hot_cache_policy={}"
@@ -425,6 +428,7 @@ fn compute_supervised_config_hash(
         label_allowlist_symbols_key,
         label_priority_target_coverage,
         label_priority_rerank_interval_s,
+        ml_cycle_shards.max(1),
         recommendation_cooldown_ns,
         opportunity_alive_threshold_pct,
         HOT_CACHE_POLICY_VERSION,
@@ -771,6 +775,7 @@ impl MlServer {
         let label_allowlist_symbols_key = String::new();
         let label_priority_target_coverage = 0.95;
         let label_priority_rerank_interval_s = 3600;
+        let ml_cycle_shards = 1;
         let runtime_config_hash = compute_supervised_config_hash(
             trigger.config(),
             baseline.config(),
@@ -782,6 +787,7 @@ impl MlServer {
             &label_allowlist_symbols_key,
             label_priority_target_coverage,
             label_priority_rerank_interval_s,
+            ml_cycle_shards,
             recommendation_cooldown_ns,
             0.0,
         );
@@ -828,6 +834,7 @@ impl MlServer {
             label_allowlist_symbols_key,
             label_priority_target_coverage,
             label_priority_rerank_interval_s,
+            ml_cycle_shards,
             priority_set_generation_id: AtomicU64::new(0),
             priority_set_updated_at_ns: AtomicU64::new(0),
         }
@@ -845,6 +852,7 @@ impl MlServer {
             &self.label_allowlist_symbols_key,
             self.label_priority_target_coverage,
             self.label_priority_rerank_interval_s,
+            self.ml_cycle_shards,
             self.recommendation_cooldown_ns,
             self.opportunity_alive_threshold_pct,
         );
@@ -910,6 +918,15 @@ impl MlServer {
         self.label_allowlist_symbols_key = allowlist_symbols_key;
         self.label_priority_target_coverage = priority_target_coverage;
         self.label_priority_rerank_interval_s = priority_rerank_interval_s;
+        self.refresh_runtime_config_hash();
+        self
+    }
+
+    /// Versiona o particionamento do estágio ML. `1` mantém ordem global; >1
+    /// preserva FIFO por rota, mas pode mudar features derivadas de estado
+    /// entre rotas, então fragmenta o hash supervisionado.
+    pub fn with_ml_cycle_shards(mut self, shards: usize) -> Self {
+        self.ml_cycle_shards = shards.max(1);
         self.refresh_runtime_config_hash();
         self
     }
@@ -2373,6 +2390,17 @@ mod tests {
         assert_ne!(
             base.runtime_config_hash, changed_rerank.runtime_config_hash,
             "cadencia de rerank altera quando rotas entram em priority supervisionado"
+        );
+    }
+
+    #[test]
+    fn ml_cycle_shards_changes_supervised_config_hash() {
+        let base = mk_server().with_ml_cycle_shards(1);
+        let sharded = mk_server().with_ml_cycle_shards(8);
+
+        assert_ne!(
+            base.runtime_config_hash, sharded.runtime_config_hash,
+            "cycle sharding can change inter-route feature ordering and must version labels"
         );
     }
 

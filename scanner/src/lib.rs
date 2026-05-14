@@ -49,6 +49,7 @@ use crate::types::now_ns;
 
 const ML_CYCLE_CHANNEL_CAPACITY: usize = 2;
 const ML_CYCLE_BUFFER_RECYCLE_CAPACITY: usize = 4;
+const ML_CYCLE_MAX_SHARDS: usize = 32;
 
 #[inline]
 fn should_mark_sample_recommended(rec: &crate::ml::contract::Recommendation) -> bool {
@@ -98,19 +99,48 @@ struct MlCycleBatch {
 }
 
 #[derive(Debug)]
+struct MlRecycledShardBuffer {
+    shard_index: usize,
+    observations: Vec<MlCycleObservation>,
+}
+
 enum MlCycleCommand {
     Batch(MlCycleBatch),
-    LabelSweep { now_ns: u64 },
+    SweepBarrier {
+        arrived_tx: tokio::sync::oneshot::Sender<()>,
+        release_rx: tokio::sync::oneshot::Receiver<()>,
+    },
+}
+
+fn ml_cycle_shard_count_from_ml_config(ml: &config::MlConfig) -> usize {
+    ml.cycle_shards.clamp(1, ML_CYCLE_MAX_SHARDS)
+}
+
+#[inline]
+fn route_shard_index(route: RouteId, shard_count: usize) -> usize {
+    debug_assert!(shard_count > 0);
+    if shard_count <= 1 {
+        return 0;
+    }
+    let mut x = route.symbol_id.0 as u64;
+    x ^= (route.buy_venue.idx() as u64) << 32;
+    x ^= (route.sell_venue.idx() as u64) << 40;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x % shard_count as u64) as usize
 }
 
 async fn run_ml_cycle_worker(
+    shard_index: usize,
     universe: Arc<SymbolUniverse>,
     ml_server: Arc<MlServer>,
     ml_writer: WriterHandle,
     ml_broadcaster: RecommendationBroadcaster,
-    label_resolver: Arc<LabelResolver>,
     mut rx: tokio::sync::mpsc::Receiver<MlCycleCommand>,
-    buffer_recycle_tx: tokio::sync::mpsc::Sender<Vec<MlCycleObservation>>,
+    buffer_recycle_tx: tokio::sync::mpsc::Sender<MlRecycledShardBuffer>,
 ) {
     let metrics = obs::Metrics::init();
     while let Some(cmd) = rx.recv().await {
@@ -128,7 +158,10 @@ async fn run_ml_cycle_worker(
                 process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, &batch)
                     .await;
                 batch.observations.clear();
-                let _ = buffer_recycle_tx.try_send(batch.observations);
+                let _ = buffer_recycle_tx.try_send(MlRecycledShardBuffer {
+                    shard_index,
+                    observations: batch.observations,
+                });
                 metrics.ml_cycle_batch_inflight_current.dec();
                 metrics
                     .ml_cycle_events_inflight_current
@@ -136,12 +169,56 @@ async fn run_ml_cycle_worker(
                 metrics.ml_cycle_batches_processed_total.inc();
                 metrics.ml_cycle_events_processed_total.inc_by(n_events);
             }
-            MlCycleCommand::LabelSweep { now_ns } => {
-                let n = label_resolver.sweep(now_ns);
-                if n > 0 {
-                    tracing::debug!(n_closed = n, "label_resolver sweep");
-                }
+            MlCycleCommand::SweepBarrier {
+                arrived_tx,
+                release_rx,
+            } => {
+                let _ = arrived_tx.send(());
+                let _ = release_rx.await;
             }
+        }
+    }
+}
+
+async fn run_label_sweeper_with_ml_barrier(
+    label_resolver: Arc<LabelResolver>,
+    ml_cycle_txs: Vec<tokio::sync::mpsc::Sender<MlCycleCommand>>,
+    label_sweeper_interval: Duration,
+) {
+    let mut tick = tokio::time::interval(label_sweeper_interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        let mut arrivals = Vec::with_capacity(ml_cycle_txs.len());
+        let mut releases = Vec::with_capacity(ml_cycle_txs.len());
+        for tx in &ml_cycle_txs {
+            let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            if tx
+                .send(MlCycleCommand::SweepBarrier {
+                    arrived_tx,
+                    release_rx,
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            arrivals.push(arrived_rx);
+            releases.push(release_tx);
+        }
+        for arrived_rx in arrivals {
+            if arrived_rx.await.is_err() {
+                return;
+            }
+        }
+        let sweep_ts = now_ns();
+        let n = label_resolver.sweep(sweep_ts);
+        for release_tx in releases {
+            let _ = release_tx.send(());
+        }
+        if n > 0 {
+            tracing::debug!(n_closed = n, "label_resolver sweep");
         }
     }
 }
@@ -328,6 +405,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .map_err(|e| Error::Config(format!("ml.parquet: {}", e)))?;
     let dataset_rotation_interval = dataset_rotation_interval_from_ml_config(&cfg.ml)
         .map_err(|e| Error::Config(format!("ml.parquet: {}", e)))?;
+    let ml_cycle_shards = ml_cycle_shard_count_from_ml_config(&cfg.ml);
     info!(
         train_window_days = model_window_policy.train_window_days,
         calibration_window_days = model_window_policy.calibration_window_days,
@@ -337,6 +415,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         parquet_zstd_level = parquet_compaction.zstd_level,
         parquet_rotation_interval_s = dataset_rotation_interval.as_secs(),
         parquet_strict_lossless = cfg.ml.parquet.strict_lossless,
+        ml_cycle_shards,
         run_id = %run_id,
         "ML window policy carregada"
     );
@@ -506,6 +585,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 label_priority_target_coverage_from_ml_config(&cfg.ml),
                 label_priority_rerank_interval_s_from_ml_config(&cfg.ml),
             )
+            .with_ml_cycle_shards(ml_cycle_shards)
             .with_raw_writer(ml_raw_writer_handle)
             .with_route_ranking(Arc::clone(&ranker))
             .with_label_resolver(Arc::clone(&label_resolver))
@@ -803,39 +883,40 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         }
     }
 
-    // --- ML cycle worker ---
+    // --- ML cycle workers ---
     // O scan loop só publica UI e enfileira observações imutáveis. Todo o
-    // trabalho variável de dataset/cache/label/recommendation roda aqui, em
-    // FIFO por ciclo, usando event_time_ns congelado para preservar PIT.
-    let (ml_cycle_tx, ml_cycle_rx) =
-        tokio::sync::mpsc::channel::<MlCycleCommand>(ML_CYCLE_CHANNEL_CAPACITY);
+    // trabalho variável de dataset/cache/label/recommendation roda aqui,
+    // particionado por rota. Com `cycle_shards=1`, preserva a ordem global
+    // histórica; com >1, preserva FIFO por rota e usa barreira para sweeps.
+    let mut ml_cycle_txs = Vec::with_capacity(ml_cycle_shards);
+    let mut ml_worker_tasks = Vec::with_capacity(ml_cycle_shards);
     let (ml_buffer_recycle_tx, ml_buffer_recycle_rx) =
-        tokio::sync::mpsc::channel::<Vec<MlCycleObservation>>(ML_CYCLE_BUFFER_RECYCLE_CAPACITY);
-    let ml_worker_task = tokio::spawn(run_ml_cycle_worker(
-        Arc::clone(&universe),
-        Arc::clone(&ml_server),
-        ml_writer_handle.clone(),
-        ml_broadcaster.clone(),
-        Arc::clone(&label_resolver),
-        ml_cycle_rx,
-        ml_buffer_recycle_tx,
-    ));
+        tokio::sync::mpsc::channel::<MlRecycledShardBuffer>(
+            ML_CYCLE_BUFFER_RECYCLE_CAPACITY.saturating_mul(ml_cycle_shards),
+        );
+    for shard_index in 0..ml_cycle_shards {
+        let (ml_cycle_tx, ml_cycle_rx) =
+            tokio::sync::mpsc::channel::<MlCycleCommand>(ML_CYCLE_CHANNEL_CAPACITY);
+        ml_cycle_txs.push(ml_cycle_tx);
+        ml_worker_tasks.push(tokio::spawn(run_ml_cycle_worker(
+            shard_index,
+            Arc::clone(&universe),
+            Arc::clone(&ml_server),
+            ml_writer_handle.clone(),
+            ml_broadcaster.clone(),
+            ml_cycle_rx,
+            ml_buffer_recycle_tx.clone(),
+        )));
+    }
+    drop(ml_buffer_recycle_tx);
     let label_sweeper_task = {
-        let tx = ml_cycle_tx.clone();
-        tokio::spawn(async move {
-            let mut tick = tokio::time::interval(label_sweeper_interval);
-            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tick.tick().await;
-                if tx
-                    .send(MlCycleCommand::LabelSweep { now_ns: now_ns() })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
+        let txs = ml_cycle_txs.clone();
+        let resolver = Arc::clone(&label_resolver);
+        tokio::spawn(run_label_sweeper_with_ml_barrier(
+            resolver,
+            txs,
+            label_sweeper_interval,
+        ))
     };
 
     // --- Spread engine loop (150ms) ---
@@ -850,8 +931,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let c_engine = Arc::clone(&counters);
     let ml_engine = Arc::clone(&ml_server);
     let ml_broadcaster_engine = ml_broadcaster.clone();
-    let ml_cycle_tx_engine = ml_cycle_tx.clone();
-    drop(ml_cycle_tx);
+    let ml_cycle_txs_engine = ml_cycle_txs.clone();
+    drop(ml_cycle_txs);
     let label_resolver_shutdown = Arc::clone(&label_resolver);
     let mut engine_task = tokio::spawn(async move {
         run_spread_engine(
@@ -868,7 +949,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             ml_engine,
             ml_writer_handle.clone(),
             ml_broadcaster_engine,
-            ml_cycle_tx_engine,
+            ml_cycle_txs_engine,
             ml_buffer_recycle_rx,
         )
         .await;
@@ -928,15 +1009,17 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 warn!(error = %e, "label sweeper task terminou com erro durante shutdown");
             }
         }
-        match ml_worker_task.await {
-            Ok(()) => {
-                info!("shutdown: ML cycle worker drenado");
-            }
-            Err(e) => {
-                warn!(error = %e, "shutdown: ML cycle worker terminou com erro");
-                terminal_error = Some(anyhow::anyhow!(
-                    "ML cycle worker failed during shutdown: {e}"
-                ));
+        for (shard_index, ml_worker_task) in ml_worker_tasks.into_iter().enumerate() {
+            match ml_worker_task.await {
+                Ok(()) => {
+                    info!(shard_index, "shutdown: ML cycle worker drenado");
+                }
+                Err(e) => {
+                    warn!(shard_index, error = %e, "shutdown: ML cycle worker terminou com erro");
+                    terminal_error = Some(anyhow::anyhow!(
+                        "ML cycle worker shard {shard_index} failed during shutdown: {e}"
+                    ));
+                }
             }
         }
 
@@ -1315,11 +1398,17 @@ async fn run_spread_engine(
     ml_server: Arc<MlServer>,
     ml_writer: WriterHandle,
     ml_broadcaster: RecommendationBroadcaster,
-    ml_cycle_tx: tokio::sync::mpsc::Sender<MlCycleCommand>,
-    mut ml_buffer_recycle_rx: tokio::sync::mpsc::Receiver<Vec<MlCycleObservation>>,
+    ml_cycle_txs: Vec<tokio::sync::mpsc::Sender<MlCycleCommand>>,
+    mut ml_buffer_recycle_rx: tokio::sync::mpsc::Receiver<MlRecycledShardBuffer>,
 ) {
     let mut buf: Vec<Opportunity> = Vec::with_capacity(1024);
-    let mut ml_observations: Vec<MlCycleObservation> = Vec::with_capacity(4096);
+    let ml_cycle_shards = ml_cycle_txs.len().max(1);
+    let per_shard_initial_capacity = (4096 / ml_cycle_shards).max(256);
+    let mut ml_observations_by_shard: Vec<Vec<MlCycleObservation>> = (0..ml_cycle_shards)
+        .map(|_| Vec::with_capacity(per_shard_initial_capacity))
+        .collect();
+    let mut recycled_by_shard: Vec<Vec<Vec<MlCycleObservation>>> =
+        (0..ml_cycle_shards).map(|_| Vec::new()).collect();
     let mut tick = tokio::time::interval(Duration::from_millis(broadcast_ms));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -1328,7 +1417,15 @@ async fn run_spread_engine(
         let metrics = obs::Metrics::init();
         let t0 = std::time::Instant::now();
         buf.clear();
-        ml_observations.clear();
+        while let Ok(mut recycled) = ml_buffer_recycle_rx.try_recv() {
+            if recycled.shard_index < recycled_by_shard.len() {
+                recycled.observations.clear();
+                recycled_by_shard[recycled.shard_index].push(recycled.observations);
+            }
+        }
+        for shard_buffer in &mut ml_observations_by_shard {
+            shard_buffer.clear();
+        }
         scan_once_with_observer(
             &universe,
             &store,
@@ -1340,7 +1437,13 @@ async fn run_spread_engine(
             &counters,
             &mut buf,
             |obs| {
-                ml_observations.push(MlCycleObservation {
+                let route = RouteId {
+                    symbol_id: obs.symbol_id,
+                    buy_venue: obs.buy_venue,
+                    sell_venue: obs.sell_venue,
+                };
+                let shard_index = route_shard_index(route, ml_cycle_shards);
+                ml_observations_by_shard[shard_index].push(MlCycleObservation {
                     observation: *obs,
                     foreground: obs.entry_spread >= threshold_pct,
                 });
@@ -1357,20 +1460,20 @@ async fn run_spread_engine(
         let now = now_ns();
         let cycle_seq = ml_server.begin_cycle();
         let cycle_budget_ns = broadcast_ms.saturating_mul(1_000_000);
-        if !ml_observations.is_empty() {
-            let next_capacity = ml_observations.capacity().max(4096);
-            let mut next_buffer = match ml_buffer_recycle_rx.try_recv() {
-                Ok(mut recycled) => {
-                    recycled.clear();
-                    if recycled.capacity() < next_capacity {
-                        recycled.reserve(next_capacity - recycled.capacity());
-                    }
-                    recycled
-                }
-                Err(_) => Vec::with_capacity(next_capacity),
-            };
+        let mut ml_cycle_send_failed = false;
+        for (shard_index, shard_buffer) in ml_observations_by_shard.iter_mut().enumerate() {
+            if shard_buffer.is_empty() {
+                continue;
+            }
+            let next_capacity = shard_buffer.capacity().max(per_shard_initial_capacity);
+            let mut next_buffer = recycled_by_shard[shard_index]
+                .pop()
+                .unwrap_or_else(|| Vec::with_capacity(next_capacity));
             next_buffer.clear();
-            let observations = std::mem::replace(&mut ml_observations, next_buffer);
+            if next_buffer.capacity() < next_capacity {
+                next_buffer.reserve(next_capacity - next_buffer.capacity());
+            }
+            let observations = std::mem::replace(shard_buffer, next_buffer);
             let n_events = observations.len() as u64;
             let batch = MlCycleBatch {
                 cycle_seq,
@@ -1378,11 +1481,19 @@ async fn run_spread_engine(
                 cycle_budget_ns,
                 observations,
             };
+            if ml_cycle_send_failed {
+                process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, &batch)
+                    .await;
+                continue;
+            }
             metrics.ml_cycle_queue_depth_current.inc();
             metrics
                 .ml_cycle_queue_events_current
                 .add(n_events.min(i64::MAX as u64) as i64);
-            match ml_cycle_tx.send(MlCycleCommand::Batch(batch)).await {
+            match ml_cycle_txs[shard_index]
+                .send(MlCycleCommand::Batch(batch))
+                .await
+            {
                 Ok(()) => {
                     metrics.ml_cycle_batches_enqueued_total.inc();
                     metrics.ml_cycle_events_enqueued_total.inc_by(n_events);
@@ -1403,11 +1514,16 @@ async fn run_spread_engine(
                             )
                             .await;
                         }
-                        MlCycleCommand::LabelSweep { .. } => {}
+                        MlCycleCommand::SweepBarrier { release_rx, .. } => {
+                            drop(release_rx);
+                        }
                     }
-                    panic!("ml_cycle strict-lossless violation: async ML cycle queue closed");
+                    ml_cycle_send_failed = true;
                 }
             }
+        }
+        if ml_cycle_send_failed {
+            panic!("ml_cycle strict-lossless violation: async ML cycle queue closed");
         }
 
         bstate.publish(&buf);
@@ -1548,6 +1664,28 @@ mod tests {
             super::label_priority_rerank_interval_s_from_ml_config(&ml),
             60
         );
+    }
+
+    #[test]
+    fn ml_cycle_shard_count_uses_configured_positive_value() {
+        let mut ml = crate::config::MlConfig::default();
+        ml.cycle_shards = 8;
+
+        assert_eq!(super::ml_cycle_shard_count_from_ml_config(&ml), 8);
+    }
+
+    #[test]
+    fn route_shard_index_preserves_single_worker_path() {
+        assert_eq!(super::route_shard_index(mk_route(), 1), 0);
+    }
+
+    #[test]
+    fn route_shard_index_is_stable_for_same_route() {
+        let route = mk_route();
+        let first = super::route_shard_index(route, 8);
+        for _ in 0..16 {
+            assert_eq!(super::route_shard_index(route, 8), first);
+        }
     }
 
     #[test]

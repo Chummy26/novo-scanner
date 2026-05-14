@@ -86,6 +86,14 @@ pub struct MlConfig {
     #[serde(default = "default_raw_rerank_interval_s")]
     pub raw_rerank_interval_s: u64,
 
+    /// Número de workers do estágio ML/candidate/label, particionado por rota.
+    ///
+    /// `1` preserva a ordem global histórica. Valores >1 preservam FIFO por
+    /// rota e usam barreira no sweeper, mas mudam a ordem entre rotas; por isso
+    /// entram no hash supervisionado.
+    #[serde(default = "default_ml_cycle_shards")]
+    pub cycle_shards: usize,
+
     /// Stride mínimo entre labels da mesma rota (s). Default 60.
     #[serde(default = "default_label_stride_s")]
     pub label_stride_s: u32,
@@ -149,6 +157,7 @@ impl Default for MlConfig {
             raw_decimation_mod: default_raw_decimation_mod(),
             label_background_decimation_mod: default_label_background_decimation_mod(),
             raw_rerank_interval_s: default_raw_rerank_interval_s(),
+            cycle_shards: default_ml_cycle_shards(),
             label_stride_s: default_label_stride_s(),
             label_horizons_s: default_label_horizons_s(),
             label_sweeper_interval_s: default_label_sweeper_interval_s(),
@@ -302,6 +311,9 @@ fn default_label_background_decimation_mod() -> u64 {
 }
 fn default_raw_rerank_interval_s() -> u64 {
     3600
+}
+fn default_ml_cycle_shards() -> usize {
+    1
 }
 fn default_label_stride_s() -> u32 {
     60
