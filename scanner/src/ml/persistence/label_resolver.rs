@@ -227,6 +227,16 @@ impl PendingLabelState {
     }
 }
 
+#[inline]
+fn shrink_horizons_after_close(horizons: &mut Vec<PendingHorizon>) {
+    // `shrink_to_fit()` on every horizon close causes allocator churn in the
+    // hottest label path. Shrink only when the Vec reached the long-horizon
+    // tail, where the memory saving is material and the close frequency is low.
+    if horizons.is_empty() || (horizons.capacity() > 2 && horizons.len() <= 2) {
+        horizons.shrink_to_fit();
+    }
+}
+
 #[derive(Debug, Clone)]
 enum PendingMetaRef {
     Memory(usize),
@@ -1693,7 +1703,8 @@ impl LabelResolver {
                 let entry_locked = pending.entry_locked_pct;
                 let label_floor = pending.label_floor_pct;
                 let label_floors = pending.label_floors_pct.as_slice();
-                let mut closed_horizons: Vec<(PendingHorizon, Option<CensorReason>)> = Vec::new();
+                let mut closed_horizons: SmallVec<[(PendingHorizon, Option<CensorReason>); 6]> =
+                    SmallVec::new();
                 let mut idx = 0usize;
                 while idx < pending.horizons.len() {
                     let mut close_reason: Option<Option<CensorReason>> = None;
@@ -1742,7 +1753,7 @@ impl LabelResolver {
                     }
                 }
                 if !closed_horizons.is_empty() {
-                    pending.horizons.shrink_to_fit();
+                    shrink_horizons_after_close(&mut pending.horizons);
                     route_closed_any = true;
                     self.metrics
                         .pending_horizons_current
@@ -1819,8 +1830,8 @@ impl LabelResolver {
                 let mut route_closed_any = false;
                 for pending in queue.iter_mut() {
                     let t_emit = pending.ts_emit_ns;
-                    let mut closed_horizons: Vec<(PendingHorizon, Option<CensorReason>)> =
-                        Vec::new();
+                    let mut closed_horizons: SmallVec<[(PendingHorizon, Option<CensorReason>); 6]> =
+                        SmallVec::new();
                     let mut idx = 0usize;
                     while idx < pending.horizons.len() {
                         let mut close_reason: Option<Option<CensorReason>> = None;
@@ -1855,7 +1866,7 @@ impl LabelResolver {
                         }
                     }
                     if !closed_horizons.is_empty() {
-                        pending.horizons.shrink_to_fit();
+                        shrink_horizons_after_close(&mut pending.horizons);
                         route_closed_any = true;
                         self.metrics
                             .pending_horizons_current

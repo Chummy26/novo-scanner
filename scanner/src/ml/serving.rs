@@ -1407,14 +1407,7 @@ impl MlServer {
                 now_ns,
                 max_horizon_s,
             );
-        let cluster_routes = self.listing.active_routes_for_symbol(route.symbol_id);
-        let cluster_size = cluster_routes.len().max(1).min(u32::MAX as usize) as u32;
-        let cluster_rank = cluster_routes
-            .iter()
-            .position(|candidate| *candidate == route)
-            .map(|idx| idx + 1)
-            .unwrap_or(cluster_routes.len().max(1))
-            .min(u32::MAX as usize) as u32;
+        let (cluster_size, cluster_rank) = self.listing.active_cluster_position(route);
         let runtime_config_hash = self.runtime_config_hash.clone();
         let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
         let candidate = LabelCandidateCommand {
@@ -2203,14 +2196,7 @@ impl MlServer {
                     now_ns,
                     max_horizon_s,
                 );
-            let cluster_routes = self.listing.active_routes_for_symbol(route.symbol_id);
-            let cluster_size = cluster_routes.len().max(1).min(u32::MAX as usize) as u32;
-            let cluster_rank = cluster_routes
-                .iter()
-                .position(|candidate| *candidate == route)
-                .map(|idx| idx + 1)
-                .unwrap_or(cluster_routes.len().max(1))
-                .min(u32::MAX as usize) as u32;
+            let (cluster_size, cluster_rank) = self.listing.active_cluster_position(route);
             let runtime_config_hash = self.runtime_config_hash.clone();
             let (priority_gen, priority_updated_ns) = self.priority_set_metadata_snapshot();
             let candidate = LabelCandidateCommand {

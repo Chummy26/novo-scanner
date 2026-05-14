@@ -1,0 +1,115 @@
+# Scanner configuration. Fields left unset use default values.
+
+# Bind address for the broadcast HTTP+WS server (/ws/scanner, /api/spread/*).
+bind = "0.0.0.0:8000"
+
+# Broadcast cadence to WS clients. 150ms matches the existing frontend contract.
+broadcast_ms = 150
+
+# Minimum entry spread (in percent) to emit as an opportunity. Spreads below
+# this are computed but not broadcast. Use 0.30 for production conservative,
+# 0.05 for noisy dev.
+entry_threshold_pct = 0.30
+
+# PhD#5 D-13: KuCoin Pro/UTA API is documented as BETA by the exchange.
+# Values: "classic" (default, opt-in), "probeta", "disabled".
+kucoin_mode = "disabled"
+
+# PhD#5 D-16: v2 = market-data (current); v3 = UTA order placement.
+# Values: "v2" (default), "v3uta".
+bitget_mode = "v2"
+
+[venues]
+binance_spot = true
+binance_fut  = true
+mexc_spot    = true
+mexc_fut     = true
+bingx_spot   = true
+bingx_fut    = true
+gate_spot    = true
+gate_fut     = true
+kucoin       = false  # off by default (see kucoin_mode)
+xt_spot      = true
+xt_fut       = true
+bitget       = true
+
+[limits]
+# Upper bound on universe size. Book store allocates VENUE_COUNT * max_symbols
+# TopOfBook slots at 64B each, so 4000 * 12 * 64 = ~3 MiB RAM for best-of-book.
+max_symbols  = 4000
+
+# Orderbook depth levels per side. 5 is enough for best bid/ask;
+# 20 permits slippage estimation. PhD#2 cap is 64.
+max_levels   = 20
+
+# Per-pair history ring buffer length (for /api/spread/history/:symbol).
+history_len  = 512
+
+[core_pinning]
+# Enable core affinity pinning for adapter and spread-engine threads.
+# Recommended in production to stabilize seqlock L1 behavior (PhD#2 C1).
+enabled             = false
+# Dedicated core index for the spread engine loop. Omit = automatic.
+# spread_engine_core = 11
+
+[ml]
+# Shared tier-0 symbols always persisted in full for raw and label background.
+raw_allowlist_symbols = ["BTC-USDT", "ETH-USDT"]
+
+# Priority-set target coverage for raw sampling and label background.
+raw_sampling_target_coverage = 0.95
+
+# Residual uniform raw decimation = 1-in-N.
+raw_decimation_mod = 10
+
+# Residual uniform label-background decimation = 1-in-N.
+label_background_decimation_mod = 10
+
+# Rerank cadence of the priority routes for raw and label background.
+raw_rerank_interval_s = 3600
+
+# Label cadence / floors.
+label_stride_s = 60
+label_horizons_s = [900, 1800, 3600, 7200, 14400, 28800]
+label_sweeper_interval_s = 10
+# Clean observations are fed to the label resolver through a strict-lossless
+# async queue. Full queue aborts instead of dropping or biasing labels.
+label_observation_channel_capacity = 32768
+label_floor_pct = 0.8
+label_floors_pct = [0.3, 0.5, 0.8, 1.2, 2.0, 3.0]
+recommendation_cooldown_s = 60
+
+[ml.retention]
+# Operational retention in disk. This is physical TTL, not the trainer
+# lookback. Current safe defaults reflect "research mode":
+# raw = 30d, accepted = 30d, labeled = 365d.
+enabled = true
+sweep_interval_s = 3600
+keep_recent_hours = 12
+raw_retention_days = 30
+accepted_retention_days = 30
+labeled_retention_days = 365
+dry_run = false
+
+[ml.parquet]
+# JSONL files are closed every 10 min inside hourly Hive partitions, then
+# compacted to Parquet/ZSTD. Hot path stays append-only JSONL; compression
+# happens only after close.
+enabled = true
+rotation_interval_s = 600
+delete_jsonl_after_success = true
+batch_size = 4096
+zstd_level = 3
+# If true, shutdown/flush/seal/compaction/audit failures mark the run unhealthy.
+# JSONL source files are preserved on failure.
+strict_lossless = true
+
+[ml.windows]
+# Statistical memory of the model/trainer. These windows do not delete
+# files. They declare the intended lookback:
+# - train_window_days: rolling training window
+# - calibration_window_days: recent window for calibrating P / IC
+# - archive_reference_days: cold slices / rare regimes kept for research
+train_window_days = 90
+calibration_window_days = 21
+archive_reference_days = 365
