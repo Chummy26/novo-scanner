@@ -15,7 +15,10 @@ pub use config::Config;
 pub use error::{Error, Result};
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use tracing::{info, warn};
@@ -62,9 +65,11 @@ fn enqueue_accepted_sample(
     mut sample: crate::ml::persistence::AcceptedSample,
     was_recommended: bool,
 ) {
+    let metrics = obs::Metrics::init();
     if was_recommended {
         sample.mark_recommended();
     }
+    let t0 = std::time::Instant::now();
     if let Err(e) = ml_writer.try_send(sample) {
         let metrics = ml_server.metrics();
         match e {
@@ -82,6 +87,7 @@ fn enqueue_accepted_sample(
             }
         }
     }
+    metrics.record_current_ml_stage("writer_enqueue_accepted", t0.elapsed().as_nanos() as u64);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -106,14 +112,44 @@ struct MlRecycledShardBuffer {
 
 enum MlCycleCommand {
     Batch(MlCycleBatch),
-    SweepBarrier {
-        arrived_tx: tokio::sync::oneshot::Sender<()>,
-        release_rx: tokio::sync::oneshot::Receiver<()>,
+    Sweep {
+        now_ns: u64,
+        reply_tx: tokio::sync::oneshot::Sender<u64>,
     },
 }
 
 fn ml_cycle_shard_count_from_ml_config(ml: &config::MlConfig) -> usize {
     ml.cycle_shards.clamp(1, ML_CYCLE_MAX_SHARDS)
+}
+
+fn spawn_isolated_writer_task<F>(name: &'static str, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "writer runtime strict-lossless violation: failed to start {name}: {e}"
+                        )
+                    });
+                rt.block_on(fut);
+            }));
+            if result.is_err() {
+                eprintln!(
+                    "writer thread strict-lossless violation: {name} panicked; aborting process"
+                );
+                std::process::abort();
+            }
+        })
+        .unwrap_or_else(|e| {
+            panic!("writer thread strict-lossless violation: failed to spawn {name}: {e}")
+        });
 }
 
 #[inline]
@@ -151,10 +187,13 @@ async fn run_ml_cycle_worker(
                 metrics
                     .ml_cycle_queue_events_current
                     .sub(n_events.min(i64::MAX as u64) as i64);
+                metrics.dec_ml_shard_queue(shard_index, n_events);
                 metrics.ml_cycle_batch_inflight_current.inc();
                 metrics
                     .ml_cycle_events_inflight_current
                     .add(n_events.min(i64::MAX as u64) as i64);
+                metrics.inc_ml_shard_inflight(shard_index, n_events);
+                let _shard_scope = metrics.enter_ml_shard(shard_index);
                 process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, &batch)
                     .await;
                 batch.observations.clear();
@@ -166,22 +205,24 @@ async fn run_ml_cycle_worker(
                 metrics
                     .ml_cycle_events_inflight_current
                     .sub(n_events.min(i64::MAX as u64) as i64);
+                metrics.dec_ml_shard_inflight(shard_index, n_events);
                 metrics.ml_cycle_batches_processed_total.inc();
                 metrics.ml_cycle_events_processed_total.inc_by(n_events);
             }
-            MlCycleCommand::SweepBarrier {
-                arrived_tx,
-                release_rx,
-            } => {
-                let _ = arrived_tx.send(());
-                let _ = release_rx.await;
+            MlCycleCommand::Sweep { now_ns, reply_tx } => {
+                let t0 = std::time::Instant::now();
+                let n = ml_server
+                    .label_resolver()
+                    .map(|resolver| resolver.sweep_shard(shard_index, now_ns))
+                    .unwrap_or(0);
+                metrics.record_ml_stage(shard_index, "label_sweep", t0.elapsed().as_nanos() as u64);
+                let _ = reply_tx.send(n);
             }
         }
     }
 }
 
-async fn run_label_sweeper_with_ml_barrier(
-    label_resolver: Arc<LabelResolver>,
+async fn run_label_sweeper_by_ml_shard(
     ml_cycle_txs: Vec<tokio::sync::mpsc::Sender<MlCycleCommand>>,
     label_sweeper_interval: Duration,
 ) {
@@ -189,33 +230,28 @@ async fn run_label_sweeper_with_ml_barrier(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        let mut arrivals = Vec::with_capacity(ml_cycle_txs.len());
-        let mut releases = Vec::with_capacity(ml_cycle_txs.len());
+        let sweep_ts = now_ns();
+        let mut replies = Vec::with_capacity(ml_cycle_txs.len());
         for tx in &ml_cycle_txs {
-            let (arrived_tx, arrived_rx) = tokio::sync::oneshot::channel();
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             if tx
-                .send(MlCycleCommand::SweepBarrier {
-                    arrived_tx,
-                    release_rx,
+                .send(MlCycleCommand::Sweep {
+                    now_ns: sweep_ts,
+                    reply_tx,
                 })
                 .await
                 .is_err()
             {
                 return;
             }
-            arrivals.push(arrived_rx);
-            releases.push(release_tx);
+            replies.push(reply_rx);
         }
-        for arrived_rx in arrivals {
-            if arrived_rx.await.is_err() {
-                return;
+        let mut n = 0u64;
+        for reply_rx in replies {
+            match reply_rx.await {
+                Ok(closed) => n = n.saturating_add(closed),
+                Err(_) => return,
             }
-        }
-        let sweep_ts = now_ns();
-        let n = label_resolver.sweep(sweep_ts);
-        for release_tx in releases {
-            let _ = release_tx.send(());
         }
         if n > 0 {
             tracing::debug!(n_closed = n, "label_resolver sweep");
@@ -231,6 +267,7 @@ async fn process_ml_cycle_batch(
     batch: &MlCycleBatch,
 ) {
     let metrics = obs::Metrics::init();
+    let batch_t0 = std::time::Instant::now();
     let ml_foreground_t0 = std::time::Instant::now();
     for item in batch.observations.iter().filter(|item| item.foreground) {
         let opp = item.observation;
@@ -240,6 +277,7 @@ async fn process_ml_cycle_batch(
             sell_venue: opp.sell_venue,
         };
         let symbol_name = universe.canonical_name_of(opp.symbol_id);
+        let event_t0 = std::time::Instant::now();
         let (rec, _dec, accepted) = ml_server.on_opportunity_with_books(
             batch.cycle_seq,
             route,
@@ -253,6 +291,10 @@ async fn process_ml_cycle_batch(
             opp.sell_price,
             opp.sell_ask_price,
             batch.event_time_ns,
+        );
+        metrics.record_current_ml_stage(
+            "foreground_event_total",
+            event_t0.elapsed().as_nanos() as u64,
         );
         let _had_active_consumers = ml_broadcaster.publish(
             batch.cycle_seq,
@@ -283,6 +325,7 @@ async fn process_ml_cycle_batch(
             sell_venue: opp.sell_venue,
         };
         let symbol_id = opp.symbol_id;
+        let event_t0 = std::time::Instant::now();
         let (_dec, accepted) = ml_server.observe_background_with_books_lazy_symbol(
             batch.cycle_seq,
             route,
@@ -297,6 +340,10 @@ async fn process_ml_cycle_batch(
             opp.sell_ask_price,
             batch.event_time_ns,
         );
+        metrics.record_current_ml_stage(
+            "background_event_total",
+            event_t0.elapsed().as_nanos() as u64,
+        );
         if let Some(sample) = accepted {
             enqueue_accepted_sample(ml_server, ml_writer, sample, false);
         }
@@ -306,6 +353,7 @@ async fn process_ml_cycle_batch(
         metrics.record_ml_background_event_estimate(ml_background_elapsed_ns / background_events);
     }
     metrics.record_ml_background_with_budget(ml_background_elapsed_ns, batch.cycle_budget_ns);
+    metrics.record_current_ml_stage("batch_total", batch_t0.elapsed().as_nanos() as u64);
 }
 
 fn route_decimator_from_ml_config(ml: &config::MlConfig) -> RouteDecimator {
@@ -530,7 +578,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     .await;
     let (ml_raw_writer, ml_raw_writer_handle) = RawSampleWriter::create(raw_writer_cfg);
     let raw_shutdown_handle = ml_raw_writer_handle.clone();
-    tokio::spawn(async move {
+    spawn_isolated_writer_task("ml-raw-writer", async move {
         ml_raw_writer.run().await;
     });
 
@@ -555,7 +603,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     .await;
     let (labeled_writer, labeled_handle) = LabeledJsonlWriter::create(labeled_writer_cfg);
     let labeled_shutdown_handle = labeled_handle.clone();
-    tokio::spawn(async move {
+    spawn_isolated_writer_task("ml-labeled-writer", async move {
         labeled_writer.run().await;
     });
 
@@ -806,7 +854,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     .await;
     let (ml_writer, ml_writer_handle) = JsonlWriter::create(writer_cfg);
     let accepted_shutdown_handle = ml_writer_handle.clone();
-    tokio::spawn(async move {
+    spawn_isolated_writer_task("ml-accepted-writer", async move {
         ml_writer.run().await;
     });
 
@@ -887,7 +935,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // O scan loop só publica UI e enfileira observações imutáveis. Todo o
     // trabalho variável de dataset/cache/label/recommendation roda aqui,
     // particionado por rota. Com `cycle_shards=1`, preserva a ordem global
-    // histórica; com >1, preserva FIFO por rota e usa barreira para sweeps.
+    // histórica; com >1, preserva FIFO por rota e agenda sweeps dentro da
+    // fila do shard correspondente, sem travar os demais shards.
     let mut ml_cycle_txs = Vec::with_capacity(ml_cycle_shards);
     let mut ml_worker_tasks = Vec::with_capacity(ml_cycle_shards);
     let (ml_buffer_recycle_tx, ml_buffer_recycle_rx) =
@@ -911,12 +960,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     drop(ml_buffer_recycle_tx);
     let label_sweeper_task = {
         let txs = ml_cycle_txs.clone();
-        let resolver = Arc::clone(&label_resolver);
-        tokio::spawn(run_label_sweeper_with_ml_barrier(
-            resolver,
-            txs,
-            label_sweeper_interval,
-        ))
+        tokio::spawn(run_label_sweeper_by_ml_shard(txs, label_sweeper_interval))
     };
 
     // --- Spread engine loop (150ms) ---
@@ -934,6 +978,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let ml_cycle_txs_engine = ml_cycle_txs.clone();
     drop(ml_cycle_txs);
     let label_resolver_shutdown = Arc::clone(&label_resolver);
+    let engine_shutdown = Arc::new(AtomicBool::new(false));
+    let engine_shutdown_task = Arc::clone(&engine_shutdown);
     let mut engine_task = tokio::spawn(async move {
         run_spread_engine(
             u_engine,
@@ -951,6 +997,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             ml_broadcaster_engine,
             ml_cycle_txs_engine,
             ml_buffer_recycle_rx,
+            engine_shutdown_task,
         )
         .await;
     });
@@ -996,11 +1043,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     };
     if let Some(reason) = shutdown_reason {
         if !engine_task_completed {
-            engine_task.abort();
+            engine_shutdown.store(true, Ordering::Relaxed);
             if let Err(e) = engine_task.await {
-                if !e.is_cancelled() {
-                    warn!(error = %e, "spread engine task terminou com erro durante shutdown");
-                }
+                warn!(error = %e, "spread engine task terminou com erro durante shutdown cooperativo");
             }
         }
         label_sweeper_task.abort();
@@ -1400,6 +1445,7 @@ async fn run_spread_engine(
     ml_broadcaster: RecommendationBroadcaster,
     ml_cycle_txs: Vec<tokio::sync::mpsc::Sender<MlCycleCommand>>,
     mut ml_buffer_recycle_rx: tokio::sync::mpsc::Receiver<MlRecycledShardBuffer>,
+    shutdown_requested: Arc<AtomicBool>,
 ) {
     let mut buf: Vec<Opportunity> = Vec::with_capacity(1024);
     let ml_cycle_shards = ml_cycle_txs.len().max(1);
@@ -1413,6 +1459,10 @@ async fn run_spread_engine(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        if shutdown_requested.load(Ordering::Relaxed) {
+            info!("spread engine encerrando em boundary de ciclo");
+            break;
+        }
         let cycle_t0 = std::time::Instant::now();
         let metrics = obs::Metrics::init();
         let t0 = std::time::Instant::now();
@@ -1460,7 +1510,7 @@ async fn run_spread_engine(
         let now = now_ns();
         let cycle_seq = ml_server.begin_cycle();
         let cycle_budget_ns = broadcast_ms.saturating_mul(1_000_000);
-        let mut ml_cycle_send_failed = false;
+        let mut ml_cycle_send_failure_reason: Option<&'static str> = None;
         for (shard_index, shard_buffer) in ml_observations_by_shard.iter_mut().enumerate() {
             if shard_buffer.is_empty() {
                 continue;
@@ -1481,7 +1531,8 @@ async fn run_spread_engine(
                 cycle_budget_ns,
                 observations,
             };
-            if ml_cycle_send_failed {
+            if ml_cycle_send_failure_reason.is_some() {
+                let _shard_scope = metrics.enter_ml_shard(shard_index);
                 process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, &batch)
                     .await;
                 continue;
@@ -1490,21 +1541,22 @@ async fn run_spread_engine(
             metrics
                 .ml_cycle_queue_events_current
                 .add(n_events.min(i64::MAX as u64) as i64);
-            match ml_cycle_txs[shard_index]
-                .send(MlCycleCommand::Batch(batch))
-                .await
-            {
+            metrics.inc_ml_shard_queue(shard_index, n_events);
+            match ml_cycle_txs[shard_index].try_send(MlCycleCommand::Batch(batch)) {
                 Ok(()) => {
                     metrics.ml_cycle_batches_enqueued_total.inc();
                     metrics.ml_cycle_events_enqueued_total.inc_by(n_events);
                 }
-                Err(err) => {
+                Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
+                    metrics.ml_cycle_queue_full_total.inc();
                     metrics.ml_cycle_queue_depth_current.dec();
                     metrics
                         .ml_cycle_queue_events_current
                         .sub(n_events.min(i64::MAX as u64) as i64);
-                    match err.0 {
+                    metrics.dec_ml_shard_queue(shard_index, n_events);
+                    match cmd {
                         MlCycleCommand::Batch(batch) => {
+                            let _shard_scope = metrics.enter_ml_shard(shard_index);
                             process_ml_cycle_batch(
                                 &universe,
                                 &ml_server,
@@ -1514,16 +1566,40 @@ async fn run_spread_engine(
                             )
                             .await;
                         }
-                        MlCycleCommand::SweepBarrier { release_rx, .. } => {
-                            drop(release_rx);
+                        MlCycleCommand::Sweep { reply_tx, .. } => {
+                            let _ = reply_tx.send(0);
                         }
                     }
-                    ml_cycle_send_failed = true;
+                    ml_cycle_send_failure_reason = Some("full");
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(cmd)) => {
+                    metrics.ml_cycle_queue_depth_current.dec();
+                    metrics
+                        .ml_cycle_queue_events_current
+                        .sub(n_events.min(i64::MAX as u64) as i64);
+                    metrics.dec_ml_shard_queue(shard_index, n_events);
+                    match cmd {
+                        MlCycleCommand::Batch(batch) => {
+                            let _shard_scope = metrics.enter_ml_shard(shard_index);
+                            process_ml_cycle_batch(
+                                &universe,
+                                &ml_server,
+                                &ml_writer,
+                                &ml_broadcaster,
+                                &batch,
+                            )
+                            .await;
+                        }
+                        MlCycleCommand::Sweep { reply_tx, .. } => {
+                            let _ = reply_tx.send(0);
+                        }
+                    }
+                    ml_cycle_send_failure_reason = Some("closed");
                 }
             }
         }
-        if ml_cycle_send_failed {
-            panic!("ml_cycle strict-lossless violation: async ML cycle queue closed");
+        if let Some(reason) = ml_cycle_send_failure_reason {
+            panic!("ml_cycle strict-lossless violation: async ML cycle queue {reason}");
         }
 
         bstate.publish(&buf);

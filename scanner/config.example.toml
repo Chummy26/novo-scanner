@@ -68,9 +68,9 @@ label_background_decimation_mod = 10
 # Rerank cadence of the priority routes for raw and label background.
 raw_rerank_interval_s = 3600
 
-# Route-keyed ML worker shards. 1 preserves historical global ordering; values
-# >1 preserve FIFO per route and sweep barriers, and are versioned in labels.
-cycle_shards = 1
+# Route-keyed ML worker shards. Preserves FIFO per route and versions labels.
+# Use 1 only for deterministic single-worker A/B debugging.
+cycle_shards = 8
 
 # Label cadence / floors.
 label_stride_s = 60

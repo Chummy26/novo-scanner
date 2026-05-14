@@ -946,6 +946,10 @@ impl MlServer {
         self
     }
 
+    pub fn label_resolver(&self) -> Option<&Arc<LabelResolver>> {
+        self.label_resolver.as_ref()
+    }
+
     pub fn with_label_observer(mut self, observer: LabelResolverAsyncHandle) -> Self {
         self.label_observer = Some(observer);
         self
@@ -1148,11 +1152,14 @@ impl MlServer {
         exit_spread: f32,
         now_ns: u64,
     ) {
+        let t0 = std::time::Instant::now();
         self.baseline
             .cache()
             .observe(route, entry_spread, exit_spread, now_ns);
         self.feature_cache_7d
             .observe(route, entry_spread, exit_spread, now_ns);
+        crate::obs::Metrics::init()
+            .record_current_ml_stage("cache_observe", t0.elapsed().as_nanos() as u64);
     }
 
     fn dispatch_clean_label_observation(
@@ -1162,6 +1169,7 @@ impl MlServer {
         entry_spread: f32,
         exit_spread: f32,
     ) {
+        let t0 = std::time::Instant::now();
         let Some(resolver) = self.label_resolver.as_ref() else {
             return;
         };
@@ -1183,6 +1191,8 @@ impl MlServer {
         } else {
             resolver.on_clean_observation(route, now_ns, entry_spread, exit_spread);
         }
+        crate::obs::Metrics::init()
+            .record_current_ml_stage("label_observation", t0.elapsed().as_nanos() as u64);
     }
 
     fn time_alive_snapshot(&self, route: RouteId, entry_spread: f32, now_ns: u64) -> Option<u32> {
@@ -1251,6 +1261,7 @@ impl MlServer {
         half_spread_buy_now: Option<f32>,
         half_spread_sell_now: Option<f32>,
     ) -> FeaturesT0 {
+        let t0 = std::time::Instant::now();
         let exit_threshold_for_primary_floor = self.label_floor_pct - entry_spread;
         let stats_24h = self.baseline.cache().feature_stats(
             route,
@@ -1278,7 +1289,7 @@ impl MlServer {
         let time_alive_at_t0_s = self.time_alive_snapshot(route, entry_spread, now_ns);
         let listing_age_days_pre_observe = self.listing.listing_age_days(route, now_ns);
 
-        FeaturesT0 {
+        let features = FeaturesT0 {
             half_spread_buy_now,
             half_spread_sell_now,
             tail_ratio_p99_p95: stats_24h.tail_ratio_p99_p95,
@@ -1312,7 +1323,10 @@ impl MlServer {
             route_last_seen_ns: lifecycle.map(|lc| lc.last_seen_ns),
             route_active_until_ns: lifecycle.and_then(|lc| lc.active_until_ns),
             route_n_snapshots: lifecycle.map(|lc| lc.n_snapshots),
-        }
+        };
+        crate::obs::Metrics::init()
+            .record_current_ml_stage("feature_materialization", t0.elapsed().as_nanos() as u64);
+        features
     }
 
     fn label_candidate_snapshot(
@@ -1458,6 +1472,7 @@ impl MlServer {
         resolver: &Arc<LabelResolver>,
         candidate: LabelCandidateCommand,
     ) {
+        let t0 = std::time::Instant::now();
         if let Some(observer) = self.label_observer.as_ref() {
             if let Err(err) = observer.try_enqueue_candidate(candidate) {
                 match err {
@@ -1471,6 +1486,8 @@ impl MlServer {
                     }
                 }
             }
+            crate::obs::Metrics::init()
+                .record_current_ml_stage("label_candidate", t0.elapsed().as_nanos() as u64);
             return;
         }
 
@@ -1520,6 +1537,8 @@ impl MlServer {
             priority_set_generation_id,
             priority_set_updated_at_ns,
         );
+        crate::obs::Metrics::init()
+            .record_current_ml_stage("label_candidate", t0.elapsed().as_nanos() as u64);
     }
 
     /// Observa uma rota válida que não necessariamente é uma oportunidade
@@ -1654,12 +1673,17 @@ impl MlServer {
         let (half_spread_buy_now, half_spread_sell_now) =
             half_spreads_from_books(buy_bid_price, buy_ask_price, sell_bid_price, sell_ask_price);
         let clean = self.trigger.is_clean_data(buy_vol24_usd, sell_vol24_usd);
+        let trigger_t0 = std::time::Instant::now();
         let sample_dec = self.trigger.evaluate(
             route,
             entry_spread,
             buy_vol24_usd,
             sell_vol24_usd,
             self.baseline.cache(),
+        );
+        crate::obs::Metrics::init().record_current_ml_stage(
+            "trigger_cache_query",
+            trigger_t0.elapsed().as_nanos() as u64,
         );
         self.bump_sample_metric(sample_dec);
         self.clear_alive_if_below_threshold(route, entry_spread);
@@ -1702,8 +1726,13 @@ impl MlServer {
                         lc.n_snapshots,
                     );
                 }
+                let writer_t0 = std::time::Instant::now();
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
+                        crate::obs::Metrics::init().record_current_ml_stage(
+                            "writer_enqueue_raw",
+                            writer_t0.elapsed().as_nanos() as u64,
+                        );
                         self.metrics
                             .raw_samples_emitted
                             .fetch_add(1, Ordering::Relaxed);
@@ -1966,12 +1995,17 @@ impl MlServer {
         let clean = self.trigger.is_clean_data(buy_vol24_usd, sell_vol24_usd);
 
         // 2. Avalia trigger de amostragem completo (inclui n_min + tail).
+        let trigger_t0 = std::time::Instant::now();
         let sample_dec = self.trigger.evaluate(
             route,
             entry_spread,
             buy_vol24_usd,
             sell_vol24_usd,
             self.baseline.cache(),
+        );
+        crate::obs::Metrics::init().record_current_ml_stage(
+            "trigger_cache_query",
+            trigger_t0.elapsed().as_nanos() as u64,
         );
         self.bump_sample_metric(sample_dec);
 
@@ -2015,8 +2049,13 @@ impl MlServer {
                         lc.n_snapshots,
                     );
                 }
+                let writer_t0 = std::time::Instant::now();
                 match raw_writer.try_send(raw) {
                     Ok(()) => {
+                        crate::obs::Metrics::init().record_current_ml_stage(
+                            "writer_enqueue_raw",
+                            writer_t0.elapsed().as_nanos() as u64,
+                        );
                         self.metrics
                             .raw_samples_emitted
                             .fetch_add(1, Ordering::Relaxed);
@@ -2044,9 +2083,14 @@ impl MlServer {
         };
 
         // 3. Gera recomendação apenas a partir dos spreads e histórico PIT.
+        let baseline_t0 = std::time::Instant::now();
         let prediction_rec = self
             .baseline
             .recommend(route, entry_spread, exit_spread, now_ns);
+        crate::obs::Metrics::init().record_current_ml_stage(
+            "baseline_recommend",
+            baseline_t0.elapsed().as_nanos() as u64,
+        );
         let n_observations = self
             .baseline
             .cache()

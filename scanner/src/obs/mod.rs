@@ -10,6 +10,7 @@ use hdrhistogram::Histogram;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
+use std::cell::Cell;
 
 use crate::types::{Venue, VENUE_COUNT};
 
@@ -57,6 +58,18 @@ pub struct Metrics {
     pub ml_cycle_events_processed_total: IntCounter,
     /// Tentativas de enqueue rejeitadas por fila ML cheia.
     pub ml_cycle_queue_full_total: IntCounter,
+    /// Batches ML aguardando por shard.
+    pub ml_cycle_shard_queue_depth_current: IntGaugeVec,
+    /// Eventos ML aguardando por shard.
+    pub ml_cycle_shard_queue_events_current: IntGaugeVec,
+    /// Batch em processamento por shard.
+    pub ml_cycle_shard_batch_inflight_current: IntGaugeVec,
+    /// Eventos em processamento por shard.
+    pub ml_cycle_shard_events_inflight_current: IntGaugeVec,
+    /// Tempo acumulado por estágio do pipeline ML shardado.
+    pub ml_cycle_stage_ns_total: IntCounterVec,
+    /// Operações acumuladas por estágio do pipeline ML shardado.
+    pub ml_cycle_stage_ops_total: IntCounterVec,
     /// Last full spread loop processing latency, excluding scheduler sleep, ns.
     pub full_cycle_last_ns: IntGauge,
     /// Max full spread loop processing latency observed in this process, ns.
@@ -78,6 +91,33 @@ pub struct Metrics {
 }
 
 static METRICS: OnceCell<Metrics> = OnceCell::new();
+
+const ML_SHARD_LABELS: [&str; 32] = [
+    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+    "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31",
+];
+
+#[inline]
+fn ml_shard_label(shard_index: usize) -> &'static str {
+    ML_SHARD_LABELS
+        .get(shard_index)
+        .copied()
+        .unwrap_or("overflow")
+}
+
+thread_local! {
+    static CURRENT_ML_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+pub struct MlShardScope {
+    previous: Option<usize>,
+}
+
+impl Drop for MlShardScope {
+    fn drop(&mut self) {
+        CURRENT_ML_SHARD.with(|slot| slot.set(self.previous));
+    }
+}
 
 impl Metrics {
     pub fn init() -> &'static Metrics {
@@ -231,6 +271,54 @@ impl Metrics {
                 "ML cycle enqueue attempts rejected because the async queue was full",
             )
             .expect("register ml_cycle_queue_full_total");
+            let ml_cycle_shard_queue_depth_current = IntGaugeVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_shard_queue_depth_current",
+                    "ML cycle batches waiting by route shard",
+                ),
+                &["shard"],
+            )
+            .expect("register ml_cycle_shard_queue_depth_current");
+            let ml_cycle_shard_queue_events_current = IntGaugeVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_shard_queue_events_current",
+                    "Route observations waiting by ML route shard",
+                ),
+                &["shard"],
+            )
+            .expect("register ml_cycle_shard_queue_events_current");
+            let ml_cycle_shard_batch_inflight_current = IntGaugeVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_shard_batch_inflight_current",
+                    "ML cycle batch currently being processed by shard",
+                ),
+                &["shard"],
+            )
+            .expect("register ml_cycle_shard_batch_inflight_current");
+            let ml_cycle_shard_events_inflight_current = IntGaugeVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_shard_events_inflight_current",
+                    "Route observations currently being processed by shard",
+                ),
+                &["shard"],
+            )
+            .expect("register ml_cycle_shard_events_inflight_current");
+            let ml_cycle_stage_ns_total = IntCounterVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_stage_ns_total",
+                    "Nanoseconds spent in ML route-shard pipeline stages",
+                ),
+                &["shard", "stage"],
+            )
+            .expect("register ml_cycle_stage_ns_total");
+            let ml_cycle_stage_ops_total = IntCounterVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_stage_ops_total",
+                    "Operations executed in ML route-shard pipeline stages",
+                ),
+                &["shard", "stage"],
+            )
+            .expect("register ml_cycle_stage_ops_total");
             let process_working_set_bytes = IntGauge::new(
                 "scanner_process_working_set_bytes",
                 "Current process working set, bytes",
@@ -321,6 +409,24 @@ impl Metrics {
                 .register(Box::new(ml_cycle_queue_full_total.clone()))
                 .expect("reg");
             registry
+                .register(Box::new(ml_cycle_shard_queue_depth_current.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_shard_queue_events_current.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_shard_batch_inflight_current.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_shard_events_inflight_current.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_stage_ns_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_stage_ops_total.clone()))
+                .expect("reg");
+            registry
                 .register(Box::new(process_working_set_bytes.clone()))
                 .expect("reg");
             registry
@@ -398,6 +504,12 @@ impl Metrics {
                 ml_cycle_events_enqueued_total,
                 ml_cycle_events_processed_total,
                 ml_cycle_queue_full_total,
+                ml_cycle_shard_queue_depth_current,
+                ml_cycle_shard_queue_events_current,
+                ml_cycle_shard_batch_inflight_current,
+                ml_cycle_shard_events_inflight_current,
+                ml_cycle_stage_ns_total,
+                ml_cycle_stage_ops_total,
                 full_cycle_last_ns,
                 full_cycle_max_ns,
                 full_cycle_budget_ns,
@@ -409,6 +521,80 @@ impl Metrics {
                 process_private_bytes,
             }
         })
+    }
+
+    #[inline]
+    pub fn enter_ml_shard(&'static self, shard_index: usize) -> MlShardScope {
+        let previous = CURRENT_ML_SHARD.with(|slot| {
+            let previous = slot.get();
+            slot.set(Some(shard_index));
+            previous
+        });
+        MlShardScope { previous }
+    }
+
+    #[inline]
+    pub fn record_current_ml_stage(&self, stage: &'static str, ns: u64) {
+        CURRENT_ML_SHARD.with(|slot| {
+            if let Some(shard) = slot.get() {
+                self.record_ml_stage(shard, stage, ns);
+            }
+        });
+    }
+
+    #[inline]
+    pub fn record_ml_stage(&self, shard_index: usize, stage: &'static str, ns: u64) {
+        let shard = ml_shard_label(shard_index);
+        self.ml_cycle_stage_ns_total
+            .with_label_values(&[shard, stage])
+            .inc_by(ns);
+        self.ml_cycle_stage_ops_total
+            .with_label_values(&[shard, stage])
+            .inc();
+    }
+
+    #[inline]
+    pub fn inc_ml_shard_queue(&self, shard_index: usize, events: u64) {
+        let shard = ml_shard_label(shard_index);
+        self.ml_cycle_shard_queue_depth_current
+            .with_label_values(&[shard])
+            .inc();
+        self.ml_cycle_shard_queue_events_current
+            .with_label_values(&[shard])
+            .add(events.min(i64::MAX as u64) as i64);
+    }
+
+    #[inline]
+    pub fn dec_ml_shard_queue(&self, shard_index: usize, events: u64) {
+        let shard = ml_shard_label(shard_index);
+        self.ml_cycle_shard_queue_depth_current
+            .with_label_values(&[shard])
+            .dec();
+        self.ml_cycle_shard_queue_events_current
+            .with_label_values(&[shard])
+            .sub(events.min(i64::MAX as u64) as i64);
+    }
+
+    #[inline]
+    pub fn inc_ml_shard_inflight(&self, shard_index: usize, events: u64) {
+        let shard = ml_shard_label(shard_index);
+        self.ml_cycle_shard_batch_inflight_current
+            .with_label_values(&[shard])
+            .inc();
+        self.ml_cycle_shard_events_inflight_current
+            .with_label_values(&[shard])
+            .add(events.min(i64::MAX as u64) as i64);
+    }
+
+    #[inline]
+    pub fn dec_ml_shard_inflight(&self, shard_index: usize, events: u64) {
+        let shard = ml_shard_label(shard_index);
+        self.ml_cycle_shard_batch_inflight_current
+            .with_label_values(&[shard])
+            .dec();
+        self.ml_cycle_shard_events_inflight_current
+            .with_label_values(&[shard])
+            .sub(events.min(i64::MAX as u64) as i64);
     }
 
     #[inline]

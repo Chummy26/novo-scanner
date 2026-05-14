@@ -1280,7 +1280,7 @@ pub struct ShutdownFlushStats {
 /// Resolver compartilhado. Thread-safe via interior mutability.
 pub struct LabelResolver {
     cfg: ResolverConfig,
-    inner: Mutex<ResolverInner>,
+    inners: Box<[Mutex<ResolverInner>]>,
     metrics: Arc<ResolverMetrics>,
     meta_store: PendingMetaStore,
     writer: LabeledWriterHandle,
@@ -1297,6 +1297,27 @@ struct ResolverInner {
     /// Último `ts_ns` em que um label foi criado por `(rota, horizonte)`.
     /// Stride por horizonte evita sobreposição extrema em horizontes longos.
     last_label_ts_by_horizon: AHashMap<(RouteId, u32), LastLabelStride>,
+}
+
+const LABEL_RESOLVER_SHARDS: usize = 32;
+
+fn resolver_shard_index(route_id: RouteId) -> usize {
+    let mut x = route_id.symbol_id.0 as u64;
+    x ^= (route_id.buy_venue.idx() as u64) << 32;
+    x ^= (route_id.sell_venue.idx() as u64) << 40;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x as usize) & (LABEL_RESOLVER_SHARDS - 1)
+}
+
+fn new_resolver_inner() -> ResolverInner {
+    ResolverInner {
+        pending_by_route: AHashMap::with_capacity(4096 / LABEL_RESOLVER_SHARDS),
+        last_label_ts_by_horizon: AHashMap::with_capacity(4096 / LABEL_RESOLVER_SHARDS),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1371,14 +1392,30 @@ impl LabelResolver {
         let meta_store = PendingMetaStore::new(spool_dir, Arc::clone(&metrics));
         Self {
             cfg,
-            inner: Mutex::new(ResolverInner {
-                pending_by_route: AHashMap::with_capacity(4096),
-                last_label_ts_by_horizon: AHashMap::with_capacity(4096),
-            }),
+            inners: (0..LABEL_RESOLVER_SHARDS)
+                .map(|_| Mutex::new(new_resolver_inner()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             metrics,
             meta_store,
             writer,
         }
+    }
+
+    fn inner_for(&self, route_id: RouteId) -> &Mutex<ResolverInner> {
+        &self.inners[resolver_shard_index(route_id)]
+    }
+
+    fn stride_entries_total(&self) -> u64 {
+        self.inners
+            .iter()
+            .map(|inner| inner.lock().last_label_ts_by_horizon.len() as u64)
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn inner_for_test(&self, route_id: RouteId) -> parking_lot::MutexGuard<'_, ResolverInner> {
+        self.inner_for(route_id).lock()
     }
 
     pub fn metrics(&self) -> Arc<ResolverMetrics> {
@@ -1400,7 +1437,7 @@ impl LabelResolver {
         if label_stride_s == 0 {
             return !self.cfg.horizons_s.is_empty();
         }
-        let inner = self.inner.lock();
+        let inner = self.inner_for(route_id).lock();
         self.cfg.horizons_s.iter().any(|&horizon_s| {
             let effective_stride_s = effective_stride_for_horizon(
                 label_stride_s,
@@ -1505,7 +1542,7 @@ impl LabelResolver {
         let floors = normalized_floors(label_floor_pct, label_floors_pct);
 
         let horizons = {
-            let mut inner = self.inner.lock();
+            let mut inner = self.inner_for(route_id).lock();
             let mut horizons: Vec<PendingHorizon> = Vec::with_capacity(self.cfg.horizons_s.len());
             let mut stride_keys = Vec::with_capacity(self.cfg.horizons_s.len());
             for &horizon_s in &self.cfg.horizons_s {
@@ -1547,10 +1584,6 @@ impl LabelResolver {
                 self.metrics
                     .labels_dropped_capacity_overflow_total
                     .fetch_add(1, Ordering::Relaxed);
-                self.metrics.stride_index_entries_current.store(
-                    inner.last_label_ts_by_horizon.len() as u64,
-                    Ordering::Relaxed,
-                );
                 tracing::error!(
                     route = ?route_id,
                     max_pending_per_route = self.cfg.max_pending_per_route,
@@ -1624,12 +1657,18 @@ impl LabelResolver {
         };
 
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.inner_for(route_id).lock();
+            let was_new_route = !inner.pending_by_route.contains_key(&route_id);
             let queue = inner
                 .pending_by_route
                 .entry(route_id)
                 .or_insert_with(VecDeque::new);
             queue.push_back(pending);
+            if was_new_route {
+                self.metrics
+                    .pending_routes_current
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
         self.metrics
             .pending_created_total
@@ -1640,19 +1679,9 @@ impl LabelResolver {
         self.metrics
             .pending_horizons_current
             .fetch_add(horizon_count, Ordering::Relaxed);
-        let (pending_routes, stride_entries) = {
-            let inner = self.inner.lock();
-            (
-                inner.pending_by_route.len() as u64,
-                inner.last_label_ts_by_horizon.len() as u64,
-            )
-        };
-        self.metrics
-            .pending_routes_current
-            .store(pending_routes, Ordering::Relaxed);
         self.metrics
             .stride_index_entries_current
-            .store(stride_entries, Ordering::Relaxed);
+            .store(self.stride_entries_total(), Ordering::Relaxed);
         true
     }
 
@@ -1673,7 +1702,7 @@ impl LabelResolver {
         let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
         let mut released_meta: Vec<PendingMetaRef> = Vec::new();
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.inner_for(route_id).lock();
             let Some(queue) = inner.pending_by_route.get_mut(&route_id) else {
                 return;
             };
@@ -1785,7 +1814,10 @@ impl LabelResolver {
                 inner.pending_by_route.remove(&route_id);
                 self.metrics
                     .pending_routes_current
-                    .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
             }
         }
         for item in to_write {
@@ -1803,16 +1835,17 @@ impl LabelResolver {
         }
     }
 
-    /// Sweeper global — chamado por task tokio em interval.
-    /// Fecha horizontes vencidos (mesmo sem observações) e censura rotas
-    /// sumidas. Retorna número de horizontes fechados nesta passagem.
-    pub fn sweep(&self, now_ns: u64) -> u64 {
+    /// Sweep de um shard lógico. Chamado a partir da fila FIFO do mesmo shard
+    /// de rota, depois das observações já capturadas para aquele shard.
+    pub fn sweep_shard(&self, shard_index: usize, now_ns: u64) -> u64 {
         let _timing =
             ResolverOpTiming::new(&self.metrics.sweep_ns_total, &self.metrics.sweep_ops_total);
         let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
         let mut released_meta: Vec<PendingMetaRef> = Vec::new();
+        let mut routes_removed_total = 0u64;
+        let stride_pruned_total: u64;
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.inners[shard_index % self.inners.len()].lock();
             let mut any_queue_removed = false;
             for (_route, queue) in inner.pending_by_route.iter_mut() {
                 let mut route_closed_any = false;
@@ -1827,9 +1860,6 @@ impl LabelResolver {
                             let slot = &mut pending.horizons[idx];
                             let deadline = t_emit + (slot.horizon_s as u64) * 1_000_000_000;
                             let idle_for = now_ns.saturating_sub(slot.observed_until_ns);
-                            // Distingue Dormant (ilíquidez transitória) de
-                            // Delisted (evento estrutural). Kaplan-Meier exige essa
-                            // separação para preservar independência de censura.
                             let dormant = idle_for >= self.cfg.route_vanish_idle_ns;
                             let delisted = idle_for >= self.cfg.route_delisted_idle_ns;
                             let expired =
@@ -1895,26 +1925,34 @@ impl LabelResolver {
                 }
             }
             if any_queue_removed {
+                let before_routes = inner.pending_by_route.len();
                 inner.pending_by_route.retain(|_, q| !q.is_empty());
-                self.metrics
-                    .pending_routes_current
-                    .store(inner.pending_by_route.len() as u64, Ordering::Relaxed);
+                routes_removed_total =
+                    before_routes.saturating_sub(inner.pending_by_route.len()) as u64;
             }
             let before_stride = inner.last_label_ts_by_horizon.len();
             inner
                 .last_label_ts_by_horizon
                 .retain(|_, last| !last.expired_at(now_ns));
             let after_stride = inner.last_label_ts_by_horizon.len();
-            let pruned = before_stride.saturating_sub(after_stride) as u64;
-            if pruned > 0 {
-                self.metrics
-                    .stride_index_pruned_total
-                    .fetch_add(pruned, Ordering::Relaxed);
-            }
-            self.metrics
-                .stride_index_entries_current
-                .store(after_stride as u64, Ordering::Relaxed);
+            stride_pruned_total = before_stride.saturating_sub(after_stride) as u64;
         }
+        if routes_removed_total > 0 {
+            self.metrics
+                .pending_routes_current
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(routes_removed_total))
+                })
+                .ok();
+        }
+        if stride_pruned_total > 0 {
+            self.metrics
+                .stride_index_pruned_total
+                .fetch_add(stride_pruned_total, Ordering::Relaxed);
+        }
+        self.metrics
+            .stride_index_entries_current
+            .store(self.stride_entries_total(), Ordering::Relaxed);
         let n = to_write.len() as u64;
         for item in to_write {
             let meta = self.materialize_meta(&item.meta_ref, item.route_id);
@@ -1940,6 +1978,13 @@ impl LabelResolver {
         n
     }
 
+    /// Sweeper global de compatibilidade para testes e callers legados.
+    pub fn sweep(&self, now_ns: u64) -> u64 {
+        (0..self.inners.len())
+            .map(|shard_index| self.sweep_shard(shard_index, now_ns))
+            .sum()
+    }
+
     /// Em shutdown limpo, fecha pendings abertos preservando o outcome real.
     ///
     /// versão anterior forçava `Censored{Shutdown}`
@@ -1955,8 +2000,8 @@ impl LabelResolver {
             &self.metrics.shutdown_flush_ops_total,
         );
         let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
-        {
-            let mut inner = self.inner.lock();
+        for shard in self.inners.iter() {
+            let mut inner = shard.lock();
             for (_route, queue) in inner.pending_by_route.iter_mut() {
                 for pending in queue.iter_mut() {
                     for mut horizon in pending.horizons.drain(..) {
@@ -1972,19 +2017,19 @@ impl LabelResolver {
             }
             inner.pending_by_route.clear();
             inner.last_label_ts_by_horizon.clear();
-            self.metrics
-                .pending_candidates_current
-                .store(0, Ordering::Relaxed);
-            self.metrics
-                .pending_routes_current
-                .store(0, Ordering::Relaxed);
-            self.metrics
-                .pending_horizons_current
-                .store(0, Ordering::Relaxed);
-            self.metrics
-                .stride_index_entries_current
-                .store(0, Ordering::Relaxed);
         }
+        self.metrics
+            .pending_candidates_current
+            .store(0, Ordering::Relaxed);
+        self.metrics
+            .pending_routes_current
+            .store(0, Ordering::Relaxed);
+        self.metrics
+            .pending_horizons_current
+            .store(0, Ordering::Relaxed);
+        self.metrics
+            .stride_index_entries_current
+            .store(0, Ordering::Relaxed);
         let mut stats = ShutdownFlushStats {
             closed_total: to_write.len() as u64,
             ..ShutdownFlushStats::default()
@@ -2579,7 +2624,7 @@ mod tests {
         resolver.on_clean_observation(mk_route(), t_emit + 2_000_000_000, 2.0, -1.0);
 
         {
-            let inner = resolver.inner.lock();
+            let inner = resolver.inner_for_test(mk_route());
             let queue = inner.pending_by_route.get(&mk_route()).unwrap();
             assert_eq!(queue.len(), 1);
             let pending = queue.front().unwrap();
@@ -3214,7 +3259,7 @@ mod tests {
             10,
         ));
 
-        let inner = resolver.inner.lock();
+        let inner = resolver.inner_for_test(mk_route());
         let queue = inner.pending_by_route.get(&mk_route()).unwrap();
         assert_eq!(queue.len(), 2);
         let second = queue.back().unwrap();

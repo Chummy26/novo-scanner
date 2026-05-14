@@ -207,6 +207,7 @@ pub struct HotCacheWindowStats {
 
 thread_local! {
     static RUN_DURATION_SCRATCH: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+    static RUN_DURATION_SCRATCH_2: RefCell<Vec<u64>> = RefCell::new(Vec::new());
     static WEIGHTED_BUCKET_SCRATCH: RefCell<Vec<(u32, u64)>> = RefCell::new(Vec::new());
     static WEIGHTED_BUCKET_SCRATCH_2: RefCell<Vec<(u32, u64)>> = RefCell::new(Vec::new());
 }
@@ -454,6 +455,79 @@ fn exit_run_duration_quantiles_from_storage(
         let p50 = select_quantile_u64(&mut runs, 0.50);
         let p95 = select_quantile_u64(&mut runs, 0.95);
         Some((p05, p50, p95))
+    })
+}
+
+fn select_run_quantiles(runs: &mut Vec<u64>) -> Option<(u32, u32, u32)> {
+    if runs.is_empty() {
+        return None;
+    }
+    let p05 = select_quantile_u64(runs, 0.05);
+    let p50 = select_quantile_u64(runs, 0.50);
+    let p95 = select_quantile_u64(runs, 0.95);
+    Some((p05, p50, p95))
+}
+
+fn exit_run_duration_quantiles_pair_from_storage(
+    storage: &PerRouteStorage,
+    first_threshold_bucket: u32,
+    second_threshold_bucket: u32,
+) -> (Option<(u32, u32, u32)>, Option<(u32, u32, u32)>) {
+    if storage.ring.is_empty() {
+        return (None, None);
+    }
+    if first_threshold_bucket == second_threshold_bucket {
+        let q = exit_run_duration_quantiles_from_storage(storage, first_threshold_bucket);
+        return (q, q);
+    }
+
+    RUN_DURATION_SCRATCH.with(|first_scratch| {
+        RUN_DURATION_SCRATCH_2.with(|second_scratch| {
+            let mut first_runs = first_scratch.borrow_mut();
+            let mut second_runs = second_scratch.borrow_mut();
+            first_runs.clear();
+            second_runs.clear();
+            let mut first_active_start: Option<u64> = None;
+            let mut second_active_start: Option<u64> = None;
+            let mut last_ts: Option<u64> = None;
+
+            for sample in &storage.ring {
+                last_ts = Some(sample.end_ts_ns);
+                if sample.exit_bucket >= first_threshold_bucket {
+                    if first_active_start.is_none() {
+                        first_active_start = Some(sample.start_ts_ns);
+                    }
+                } else if let Some(start) = first_active_start.take() {
+                    first_runs.push(
+                        (sample.start_ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000,
+                    );
+                }
+
+                if sample.exit_bucket >= second_threshold_bucket {
+                    if second_active_start.is_none() {
+                        second_active_start = Some(sample.start_ts_ns);
+                    }
+                } else if let Some(start) = second_active_start.take() {
+                    second_runs.push(
+                        (sample.start_ts_ns.saturating_sub(start) + 999_999_999) / 1_000_000_000,
+                    );
+                }
+            }
+
+            if let Some(end) = last_ts {
+                if let Some(start) = first_active_start {
+                    first_runs.push((end.saturating_sub(start) + 999_999_999) / 1_000_000_000);
+                }
+                if let Some(start) = second_active_start {
+                    second_runs.push((end.saturating_sub(start) + 999_999_999) / 1_000_000_000);
+                }
+            }
+
+            (
+                select_run_quantiles(&mut first_runs),
+                select_run_quantiles(&mut second_runs),
+            )
+        })
     })
 }
 
@@ -815,13 +889,16 @@ impl PerRouteCache {
                 } else {
                     None
                 };
-                let (gross_run_p05_s, gross_run_p50_s, gross_run_p95_s) =
-                    exit_run_duration_quantiles_from_storage(storage, exit_threshold_bucket)
-                        .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
-                        .unwrap_or((None, None, None));
-                let exit_excess_run_s =
-                    exit_run_duration_quantiles_from_storage(storage, exit_p50_bucket)
-                        .map(|(_, p50, _)| p50);
+                let (gross_run_quantiles, exit_excess_quantiles) =
+                    exit_run_duration_quantiles_pair_from_storage(
+                        storage,
+                        exit_threshold_bucket,
+                        exit_p50_bucket,
+                    );
+                let (gross_run_p05_s, gross_run_p50_s, gross_run_p95_s) = gross_run_quantiles
+                    .map(|(p05, p50, p95)| (Some(p05), Some(p50), Some(p95)))
+                    .unwrap_or((None, None, None));
+                let exit_excess_run_s = exit_excess_quantiles.map(|(_, p50, _)| p50);
 
                 HotCacheFeatureStats {
                     entry_p25: Some(entry_p25),
@@ -971,8 +1048,22 @@ impl PerRouteCache {
 // ---------------------------------------------------------------------------
 
 /// Cache thread-safe de percentis de spread por rota com janela rolante 24h.
+const HOT_QUERY_CACHE_SHARDS: usize = 32;
+
+fn cache_shard_index(route: RouteId) -> usize {
+    let mut x = route.symbol_id.0 as u64;
+    x ^= (route.buy_venue.idx() as u64) << 32;
+    x ^= (route.sell_venue.idx() as u64) << 40;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x as usize) & (HOT_QUERY_CACHE_SHARDS - 1)
+}
+
 pub struct HotQueryCache {
-    routes: Arc<RwLock<AHashMap<RouteId, PerRouteCache>>>,
+    routes: Arc<[RwLock<AHashMap<RouteId, PerRouteCache>>]>,
     cfg: CacheConfig,
 }
 
@@ -984,7 +1075,11 @@ impl HotQueryCache {
 
     pub fn with_config(cfg: CacheConfig) -> Self {
         Self {
-            routes: Arc::new(RwLock::new(AHashMap::with_capacity(4096))),
+            routes: Arc::from(
+                (0..HOT_QUERY_CACHE_SHARDS)
+                    .map(|_| RwLock::new(AHashMap::with_capacity(4096 / HOT_QUERY_CACHE_SHARDS)))
+                    .collect::<Vec<_>>(),
+            ),
             cfg,
         }
     }
@@ -1000,7 +1095,7 @@ impl HotQueryCache {
     /// gate `n_min=500` represente ~500 observações limpas brutas, enquanto os
     /// percentis seguem calculados sobre a amostra decimada.
     pub fn observe(&self, route: RouteId, entry_spread: f32, exit_spread: f32, ts_ns: u64) {
-        let mut guard = self.routes.write();
+        let mut guard = self.routes[cache_shard_index(route)].write();
         let cache = guard
             .entry(route)
             .or_insert_with(|| PerRouteCache::new(self.cfg));
@@ -1008,7 +1103,7 @@ impl HotQueryCache {
     }
 
     pub fn quantile_entry(&self, route: RouteId, q: f64) -> Option<f32> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route)?.quantile_entry(q)
     }
 
@@ -1018,7 +1113,7 @@ impl HotQueryCache {
         entry_spread: f32,
         exit_threshold: f32,
     ) -> HotCacheFeatureStats {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard
             .get(&route)
             .map(|cache| cache.feature_stats(entry_spread, exit_threshold))
@@ -1033,7 +1128,7 @@ impl HotQueryCache {
         cutoff_ns: Option<u64>,
         include_p95: bool,
     ) -> HotCacheWindowStats {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard
             .get(&route)
             .map(|cache| cache.window_stats(entry_spread, exit_threshold, cutoff_ns, include_p95))
@@ -1041,22 +1136,22 @@ impl HotQueryCache {
     }
 
     pub fn quantile_exit(&self, route: RouteId, q: f64) -> Option<f32> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route)?.quantile_exit(q)
     }
 
     pub fn quantile_entry_since(&self, route: RouteId, q: f64, cutoff_ns: u64) -> Option<f32> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route)?.quantile_entry_since(cutoff_ns, q)
     }
 
     pub fn n_observations(&self, route: RouteId) -> u64 {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route).map(|c| c.n_observations).unwrap_or(0)
     }
 
     pub fn sampled_observations(&self, route: RouteId) -> u64 {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard
             .get(&route)
             .map(|c| c.sampled_observations())
@@ -1064,12 +1159,12 @@ impl HotQueryCache {
     }
 
     pub fn probability_entry_ge(&self, route: RouteId, threshold: f32) -> Option<(f32, u64, u64)> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route)?.probability_entry_ge(threshold)
     }
 
     pub fn probability_exit_ge(&self, route: RouteId, threshold: f32) -> Option<(f32, u64, u64)> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route)?.probability_exit_ge(threshold)
     }
 
@@ -1079,7 +1174,7 @@ impl HotQueryCache {
         threshold: f32,
         cutoff_ns: u64,
     ) -> Option<(f32, u64, u64)> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard
             .get(&route)?
             .probability_exit_ge_since(threshold, cutoff_ns)
@@ -1088,7 +1183,7 @@ impl HotQueryCache {
     /// percentil empírico de `spread_pct` na ECDF 24h de entry.
     /// Retorna `P_hist(entry ≤ spread_pct)` em [0,1] — Teste 1 literal.
     pub fn entry_rank_percentile(&self, route: RouteId, spread_pct: f32) -> Option<f32> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route)?.entry_rank_percentile(spread_pct)
     }
 
@@ -1100,7 +1195,7 @@ impl HotQueryCache {
         spread_pct: f32,
         cutoff_ns: u64,
     ) -> Option<f32> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard
             .get(&route)?
             .entry_rank_percentile_since(spread_pct, cutoff_ns)
@@ -1108,13 +1203,13 @@ impl HotQueryCache {
 
     /// MAD robusto de entry (via IQR consistente com normal).
     pub fn entry_mad_robust(&self, route: RouteId) -> Option<f32> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route)?.entry_mad_robust()
     }
 
     /// tail ratio com safeguard para buckets colapsados.
     pub fn tail_ratio_p99_p95(&self, route: RouteId) -> Option<f32> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route)?.tail_ratio_p99_p95()
     }
 
@@ -1128,14 +1223,14 @@ impl HotQueryCache {
         route: RouteId,
         exit_threshold: f32,
     ) -> Option<(u32, u32, u32)> {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard
             .get(&route)?
             .exit_run_duration_quantiles(exit_threshold)
     }
 
     pub fn last_update_ns(&self, route: RouteId) -> u64 {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard.get(&route).map(|c| c.last_update_ns).unwrap_or(0)
     }
 
@@ -1145,7 +1240,7 @@ impl HotQueryCache {
     /// podem ter apenas minutos de histórico dentro de uma janela configurada
     /// para 24h. Esse valor é usado no dataset para medir cobertura PIT real.
     pub fn oldest_observation_ns(&self, route: RouteId) -> u64 {
-        let guard = self.routes.read();
+        let guard = self.routes[cache_shard_index(route)].read();
         guard
             .get(&route)
             .map(|c| c.oldest_observation_ns())
@@ -1153,43 +1248,44 @@ impl HotQueryCache {
     }
 
     pub fn routes_tracked(&self) -> usize {
-        self.routes.read().len()
+        self.routes.iter().map(|shard| shard.read().len()).sum()
     }
 
     pub fn stats(&self) -> HotCacheStats {
-        let guard = self.routes.read();
-        let mut stats = HotCacheStats {
-            routes_tracked: guard.len(),
-            materialized_routes: 0,
-            retained_ticks: 0,
-        };
-        for cache in guard.values() {
-            if cache.storage.is_some() {
-                stats.materialized_routes += 1;
+        let mut stats = HotCacheStats::default();
+        for shard in self.routes.iter() {
+            let guard = shard.read();
+            stats.routes_tracked = stats.routes_tracked.saturating_add(guard.len());
+            for cache in guard.values() {
+                if cache.storage.is_some() {
+                    stats.materialized_routes += 1;
+                }
+                stats.retained_ticks = stats
+                    .retained_ticks
+                    .saturating_add(cache.sampled_observations());
             }
-            stats.retained_ticks = stats
-                .retained_ticks
-                .saturating_add(cache.sampled_observations());
         }
         stats
     }
 
     pub fn sweep_expired(&self, now_ns: u64) -> HotCacheSweepStats {
-        let mut guard = self.routes.write();
         let mut stats = HotCacheSweepStats::default();
-        guard.retain(|_, cache| {
-            let (expired, remove_route) = cache.sweep_expired(now_ns);
-            if expired > 0 {
-                stats.ticks_expired = stats.ticks_expired.saturating_add(expired);
-                stats.routes_rebuilt = stats.routes_rebuilt.saturating_add(1);
-            }
-            if remove_route {
-                stats.routes_removed = stats.routes_removed.saturating_add(1);
-                false
-            } else {
-                true
-            }
-        });
+        for shard in self.routes.iter() {
+            let mut guard = shard.write();
+            guard.retain(|_, cache| {
+                let (expired, remove_route) = cache.sweep_expired(now_ns);
+                if expired > 0 {
+                    stats.ticks_expired = stats.ticks_expired.saturating_add(expired);
+                    stats.routes_rebuilt = stats.routes_rebuilt.saturating_add(1);
+                }
+                if remove_route {
+                    stats.routes_removed = stats.routes_removed.saturating_add(1);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         stats
     }
 }
@@ -1394,7 +1490,7 @@ mod tests {
         assert_eq!(cache.n_observations(route), 0);
         assert_eq!(cache.quantile_entry(route, 0.5), None);
         {
-            let guard = cache.routes.read();
+            let guard = cache.routes[cache_shard_index(route)].read();
             assert!(
                 guard.get(&route).unwrap().storage.is_none(),
                 "decimation skips must not allocate histograms/ring"

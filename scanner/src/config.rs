@@ -313,7 +313,7 @@ fn default_raw_rerank_interval_s() -> u64 {
     3600
 }
 fn default_ml_cycle_shards() -> usize {
-    1
+    8
 }
 fn default_label_stride_s() -> u32 {
     60
