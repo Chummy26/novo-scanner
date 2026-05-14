@@ -264,14 +264,6 @@ impl PerRouteStorage {
 }
 
 #[inline]
-fn logical_sampled_observations(storage: &PerRouteStorage) -> u64 {
-    storage
-        .ring
-        .iter()
-        .fold(0u64, |acc, s| acc.saturating_add(s.weight as u64))
-}
-
-#[inline]
 fn weighted_quantile_entry(storage: &PerRouteStorage, q: f64) -> Option<u32> {
     WEIGHTED_BUCKET_SCRATCH.with(|scratch| {
         let mut values = scratch.borrow_mut();
@@ -368,20 +360,24 @@ fn proportional_weight(sample: &SampleTick, cutoff_ns: u64) -> u64 {
 }
 
 #[inline]
-fn trim_front_sample_to_cutoff(storage: &mut PerRouteStorage, cutoff_ns: u64) -> bool {
+fn trim_front_sample_to_cutoff(
+    storage: &mut PerRouteStorage,
+    cutoff_ns: u64,
+) -> Option<(u32, u32)> {
     let Some(front) = storage.ring.front_mut() else {
-        return false;
+        return None;
     };
     if front.start_ts_ns >= cutoff_ns || front.end_ts_ns < cutoff_ns {
-        return false;
+        return None;
     }
+    let old_weight = front.weight;
     let kept = proportional_weight(front, cutoff_ns)
         .max(1)
         .min(front.weight as u64) as u32;
     let changed = kept != front.weight || front.start_ts_ns != cutoff_ns;
     front.weight = kept;
     front.start_ts_ns = cutoff_ns;
-    changed
+    changed.then_some((old_weight, kept))
 }
 
 fn compact_prefix_once(prefix: Vec<SampleTick>) -> Vec<SampleTick> {
@@ -464,6 +460,9 @@ fn exit_run_duration_quantiles_from_storage(
 struct PerRouteCache {
     storage: Option<PerRouteStorage>,
     cached_entry_p95_bucket: Option<u32>,
+    /// Soma exata dos pesos no ring. Evita varrer o ring em todo observe
+    /// quente mantendo a mesma semântica dos quantis ponderados.
+    sampled_weight_sum: u64,
     /// Wrap seguro por ~34×10⁹ anos em 17k RPS.
     decimation_counter: u64,
     /// Contagem efetiva de samples limpos na janela, compensada pela
@@ -478,6 +477,7 @@ impl PerRouteCache {
         Self {
             storage: None,
             cached_entry_p95_bucket: None,
+            sampled_weight_sum: 0,
             decimation_counter: 0,
             n_observations: 0,
             last_update_ns: 0,
@@ -514,6 +514,7 @@ impl PerRouteCache {
         let cfg = self.cfg;
 
         let retained_len = {
+            let mut sampled_weight_sum = self.sampled_weight_sum.saturating_add(1);
             let storage = self.storage_mut();
             storage.ring.push_back(SampleTick {
                 start_ts_ns: ts_ns,
@@ -526,17 +527,25 @@ impl PerRouteCache {
             let cutoff = ts_ns.saturating_sub(cfg.window_ns);
             while let Some(front) = storage.ring.front() {
                 if front.end_ts_ns < cutoff {
-                    storage.ring.pop_front();
+                    if let Some(expired) = storage.ring.pop_front() {
+                        sampled_weight_sum =
+                            sampled_weight_sum.saturating_sub(expired.weight as u64);
+                    }
                 } else {
                     break;
                 }
             }
-            let _ = trim_front_sample_to_cutoff(storage, cutoff);
+            if let Some((old_weight, kept_weight)) = trim_front_sample_to_cutoff(storage, cutoff) {
+                sampled_weight_sum = sampled_weight_sum
+                    .saturating_sub(old_weight as u64)
+                    .saturating_add(kept_weight as u64);
+            }
             let _ = compact_ring_if_needed(storage);
 
-            logical_sampled_observations(storage)
+            sampled_weight_sum
         };
 
+        self.sampled_weight_sum = retained_len;
         self.n_observations = retained_len.saturating_mul(cfg.decimation.max(1) as u64);
         self.refresh_cached_common_quantiles();
         self.last_update_ns = ts_ns;
@@ -552,10 +561,7 @@ impl PerRouteCache {
 
     #[inline]
     fn logical_sampled_observations(&self) -> u64 {
-        self.storage
-            .as_ref()
-            .map(logical_sampled_observations)
-            .unwrap_or(0)
+        self.sampled_weight_sum
     }
 
     #[inline]
@@ -910,24 +916,34 @@ impl PerRouteCache {
     fn sweep_expired(&mut self, now_ns: u64) -> (u64, bool) {
         let cutoff = now_ns.saturating_sub(self.cfg.window_ns);
         let mut expired = 0u64;
+        let mut sampled_weight_sum = self.sampled_weight_sum;
         let mut should_clear_storage = false;
         let mut cache_changed = false;
 
         if let Some(storage) = self.storage.as_mut() {
             while let Some(front) = storage.ring.front() {
                 if front.end_ts_ns < cutoff {
-                    storage.ring.pop_front();
-                    expired = expired.saturating_add(1);
+                    if let Some(expired_sample) = storage.ring.pop_front() {
+                        expired = expired.saturating_add(1);
+                        sampled_weight_sum =
+                            sampled_weight_sum.saturating_sub(expired_sample.weight as u64);
+                    }
                 } else {
                     break;
                 }
             }
             let trimmed = trim_front_sample_to_cutoff(storage, cutoff);
+            if let Some((old_weight, kept_weight)) = trimmed {
+                sampled_weight_sum = sampled_weight_sum
+                    .saturating_sub(old_weight as u64)
+                    .saturating_add(kept_weight as u64);
+            }
 
-            if expired > 0 || trimmed {
+            if expired > 0 || trimmed.is_some() {
                 cache_changed = true;
-                self.n_observations = logical_sampled_observations(storage)
-                    .saturating_mul(self.cfg.decimation.max(1) as u64);
+                self.sampled_weight_sum = sampled_weight_sum;
+                self.n_observations =
+                    sampled_weight_sum.saturating_mul(self.cfg.decimation.max(1) as u64);
                 let min_capacity = self.cfg.ring_initial_capacity.max(storage.ring.len());
                 if storage.ring.capacity() > min_capacity.saturating_mul(4) {
                     storage.ring.shrink_to(min_capacity);
@@ -938,6 +954,7 @@ impl PerRouteCache {
 
         if should_clear_storage {
             self.storage = None;
+            self.sampled_weight_sum = 0;
             self.n_observations = 0;
             self.cached_entry_p95_bucket = None;
         } else if cache_changed {
@@ -1619,6 +1636,36 @@ mod tests {
         assert_eq!(proportional_weight(&sample, 0), 101);
         assert_eq!(proportional_weight(&sample, 50), 51);
         assert_eq!(proportional_weight(&sample, 101), 0);
+    }
+
+    #[test]
+    fn cached_logical_weight_tracks_partial_trim() {
+        let cfg = CacheConfig {
+            decimation: 1,
+            window_ns: 100,
+            rebuild_interval_ns: u64::MAX,
+            ring_initial_capacity: 64,
+        };
+        let mut cache = PerRouteCache::new(cfg);
+        cache.storage = Some(PerRouteStorage {
+            ring: VecDeque::from([SampleTick {
+                start_ts_ns: 0,
+                end_ts_ns: 100,
+                entry_bucket: to_bucket(1.0) as u32,
+                exit_bucket: to_bucket(-1.0) as u32,
+                weight: 101,
+            }]),
+        });
+        cache.sampled_weight_sum = 101;
+        cache.n_observations = 101;
+        cache.last_update_ns = 100;
+
+        let (expired, remove_route) = cache.sweep_expired(150);
+
+        assert_eq!(expired, 0);
+        assert!(!remove_route);
+        assert_eq!(cache.logical_sampled_observations(), 51);
+        assert_eq!(cache.n_observations, 51);
     }
 
     #[test]

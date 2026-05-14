@@ -196,7 +196,9 @@ async fn process_ml_cycle_batch(
     metrics.record_ml_foreground(ml_foreground_t0.elapsed().as_nanos() as u64);
 
     let ml_background_t0 = std::time::Instant::now();
+    let mut background_events = 0u64;
     for item in batch.observations.iter().filter(|item| !item.foreground) {
+        background_events = background_events.saturating_add(1);
         let opp = item.observation;
         let route = RouteId {
             symbol_id: opp.symbol_id,
@@ -222,10 +224,11 @@ async fn process_ml_cycle_batch(
             enqueue_accepted_sample(ml_server, ml_writer, sample, false);
         }
     }
-    metrics.record_ml_background_with_budget(
-        ml_background_t0.elapsed().as_nanos() as u64,
-        batch.cycle_budget_ns,
-    );
+    let ml_background_elapsed_ns = ml_background_t0.elapsed().as_nanos() as u64;
+    if background_events > 0 {
+        metrics.record_ml_background_event_estimate(ml_background_elapsed_ns / background_events);
+    }
+    metrics.record_ml_background_with_budget(ml_background_elapsed_ns, batch.cycle_budget_ns);
 }
 
 fn route_decimator_from_ml_config(ml: &config::MlConfig) -> RouteDecimator {

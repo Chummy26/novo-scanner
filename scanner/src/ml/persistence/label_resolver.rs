@@ -1504,7 +1504,7 @@ impl LabelResolver {
         );
         let floors = normalized_floors(label_floor_pct, label_floors_pct);
 
-        let (horizons, stride_keys) = {
+        let horizons = {
             let mut inner = self.inner.lock();
             let mut horizons: Vec<PendingHorizon> = Vec::with_capacity(self.cfg.horizons_s.len());
             let mut stride_keys = Vec::with_capacity(self.cfg.horizons_s.len());
@@ -1562,7 +1562,7 @@ impl LabelResolver {
                     route_id
                 );
             }
-            (horizons, stride_keys)
+            horizons
         };
 
         if horizons.is_empty() {
@@ -1605,24 +1605,12 @@ impl LabelResolver {
                 tracing::error!(
                     error = %e,
                     route = ?route_id,
-                    "label_resolver failed to persist pending metadata; candidate skipped"
+                    "label_resolver failed to persist pending metadata; aborting strict-lossless label path"
                 );
-                let mut inner = self.inner.lock();
-                for key in stride_keys {
-                    if inner
-                        .last_label_ts_by_horizon
-                        .get(&key)
-                        .map(|prev| prev.ts_emit_ns == ts_emit_ns)
-                        .unwrap_or(false)
-                    {
-                        inner.last_label_ts_by_horizon.remove(&key);
-                    }
-                }
-                self.metrics.stride_index_entries_current.store(
-                    inner.last_label_ts_by_horizon.len() as u64,
-                    Ordering::Relaxed,
+                panic!(
+                    "label_resolver strict-lossless violation: failed to persist pending metadata for route {:?}: {e}",
+                    route_id
                 );
-                return false;
             }
         };
         let pending = PendingLabelState {
@@ -3532,6 +3520,55 @@ mod tests {
                 0, // sem stride
             );
         }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "strict-lossless violation")]
+    async fn meta_spool_insert_failure_fails_high_instead_of_skipping_candidate() {
+        // Falha de journal/spool não pode virar "candidate skipped": isso muda
+        // a população supervisionada. O comportamento correto é fail-high.
+        let cfg = ResolverConfig {
+            horizons_s: vec![60, 120, 180],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, _tmp, _task) = setup_resolver_with_spool(cfg).await;
+
+        if let PendingMetaBackend::Disk(spool) = &resolver.meta_store.backend {
+            let mut spool = spool.lock();
+            let segment_id = spool.current_segment_id;
+            let path = spool
+                .segments
+                .get(&segment_id)
+                .expect("current spool segment must exist")
+                .path
+                .clone();
+            spool.write_file = OpenOptions::new()
+                .read(true)
+                .open(path)
+                .expect("test must reopen spool as read-only");
+        } else {
+            panic!("test requires disk-backed pending meta spool");
+        }
+
+        resolver.on_accepted(
+            "sid_spool_fail".into(),
+            1_000_000_000,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.5,
+            -1.2,
+            mk_features(),
+            0.8,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
+        );
     }
 
     #[test]

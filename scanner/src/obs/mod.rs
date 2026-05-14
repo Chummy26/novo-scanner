@@ -37,6 +37,8 @@ pub struct Metrics {
     pub ml_foreground_hist: Mutex<Histogram<u64>>,
     /// Background ML/cache pass over below-threshold observations, ns.
     pub ml_background_hist: Mutex<Histogram<u64>>,
+    /// Estimated per-event cost inside background ML/cache batches, ns/event.
+    pub ml_background_event_hist: Mutex<Histogram<u64>>,
     /// Batches de observações aguardando processamento ML assíncrono.
     pub ml_cycle_queue_depth_current: IntGauge,
     /// Eventos de rota aguardando processamento ML assíncrono.
@@ -352,6 +354,7 @@ impl Metrics {
                 "spread_full_cycle",
                 "ml_foreground",
                 "ml_background",
+                "ml_background_event",
             ] {
                 hist_record_dropped_total
                     .with_label_values(&[histogram])
@@ -366,6 +369,7 @@ impl Metrics {
             let full_cycle_hist = Mutex::new(new_hist());
             let ml_foreground_hist = Mutex::new(new_hist());
             let ml_background_hist = Mutex::new(new_hist());
+            let ml_background_event_hist = Mutex::new(new_hist());
 
             Metrics {
                 registry,
@@ -384,6 +388,7 @@ impl Metrics {
                 full_cycle_hist,
                 ml_foreground_hist,
                 ml_background_hist,
+                ml_background_event_hist,
                 ml_cycle_queue_depth_current,
                 ml_cycle_queue_events_current,
                 ml_cycle_batch_inflight_current,
@@ -476,6 +481,16 @@ impl Metrics {
         if budget_ns > 0 && ns > budget_ns {
             self.ml_background_over_budget_total.inc();
         }
+    }
+
+    #[inline]
+    pub fn record_ml_background_event_estimate(&self, ns_per_event: u64) {
+        record_hist(
+            &self.ml_background_event_hist,
+            ns_per_event,
+            &self.hist_record_dropped_total,
+            "ml_background_event",
+        );
     }
 
     #[inline]
@@ -675,5 +690,14 @@ mod tests {
         assert_eq!(m.ml_background_last_ns.get(), 120);
         assert!(m.ml_background_max_ns.get() >= 120);
         assert_eq!(m.ml_background_over_budget_total.get(), before + 1);
+    }
+
+    #[test]
+    fn record_ml_background_event_estimate_records_histogram() {
+        let m = Metrics::init();
+        m.record_ml_background_event_estimate(42);
+        let h = m.ml_background_event_hist.lock();
+        assert!(h.len() > 0);
+        assert!(h.value_at_quantile(0.99) >= 42);
     }
 }

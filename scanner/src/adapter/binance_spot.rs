@@ -132,11 +132,22 @@ impl BinanceSpotAdapter {
                     last_frame_at = std::time::Instant::now();
 
                     n_frames += 1;
-                    if n_frames <= 3 || n_frames % 5000 == 0 {
+                    if n_frames <= 3 {
                         let sz = msg.as_payload().len();
                         info!(n_frames, is_text = msg.is_text(), is_binary = msg.is_binary(),
                               is_ping = msg.is_ping(), is_close = msg.is_close(), size = sz,
                               "binance-spot frame");
+                    } else if n_frames % 500_000 == 0 {
+                        let sz = msg.as_payload().len();
+                        tracing::debug!(
+                            n_frames,
+                            is_text = msg.is_text(),
+                            is_binary = msg.is_binary(),
+                            is_ping = msg.is_ping(),
+                            is_close = msg.is_close(),
+                            size = sz,
+                            "binance-spot frame"
+                        );
                     }
 
                     if msg.is_ping() {
