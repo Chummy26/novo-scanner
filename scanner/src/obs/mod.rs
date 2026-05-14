@@ -10,7 +10,8 @@ use hdrhistogram::Histogram;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use prometheus::{IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use crate::types::{Venue, VENUE_COUNT};
 
@@ -107,6 +108,8 @@ fn ml_shard_label(shard_index: usize) -> &'static str {
 
 thread_local! {
     static CURRENT_ML_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
+    static ML_STAGE_COUNTER_CACHE: RefCell<HashMap<(usize, &'static str), (IntCounter, IntCounter)>> =
+        RefCell::new(HashMap::new());
 }
 
 pub struct MlShardScope {
@@ -544,13 +547,23 @@ impl Metrics {
 
     #[inline]
     pub fn record_ml_stage(&self, shard_index: usize, stage: &'static str, ns: u64) {
-        let shard = ml_shard_label(shard_index);
-        self.ml_cycle_stage_ns_total
-            .with_label_values(&[shard, stage])
-            .inc_by(ns);
-        self.ml_cycle_stage_ops_total
-            .with_label_values(&[shard, stage])
-            .inc();
+        let (ns_counter, ops_counter) = ML_STAGE_COUNTER_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache
+                .entry((shard_index, stage))
+                .or_insert_with(|| {
+                    let shard = ml_shard_label(shard_index);
+                    (
+                        self.ml_cycle_stage_ns_total
+                            .with_label_values(&[shard, stage]),
+                        self.ml_cycle_stage_ops_total
+                            .with_label_values(&[shard, stage]),
+                    )
+                })
+                .clone()
+        });
+        ns_counter.inc_by(ns);
+        ops_counter.inc();
     }
 
     #[inline]

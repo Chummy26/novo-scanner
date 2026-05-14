@@ -114,12 +114,33 @@ enum MlCycleCommand {
     Batch(MlCycleBatch),
     Sweep {
         now_ns: u64,
+        resolver_shards: Arc<[usize]>,
         reply_tx: tokio::sync::oneshot::Sender<u64>,
     },
 }
 
-fn ml_cycle_shard_count_from_ml_config(ml: &config::MlConfig) -> usize {
-    ml.cycle_shards.clamp(1, ML_CYCLE_MAX_SHARDS)
+fn ml_cycle_shard_count_from_ml_config(ml: &config::MlConfig) -> anyhow::Result<usize> {
+    let shards = ml.cycle_shards;
+    if !matches!(shards, 1 | 2 | 4 | 8 | 16 | 32) {
+        anyhow::bail!("cycle_shards must be one of [1, 2, 4, 8, 16, 32], got {shards}");
+    }
+    if shards > ML_CYCLE_MAX_SHARDS {
+        anyhow::bail!("cycle_shards must be <= {ML_CYCLE_MAX_SHARDS}, got {shards}");
+    }
+    Ok(shards)
+}
+
+fn resolver_shards_for_ml_shard(
+    ml_shard_index: usize,
+    ml_shard_count: usize,
+    resolver_shard_count: usize,
+) -> Arc<[usize]> {
+    debug_assert!(ml_shard_count > 0);
+    debug_assert_eq!(resolver_shard_count % ml_shard_count, 0);
+    (ml_shard_index..resolver_shard_count)
+        .step_by(ml_shard_count)
+        .collect::<Vec<_>>()
+        .into()
 }
 
 fn spawn_isolated_writer_task<F>(name: &'static str, fut: F)
@@ -209,11 +230,20 @@ async fn run_ml_cycle_worker(
                 metrics.ml_cycle_batches_processed_total.inc();
                 metrics.ml_cycle_events_processed_total.inc_by(n_events);
             }
-            MlCycleCommand::Sweep { now_ns, reply_tx } => {
+            MlCycleCommand::Sweep {
+                now_ns,
+                resolver_shards,
+                reply_tx,
+            } => {
                 let t0 = std::time::Instant::now();
                 let n = ml_server
                     .label_resolver()
-                    .map(|resolver| resolver.sweep_shard(shard_index, now_ns))
+                    .map(|resolver| {
+                        resolver_shards
+                            .iter()
+                            .map(|&resolver_shard| resolver.sweep_shard(resolver_shard, now_ns))
+                            .sum()
+                    })
                     .unwrap_or(0);
                 metrics.record_ml_stage(shard_index, "label_sweep", t0.elapsed().as_nanos() as u64);
                 let _ = reply_tx.send(n);
@@ -225,18 +255,25 @@ async fn run_ml_cycle_worker(
 async fn run_label_sweeper_by_ml_shard(
     ml_cycle_txs: Vec<tokio::sync::mpsc::Sender<MlCycleCommand>>,
     label_sweeper_interval: Duration,
+    resolver_shard_count: usize,
 ) {
+    let assignments = (0..ml_cycle_txs.len())
+        .map(|shard_index| {
+            resolver_shards_for_ml_shard(shard_index, ml_cycle_txs.len(), resolver_shard_count)
+        })
+        .collect::<Vec<_>>();
     let mut tick = tokio::time::interval(label_sweeper_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let sweep_ts = now_ns();
         let mut replies = Vec::with_capacity(ml_cycle_txs.len());
-        for tx in &ml_cycle_txs {
+        for (tx, resolver_shards) in ml_cycle_txs.iter().zip(assignments.iter()) {
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
             if tx
                 .send(MlCycleCommand::Sweep {
                     now_ns: sweep_ts,
+                    resolver_shards: Arc::clone(resolver_shards),
                     reply_tx,
                 })
                 .await
@@ -277,7 +314,6 @@ async fn process_ml_cycle_batch(
             sell_venue: opp.sell_venue,
         };
         let symbol_name = universe.canonical_name_of(opp.symbol_id);
-        let event_t0 = std::time::Instant::now();
         let (rec, _dec, accepted) = ml_server.on_opportunity_with_books(
             batch.cycle_seq,
             route,
@@ -291,10 +327,6 @@ async fn process_ml_cycle_batch(
             opp.sell_price,
             opp.sell_ask_price,
             batch.event_time_ns,
-        );
-        metrics.record_current_ml_stage(
-            "foreground_event_total",
-            event_t0.elapsed().as_nanos() as u64,
         );
         let _had_active_consumers = ml_broadcaster.publish(
             batch.cycle_seq,
@@ -312,7 +344,9 @@ async fn process_ml_cycle_batch(
             );
         }
     }
-    metrics.record_ml_foreground(ml_foreground_t0.elapsed().as_nanos() as u64);
+    let ml_foreground_elapsed_ns = ml_foreground_t0.elapsed().as_nanos() as u64;
+    metrics.record_ml_foreground(ml_foreground_elapsed_ns);
+    metrics.record_current_ml_stage("foreground_pass_total", ml_foreground_elapsed_ns);
 
     let ml_background_t0 = std::time::Instant::now();
     let mut background_events = 0u64;
@@ -325,7 +359,6 @@ async fn process_ml_cycle_batch(
             sell_venue: opp.sell_venue,
         };
         let symbol_id = opp.symbol_id;
-        let event_t0 = std::time::Instant::now();
         let (_dec, accepted) = ml_server.observe_background_with_books_lazy_symbol(
             batch.cycle_seq,
             route,
@@ -340,10 +373,6 @@ async fn process_ml_cycle_batch(
             opp.sell_ask_price,
             batch.event_time_ns,
         );
-        metrics.record_current_ml_stage(
-            "background_event_total",
-            event_t0.elapsed().as_nanos() as u64,
-        );
         if let Some(sample) = accepted {
             enqueue_accepted_sample(ml_server, ml_writer, sample, false);
         }
@@ -353,6 +382,7 @@ async fn process_ml_cycle_batch(
         metrics.record_ml_background_event_estimate(ml_background_elapsed_ns / background_events);
     }
     metrics.record_ml_background_with_budget(ml_background_elapsed_ns, batch.cycle_budget_ns);
+    metrics.record_current_ml_stage("background_pass_total", ml_background_elapsed_ns);
     metrics.record_current_ml_stage("batch_total", batch_t0.elapsed().as_nanos() as u64);
 }
 
@@ -453,7 +483,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .map_err(|e| Error::Config(format!("ml.parquet: {}", e)))?;
     let dataset_rotation_interval = dataset_rotation_interval_from_ml_config(&cfg.ml)
         .map_err(|e| Error::Config(format!("ml.parquet: {}", e)))?;
-    let ml_cycle_shards = ml_cycle_shard_count_from_ml_config(&cfg.ml);
+    let ml_cycle_shards = ml_cycle_shard_count_from_ml_config(&cfg.ml)
+        .map_err(|e| Error::Config(format!("ml.cycle_shards: {}", e)))?;
     info!(
         train_window_days = model_window_policy.train_window_days,
         calibration_window_days = model_window_policy.calibration_window_days,
@@ -617,6 +648,14 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         labeled_handle,
         Some(labeled_writer_abs.join("_pending_spool")),
     ));
+    let label_resolver_shard_count = label_resolver.shard_count();
+    if label_resolver_shard_count % ml_cycle_shards != 0 {
+        return Err(Error::Config(format!(
+            "ml.cycle_shards={} must divide label_resolver_shards={}",
+            ml_cycle_shards, label_resolver_shard_count
+        ))
+        .into());
+    }
 
     // Ranker rolling — 24h de buckets × 15 min.
     let ranker = Arc::new(RouteRanking::new(
@@ -960,7 +999,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     drop(ml_buffer_recycle_tx);
     let label_sweeper_task = {
         let txs = ml_cycle_txs.clone();
-        tokio::spawn(run_label_sweeper_by_ml_shard(txs, label_sweeper_interval))
+        tokio::spawn(run_label_sweeper_by_ml_shard(
+            txs,
+            label_sweeper_interval,
+            label_resolver_shard_count,
+        ))
     };
 
     // --- Spread engine loop (150ms) ---
@@ -1570,7 +1613,6 @@ async fn run_spread_engine(
                             let _ = reply_tx.send(0);
                         }
                     }
-                    ml_cycle_send_failure_reason = Some("full");
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(cmd)) => {
                     metrics.ml_cycle_queue_depth_current.dec();
@@ -1747,7 +1789,31 @@ mod tests {
         let mut ml = crate::config::MlConfig::default();
         ml.cycle_shards = 8;
 
-        assert_eq!(super::ml_cycle_shard_count_from_ml_config(&ml), 8);
+        assert_eq!(super::ml_cycle_shard_count_from_ml_config(&ml).unwrap(), 8);
+    }
+
+    #[test]
+    fn ml_cycle_shard_count_rejects_non_divisor_values() {
+        let mut ml = crate::config::MlConfig::default();
+        ml.cycle_shards = 6;
+
+        assert!(super::ml_cycle_shard_count_from_ml_config(&ml).is_err());
+    }
+
+    #[test]
+    fn resolver_shard_assignments_cover_all_resolver_shards_once() {
+        let assignments = (0..8)
+            .map(|shard| super::resolver_shards_for_ml_shard(shard, 8, 32))
+            .collect::<Vec<_>>();
+        let mut seen = assignments
+            .iter()
+            .flat_map(|assignment| assignment.iter().copied())
+            .collect::<Vec<_>>();
+        seen.sort_unstable();
+
+        assert_eq!(seen, (0..32).collect::<Vec<_>>());
+        assert_eq!(&*assignments[0], &[0, 8, 16, 24]);
+        assert_eq!(&*assignments[7], &[7, 15, 23, 31]);
     }
 
     #[test]

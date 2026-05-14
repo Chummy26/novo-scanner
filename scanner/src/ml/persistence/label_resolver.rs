@@ -1422,6 +1422,10 @@ impl LabelResolver {
         Arc::clone(&self.metrics)
     }
 
+    pub fn shard_count(&self) -> usize {
+        self.inners.len()
+    }
+
     /// Checagem barata para evitar materializar `FeaturesT0`/metadata quando
     /// nenhum horizonte passaria pelo stride determinístico.
     ///
