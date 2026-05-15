@@ -39,6 +39,7 @@ pub mod route_ranking;
 pub mod run_audit;
 pub mod sample;
 pub mod sample_id;
+pub mod storage_v2;
 pub mod writer;
 
 pub use label_resolver::{
