@@ -41,13 +41,54 @@ Auditoria completa offline:
 cargo run --release --bin ml_storage_v2_shadow -- --root data/ml --out data/ml/storage_v2_shadow_report.json
 ```
 
+Materializacao sidecar offline para benchmark:
+
+```powershell
+cargo run --release --bin ml_storage_v2_shadow -- --root data/ml --materialize-out-dir target/ml_storage_v2_sidecars --out target/ml_storage_v2_sidecars/storage_v2_materialization_report.json
+```
+
 Se o report vier Red, o v2 nao esta liberado para substituir nenhuma fonte de
 dados. Isso inclui schemas antigos: eles devem ficar particionados/filtrados no
 trainer por `schema_version`, `scanner_version` e hashes de config.
 
-## O que ainda nao foi implementado
+## Materializacao sidecar
 
-Esta etapa ainda nao escreve fatos v2 nem `route_dim.parquet`. Ela implementa o
-gate necessario antes disso: detectar se o contrato logico atual pode ser
-reconstruido com diff zero. A etapa seguinte deve gerar Parquets sidecar v2 a
-partir de Parquets v1 ja validados, mantendo v1 ate comparacao full-schema.
+A materializacao sidecar le Parquets v1 ja fechados e validados, grava:
+
+- `*.fact.parquet`: fato v2 com `route_key` e sem colunas fisicas
+  virtualizaveis (`sample_id`, `route_id`, identidade textual de rota e
+  `symbol_id`);
+- `*.route_dim.parquet`: dimensao local do snapshot/run para reconstruir a
+  rota logica;
+- `*.storage_v2.manifest.json`: manifesto com contagens, bytes, digest logico e
+  versoes de contrato.
+
+Essa etapa nao substitui writer, nao altera a coleta e nao remove o Parquet v1.
+Ela existe para medir compressao real e validar contrato antes de qualquer
+migracao.
+
+## Benchmarks reais
+
+Benchmark materializado em dois snapshots ja auditados:
+
+| Snapshot | Status | Linhas | V1 | V2 sidecar | Reducao |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `scanner-43192` | Green | 16.613.765 | 0,552 GiB | 0,202 GiB | 63,51% |
+| `scanner-51688` | Green | 37.931.635 | 1,271 GiB | 0,466 GiB | 63,36% |
+
+Projetando sobre os tamanhos de 7 dias estimados anteriormente:
+
+| Snapshot | Projecao v1 7d | Projecao v2 7d |
+| --- | ---: | ---: |
+| `scanner-43192` | 307,6 GiB | ~112,3 GiB |
+| `scanner-51688` | 327,7 GiB | ~120,1 GiB |
+
+O ganho real ficou acima da estimativa shadow porque remover colunas de alta
+cardinalidade tambem melhora a compressao das colunas restantes no Parquet.
+
+## Proximo gate
+
+Antes de qualquer substituicao do storage canonico, ainda precisa existir um
+loader/auditor que leia `fact + route_dim + manifest`, reconstitua o schema
+logico usado pelo trainer e compare contra o v1 em amostras completas por
+dataset.

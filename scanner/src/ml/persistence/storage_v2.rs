@@ -10,10 +10,16 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use arrow_array::{Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array};
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use arrow_array::{
+    Array, ArrayRef, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +105,68 @@ pub struct StorageV2ShadowReport {
 pub enum StorageV2ShadowStatus {
     Green,
     Red,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageV2MaterializeConfig {
+    pub zstd_level: i32,
+    pub overwrite_existing: bool,
+}
+
+impl Default for StorageV2MaterializeConfig {
+    fn default() -> Self {
+        Self {
+            zstd_level: 3,
+            overwrite_existing: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageV2SidecarManifest {
+    pub manifest_version: u16,
+    pub dataset_kind: String,
+    pub source_parquet_path: String,
+    pub fact_parquet_path: String,
+    pub route_dim_parquet_path: String,
+    pub source_row_count: u64,
+    pub fact_row_count: u64,
+    pub route_dim_row_count: u64,
+    pub source_file_bytes: u64,
+    pub fact_file_bytes: u64,
+    pub route_dim_file_bytes: u64,
+    pub logical_required_digest_kind: String,
+    pub logical_required_digest_hex: String,
+    pub sample_id_algorithm_version: String,
+    pub route_dim_key_policy: String,
+    pub virtualized_columns: Vec<String>,
+    pub parquet_zstd_level: i32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageV2MaterializationDatasetSummary {
+    pub dataset_kind: String,
+    pub files: u64,
+    pub source_rows: u64,
+    pub route_dim_rows: u64,
+    pub source_bytes: u64,
+    pub fact_bytes: u64,
+    pub route_dim_bytes: u64,
+    pub manifest_bytes: u64,
+    pub v2_total_bytes: u64,
+    pub issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageV2MaterializationReport {
+    pub status: StorageV2ShadowStatus,
+    pub source_root: String,
+    pub output_root: String,
+    pub datasets: BTreeMap<String, StorageV2MaterializationDatasetSummary>,
+    pub source_bytes: u64,
+    pub v2_total_bytes: u64,
+    pub reduction_bytes: u64,
+    pub issues: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -262,6 +330,461 @@ pub fn build_storage_v2_shadow_report_with_limit(
         total_estimated_reclaimable_bytes_with_route_dim,
         issues,
     })
+}
+
+pub fn materialize_storage_v2_sidecars(
+    source_root: &Path,
+    output_root: &Path,
+    max_files_per_dataset: Option<usize>,
+    cfg: &StorageV2MaterializeConfig,
+) -> Result<StorageV2MaterializationReport> {
+    let datasets = [
+        (DatasetKind::RawSamples, "raw_samples"),
+        (DatasetKind::AcceptedSamples, "accepted_samples"),
+        (DatasetKind::LabeledTrades, "labeled_trades"),
+    ];
+    let mut summaries = BTreeMap::new();
+    let mut issues = Vec::new();
+
+    for (kind, name) in datasets {
+        let mut paths = collect_parquet_files(&source_root.join(name))?;
+        if let Some(max_files) = max_files_per_dataset {
+            paths.truncate(max_files);
+        }
+        let dataset_out = output_root.join(name);
+        let mut summary = StorageV2MaterializationDatasetSummary {
+            dataset_kind: kind.as_str().to_string(),
+            ..StorageV2MaterializationDatasetSummary::default()
+        };
+
+        for source_path in paths {
+            match materialize_parquet_file_to_storage_v2_sidecar(
+                &source_path,
+                kind,
+                &dataset_out,
+                cfg,
+            ) {
+                Ok(manifest) => {
+                    summary.files = summary.files.saturating_add(1);
+                    summary.source_rows = summary
+                        .source_rows
+                        .saturating_add(manifest.source_row_count);
+                    summary.route_dim_rows = summary
+                        .route_dim_rows
+                        .saturating_add(manifest.route_dim_row_count);
+                    summary.source_bytes = summary
+                        .source_bytes
+                        .saturating_add(manifest.source_file_bytes);
+                    summary.fact_bytes =
+                        summary.fact_bytes.saturating_add(manifest.fact_file_bytes);
+                    summary.route_dim_bytes = summary
+                        .route_dim_bytes
+                        .saturating_add(manifest.route_dim_file_bytes);
+                    let manifest_bytes =
+                        fs::metadata(sidecar_manifest_path_for_source(&source_path, &dataset_out))
+                            .map(|m| m.len())
+                            .unwrap_or(0);
+                    summary.manifest_bytes = summary.manifest_bytes.saturating_add(manifest_bytes);
+                }
+                Err(e) => {
+                    let issue = format!("{}: {}: {e}", name, source_path.display());
+                    summary.issues.push(issue.clone());
+                    issues.push(issue);
+                }
+            }
+        }
+        summary.v2_total_bytes = summary
+            .fact_bytes
+            .saturating_add(summary.route_dim_bytes)
+            .saturating_add(summary.manifest_bytes);
+        summaries.insert(name.to_string(), summary);
+    }
+
+    let source_bytes: u64 = summaries.values().map(|d| d.source_bytes).sum();
+    let v2_total_bytes: u64 = summaries.values().map(|d| d.v2_total_bytes).sum();
+    let reduction_bytes = source_bytes.saturating_sub(v2_total_bytes);
+    let status = if issues.is_empty() {
+        StorageV2ShadowStatus::Green
+    } else {
+        StorageV2ShadowStatus::Red
+    };
+    Ok(StorageV2MaterializationReport {
+        status,
+        source_root: source_root.display().to_string(),
+        output_root: output_root.display().to_string(),
+        datasets: summaries,
+        source_bytes,
+        v2_total_bytes,
+        reduction_bytes,
+        issues,
+    })
+}
+
+pub fn materialize_parquet_file_to_storage_v2_sidecar(
+    source_path: &Path,
+    dataset_kind: DatasetKind,
+    out_dir: &Path,
+    cfg: &StorageV2MaterializeConfig,
+) -> Result<StorageV2SidecarManifest> {
+    let source_audit = analyze_parquet_file_for_storage_v2(source_path, dataset_kind)
+        .with_context(|| {
+            format!(
+                "validate source before v2 materialization {}",
+                source_path.display()
+            )
+        })?;
+    if !source_audit.issues.is_empty() {
+        anyhow::bail!("{}", source_audit.issues.join("; "));
+    }
+
+    fs::create_dir_all(out_dir).with_context(|| format!("create {}", out_dir.display()))?;
+    let fact_path = sidecar_fact_path_for_source(source_path, out_dir);
+    let route_dim_path = sidecar_route_dim_path_for_source(source_path, out_dir);
+    let manifest_path = sidecar_manifest_path_for_source(source_path, out_dir);
+    let temp_fact_path = fact_path.with_extension("fact.parquet.tmp");
+    let temp_route_dim_path = route_dim_path.with_extension("route_dim.parquet.tmp");
+    let temp_manifest_path = manifest_path.with_extension("manifest.json.tmp");
+
+    prepare_output_path(&fact_path, cfg.overwrite_existing)?;
+    prepare_output_path(&route_dim_path, cfg.overwrite_existing)?;
+    prepare_output_path(&manifest_path, cfg.overwrite_existing)?;
+    remove_file_if_exists(&temp_fact_path)?;
+    remove_file_if_exists(&temp_route_dim_path)?;
+    remove_file_if_exists(&temp_manifest_path)?;
+
+    let input = File::open(source_path)
+        .with_context(|| format!("open source {}", source_path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(input)
+        .with_context(|| format!("build source reader {}", source_path.display()))?;
+    let mut reader = builder
+        .build()
+        .with_context(|| format!("read source {}", source_path.display()))?;
+
+    let fact_file = File::create(&temp_fact_path)
+        .with_context(|| format!("create {}", temp_fact_path.display()))?;
+    let mut fact_file = Some(fact_file);
+    let mut fact_writer: Option<ArrowWriter<File>> = None;
+    let mut route_id_to_key = BTreeMap::<String, u32>::new();
+    let mut route_dim = BTreeMap::<u32, RouteDimEntry>::new();
+    let mut fact_row_count = 0u64;
+
+    for maybe_batch in &mut reader {
+        let batch = maybe_batch.with_context(|| format!("read batch {}", source_path.display()))?;
+        let fact_batch =
+            build_fact_batch(dataset_kind, &batch, &mut route_id_to_key, &mut route_dim)?;
+        if fact_writer.is_none() {
+            let file = fact_file
+                .take()
+                .context("fact file handle already consumed before writer init")?;
+            fact_writer = Some(
+                ArrowWriter::try_new(
+                    file,
+                    fact_batch.schema(),
+                    Some(sidecar_writer_properties(cfg)?),
+                )
+                .with_context(|| format!("create fact writer {}", temp_fact_path.display()))?,
+            );
+        }
+        if let Some(writer) = fact_writer.as_mut() {
+            writer
+                .write(&fact_batch)
+                .with_context(|| format!("write fact {}", temp_fact_path.display()))?;
+        }
+        fact_row_count = fact_row_count.saturating_add(fact_batch.num_rows() as u64);
+    }
+
+    let Some(writer) = fact_writer else {
+        anyhow::bail!(
+            "source parquet has no record batches: {}",
+            source_path.display()
+        );
+    };
+    writer
+        .close()
+        .with_context(|| format!("close fact {}", temp_fact_path.display()))?;
+
+    let route_dim_batch = build_route_dim_batch(&route_dim)?;
+    let route_dim_file = File::create(&temp_route_dim_path)
+        .with_context(|| format!("create {}", temp_route_dim_path.display()))?;
+    let mut route_dim_writer = ArrowWriter::try_new(
+        route_dim_file,
+        route_dim_batch.schema(),
+        Some(sidecar_writer_properties(cfg)?),
+    )
+    .with_context(|| format!("create route_dim writer {}", temp_route_dim_path.display()))?;
+    route_dim_writer
+        .write(&route_dim_batch)
+        .with_context(|| format!("write route_dim {}", temp_route_dim_path.display()))?;
+    route_dim_writer
+        .close()
+        .with_context(|| format!("close route_dim {}", temp_route_dim_path.display()))?;
+
+    let source_file_bytes = fs::metadata(source_path)?.len();
+    let fact_file_bytes = fs::metadata(&temp_fact_path)?.len();
+    let route_dim_file_bytes = fs::metadata(&temp_route_dim_path)?.len();
+    let manifest = StorageV2SidecarManifest {
+        manifest_version: 1,
+        dataset_kind: dataset_kind.as_str().to_string(),
+        source_parquet_path: source_path.display().to_string(),
+        fact_parquet_path: fact_path.display().to_string(),
+        route_dim_parquet_path: route_dim_path.display().to_string(),
+        source_row_count: source_audit.rows,
+        fact_row_count,
+        route_dim_row_count: route_dim.len() as u64,
+        source_file_bytes,
+        fact_file_bytes,
+        route_dim_file_bytes,
+        logical_required_digest_kind: source_audit.logical_required_digest_kind,
+        logical_required_digest_hex: source_audit.logical_required_digest_hex,
+        sample_id_algorithm_version: SAMPLE_ID_ALGORITHM_VERSION.to_string(),
+        route_dim_key_policy: ROUTE_DIM_KEY_POLICY.to_string(),
+        virtualized_columns: virtualized_columns()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        parquet_zstd_level: cfg.zstd_level,
+    };
+    write_sidecar_manifest_temp(&manifest, &temp_manifest_path)?;
+
+    fs::rename(&temp_fact_path, &fact_path).with_context(|| {
+        format!(
+            "publish {} -> {}",
+            temp_fact_path.display(),
+            fact_path.display()
+        )
+    })?;
+    fs::rename(&temp_route_dim_path, &route_dim_path).with_context(|| {
+        format!(
+            "publish {} -> {}",
+            temp_route_dim_path.display(),
+            route_dim_path.display()
+        )
+    })?;
+    fs::rename(&temp_manifest_path, &manifest_path).with_context(|| {
+        format!(
+            "publish {} -> {}",
+            temp_manifest_path.display(),
+            manifest_path.display()
+        )
+    })?;
+
+    Ok(StorageV2SidecarManifest {
+        fact_parquet_path: fact_path.display().to_string(),
+        route_dim_parquet_path: route_dim_path.display().to_string(),
+        ..manifest
+    })
+}
+
+fn build_fact_batch(
+    dataset_kind: DatasetKind,
+    batch: &RecordBatch,
+    route_id_to_key: &mut BTreeMap<String, u32>,
+    route_dim: &mut BTreeMap<u32, RouteDimEntry>,
+) -> Result<RecordBatch> {
+    let columns = BatchColumns::new(dataset_kind, batch)?;
+    let mut route_keys = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        if required_row_has_nulls(&columns, row) {
+            anyhow::bail!("required identity field is null at row {}", row + 1);
+        }
+        let entry = route_dim_entry_for_row(&columns, row)?;
+        let route_id = entry.route_id.clone();
+        let route_key = if let Some(route_key) = route_id_to_key.get(&route_id) {
+            *route_key
+        } else {
+            let next = (route_id_to_key.len() + 1)
+                .try_into()
+                .context("too many routes for u32 route_key")?;
+            route_id_to_key.insert(route_id, next);
+            route_dim.insert(next, entry);
+            next
+        };
+        if let Some(existing) = route_dim.get(&route_key) {
+            if existing.route_id != columns.route_id.value(row) {
+                let expected = route_dim_entry_for_row(&columns, row)?;
+                if existing != &expected {
+                    anyhow::bail!("route_dim conflict for route_key={route_key}");
+                }
+            }
+        }
+        route_keys.push(route_key);
+    }
+
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut arrays = Vec::with_capacity(batch.num_columns());
+    fields.push(Field::new("route_key", DataType::UInt32, false));
+    arrays.push(Arc::new(UInt32Array::from(route_keys)) as ArrayRef);
+
+    for (idx, field) in batch.schema().fields().iter().enumerate() {
+        if is_virtualized_column(field.name()) {
+            continue;
+        }
+        fields.push(field.as_ref().clone());
+        arrays.push(batch.column(idx).clone());
+    }
+    let schema: SchemaRef = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, arrays).context("build storage_v2 fact batch")
+}
+
+fn build_route_dim_batch(route_dim: &BTreeMap<u32, RouteDimEntry>) -> Result<RecordBatch> {
+    let mut route_keys = Vec::with_capacity(route_dim.len());
+    let mut route_ids = Vec::with_capacity(route_dim.len());
+    let mut symbol_names = Vec::with_capacity(route_dim.len());
+    let mut canonical_symbols = Vec::with_capacity(route_dim.len());
+    let mut symbol_ids = Vec::with_capacity(route_dim.len());
+    let mut buy_venues = Vec::with_capacity(route_dim.len());
+    let mut sell_venues = Vec::with_capacity(route_dim.len());
+    let mut buy_markets = Vec::with_capacity(route_dim.len());
+    let mut sell_markets = Vec::with_capacity(route_dim.len());
+
+    for (route_key, entry) in route_dim {
+        route_keys.push(*route_key);
+        route_ids.push(entry.route_id.as_str());
+        symbol_names.push(entry.symbol_name.as_str());
+        canonical_symbols.push(entry.canonical_symbol.as_str());
+        symbol_ids.push(entry.symbol_id);
+        buy_venues.push(entry.buy_venue.as_str());
+        sell_venues.push(entry.sell_venue.as_str());
+        buy_markets.push(entry.buy_market.as_str());
+        sell_markets.push(entry.sell_market.as_str());
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("route_key", DataType::UInt32, false),
+        Field::new("route_id", DataType::Utf8, false),
+        Field::new("symbol_name", DataType::Utf8, false),
+        Field::new("canonical_symbol", DataType::Utf8, false),
+        Field::new("symbol_id", DataType::UInt32, false),
+        Field::new("buy_venue", DataType::Utf8, false),
+        Field::new("sell_venue", DataType::Utf8, false),
+        Field::new("buy_market", DataType::Utf8, false),
+        Field::new("sell_market", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt32Array::from(route_keys)) as ArrayRef,
+            Arc::new(StringArray::from(route_ids)) as ArrayRef,
+            Arc::new(StringArray::from(symbol_names)) as ArrayRef,
+            Arc::new(StringArray::from(canonical_symbols)) as ArrayRef,
+            Arc::new(UInt32Array::from(symbol_ids)) as ArrayRef,
+            Arc::new(StringArray::from(buy_venues)) as ArrayRef,
+            Arc::new(StringArray::from(sell_venues)) as ArrayRef,
+            Arc::new(StringArray::from(buy_markets)) as ArrayRef,
+            Arc::new(StringArray::from(sell_markets)) as ArrayRef,
+        ],
+    )
+    .context("build route_dim batch")
+}
+
+fn route_dim_entry_for_row(columns: &BatchColumns<'_>, row: usize) -> Result<RouteDimEntry> {
+    let symbol_name = columns.symbol_name.value(row);
+    let canonical_symbol = columns.canonical_symbol.value(row);
+    let symbol_for_id = if canonical_symbol.is_empty() {
+        symbol_name
+    } else {
+        canonical_symbol
+    };
+    let buy_venue = parse_venue(columns.buy_venue.value(row), columns.buy_market.value(row))?;
+    let sell_venue = parse_venue(
+        columns.sell_venue.value(row),
+        columns.sell_market.value(row),
+    )?;
+    let route_id = RouteId {
+        symbol_id: SymbolId(columns.symbol_id.value(row)),
+        buy_venue,
+        sell_venue,
+    };
+    Ok(RouteDimEntry {
+        route_id: route_id_key(symbol_for_id, route_id),
+        symbol_name: symbol_name.to_string(),
+        canonical_symbol: symbol_for_id.to_string(),
+        symbol_id: columns.symbol_id.value(row),
+        buy_venue: buy_venue.as_str().to_string(),
+        sell_venue: sell_venue.as_str().to_string(),
+        buy_market: buy_venue.market().as_str().to_string(),
+        sell_market: sell_venue.market().as_str().to_string(),
+    })
+}
+
+fn sidecar_writer_properties(cfg: &StorageV2MaterializeConfig) -> Result<WriterProperties> {
+    let zstd_level = ZstdLevel::try_new(cfg.zstd_level).context("invalid storage_v2 zstd level")?;
+    Ok(WriterProperties::builder()
+        .set_compression(Compression::ZSTD(zstd_level))
+        .build())
+}
+
+fn sidecar_fact_path_for_source(source_path: &Path, out_dir: &Path) -> PathBuf {
+    out_dir.join(format!("{}.fact.parquet", source_stem(source_path)))
+}
+
+fn sidecar_route_dim_path_for_source(source_path: &Path, out_dir: &Path) -> PathBuf {
+    out_dir.join(format!("{}.route_dim.parquet", source_stem(source_path)))
+}
+
+fn sidecar_manifest_path_for_source(source_path: &Path, out_dir: &Path) -> PathBuf {
+    out_dir.join(format!(
+        "{}.storage_v2.manifest.json",
+        source_stem(source_path)
+    ))
+}
+
+fn source_stem(source_path: &Path) -> String {
+    source_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("part")
+        .to_string()
+}
+
+fn prepare_output_path(path: &Path, overwrite_existing: bool) -> Result<()> {
+    if path.exists() {
+        if !overwrite_existing {
+            anyhow::bail!("output exists and overwrite disabled: {}", path.display());
+        }
+        fs::remove_file(path).with_context(|| format!("remove existing {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn write_sidecar_manifest_temp(manifest: &StorageV2SidecarManifest, path: &Path) -> Result<()> {
+    {
+        let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
+        serde_json::to_writer_pretty(file, manifest)
+            .with_context(|| format!("write {}", path.display()))?;
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let roundtrip: StorageV2SidecarManifest =
+        serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))?;
+    if &roundtrip != manifest {
+        anyhow::bail!("storage_v2 manifest roundtrip mismatch: {}", path.display());
+    }
+    Ok(())
+}
+
+fn virtualized_columns() -> &'static [&'static str] {
+    &[
+        "sample_id",
+        "route_id",
+        "symbol_id",
+        "symbol_name",
+        "canonical_symbol",
+        "buy_venue",
+        "sell_venue",
+        "buy_market",
+        "sell_market",
+    ]
+}
+
+fn is_virtualized_column(name: &str) -> bool {
+    virtualized_columns().contains(&name)
 }
 
 fn analyze_single_file_into_dataset(

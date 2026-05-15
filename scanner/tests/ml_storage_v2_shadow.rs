@@ -2,12 +2,19 @@ use std::sync::Arc;
 
 use arrow_array::{RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
+use parquet::arrow::ArrowWriter;
+use parquet::basic::{Compression, ZstdLevel};
+use parquet::file::properties::WriterProperties;
 use scanner::ml::persistence::sample_id::sample_id_of;
-use scanner::ml::persistence::storage_v2::analyze_record_batch_for_storage_v2;
+use scanner::ml::persistence::storage_v2::{
+    analyze_record_batch_for_storage_v2, materialize_parquet_file_to_storage_v2_sidecar,
+    StorageV2MaterializeConfig,
+};
 use scanner::ml::persistence::{
     DatasetKind, LABELED_TRADE_SCHEMA_VERSION, RAW_SAMPLE_SCHEMA_VERSION,
 };
 use scanner::types::Venue;
+use tempfile::tempdir;
 
 fn raw_batch(sample_id: &str, route_id: &str) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -42,6 +49,16 @@ fn raw_batch(sample_id: &str, route_id: &str) -> RecordBatch {
         ],
     )
     .expect("valid raw batch")
+}
+
+fn write_parquet(path: &std::path::Path, batch: &RecordBatch) {
+    let file = std::fs::File::create(path).expect("create parquet");
+    let props = WriterProperties::builder()
+        .set_compression(Compression::ZSTD(ZstdLevel::try_new(3).unwrap()))
+        .build();
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();
+    writer.write(batch).unwrap();
+    writer.close().unwrap();
 }
 
 #[test]
@@ -143,4 +160,85 @@ fn storage_v2_shadow_flags_labeled_window_drift() {
         .issues
         .iter()
         .any(|issue| issue.contains("label_window_mismatches=1")));
+}
+
+#[test]
+fn storage_v2_sidecar_materializes_fact_and_route_dim_without_touching_v1() {
+    let sample_id = sample_id_of(
+        1_700_000_000_000_000_000,
+        7,
+        "BTC-USDT",
+        Venue::MexcFut,
+        Venue::BingxFut,
+    );
+    let batch = raw_batch(&sample_id, "BTC-USDT|mexc:FUTURES->bingx:FUTURES");
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("raw-source.parquet");
+    let out_dir = dir.path().join("v2");
+    write_parquet(&source, &batch);
+
+    let manifest = materialize_parquet_file_to_storage_v2_sidecar(
+        &source,
+        DatasetKind::RawSamples,
+        &out_dir,
+        &StorageV2MaterializeConfig::default(),
+    )
+    .expect("materialize v2 sidecar");
+
+    assert_eq!(manifest.source_row_count, 1);
+    assert_eq!(manifest.fact_row_count, 1);
+    assert_eq!(manifest.route_dim_row_count, 1);
+    assert!(
+        source.exists(),
+        "v1 source must remain canonical and untouched"
+    );
+    assert!(manifest.fact_parquet_path.ends_with(".fact.parquet"));
+    assert!(manifest
+        .route_dim_parquet_path
+        .ends_with(".route_dim.parquet"));
+
+    let fact_schema = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(&manifest.fact_parquet_path).unwrap(),
+    )
+    .unwrap()
+    .schema()
+    .clone();
+    assert!(fact_schema.field_with_name("route_key").is_ok());
+    assert!(fact_schema.field_with_name("sample_id").is_err());
+    assert!(fact_schema.field_with_name("route_id").is_err());
+    assert!(fact_schema.field_with_name("symbol_name").is_err());
+    assert!(fact_schema.field_with_name("canonical_symbol").is_err());
+
+    let dim_schema = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+        std::fs::File::open(&manifest.route_dim_parquet_path).unwrap(),
+    )
+    .unwrap()
+    .schema()
+    .clone();
+    assert!(dim_schema.field_with_name("route_key").is_ok());
+    assert!(dim_schema.field_with_name("route_id").is_ok());
+    assert!(dim_schema.field_with_name("canonical_symbol").is_ok());
+}
+
+#[test]
+fn storage_v2_sidecar_refuses_contract_mismatch() {
+    let batch = raw_batch(
+        "00000000000000000000000000000000",
+        "BTC-USDT|mexc:FUTURES->bingx:FUTURES",
+    );
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("bad-raw-source.parquet");
+    let out_dir = dir.path().join("v2");
+    write_parquet(&source, &batch);
+
+    let err = materialize_parquet_file_to_storage_v2_sidecar(
+        &source,
+        DatasetKind::RawSamples,
+        &out_dir,
+        &StorageV2MaterializeConfig::default(),
+    )
+    .expect_err("bad sample_id must block sidecar publication");
+
+    assert!(err.to_string().contains("sample_id_mismatches=1"));
+    assert!(!out_dir.exists() || std::fs::read_dir(&out_dir).unwrap().next().is_none());
 }
