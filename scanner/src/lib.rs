@@ -767,10 +767,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         sweeper_interval: Duration::from_secs(cfg.ml.label_sweeper_interval_s),
         ..ResolverConfig::default()
     };
-    let label_resolver = Arc::new(LabelResolver::new_with_spool_dir(
+    let label_resolver = Arc::new(LabelResolver::new_with_spool_dir_and_route_exit_log_shadow(
         resolver_cfg,
         labeled_handle,
         Some(labeled_writer_abs.join("_pending_spool")),
+        cfg.ml.route_exit_log_shadow_enabled,
     ));
     let label_resolver_shard_count = label_resolver.shard_count();
     if label_resolver_shard_count % ml_cycle_shards != 0 {

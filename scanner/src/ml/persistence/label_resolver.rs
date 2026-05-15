@@ -969,6 +969,20 @@ pub struct ResolverMetrics {
     pub async_observation_processed_total: AtomicU64,
     pub async_sweep_enqueued_total: AtomicU64,
     pub async_sweep_processed_total: AtomicU64,
+    /// Shadow RouteExitLog habilitado (0/1). Não altera labels canônicos.
+    pub route_exit_log_shadow_enabled_current: AtomicU64,
+    /// Observações limpas appendadas ao RouteExitLog shadow.
+    pub route_exit_log_shadow_observations_total: AtomicU64,
+    /// Entradas vivas retidas no RouteExitLog shadow.
+    pub route_exit_log_shadow_entries_current: AtomicU64,
+    /// Rotas vivas retidas no RouteExitLog shadow.
+    pub route_exit_log_shadow_routes_current: AtomicU64,
+    /// Horizontes canônicos comparados contra RouteExitLog shadow.
+    pub route_exit_log_shadow_compared_total: AtomicU64,
+    /// Divergências entre resolver canônico e RouteExitLog shadow.
+    pub route_exit_log_shadow_diverged_total: AtomicU64,
+    /// Observações removidas da retenção do RouteExitLog shadow.
+    pub route_exit_log_shadow_pruned_total: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1284,6 +1298,7 @@ pub struct LabelResolver {
     metrics: Arc<ResolverMetrics>,
     meta_store: PendingMetaStore,
     writer: LabeledWriterHandle,
+    route_exit_log_shadow: Option<RouteExitLogShadow>,
 }
 
 struct ResolverInner {
@@ -1317,6 +1332,159 @@ fn new_resolver_inner() -> ResolverInner {
     ResolverInner {
         pending_by_route: AHashMap::with_capacity(4096 / LABEL_RESOLVER_SHARDS),
         last_label_ts_by_horizon: AHashMap::with_capacity(4096 / LABEL_RESOLVER_SHARDS),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RouteExitLogObservation {
+    ts_ns: u64,
+    exit_spread: f32,
+}
+
+#[derive(Debug)]
+struct RouteExitLogShard {
+    routes: AHashMap<RouteId, VecDeque<RouteExitLogObservation>>,
+    entries: u64,
+}
+
+impl Default for RouteExitLogShard {
+    fn default() -> Self {
+        Self {
+            routes: AHashMap::with_capacity(4096 / LABEL_RESOLVER_SHARDS),
+            entries: 0,
+        }
+    }
+}
+
+struct RouteExitLogShadow {
+    shards: Box<[Mutex<RouteExitLogShard>]>,
+    retention_ns: u64,
+}
+
+impl RouteExitLogShadow {
+    fn new(cfg: &ResolverConfig) -> Self {
+        let max_horizon_s = cfg.horizons_s.iter().copied().max().unwrap_or(0);
+        let max_horizon_ns = u64::from(max_horizon_s).saturating_mul(1_000_000_000);
+        let retention_ns = max_horizon_ns
+            .saturating_add(cfg.close_slack_ns)
+            .max(cfg.route_delisted_idle_ns)
+            .saturating_add(1_000_000_000);
+        Self {
+            shards: (0..LABEL_RESOLVER_SHARDS)
+                .map(|_| Mutex::new(RouteExitLogShard::default()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            retention_ns,
+        }
+    }
+
+    fn observe(&self, route_id: RouteId, now_ns: u64, exit_spread: f32, metrics: &ResolverMetrics) {
+        let mut shard = self.shards[resolver_shard_index(route_id)].lock();
+        let cutoff_ns = now_ns.saturating_sub(self.retention_ns);
+        let mut pruned = 0u64;
+        let was_new_route = !shard.routes.contains_key(&route_id);
+        let remove_route = {
+            let queue = shard.routes.entry(route_id).or_insert_with(VecDeque::new);
+            queue.push_back(RouteExitLogObservation {
+                ts_ns: now_ns,
+                exit_spread,
+            });
+            while queue
+                .front()
+                .map(|obs| obs.ts_ns < cutoff_ns)
+                .unwrap_or(false)
+            {
+                queue.pop_front();
+                pruned = pruned.saturating_add(1);
+            }
+            queue.is_empty()
+        };
+        shard.entries = shard.entries.saturating_add(1).saturating_sub(pruned);
+        metrics
+            .route_exit_log_shadow_observations_total
+            .fetch_add(1, Ordering::Relaxed);
+        metrics
+            .route_exit_log_shadow_entries_current
+            .fetch_add(1, Ordering::Relaxed);
+        if was_new_route && !remove_route {
+            metrics
+                .route_exit_log_shadow_routes_current
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if pruned > 0 {
+            metrics
+                .route_exit_log_shadow_entries_current
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(pruned))
+                })
+                .ok();
+            metrics
+                .route_exit_log_shadow_pruned_total
+                .fetch_add(pruned, Ordering::Relaxed);
+        }
+        if remove_route {
+            shard.routes.remove(&route_id);
+            if !was_new_route {
+                metrics
+                    .route_exit_log_shadow_routes_current
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(1))
+                    })
+                    .ok();
+            }
+        }
+    }
+
+    fn replay_horizon(
+        &self,
+        meta: &PendingLabelMeta,
+        horizon_s: u32,
+        close_ts_ns: u64,
+        close_slack_ns: u64,
+    ) -> PendingHorizon {
+        let mut slot = PendingHorizon::new(horizon_s, meta.ts_emit_ns, meta.label_floors_pct.len());
+        let deadline = meta
+            .ts_emit_ns
+            .saturating_add((horizon_s as u64).saturating_mul(1_000_000_000));
+        let shard = self.shards[resolver_shard_index(meta.route_id)].lock();
+        let Some(route_log) = shard.routes.get(&meta.route_id) else {
+            return slot;
+        };
+        for obs in route_log {
+            if obs.ts_ns <= meta.ts_emit_ns {
+                continue;
+            }
+            if obs.ts_ns > close_ts_ns {
+                break;
+            }
+            if obs.ts_ns == deadline {
+                record_future_sample(
+                    &mut slot,
+                    deadline,
+                    obs.exit_spread,
+                    meta.entry_locked_pct,
+                    meta.label_floor_pct,
+                    &meta.label_floors_pct,
+                );
+                break;
+            }
+            if obs.ts_ns > deadline {
+                let gap_to_deadline = deadline.saturating_sub(slot.observed_until_ns);
+                if slot.n_clean_future_samples > 0 && gap_to_deadline <= close_slack_ns {
+                    slot.observed_until_ns = deadline;
+                }
+                break;
+            }
+            record_future_sample(
+                &mut slot,
+                obs.ts_ns,
+                obs.exit_spread,
+                meta.entry_locked_pct,
+                meta.label_floor_pct,
+                &meta.label_floors_pct,
+            );
+        }
+        slot
     }
 }
 
@@ -1380,7 +1548,20 @@ fn record_future_sample(
 
 impl LabelResolver {
     pub fn new(cfg: ResolverConfig, writer: LabeledWriterHandle) -> Self {
-        Self::new_with_spool_dir(cfg, writer, None)
+        Self::new_with_spool_dir_and_route_exit_log_shadow(cfg, writer, None, false)
+    }
+
+    pub fn new_with_route_exit_log_shadow(
+        cfg: ResolverConfig,
+        writer: LabeledWriterHandle,
+        route_exit_log_shadow_enabled: bool,
+    ) -> Self {
+        Self::new_with_spool_dir_and_route_exit_log_shadow(
+            cfg,
+            writer,
+            None,
+            route_exit_log_shadow_enabled,
+        )
     }
 
     pub fn new_with_spool_dir(
@@ -1388,7 +1569,21 @@ impl LabelResolver {
         writer: LabeledWriterHandle,
         spool_dir: Option<PathBuf>,
     ) -> Self {
+        Self::new_with_spool_dir_and_route_exit_log_shadow(cfg, writer, spool_dir, false)
+    }
+
+    pub fn new_with_spool_dir_and_route_exit_log_shadow(
+        cfg: ResolverConfig,
+        writer: LabeledWriterHandle,
+        spool_dir: Option<PathBuf>,
+        route_exit_log_shadow_enabled: bool,
+    ) -> Self {
         let metrics = Arc::new(ResolverMetrics::default());
+        metrics
+            .route_exit_log_shadow_enabled_current
+            .store(route_exit_log_shadow_enabled as u64, Ordering::Relaxed);
+        let route_exit_log_shadow =
+            route_exit_log_shadow_enabled.then(|| RouteExitLogShadow::new(&cfg));
         let meta_store = PendingMetaStore::new(spool_dir, Arc::clone(&metrics));
         Self {
             cfg,
@@ -1399,6 +1594,7 @@ impl LabelResolver {
             metrics,
             meta_store,
             writer,
+            route_exit_log_shadow,
         }
     }
 
@@ -1703,6 +1899,9 @@ impl LabelResolver {
             &self.metrics.on_observation_ns_total,
             &self.metrics.on_observation_ops_total,
         );
+        if let Some(shadow) = &self.route_exit_log_shadow {
+            shadow.observe(route_id, now_ns, exit_spread, &self.metrics);
+        }
         let mut to_write: Vec<ClosedHorizonWrite> = Vec::new();
         let mut released_meta: Vec<PendingMetaRef> = Vec::new();
         {
@@ -2053,6 +2252,7 @@ impl LabelResolver {
                     .shutdown_lost_pending_total
                     .fetch_add(1, Ordering::Relaxed);
             }
+            self.compare_route_exit_log_shadow(&meta, &item.horizon, now_ns, outcome);
             let label =
                 self.build_closed_horizon_label(&meta, &item.horizon, now_ns, outcome, reason);
             match self.writer.send(label).await {
@@ -2108,6 +2308,7 @@ impl LabelResolver {
         outcome: LabelOutcome,
         censor_reason: Option<CensorReason>,
     ) {
+        self.compare_route_exit_log_shadow(meta, horizon, now_ns, outcome);
         let label = self.build_closed_horizon_label(meta, horizon, now_ns, outcome, censor_reason);
         match self.writer.try_send(label) {
             Ok(()) => {
@@ -2127,6 +2328,46 @@ impl LabelResolver {
                     .fetch_add(1, Ordering::Relaxed);
                 panic!(
                     "label_resolver strict-lossless violation: labeled writer channel closed while closing horizon"
+                );
+            }
+        }
+    }
+
+    fn compare_route_exit_log_shadow(
+        &self,
+        meta: &PendingLabelMeta,
+        horizon: &PendingHorizon,
+        now_ns: u64,
+        outcome: LabelOutcome,
+    ) {
+        let Some(shadow) = &self.route_exit_log_shadow else {
+            return;
+        };
+        self.metrics
+            .route_exit_log_shadow_compared_total
+            .fetch_add(1, Ordering::Relaxed);
+        let replay =
+            shadow.replay_horizon(meta, horizon.horizon_s, now_ns, self.cfg.close_slack_ns);
+        let replay_outcome = LabelOutcome::from_horizon(meta.ts_emit_ns, &replay);
+        if !pending_horizon_shadow_matches(horizon, &replay) || replay_outcome != outcome {
+            let prev = self
+                .metrics
+                .route_exit_log_shadow_diverged_total
+                .fetch_add(1, Ordering::Relaxed);
+            if prev < 32 {
+                tracing::warn!(
+                    sample_id = %meta.sample_id,
+                    route = ?meta.route_id,
+                    horizon_s = horizon.horizon_s,
+                    canonical_outcome = ?outcome,
+                    replay_outcome = ?replay_outcome,
+                    canonical_best_exit = ?horizon.best_exit_pct_so_far,
+                    replay_best_exit = ?replay.best_exit_pct_so_far,
+                    canonical_first_hit_ts = ?horizon.first_exit_ge_floor_ts_ns,
+                    replay_first_hit_ts = ?replay.first_exit_ge_floor_ts_ns,
+                    canonical_observed_until_ns = horizon.observed_until_ns,
+                    replay_observed_until_ns = replay.observed_until_ns,
+                    "route_exit_log_shadow diverged from canonical LabelResolver state"
                 );
             }
         }
@@ -2258,6 +2499,36 @@ impl LabelOutcome {
         } else {
             LabelOutcome::Censored
         }
+    }
+}
+
+fn pending_horizon_shadow_matches(canonical: &PendingHorizon, replay: &PendingHorizon) -> bool {
+    canonical.horizon_s == replay.horizon_s
+        && opt_f32_eq(canonical.best_exit_pct_so_far, replay.best_exit_pct_so_far)
+        && canonical.best_exit_ts_ns_so_far == replay.best_exit_ts_ns_so_far
+        && canonical.first_exit_ge_floor_ts_ns == replay.first_exit_ge_floor_ts_ns
+        && opt_f32_eq(
+            canonical.first_exit_ge_floor_pct,
+            replay.first_exit_ge_floor_pct,
+        )
+        && canonical.observed_until_ns == replay.observed_until_ns
+        && canonical.n_clean_future_samples == replay.n_clean_future_samples
+        && canonical.floor_hits.len() == replay.floor_hits.len()
+        && canonical
+            .floor_hits
+            .iter()
+            .zip(replay.floor_hits.iter())
+            .all(|(a, b)| {
+                a.first_exit_ge_floor_ts_ns == b.first_exit_ge_floor_ts_ns
+                    && opt_f32_eq(a.first_exit_ge_floor_pct, b.first_exit_ge_floor_pct)
+            })
+}
+
+fn opt_f32_eq(a: Option<f32>, b: Option<f32>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => (x - y).abs() <= 1e-6,
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -2468,6 +2739,34 @@ mod tests {
         (resolver, tmp, task)
     }
 
+    async fn setup_resolver_with_route_exit_log_shadow(
+        cfg: ResolverConfig,
+    ) -> (
+        Arc<LabelResolver>,
+        tempfile::TempDir,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let wcfg = LabeledWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 1024,
+            flush_after_n: 1,
+            flush_interval: Duration::from_millis(50),
+            file_prefix: "lrtest".into(),
+            rotation_interval: Duration::from_secs(3600),
+            parquet: ParquetCompactionConfig {
+                enabled: false,
+                ..ParquetCompactionConfig::default()
+            },
+        };
+        let (writer, handle) = LabeledJsonlWriter::create(wcfg);
+        let task = tokio::spawn(writer.run());
+        let resolver = Arc::new(LabelResolver::new_with_route_exit_log_shadow(
+            cfg, handle, true,
+        ));
+        (resolver, tmp, task)
+    }
+
     fn first_labeled_json(tmp: &tempfile::TempDir) -> serde_json::Value {
         let mut stack = vec![tmp.path().to_path_buf()];
         while let Some(dir) = stack.pop() {
@@ -2587,6 +2886,123 @@ mod tests {
             serde_json::Value::Null
         );
         assert_eq!(v["n_clean_future_samples"], 1);
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn route_exit_log_shadow_matches_incremental_label_state() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![2],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver_with_route_exit_log_shadow(cfg).await;
+        let t_emit = 1_000_000_000u64;
+
+        assert!(resolver.on_candidate(
+            "sid_shadow".into(),
+            "accept",
+            t_emit,
+            7,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            0.8,
+            vec![0.8, 1.2, 3.0],
+            mk_policy(),
+            "priority",
+            1.0,
+            0,
+            derive_cluster_id(mk_route(), t_emit),
+            1,
+            1,
+            "0000000000000000".to_string(),
+            0,
+            0,
+        ));
+
+        resolver.on_clean_observation(mk_route(), t_emit, 2.0, 99.0);
+        resolver.on_clean_observation(mk_route(), t_emit + 1_000_000_000, 2.0, -1.0);
+        resolver.on_clean_observation(mk_route(), t_emit + 2_000_000_000, 2.0, 0.5);
+        sleep(Duration::from_millis(150)).await;
+
+        let m = resolver.metrics();
+        assert_eq!(
+            m.route_exit_log_shadow_compared_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            m.route_exit_log_shadow_diverged_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            m.route_exit_log_shadow_observations_total
+                .load(Ordering::Relaxed),
+            3
+        );
+        let v = first_labeled_json(&tmp);
+        assert_eq!(v["sample_id"], "sid_shadow");
+        assert_eq!(v["outcome"], "realized");
+        assert_eq!(v["audit_hindsight_best_exit_pct"], 0.5);
+        assert_eq!(v["label_floor_hits"].as_array().unwrap().len(), 3);
+        drop(resolver);
+        drop(tmp);
+    }
+
+    #[tokio::test]
+    async fn route_exit_log_shadow_matches_shutdown_censoring() {
+        let cfg = ResolverConfig {
+            horizons_s: vec![10],
+            close_slack_ns: 1_000_000_000,
+            route_vanish_idle_ns: 10 * 60 * 1_000_000_000,
+            route_delisted_idle_ns: 30 * 60 * 1_000_000_000,
+            max_pending_per_route: 100,
+            sweeper_interval: Duration::from_secs(10),
+        };
+        let (resolver, tmp, _task) = setup_resolver_with_route_exit_log_shadow(cfg).await;
+        let t_emit = 1_000_000_000u64;
+        assert!(resolver.on_accepted(
+            "sid_shadow_shutdown".into(),
+            t_emit,
+            1,
+            mk_route(),
+            "BTC-USDT".into(),
+            2.0,
+            -1.0,
+            mk_features(),
+            5.0,
+            mk_policy(),
+            "allowlist",
+            1.0,
+            0,
+        ));
+        resolver.on_clean_observation(mk_route(), t_emit + 2_000_000_000, 2.0, -1.0);
+        let closed = resolver.shutdown_flush(t_emit + 3_000_000_000).await;
+        assert_eq!(closed.closed_total, 1);
+        sleep(Duration::from_millis(150)).await;
+
+        let m = resolver.metrics();
+        assert_eq!(
+            m.route_exit_log_shadow_compared_total
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            m.route_exit_log_shadow_diverged_total
+                .load(Ordering::Relaxed),
+            0
+        );
+        let v = first_labeled_json(&tmp);
+        assert_eq!(v["outcome"], "censored");
+        assert_eq!(v["censor_reason"], "shutdown");
         drop(resolver);
         drop(tmp);
     }

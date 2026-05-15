@@ -114,6 +114,15 @@ pub struct MlConfig {
     #[serde(default = "default_label_observation_channel_capacity")]
     pub label_observation_channel_capacity: usize,
 
+    /// Habilita RouteExitLog em modo shadow para comparar a reconstrução de
+    /// first-hit/observed_until contra o LabelResolver canônico.
+    ///
+    /// Default false. É uma validação operacional: não escreve dataset, não
+    /// muda labels, não entra no hash supervisionado e não deve ser ligada em
+    /// runs longos sem soak de performance.
+    #[serde(default)]
+    pub route_exit_log_shadow_enabled: bool,
+
     /// Floor percentual bruto usado pelo baseline A3 + labels derivados.
     /// Default 0.8% — filtro sobre LUCRO BRUTO COTADO (fees/funding ficam
     /// fora, fronteira ML explícita).
@@ -162,6 +171,7 @@ impl Default for MlConfig {
             label_horizons_s: default_label_horizons_s(),
             label_sweeper_interval_s: default_label_sweeper_interval_s(),
             label_observation_channel_capacity: default_label_observation_channel_capacity(),
+            route_exit_log_shadow_enabled: false,
             label_floor_pct: default_label_floor_pct(),
             label_floors_pct: default_label_floors_pct(),
             recommendation_cooldown_s: default_recommendation_cooldown_s(),
