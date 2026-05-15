@@ -71,6 +71,12 @@ pub struct Metrics {
     pub ml_cycle_stage_ns_total: IntCounterVec,
     /// Operações acumuladas por estágio do pipeline ML shardado.
     pub ml_cycle_stage_ops_total: IntCounterVec,
+    /// Batches ML processados por shard.
+    pub ml_cycle_shard_batches_processed_total: IntCounterVec,
+    /// Eventos ML processados por shard.
+    pub ml_cycle_shard_events_processed_total: IntCounterVec,
+    /// Tempo total de batches ML processados por shard.
+    pub ml_cycle_shard_batch_ns_total: IntCounterVec,
     /// Last full spread loop processing latency, excluding scheduler sleep, ns.
     pub full_cycle_last_ns: IntGauge,
     /// Max full spread loop processing latency observed in this process, ns.
@@ -322,6 +328,30 @@ impl Metrics {
                 &["shard", "stage"],
             )
             .expect("register ml_cycle_stage_ops_total");
+            let ml_cycle_shard_batches_processed_total = IntCounterVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_shard_batches_processed_total",
+                    "ML cycle batches processed by route shard",
+                ),
+                &["shard"],
+            )
+            .expect("register ml_cycle_shard_batches_processed_total");
+            let ml_cycle_shard_events_processed_total = IntCounterVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_shard_events_processed_total",
+                    "Route observations processed by ML route shard",
+                ),
+                &["shard"],
+            )
+            .expect("register ml_cycle_shard_events_processed_total");
+            let ml_cycle_shard_batch_ns_total = IntCounterVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_shard_batch_ns_total",
+                    "Nanoseconds spent processing ML cycle batches by route shard",
+                ),
+                &["shard"],
+            )
+            .expect("register ml_cycle_shard_batch_ns_total");
             let process_working_set_bytes = IntGauge::new(
                 "scanner_process_working_set_bytes",
                 "Current process working set, bytes",
@@ -430,6 +460,15 @@ impl Metrics {
                 .register(Box::new(ml_cycle_stage_ops_total.clone()))
                 .expect("reg");
             registry
+                .register(Box::new(ml_cycle_shard_batches_processed_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_shard_events_processed_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_shard_batch_ns_total.clone()))
+                .expect("reg");
+            registry
                 .register(Box::new(process_working_set_bytes.clone()))
                 .expect("reg");
             registry
@@ -513,6 +552,9 @@ impl Metrics {
                 ml_cycle_shard_events_inflight_current,
                 ml_cycle_stage_ns_total,
                 ml_cycle_stage_ops_total,
+                ml_cycle_shard_batches_processed_total,
+                ml_cycle_shard_events_processed_total,
+                ml_cycle_shard_batch_ns_total,
                 full_cycle_last_ns,
                 full_cycle_max_ns,
                 full_cycle_budget_ns,
@@ -564,6 +606,20 @@ impl Metrics {
         });
         ns_counter.inc_by(ns);
         ops_counter.inc();
+    }
+
+    #[inline]
+    pub fn record_ml_shard_batch(&self, shard_index: usize, events: u64, ns: u64) {
+        let shard = ml_shard_label(shard_index);
+        self.ml_cycle_shard_batches_processed_total
+            .with_label_values(&[shard])
+            .inc();
+        self.ml_cycle_shard_events_processed_total
+            .with_label_values(&[shard])
+            .inc_by(events);
+        self.ml_cycle_shard_batch_ns_total
+            .with_label_values(&[shard])
+            .inc_by(ns);
     }
 
     #[inline]

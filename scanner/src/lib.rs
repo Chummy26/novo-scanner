@@ -215,8 +215,14 @@ async fn run_ml_cycle_worker(
                     .add(n_events.min(i64::MAX as u64) as i64);
                 metrics.inc_ml_shard_inflight(shard_index, n_events);
                 let _shard_scope = metrics.enter_ml_shard(shard_index);
+                let batch_t0 = std::time::Instant::now();
                 process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, &batch)
                     .await;
+                metrics.record_ml_shard_batch(
+                    shard_index,
+                    n_events,
+                    batch_t0.elapsed().as_nanos() as u64,
+                );
                 batch.observations.clear();
                 let _ = buffer_recycle_tx.try_send(MlRecycledShardBuffer {
                     shard_index,
@@ -1576,8 +1582,14 @@ async fn run_spread_engine(
             };
             if ml_cycle_send_failure_reason.is_some() {
                 let _shard_scope = metrics.enter_ml_shard(shard_index);
+                let batch_t0 = std::time::Instant::now();
                 process_ml_cycle_batch(&universe, &ml_server, &ml_writer, &ml_broadcaster, &batch)
                     .await;
+                metrics.record_ml_shard_batch(
+                    shard_index,
+                    n_events,
+                    batch_t0.elapsed().as_nanos() as u64,
+                );
                 continue;
             }
             metrics.ml_cycle_queue_depth_current.inc();
@@ -1600,6 +1612,7 @@ async fn run_spread_engine(
                     match cmd {
                         MlCycleCommand::Batch(batch) => {
                             let _shard_scope = metrics.enter_ml_shard(shard_index);
+                            let batch_t0 = std::time::Instant::now();
                             process_ml_cycle_batch(
                                 &universe,
                                 &ml_server,
@@ -1608,6 +1621,11 @@ async fn run_spread_engine(
                                 &batch,
                             )
                             .await;
+                            metrics.record_ml_shard_batch(
+                                shard_index,
+                                n_events,
+                                batch_t0.elapsed().as_nanos() as u64,
+                            );
                         }
                         MlCycleCommand::Sweep { reply_tx, .. } => {
                             let _ = reply_tx.send(0);
@@ -1624,6 +1642,7 @@ async fn run_spread_engine(
                     match cmd {
                         MlCycleCommand::Batch(batch) => {
                             let _shard_scope = metrics.enter_ml_shard(shard_index);
+                            let batch_t0 = std::time::Instant::now();
                             process_ml_cycle_batch(
                                 &universe,
                                 &ml_server,
@@ -1632,6 +1651,11 @@ async fn run_spread_engine(
                                 &batch,
                             )
                             .await;
+                            metrics.record_ml_shard_batch(
+                                shard_index,
+                                n_events,
+                                batch_t0.elapsed().as_nanos() as u64,
+                            );
                         }
                         MlCycleCommand::Sweep { reply_tx, .. } => {
                             let _ = reply_tx.send(0);

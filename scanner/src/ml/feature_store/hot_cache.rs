@@ -109,6 +109,7 @@ fn select_quantile_u64(values: &mut [u64], q: f64) -> u32 {
 }
 
 #[inline]
+#[cfg(test)]
 fn select_weighted_quantile_u32(values: &mut [(u32, u64)], q: f64) -> u32 {
     debug_assert!(!values.is_empty());
     values.sort_unstable_by_key(|(bucket, _)| *bucket);
@@ -284,8 +285,7 @@ pub struct HotCacheWindowStats {
 thread_local! {
     static RUN_DURATION_SCRATCH: RefCell<Vec<u64>> = RefCell::new(Vec::new());
     static RUN_DURATION_SCRATCH_2: RefCell<Vec<u64>> = RefCell::new(Vec::new());
-    static WEIGHTED_BUCKET_SCRATCH: RefCell<Vec<(u32, u64)>> = RefCell::new(Vec::new());
-    static WEIGHTED_BUCKET_SCRATCH_2: RefCell<Vec<(u32, u64)>> = RefCell::new(Vec::new());
+    static ENTRY_HIST_SCRATCH: RefCell<BucketHistogram> = RefCell::new(BucketHistogram::default());
 }
 
 impl Default for CacheConfig {
@@ -765,18 +765,16 @@ impl PerRouteCache {
     #[inline]
     fn quantile_entry_since(&self, cutoff_ns: u64, q: f64) -> Option<f32> {
         let storage = self.storage.as_ref()?;
-        WEIGHTED_BUCKET_SCRATCH.with(|scratch| {
-            let mut values = scratch.borrow_mut();
-            values.clear();
-            values.extend(storage.ring.iter().filter_map(|s| {
+        ENTRY_HIST_SCRATCH.with(|scratch| {
+            let mut hist = scratch.borrow_mut();
+            hist.clear();
+            for s in storage.ring.iter() {
                 let weight = proportional_weight(s, cutoff_ns);
-                (weight > 0).then_some((s.entry_bucket, weight))
-            }));
-            if values.is_empty() {
-                return None;
+                if weight > 0 {
+                    hist.add(s.entry_bucket, weight);
+                }
             }
-            let bucket = select_weighted_quantile_u32(&mut values, q);
-            Some(from_bucket(bucket as u64))
+            hist.quantile(q).map(|bucket| from_bucket(bucket as u64))
         })
     }
 
@@ -1040,9 +1038,9 @@ impl PerRouteCache {
             };
         }
 
-        WEIGHTED_BUCKET_SCRATCH.with(|scratch| {
-            let mut values = scratch.borrow_mut();
-            values.clear();
+        ENTRY_HIST_SCRATCH.with(|scratch| {
+            let mut hist = scratch.borrow_mut();
+            hist.clear();
             let mut total = 0u64;
             let mut below = 0u64;
             let mut exit_successes = 0u64;
@@ -1053,7 +1051,7 @@ impl PerRouteCache {
                 if weight == 0 {
                     continue;
                 }
-                values.push((sample.entry_bucket, weight));
+                hist.add(sample.entry_bucket, weight);
                 total = total.saturating_add(weight);
                 if sample.entry_bucket <= entry_bucket {
                     below = below.saturating_add(weight);
@@ -1062,15 +1060,15 @@ impl PerRouteCache {
                     exit_successes = exit_successes.saturating_add(weight);
                 }
             }
-            if values.is_empty() || total == 0 {
+            if hist.is_empty() || total == 0 {
                 return HotCacheWindowStats::default();
             }
-            values.sort_unstable_by_key(|(bucket, _)| *bucket);
-            let entry_p50 = from_bucket(select_weighted_quantile_sorted_u32(&values, 0.50) as u64);
+            let entry_p50 = hist.quantile(0.50).map(|bucket| from_bucket(bucket as u64));
             let entry_p95 = include_p95
-                .then(|| from_bucket(select_weighted_quantile_sorted_u32(&values, 0.95) as u64));
+                .then(|| hist.quantile(0.95).map(|bucket| from_bucket(bucket as u64)))
+                .flatten();
             HotCacheWindowStats {
-                entry_p50: Some(entry_p50),
+                entry_p50,
                 entry_p95,
                 entry_rank_percentile: Some(below as f32 / total as f32),
                 p_exit_ge_threshold: Some(exit_successes as f32 / total as f32),
@@ -1879,6 +1877,64 @@ mod tests {
         assert!(
             p50 >= 2.3,
             "features since-cutoff recentes não devem ser diluídas por prefixo compactado; p50={p50}"
+        );
+    }
+
+    #[test]
+    fn cutoff_window_stats_match_manual_ring_calculation() {
+        let cfg = CacheConfig {
+            decimation: 1,
+            window_ns: u64::MAX,
+            rebuild_interval_ns: u64::MAX,
+            ring_initial_capacity: 64,
+        };
+        let cache = HotQueryCache::with_config(cfg);
+        let route = mk_route(1);
+
+        for i in 0..128u64 {
+            let entry = 0.4 + (i % 17) as f32 * 0.03;
+            let exit = -1.2 + (i % 11) as f32 * 0.04;
+            cache.observe(route, entry, exit, i * 1_000_000_000);
+        }
+
+        let cutoff = 40 * 1_000_000_000;
+        let stats = cache.window_stats(route, 0.8, -0.95, Some(cutoff), true);
+        let guard = cache.routes[cache_shard_index(route)].read();
+        let storage = guard
+            .get(&route)
+            .and_then(|cache| cache.storage.as_ref())
+            .expect("storage");
+
+        let mut values = Vec::new();
+        let mut total = 0u64;
+        let mut below = 0u64;
+        let mut exit_successes = 0u64;
+        let entry_bucket = to_bucket(0.8) as u32;
+        let exit_threshold_bucket = to_bucket(-0.95) as u32;
+        for sample in storage.ring.iter() {
+            let weight = proportional_weight(sample, cutoff);
+            if weight == 0 {
+                continue;
+            }
+            values.push((sample.entry_bucket, weight));
+            total = total.saturating_add(weight);
+            if sample.entry_bucket <= entry_bucket {
+                below = below.saturating_add(weight);
+            }
+            if sample.exit_bucket >= exit_threshold_bucket {
+                exit_successes = exit_successes.saturating_add(weight);
+            }
+        }
+        let expected_p50 =
+            from_bucket(select_weighted_quantile_u32(&mut values.clone(), 0.50) as u64);
+        let expected_p95 = from_bucket(select_weighted_quantile_u32(&mut values, 0.95) as u64);
+
+        assert!((stats.entry_p50.unwrap() - expected_p50).abs() < 0.0002);
+        assert!((stats.entry_p95.unwrap() - expected_p95).abs() < 0.0002);
+        assert!((stats.entry_rank_percentile.unwrap() - below as f32 / total as f32).abs() < 1e-6);
+        assert!(
+            (stats.p_exit_ge_threshold.unwrap() - exit_successes as f32 / total as f32).abs()
+                < 1e-6
         );
     }
 

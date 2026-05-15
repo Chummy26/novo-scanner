@@ -701,6 +701,8 @@ pub struct ParquetManifest {
     pub compactor_version: String,
     pub dataset_kind: String,
     pub schema_version: u16,
+    #[serde(default = "default_physical_source_format")]
+    pub physical_source_format: String,
     pub source_jsonl_path: String,
     pub parquet_path: String,
     pub source_row_count: u64,
@@ -712,9 +714,19 @@ pub struct ParquetManifest {
     pub max_timestamp_ns: Option<u64>,
     pub required_columns: Vec<String>,
     pub required_null_counts: BTreeMap<String, u64>,
+    #[serde(default = "default_required_field_digest_kind")]
+    pub required_field_digest_kind: String,
     pub required_field_digest_hex: String,
     pub parquet_config: ParquetManifestConfig,
     pub semantic_stats: DatasetSemanticStats,
+}
+
+fn default_physical_source_format() -> String {
+    "jsonl_compaction".to_string()
+}
+
+fn default_required_field_digest_kind() -> String {
+    "xxh3_required_fields_v1".to_string()
 }
 
 impl ParquetManifest {
@@ -728,10 +740,11 @@ impl ParquetManifest {
         cfg: &ParquetCompactionConfig,
     ) -> Self {
         Self {
-            manifest_version: 1,
+            manifest_version: 2,
             compactor_version: COMPACTOR_VERSION.to_string(),
             dataset_kind: dataset_kind.as_str().to_string(),
             schema_version: dataset_kind.expected_schema_version(),
+            physical_source_format: default_physical_source_format(),
             source_jsonl_path: jsonl_path.display().to_string(),
             parquet_path: parquet_path.display().to_string(),
             source_row_count: validation.rows,
@@ -746,6 +759,7 @@ impl ParquetManifest {
                 .map(|c| c.name.to_string())
                 .collect(),
             required_null_counts: validation.required_null_counts.clone(),
+            required_field_digest_kind: default_required_field_digest_kind(),
             required_field_digest_hex: format!("{:016x}", validation.hash),
             parquet_config: ParquetManifestConfig {
                 zstd_level: cfg.zstd_level,
@@ -1588,6 +1602,12 @@ mod tests {
         assert!(!jsonl.exists());
         assert_eq!(parquet_row_count(&parquet), 1);
         let manifest = read_manifest(&parquet);
+        assert_eq!(manifest.manifest_version, 2);
+        assert_eq!(manifest.physical_source_format, "jsonl_compaction");
+        assert_eq!(
+            manifest.required_field_digest_kind,
+            "xxh3_required_fields_v1"
+        );
         assert_eq!(manifest.dataset_kind, "accepted_samples");
         assert_eq!(manifest.source_row_count, 1);
         assert_eq!(manifest.parquet_row_count, 1);
