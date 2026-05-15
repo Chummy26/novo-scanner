@@ -119,6 +119,64 @@ enum MlCycleCommand {
     },
 }
 
+#[inline]
+fn record_ml_cycle_command_queued(metrics: &obs::Metrics, shard_index: usize, n_events: u64) {
+    metrics.ml_cycle_queue_depth_current.inc();
+    metrics
+        .ml_cycle_queue_events_current
+        .add(n_events.min(i64::MAX as u64) as i64);
+    metrics.inc_ml_shard_queue(shard_index, n_events);
+}
+
+#[inline]
+fn record_ml_cycle_command_enqueued(metrics: &obs::Metrics, n_events: u64) {
+    metrics.ml_cycle_batches_enqueued_total.inc();
+    metrics.ml_cycle_events_enqueued_total.inc_by(n_events);
+}
+
+async fn enqueue_ml_cycle_command_lossless(
+    metrics: &obs::Metrics,
+    shard_index: usize,
+    tx: &tokio::sync::mpsc::Sender<MlCycleCommand>,
+    cmd: MlCycleCommand,
+    n_events: u64,
+) -> std::result::Result<(), MlCycleCommand> {
+    match tx.try_reserve() {
+        Ok(permit) => {
+            record_ml_cycle_command_queued(metrics, shard_index, n_events);
+            permit.send(cmd);
+            record_ml_cycle_command_enqueued(metrics, n_events);
+            Ok(())
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Full(())) => {
+            metrics.ml_cycle_queue_full_total.inc();
+            let wait_t0 = std::time::Instant::now();
+            match tx.reserve().await {
+                Ok(permit) => {
+                    metrics.record_ml_stage(
+                        shard_index,
+                        "queue_wait",
+                        wait_t0.elapsed().as_nanos() as u64,
+                    );
+                    record_ml_cycle_command_queued(metrics, shard_index, n_events);
+                    permit.send(cmd);
+                    record_ml_cycle_command_enqueued(metrics, n_events);
+                    Ok(())
+                }
+                Err(_) => {
+                    metrics.record_ml_stage(
+                        shard_index,
+                        "queue_wait",
+                        wait_t0.elapsed().as_nanos() as u64,
+                    );
+                    Err(cmd)
+                }
+            }
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(())) => Err(cmd),
+    }
+}
+
 fn ml_cycle_shard_count_from_ml_config(ml: &config::MlConfig) -> anyhow::Result<usize> {
     let shards = ml.cycle_shards;
     if !matches!(shards, 1 | 2 | 4 | 8 | 16 | 32) {
@@ -1592,53 +1650,17 @@ async fn run_spread_engine(
                 );
                 continue;
             }
-            metrics.ml_cycle_queue_depth_current.inc();
-            metrics
-                .ml_cycle_queue_events_current
-                .add(n_events.min(i64::MAX as u64) as i64);
-            metrics.inc_ml_shard_queue(shard_index, n_events);
-            match ml_cycle_txs[shard_index].try_send(MlCycleCommand::Batch(batch)) {
-                Ok(()) => {
-                    metrics.ml_cycle_batches_enqueued_total.inc();
-                    metrics.ml_cycle_events_enqueued_total.inc_by(n_events);
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(cmd)) => {
-                    metrics.ml_cycle_queue_full_total.inc();
-                    metrics.ml_cycle_queue_depth_current.dec();
-                    metrics
-                        .ml_cycle_queue_events_current
-                        .sub(n_events.min(i64::MAX as u64) as i64);
-                    metrics.dec_ml_shard_queue(shard_index, n_events);
-                    match cmd {
-                        MlCycleCommand::Batch(batch) => {
-                            let _shard_scope = metrics.enter_ml_shard(shard_index);
-                            let batch_t0 = std::time::Instant::now();
-                            process_ml_cycle_batch(
-                                &universe,
-                                &ml_server,
-                                &ml_writer,
-                                &ml_broadcaster,
-                                &batch,
-                            )
-                            .await;
-                            metrics.record_ml_shard_batch(
-                                shard_index,
-                                n_events,
-                                batch_t0.elapsed().as_nanos() as u64,
-                            );
-                        }
-                        MlCycleCommand::Sweep { reply_tx, .. } => {
-                            let _ = reply_tx.send(0);
-                        }
-                    }
-                    ml_cycle_send_failure_reason = Some("full");
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(cmd)) => {
-                    metrics.ml_cycle_queue_depth_current.dec();
-                    metrics
-                        .ml_cycle_queue_events_current
-                        .sub(n_events.min(i64::MAX as u64) as i64);
-                    metrics.dec_ml_shard_queue(shard_index, n_events);
+            match enqueue_ml_cycle_command_lossless(
+                &metrics,
+                shard_index,
+                &ml_cycle_txs[shard_index],
+                MlCycleCommand::Batch(batch),
+                n_events,
+            )
+            .await
+            {
+                Ok(()) => {}
+                Err(cmd) => {
                     match cmd {
                         MlCycleCommand::Batch(batch) => {
                             let _shard_scope = metrics.enter_ml_shard(shard_index);
@@ -1682,6 +1704,7 @@ mod tests {
         Recommendation, RouteId, TradeReason, TradeSetup,
     };
     use crate::types::{SymbolId, Venue};
+    use std::time::Duration;
 
     fn mk_route() -> RouteId {
         RouteId {
@@ -1839,6 +1862,56 @@ mod tests {
         assert_eq!(seen, (0..32).collect::<Vec<_>>());
         assert_eq!(&*assignments[0], &[0, 8, 16, 24]);
         assert_eq!(&*assignments[7], &[7, 15, 23, 31]);
+    }
+
+    #[tokio::test]
+    async fn ml_cycle_enqueue_waits_for_capacity_without_reordering() {
+        let metrics = crate::obs::Metrics::init();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        let first = super::MlCycleCommand::Batch(super::MlCycleBatch {
+            cycle_seq: 1,
+            event_time_ns: 10,
+            cycle_budget_ns: 150_000_000,
+            observations: Vec::new(),
+        });
+        assert!(
+            super::enqueue_ml_cycle_command_lossless(&metrics, 0, &tx, first, 1)
+                .await
+                .is_ok()
+        );
+
+        let second = super::MlCycleCommand::Batch(super::MlCycleBatch {
+            cycle_seq: 2,
+            event_time_ns: 20,
+            cycle_budget_ns: 150_000_000,
+            observations: Vec::new(),
+        });
+        let enqueue_second = super::enqueue_ml_cycle_command_lossless(&metrics, 0, &tx, second, 1);
+        tokio::pin!(enqueue_second);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut enqueue_second)
+                .await
+                .is_err(),
+            "a full queue must backpressure instead of running the newer batch inline"
+        );
+
+        match rx.recv().await.expect("first batch") {
+            super::MlCycleCommand::Batch(batch) => assert_eq!(batch.cycle_seq, 1),
+            super::MlCycleCommand::Sweep { .. } => panic!("unexpected sweep"),
+        }
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut enqueue_second)
+                .await
+                .expect("enqueue after capacity is freed")
+                .is_ok()
+        );
+        match rx.recv().await.expect("second batch") {
+            super::MlCycleCommand::Batch(batch) => assert_eq!(batch.cycle_seq, 2),
+            super::MlCycleCommand::Sweep { .. } => panic!("unexpected sweep"),
+        }
     }
 
     #[test]
