@@ -121,13 +121,6 @@ pub struct MlPrometheusMetrics {
     resolver_async_observation_processed_total: IntCounter,
     resolver_async_sweep_enqueued_total: IntCounter,
     resolver_async_sweep_processed_total: IntCounter,
-    resolver_route_exit_log_shadow_enabled_current: IntGauge,
-    resolver_route_exit_log_shadow_observations_total: IntCounter,
-    resolver_route_exit_log_shadow_entries_current: IntGauge,
-    resolver_route_exit_log_shadow_routes_current: IntGauge,
-    resolver_route_exit_log_shadow_compared_total: IntCounter,
-    resolver_route_exit_log_shadow_diverged_total: IntCounter,
-    resolver_route_exit_log_shadow_pruned_total: IntCounter,
 
     // Snapshots do último update (para computar delta → Counter.inc_by).
     last_seen: ServerMetricsSnapshot,
@@ -168,10 +161,6 @@ struct ResolverSnapshot {
     resolver_async_observation_processed: u64,
     resolver_async_sweep_enqueued: u64,
     resolver_async_sweep_processed: u64,
-    resolver_route_exit_log_shadow_observations: u64,
-    resolver_route_exit_log_shadow_compared: u64,
-    resolver_route_exit_log_shadow_diverged: u64,
-    resolver_route_exit_log_shadow_pruned: u64,
 }
 
 #[derive(Default)]
@@ -519,34 +508,6 @@ impl MlPrometheusMetrics {
             "ml_label_resolver_async_sweep_processed_total",
             "Sweeps processados pelo LabelResolver assíncrono",
         ))?;
-        let resolver_route_exit_log_shadow_enabled_current = IntGauge::with_opts(Opts::new(
-            "ml_label_route_exit_log_shadow_enabled_current",
-            "RouteExitLog shadow habilitado no LabelResolver (0/1)",
-        ))?;
-        let resolver_route_exit_log_shadow_observations_total = IntCounter::with_opts(Opts::new(
-            "ml_label_route_exit_log_shadow_observations_total",
-            "Observações limpas appendadas ao RouteExitLog shadow",
-        ))?;
-        let resolver_route_exit_log_shadow_entries_current = IntGauge::with_opts(Opts::new(
-            "ml_label_route_exit_log_shadow_entries_current",
-            "Entradas vivas retidas no RouteExitLog shadow",
-        ))?;
-        let resolver_route_exit_log_shadow_routes_current = IntGauge::with_opts(Opts::new(
-            "ml_label_route_exit_log_shadow_routes_current",
-            "Rotas vivas retidas no RouteExitLog shadow",
-        ))?;
-        let resolver_route_exit_log_shadow_compared_total = IntCounter::with_opts(Opts::new(
-            "ml_label_route_exit_log_shadow_compared_total",
-            "Horizontes canônicos comparados contra RouteExitLog shadow",
-        ))?;
-        let resolver_route_exit_log_shadow_diverged_total = IntCounter::with_opts(Opts::new(
-            "ml_label_route_exit_log_shadow_diverged_total",
-            "Divergências entre LabelResolver canônico e RouteExitLog shadow",
-        ))?;
-        let resolver_route_exit_log_shadow_pruned_total = IntCounter::with_opts(Opts::new(
-            "ml_label_route_exit_log_shadow_pruned_total",
-            "Observações removidas por retenção do RouteExitLog shadow",
-        ))?;
 
         registry.register(Box::new(opportunities_seen_total.clone()))?;
         registry.register(Box::new(sample_decisions_total.clone()))?;
@@ -612,27 +573,6 @@ impl MlPrometheusMetrics {
         registry.register(Box::new(resolver_async_observation_processed_total.clone()))?;
         registry.register(Box::new(resolver_async_sweep_enqueued_total.clone()))?;
         registry.register(Box::new(resolver_async_sweep_processed_total.clone()))?;
-        registry.register(Box::new(
-            resolver_route_exit_log_shadow_enabled_current.clone(),
-        ))?;
-        registry.register(Box::new(
-            resolver_route_exit_log_shadow_observations_total.clone(),
-        ))?;
-        registry.register(Box::new(
-            resolver_route_exit_log_shadow_entries_current.clone(),
-        ))?;
-        registry.register(Box::new(
-            resolver_route_exit_log_shadow_routes_current.clone(),
-        ))?;
-        registry.register(Box::new(
-            resolver_route_exit_log_shadow_compared_total.clone(),
-        ))?;
-        registry.register(Box::new(
-            resolver_route_exit_log_shadow_diverged_total.clone(),
-        ))?;
-        registry.register(Box::new(
-            resolver_route_exit_log_shadow_pruned_total.clone(),
-        ))?;
 
         // Pre-touch todos os labels — garante que aparecem em `gather()`
         // desde o primeiro scrape Prometheus, mesmo sem incrementos ainda.
@@ -764,13 +704,6 @@ impl MlPrometheusMetrics {
             resolver_async_observation_processed_total,
             resolver_async_sweep_enqueued_total,
             resolver_async_sweep_processed_total,
-            resolver_route_exit_log_shadow_enabled_current,
-            resolver_route_exit_log_shadow_observations_total,
-            resolver_route_exit_log_shadow_entries_current,
-            resolver_route_exit_log_shadow_routes_current,
-            resolver_route_exit_log_shadow_compared_total,
-            resolver_route_exit_log_shadow_diverged_total,
-            resolver_route_exit_log_shadow_pruned_total,
             last_seen: ServerMetricsSnapshot::default(),
             last_broadcaster: BroadcasterSnapshot::default(),
             last_economic: EconomicSnapshot::default(),
@@ -976,27 +909,6 @@ impl MlPrometheusMetrics {
             rm.async_observation_processed_total.load(Ordering::Relaxed);
         let resolver_async_sweep_enqueued = rm.async_sweep_enqueued_total.load(Ordering::Relaxed);
         let resolver_async_sweep_processed = rm.async_sweep_processed_total.load(Ordering::Relaxed);
-        let route_exit_log_shadow_enabled = rm
-            .route_exit_log_shadow_enabled_current
-            .load(Ordering::Relaxed);
-        let route_exit_log_shadow_observations = rm
-            .route_exit_log_shadow_observations_total
-            .load(Ordering::Relaxed);
-        let route_exit_log_shadow_entries = rm
-            .route_exit_log_shadow_entries_current
-            .load(Ordering::Relaxed);
-        let route_exit_log_shadow_routes = rm
-            .route_exit_log_shadow_routes_current
-            .load(Ordering::Relaxed);
-        let route_exit_log_shadow_compared = rm
-            .route_exit_log_shadow_compared_total
-            .load(Ordering::Relaxed);
-        let route_exit_log_shadow_diverged = rm
-            .route_exit_log_shadow_diverged_total
-            .load(Ordering::Relaxed);
-        let route_exit_log_shadow_pruned = rm
-            .route_exit_log_shadow_pruned_total
-            .load(Ordering::Relaxed);
 
         self.labels_created_total
             .inc_by(pending.saturating_sub(self.last_resolver.pending_created));
@@ -1098,31 +1010,6 @@ impl MlPrometheusMetrics {
             resolver_async_sweep_processed
                 .saturating_sub(self.last_resolver.resolver_async_sweep_processed),
         );
-        self.resolver_route_exit_log_shadow_enabled_current
-            .set(route_exit_log_shadow_enabled.min(i64::MAX as u64) as i64);
-        self.resolver_route_exit_log_shadow_observations_total
-            .inc_by(
-                route_exit_log_shadow_observations.saturating_sub(
-                    self.last_resolver
-                        .resolver_route_exit_log_shadow_observations,
-                ),
-            );
-        self.resolver_route_exit_log_shadow_entries_current
-            .set(route_exit_log_shadow_entries.min(i64::MAX as u64) as i64);
-        self.resolver_route_exit_log_shadow_routes_current
-            .set(route_exit_log_shadow_routes.min(i64::MAX as u64) as i64);
-        self.resolver_route_exit_log_shadow_compared_total.inc_by(
-            route_exit_log_shadow_compared
-                .saturating_sub(self.last_resolver.resolver_route_exit_log_shadow_compared),
-        );
-        self.resolver_route_exit_log_shadow_diverged_total.inc_by(
-            route_exit_log_shadow_diverged
-                .saturating_sub(self.last_resolver.resolver_route_exit_log_shadow_diverged),
-        );
-        self.resolver_route_exit_log_shadow_pruned_total.inc_by(
-            route_exit_log_shadow_pruned
-                .saturating_sub(self.last_resolver.resolver_route_exit_log_shadow_pruned),
-        );
 
         self.last_resolver = ResolverSnapshot {
             pending_created: pending,
@@ -1155,10 +1042,6 @@ impl MlPrometheusMetrics {
             resolver_async_observation_processed,
             resolver_async_sweep_enqueued,
             resolver_async_sweep_processed,
-            resolver_route_exit_log_shadow_observations: route_exit_log_shadow_observations,
-            resolver_route_exit_log_shadow_compared: route_exit_log_shadow_compared,
-            resolver_route_exit_log_shadow_diverged: route_exit_log_shadow_diverged,
-            resolver_route_exit_log_shadow_pruned: route_exit_log_shadow_pruned,
         };
     }
 
@@ -1361,9 +1244,6 @@ mod tests {
         assert!(names.contains(&"ml_label_resolver_shutdown_flush_ns_total".to_string()));
         assert!(names.contains(&"ml_label_resolver_async_queue_depth_current".to_string()));
         assert!(names.contains(&"ml_label_resolver_async_queue_full_total".to_string()));
-        assert!(names.contains(&"ml_label_route_exit_log_shadow_enabled_current".to_string()));
-        assert!(names.contains(&"ml_label_route_exit_log_shadow_compared_total".to_string()));
-        assert!(names.contains(&"ml_label_route_exit_log_shadow_diverged_total".to_string()));
     }
 
     #[test]
