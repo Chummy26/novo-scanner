@@ -446,6 +446,7 @@ async fn process_ml_cycle_batch(
     if background_events > 0 {
         metrics.record_ml_background_event_estimate(ml_background_elapsed_ns / background_events);
     }
+    metrics.record_current_ml_background_batch_events(background_events);
     metrics.record_ml_background_with_budget(ml_background_elapsed_ns, batch.cycle_budget_ns);
     metrics.record_current_ml_stage("background_pass_total", ml_background_elapsed_ns);
     metrics.record_current_ml_stage("batch_total", batch_t0.elapsed().as_nanos() as u64);

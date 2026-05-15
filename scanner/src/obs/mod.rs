@@ -41,6 +41,8 @@ pub struct Metrics {
     pub ml_background_hist: Mutex<Histogram<u64>>,
     /// Estimated per-event cost inside background ML/cache batches, ns/event.
     pub ml_background_event_hist: Mutex<Histogram<u64>>,
+    /// Background events processed per ML route-shard batch.
+    pub ml_background_events_per_batch_hist: Mutex<Histogram<u64>>,
     /// Batches de observações aguardando processamento ML assíncrono.
     pub ml_cycle_queue_depth_current: IntGauge,
     /// Eventos de rota aguardando processamento ML assíncrono.
@@ -71,12 +73,18 @@ pub struct Metrics {
     pub ml_cycle_stage_ns_total: IntCounterVec,
     /// Operações acumuladas por estágio do pipeline ML shardado.
     pub ml_cycle_stage_ops_total: IntCounterVec,
+    /// Última duração observada por estágio do pipeline ML shardado.
+    pub ml_cycle_stage_last_ns: IntGaugeVec,
+    /// Maior duração observada por estágio do pipeline ML shardado.
+    pub ml_cycle_stage_max_ns: IntGaugeVec,
     /// Batches ML processados por shard.
     pub ml_cycle_shard_batches_processed_total: IntCounterVec,
     /// Eventos ML processados por shard.
     pub ml_cycle_shard_events_processed_total: IntCounterVec,
     /// Tempo total de batches ML processados por shard.
     pub ml_cycle_shard_batch_ns_total: IntCounterVec,
+    /// Maior quantidade de eventos background em um batch por shard.
+    pub ml_cycle_shard_background_events_max: IntGaugeVec,
     /// Last full spread loop processing latency, excluding scheduler sleep, ns.
     pub full_cycle_last_ns: IntGauge,
     /// Max full spread loop processing latency observed in this process, ns.
@@ -89,6 +97,8 @@ pub struct Metrics {
     pub ml_background_last_ns: IntGauge,
     /// Max background ML/cache pass latency observed in this process, ns.
     pub ml_background_max_ns: IntGauge,
+    /// Max background events observed in a route-shard batch.
+    pub ml_background_events_per_batch_max: IntGauge,
     /// Background ML/cache passes whose latency exceeded the configured budget.
     pub ml_background_over_budget_total: IntCounter,
     /// Current process working set, bytes. Populated on scrape when available.
@@ -114,8 +124,16 @@ fn ml_shard_label(shard_index: usize) -> &'static str {
 
 thread_local! {
     static CURRENT_ML_SHARD: Cell<Option<usize>> = const { Cell::new(None) };
-    static ML_STAGE_COUNTER_CACHE: RefCell<HashMap<(usize, &'static str), (IntCounter, IntCounter)>> =
+    static ML_STAGE_COUNTER_CACHE: RefCell<HashMap<(usize, &'static str), MlStageHandles>> =
         RefCell::new(HashMap::new());
+}
+
+#[derive(Clone)]
+struct MlStageHandles {
+    ns_total: IntCounter,
+    ops_total: IntCounter,
+    last_ns: IntGauge,
+    max_ns: IntGauge,
 }
 
 pub struct MlShardScope {
@@ -230,6 +248,11 @@ impl Metrics {
                 "Max background ML/cache pass latency observed in this process, ns",
             )
             .expect("register ml_background_max_ns");
+            let ml_background_events_per_batch_max = IntGauge::new(
+                "scanner_ml_background_events_per_batch_max",
+                "Max background route observations processed in one ML shard batch",
+            )
+            .expect("register ml_background_events_per_batch_max");
             let ml_background_over_budget_total = IntCounter::new(
                 "scanner_ml_background_over_budget_total",
                 "Background ML/cache passes whose latency exceeded budget",
@@ -328,6 +351,22 @@ impl Metrics {
                 &["shard", "stage"],
             )
             .expect("register ml_cycle_stage_ops_total");
+            let ml_cycle_stage_last_ns = IntGaugeVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_stage_last_ns",
+                    "Last observed latency by ML route-shard pipeline stage",
+                ),
+                &["shard", "stage"],
+            )
+            .expect("register ml_cycle_stage_last_ns");
+            let ml_cycle_stage_max_ns = IntGaugeVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_stage_max_ns",
+                    "Max observed latency by ML route-shard pipeline stage",
+                ),
+                &["shard", "stage"],
+            )
+            .expect("register ml_cycle_stage_max_ns");
             let ml_cycle_shard_batches_processed_total = IntCounterVec::new(
                 Opts::new(
                     "scanner_ml_cycle_shard_batches_processed_total",
@@ -352,6 +391,14 @@ impl Metrics {
                 &["shard"],
             )
             .expect("register ml_cycle_shard_batch_ns_total");
+            let ml_cycle_shard_background_events_max = IntGaugeVec::new(
+                Opts::new(
+                    "scanner_ml_cycle_shard_background_events_max",
+                    "Max background route observations processed in one batch by shard",
+                ),
+                &["shard"],
+            )
+            .expect("register ml_cycle_shard_background_events_max");
             let process_working_set_bytes = IntGauge::new(
                 "scanner_process_working_set_bytes",
                 "Current process working set, bytes",
@@ -412,6 +459,9 @@ impl Metrics {
                 .register(Box::new(ml_background_max_ns.clone()))
                 .expect("reg");
             registry
+                .register(Box::new(ml_background_events_per_batch_max.clone()))
+                .expect("reg");
+            registry
                 .register(Box::new(ml_background_over_budget_total.clone()))
                 .expect("reg");
             registry
@@ -460,6 +510,12 @@ impl Metrics {
                 .register(Box::new(ml_cycle_stage_ops_total.clone()))
                 .expect("reg");
             registry
+                .register(Box::new(ml_cycle_stage_last_ns.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_stage_max_ns.clone()))
+                .expect("reg");
+            registry
                 .register(Box::new(ml_cycle_shard_batches_processed_total.clone()))
                 .expect("reg");
             registry
@@ -467,6 +523,9 @@ impl Metrics {
                 .expect("reg");
             registry
                 .register(Box::new(ml_cycle_shard_batch_ns_total.clone()))
+                .expect("reg");
+            registry
+                .register(Box::new(ml_cycle_shard_background_events_max.clone()))
                 .expect("reg");
             registry
                 .register(Box::new(process_working_set_bytes.clone()))
@@ -503,6 +562,7 @@ impl Metrics {
                 "ml_foreground",
                 "ml_background",
                 "ml_background_event",
+                "ml_background_events_per_batch",
             ] {
                 hist_record_dropped_total
                     .with_label_values(&[histogram])
@@ -518,6 +578,7 @@ impl Metrics {
             let ml_foreground_hist = Mutex::new(new_hist());
             let ml_background_hist = Mutex::new(new_hist());
             let ml_background_event_hist = Mutex::new(new_hist());
+            let ml_background_events_per_batch_hist = Mutex::new(new_hist());
 
             Metrics {
                 registry,
@@ -537,6 +598,7 @@ impl Metrics {
                 ml_foreground_hist,
                 ml_background_hist,
                 ml_background_event_hist,
+                ml_background_events_per_batch_hist,
                 ml_cycle_queue_depth_current,
                 ml_cycle_queue_events_current,
                 ml_cycle_batch_inflight_current,
@@ -552,15 +614,19 @@ impl Metrics {
                 ml_cycle_shard_events_inflight_current,
                 ml_cycle_stage_ns_total,
                 ml_cycle_stage_ops_total,
+                ml_cycle_stage_last_ns,
+                ml_cycle_stage_max_ns,
                 ml_cycle_shard_batches_processed_total,
                 ml_cycle_shard_events_processed_total,
                 ml_cycle_shard_batch_ns_total,
+                ml_cycle_shard_background_events_max,
                 full_cycle_last_ns,
                 full_cycle_max_ns,
                 full_cycle_budget_ns,
                 full_cycle_over_budget_total,
                 ml_background_last_ns,
                 ml_background_max_ns,
+                ml_background_events_per_batch_max,
                 ml_background_over_budget_total,
                 process_working_set_bytes,
                 process_private_bytes,
@@ -589,23 +655,32 @@ impl Metrics {
 
     #[inline]
     pub fn record_ml_stage(&self, shard_index: usize, stage: &'static str, ns: u64) {
-        let (ns_counter, ops_counter) = ML_STAGE_COUNTER_CACHE.with(|cache| {
+        let handles = ML_STAGE_COUNTER_CACHE.with(|cache| {
             let mut cache = cache.borrow_mut();
             cache
                 .entry((shard_index, stage))
                 .or_insert_with(|| {
                     let shard = ml_shard_label(shard_index);
-                    (
-                        self.ml_cycle_stage_ns_total
+                    MlStageHandles {
+                        ns_total: self
+                            .ml_cycle_stage_ns_total
                             .with_label_values(&[shard, stage]),
-                        self.ml_cycle_stage_ops_total
+                        ops_total: self
+                            .ml_cycle_stage_ops_total
                             .with_label_values(&[shard, stage]),
-                    )
+                        last_ns: self
+                            .ml_cycle_stage_last_ns
+                            .with_label_values(&[shard, stage]),
+                        max_ns: self
+                            .ml_cycle_stage_max_ns
+                            .with_label_values(&[shard, stage]),
+                    }
                 })
                 .clone()
         });
-        ns_counter.inc_by(ns);
-        ops_counter.inc();
+        handles.ns_total.inc_by(ns);
+        handles.ops_total.inc();
+        record_last_max(&handles.last_ns, &handles.max_ns, ns);
     }
 
     #[inline]
@@ -620,6 +695,36 @@ impl Metrics {
         self.ml_cycle_shard_batch_ns_total
             .with_label_values(&[shard])
             .inc_by(ns);
+    }
+
+    #[inline]
+    pub fn record_current_ml_background_batch_events(&self, events: u64) {
+        CURRENT_ML_SHARD.with(|slot| {
+            if let Some(shard) = slot.get() {
+                self.record_ml_background_batch_events(shard, events);
+            }
+        });
+    }
+
+    #[inline]
+    pub fn record_ml_background_batch_events(&self, shard_index: usize, events: u64) {
+        record_hist(
+            &self.ml_background_events_per_batch_hist,
+            events,
+            &self.hist_record_dropped_total,
+            "ml_background_events_per_batch",
+        );
+        let events_i64 = gauge_value(events);
+        if events_i64 > self.ml_background_events_per_batch_max.get() {
+            self.ml_background_events_per_batch_max.set(events_i64);
+        }
+        let shard = ml_shard_label(shard_index);
+        let shard_max = self
+            .ml_cycle_shard_background_events_max
+            .with_label_values(&[shard]);
+        if events_i64 > shard_max.get() {
+            shard_max.set(events_i64);
+        }
     }
 
     #[inline]
@@ -954,5 +1059,51 @@ mod tests {
         let h = m.ml_background_event_hist.lock();
         assert!(h.len() > 0);
         assert!(h.value_at_quantile(0.99) >= 42);
+    }
+
+    #[test]
+    fn record_ml_stage_tracks_last_and_max() {
+        let m = Metrics::init();
+        let shard = 31usize;
+        let stage = "unit_test_stage_latency";
+
+        m.record_ml_stage(shard, stage, 11);
+        m.record_ml_stage(shard, stage, 7);
+
+        let shard_label = ml_shard_label(shard);
+        assert_eq!(
+            m.ml_cycle_stage_last_ns
+                .with_label_values(&[shard_label, stage])
+                .get(),
+            7
+        );
+        assert!(
+            m.ml_cycle_stage_max_ns
+                .with_label_values(&[shard_label, stage])
+                .get()
+                >= 11
+        );
+    }
+
+    #[test]
+    fn record_background_events_per_batch_tracks_histogram_and_max() {
+        let m = Metrics::init();
+        let shard = 30usize;
+        m.record_ml_background_batch_events(shard, 123);
+        m.record_ml_background_batch_events(shard, 42);
+
+        assert!(
+            m.ml_background_events_per_batch_hist
+                .lock()
+                .value_at_quantile(0.99)
+                >= 123
+        );
+        assert!(m.ml_background_events_per_batch_max.get() >= 123);
+        assert!(
+            m.ml_cycle_shard_background_events_max
+                .with_label_values(&[ml_shard_label(shard)])
+                .get()
+                >= 123
+        );
     }
 }

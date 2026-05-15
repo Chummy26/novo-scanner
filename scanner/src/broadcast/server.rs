@@ -862,6 +862,16 @@ async fn rest_metrics(State(state): State<BroadcastState>) -> impl IntoResponse 
             ));
         }
     }
+    if let Some(h) = metrics.ml_background_events_per_batch_hist.try_lock() {
+        if h.len() > 0 {
+            extra.push_str(&format!(
+                "# HELP scanner_ml_background_events_per_batch_p99 Background route observations processed per ML shard batch p99\n\
+                 # TYPE scanner_ml_background_events_per_batch_p99 gauge\n\
+                 scanner_ml_background_events_per_batch_p99 {}\n",
+                h.value_at_quantile(0.99)
+            ));
+        }
+    }
     let history_stats = state.history.read().stats();
     extra.push_str(&format!(
         "# HELP scanner_broadcast_history_symbols Symbols retained in the UI opportunity history store\n\
