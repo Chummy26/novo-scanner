@@ -419,6 +419,8 @@ mod tests {
             features_t0: FeaturesT0 {
                 half_spread_buy_now: None,
                 half_spread_sell_now: None,
+                gross_if_closed_now_pct: 1.3,
+                t0_round_trip_near_zero: false,
                 tail_ratio_p99_p95: None,
                 entry_p25_24h: None,
                 entry_p50_24h: None,

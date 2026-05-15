@@ -106,6 +106,8 @@ pub fn run_full_audit() -> LeakageAuditReport {
         "audit_hindsight_best_exit",
         "audit_hindsight_best_gross",
         "audit_hindsight_t_to_best",
+        "audit_first_hit_exit_near_zero",
+        "audit_spread_artifact_kind",
         "n_clean_future_samples",
         "first_exit_ge_label_floor",
         "t_to_first_hit_s",

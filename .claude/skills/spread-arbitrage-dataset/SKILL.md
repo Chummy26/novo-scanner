@@ -294,6 +294,7 @@ Agrega poder ou robustez, mas a falta em fase 1 não impede um primeiro modelo d
 - Múltiplas janelas rolantes em paralelo além das duas mínimas (§6.1).
 - Lifecycle estruturado rico de listing/delisting/halt e eventos externos. O mínimo anti-survivorship não é opcional: o dataset precisa carregar pelo menos idade ou `first_seen`, último ponto observado ou `last_seen` quando disponível, e `censor_reason` nas amostras censuradas. A classificação rica do evento pode ficar para fase posterior.
 - Campos de hindsight (`audit_*`) — auditoria offline; podem ser adicionados depois sem retro-coletar, pois a observação contínua já contém a informação para reconstrução.
+- Auditoria de artefatos discretos de spread. Sinais conhecidos em `t₀`, como `gross_if_closed_now_pct = entry_locked + exit_start` e flag de simetria quase zero, podem ser feature PIT. Sinais conhecidos só após a janela, como `S_saída(t_realize) = 0`, pertencem a `audit_*`/filtro de treino, nunca a `features_t0`.
 - Survival modeling explícito (Random Survival Forest, Ishwaran et al. 2008, *Annals of Applied Statistics* 2(3)) — ganho marginal quando o trainer quer estimar funções de sobrevivência contínuas; a categorização em três níveis basta para análises por horizonte com IPCW.
 
 ### 6.3 Critério para promoção e anti-padrão

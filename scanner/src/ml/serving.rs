@@ -1256,6 +1256,7 @@ impl MlServer {
         &self,
         route: RouteId,
         entry_spread: f32,
+        exit_spread: f32,
         now_ns: u64,
         lifecycle: Option<RouteLifecycle>,
         half_spread_buy_now: Option<f32>,
@@ -1288,10 +1289,14 @@ impl MlServer {
         let oldest_cache_ts_pre = stats_24h.oldest_observation_ns;
         let time_alive_at_t0_s = self.time_alive_snapshot(route, entry_spread, now_ns);
         let listing_age_days_pre_observe = self.listing.listing_age_days(route, now_ns);
+        let gross_if_closed_now_pct = entry_spread + exit_spread;
 
         let features = FeaturesT0 {
             half_spread_buy_now,
             half_spread_sell_now,
+            gross_if_closed_now_pct,
+            t0_round_trip_near_zero: gross_if_closed_now_pct.is_finite()
+                && gross_if_closed_now_pct.abs() <= 0.0001,
             tail_ratio_p99_p95: stats_24h.tail_ratio_p99_p95,
             entry_p25_24h: stats_24h.entry_p25,
             entry_p50_24h: stats_24h.entry_p50,
@@ -1792,6 +1797,7 @@ impl MlServer {
             Some(self.build_features_t0(
                 route,
                 entry_spread,
+                exit_spread,
                 now_ns,
                 lifecycle,
                 half_spread_buy_now,
@@ -2114,6 +2120,7 @@ impl MlServer {
             let mut features = self.build_features_t0(
                 route,
                 entry_spread,
+                exit_spread,
                 now_ns,
                 lifecycle,
                 half_spread_buy_now,

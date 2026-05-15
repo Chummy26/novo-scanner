@@ -59,7 +59,9 @@ use crate::ml::persistence::sample_id::route_id_key;
 
 /// Versão atual do schema do `LabeledTrade`. Bump em qualquer alteração
 /// de campos persistidos. Histórico em git log.
-pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 11;
+pub const LABELED_TRADE_SCHEMA_VERSION: u16 = 12;
+
+const SPREAD_ARTIFACT_EPS_PCT: f32 = 0.0001;
 
 #[cfg(test)]
 use crate::ml::SCANNER_VERSION;
@@ -128,6 +130,12 @@ pub struct FeaturesT0 {
     /// Meio-spread da perna de venda, também normalizado pelo ask de compra
     /// em t0 para manter a mesma base de `entry_spread` e `exit_spread`.
     pub half_spread_sell_now: Option<f32>,
+    /// PnL bruto hipotético de fechar imediatamente em t0.
+    /// É PIT e ajuda o trainer/auditoria a distinguir oportunidade real de
+    /// simetria mecânica do book (`entry + exit_start ~= 0`).
+    pub gross_if_closed_now_pct: f32,
+    /// Flag PIT conservadora para spreads quase simétricos em t0.
+    pub t0_round_trip_near_zero: bool,
 
     // --- Cauda (skill §4 Teste 1) ----------------------------------------
     pub tail_ratio_p99_p95: Option<f32>,
@@ -382,6 +390,7 @@ impl LabeledTrade {
                 r#""entry_locked_pct":{},"exit_start_pct":{},"#,
                 r#""features_t0":{{"#,
                 r#""half_spread_buy_now":{},"half_spread_sell_now":{},"#,
+                r#""gross_if_closed_now_pct":{},"t0_round_trip_near_zero":{},"#,
                 r#""tail_ratio_p99_p95":{},"entry_p25_24h":{},"entry_p50_24h":{},"#,
                 r#""entry_p75_24h":{},"entry_p95_24h":{},"#,
                 r#""entry_rank_percentile_24h":{},"entry_minus_p50_24h":{},"entry_mad_robust_24h":{},"#,
@@ -401,6 +410,7 @@ impl LabeledTrade {
                 r#""label_floor_pct":{},"first_exit_ge_label_floor_ts_ns":{},"#,
                 r#""first_exit_ge_label_floor_pct":{},"t_to_first_hit_s":{},"#,
                 r#""label_floor_hits":{},"#,
+                r#""audit_first_hit_exit_near_zero":{},"audit_spread_artifact_kind":"{}","#,
                 r#""outcome":"{}","censor_reason":{},"#,
                 r#""observed_until_ns":{},"label_window_closed_at_ns":{},"closed_ts_ns":{},"written_ts_ns":{},"#,
                 r#""policy_metadata":{{"baseline_model_version":"{}","#,
@@ -445,6 +455,8 @@ impl LabeledTrade {
             f32_or_null(self.exit_start_pct),
             opt_f32(self.features_t0.half_spread_buy_now),
             opt_f32(self.features_t0.half_spread_sell_now),
+            f32_or_null(self.features_t0.gross_if_closed_now_pct),
+            self.features_t0.t0_round_trip_near_zero,
             opt_f32(self.features_t0.tail_ratio_p99_p95),
             opt_f32(self.features_t0.entry_p25_24h),
             opt_f32(self.features_t0.entry_p50_24h),
@@ -486,6 +498,8 @@ impl LabeledTrade {
             opt_f32(self.first_exit_ge_label_floor_pct),
             opt_u32(self.t_to_first_hit_s),
             label_floor_hits,
+            self.audit_first_hit_exit_near_zero(),
+            self.audit_spread_artifact_kind(),
             self.outcome.as_str(),
             censor_str,
             self.observed_until_ns,
@@ -528,6 +542,27 @@ impl LabeledTrade {
             f32_or_null(self.sampling_probability),
             self.sampling_probability_kind,
         )
+    }
+
+    fn audit_first_hit_exit_near_zero(&self) -> bool {
+        self.first_exit_ge_label_floor_pct
+            .map(|exit| exit.is_finite() && exit.abs() <= SPREAD_ARTIFACT_EPS_PCT)
+            .unwrap_or(false)
+    }
+
+    fn audit_spread_artifact_kind(&self) -> &'static str {
+        let entry_positive = self.entry_locked_pct.is_finite() && self.entry_locked_pct > 0.0;
+        let t0_symmetric = self.features_t0.t0_round_trip_near_zero;
+        let hit_zero = self.audit_first_hit_exit_near_zero();
+        if entry_positive && t0_symmetric && hit_zero {
+            "symmetric_t0_zero_exit_hit"
+        } else if entry_positive && hit_zero {
+            "zero_exit_hit"
+        } else if entry_positive && t0_symmetric {
+            "symmetric_t0"
+        } else {
+            "none"
+        }
     }
 }
 
@@ -646,6 +681,8 @@ mod tests {
             features_t0: FeaturesT0 {
                 half_spread_buy_now: Some(0.025),
                 half_spread_sell_now: Some(0.030),
+                gross_if_closed_now_pct: 1.3,
+                t0_round_trip_near_zero: false,
                 tail_ratio_p99_p95: Some(1.8),
                 entry_p25_24h: Some(1.4),
                 entry_p50_24h: Some(2.0),
@@ -804,6 +841,8 @@ mod tests {
         );
         assert_eq!(v["features_t0"]["half_spread_buy_now"], 0.025);
         assert_eq!(v["features_t0"]["half_spread_sell_now"], 0.03);
+        assert_eq!(v["features_t0"]["gross_if_closed_now_pct"], 1.3);
+        assert_eq!(v["features_t0"]["t0_round_trip_near_zero"], false);
         assert_eq!(v["features_t0"]["n_cache_observations_at_t0"], 850);
         assert_eq!(v["features_t0"]["entry_p95_24h"], 3.0);
         assert_eq!(v["features_t0"]["entry_p50_1h"], 2.1);
@@ -827,6 +866,8 @@ mod tests {
             "nome antigo não deve sair no v6"
         );
         assert_eq!(v["audit_hindsight_best_exit_pct"], -0.3);
+        assert_eq!(v["audit_first_hit_exit_near_zero"], false);
+        assert_eq!(v["audit_spread_artifact_kind"], "none");
         assert!(v["features_t0"].get("buy_book_age_ms").is_none());
         assert!(v["features_t0"].get("sell_book_age_ms").is_none());
         assert!(v["features_t0"].get("halt_active").is_none());
@@ -872,6 +913,23 @@ mod tests {
         assert!(v["first_exit_ge_label_floor_ts_ns"].is_null());
         // Mesmo em miss, audit_hindsight_best_exit_pct é um número.
         assert!(v["audit_hindsight_best_exit_pct"].is_number());
+    }
+
+    #[test]
+    fn zero_exit_hit_symmetric_t0_is_audited_not_feature_leaked() {
+        let mut l = mk_label();
+        l.entry_locked_pct = 11.111111;
+        l.exit_start_pct = -11.111111;
+        l.features_t0.gross_if_closed_now_pct = 0.0;
+        l.features_t0.t0_round_trip_near_zero = true;
+        l.first_exit_ge_label_floor_pct = Some(0.0);
+        let v: serde_json::Value = serde_json::from_str(&l.to_json_line()).unwrap();
+        assert_eq!(v["features_t0"]["t0_round_trip_near_zero"], true);
+        assert_eq!(v["audit_first_hit_exit_near_zero"], true);
+        assert_eq!(
+            v["audit_spread_artifact_kind"],
+            "symmetric_t0_zero_exit_hit"
+        );
     }
 
     #[test]
