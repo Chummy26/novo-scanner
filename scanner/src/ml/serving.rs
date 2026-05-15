@@ -53,7 +53,8 @@ use crate::ml::persistence::label_resolver::{DEFAULT_HORIZONS_S, DEFAULT_LABEL_F
 use crate::ml::persistence::sample_id::sample_id_of;
 use crate::ml::persistence::{
     AcceptedSample, DecisionResult, FeaturesT0, LabelResolver, PolicyMetadata, RawSample,
-    RawWriterHandle, RouteDecimator, RouteRanking, SamplingTier,
+    RawWriterHandle, RouteDecimator, RouteRanking, SamplingTier, ACCEPTED_SAMPLE_SCHEMA_VERSION,
+    LABELED_TRADE_SCHEMA_VERSION, RAW_SAMPLE_SCHEMA_VERSION,
 };
 use crate::ml::trigger::{SampleDecision, SamplingTrigger};
 use ahash::AHashMap;
@@ -410,6 +411,7 @@ fn compute_supervised_config_hash(
             "label_priority_rerank_interval_s={}|",
             "ml_cycle_shards={}|",
             "recommendation_cooldown_ns={}|",
+            "accepted_schema_version={}|labeled_schema_version={}|",
             "feature_windows_s=[3600,86400,604800]|opportunity_alive_threshold_pct={:.6}|",
             "hot_cache_policy={}"
         ),
@@ -430,6 +432,8 @@ fn compute_supervised_config_hash(
         label_priority_rerank_interval_s,
         ml_cycle_shards.max(1),
         recommendation_cooldown_ns,
+        ACCEPTED_SAMPLE_SCHEMA_VERSION,
+        LABELED_TRADE_SCHEMA_VERSION,
         opportunity_alive_threshold_pct,
         HOT_CACHE_POLICY_VERSION,
     );
@@ -438,10 +442,11 @@ fn compute_supervised_config_hash(
 
 fn compute_raw_persistence_config_hash(supervised_hash: &str, raw_decimation_mod: u64) -> String {
     let config_blob = format!(
-        "scanner_version={}|supervised_config_hash={}|raw_decimation_mod={}|",
+        "scanner_version={}|supervised_config_hash={}|raw_decimation_mod={}|raw_schema_version={}|",
         crate::ml::SCANNER_VERSION,
         supervised_hash,
         raw_decimation_mod,
+        RAW_SAMPLE_SCHEMA_VERSION,
     );
     format!("{:016x}", crate::ml::util::fnv1a_64(config_blob.as_bytes()))
 }
