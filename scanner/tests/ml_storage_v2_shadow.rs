@@ -8,7 +8,8 @@ use parquet::file::properties::WriterProperties;
 use scanner::ml::persistence::sample_id::sample_id_of;
 use scanner::ml::persistence::storage_v2::{
     analyze_record_batch_for_storage_v2, materialize_parquet_file_to_storage_v2_sidecar,
-    StorageV2MaterializeConfig,
+    read_storage_v2_sidecar_as_logical_batches, verify_storage_v2_sidecar_equivalence,
+    StorageV2MaterializeConfig, StorageV2ShadowStatus,
 };
 use scanner::ml::persistence::{
     DatasetKind, LABELED_TRADE_SCHEMA_VERSION, RAW_SAMPLE_SCHEMA_VERSION,
@@ -17,6 +18,15 @@ use scanner::types::Venue;
 use tempfile::tempdir;
 
 fn raw_batch(sample_id: &str, route_id: &str) -> RecordBatch {
+    raw_batch_with_symbol(sample_id, route_id, "BTC-USDT", "BTC-USDT")
+}
+
+fn raw_batch_with_symbol(
+    sample_id: &str,
+    route_id: &str,
+    symbol_name: &str,
+    canonical_symbol: &str,
+) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("ts_ns", DataType::UInt64, false),
         Field::new("cycle_seq", DataType::UInt32, false),
@@ -39,13 +49,58 @@ fn raw_batch(sample_id: &str, route_id: &str) -> RecordBatch {
             Arc::new(UInt16Array::from(vec![RAW_SAMPLE_SCHEMA_VERSION])),
             Arc::new(StringArray::from(vec![sample_id])),
             Arc::new(UInt32Array::from(vec![42])),
-            Arc::new(StringArray::from(vec!["BTC-USDT"])),
-            Arc::new(StringArray::from(vec!["BTC-USDT"])),
+            Arc::new(StringArray::from(vec![symbol_name])),
+            Arc::new(StringArray::from(vec![canonical_symbol])),
             Arc::new(StringArray::from(vec![route_id])),
             Arc::new(StringArray::from(vec!["mexc"])),
             Arc::new(StringArray::from(vec!["bingx"])),
             Arc::new(StringArray::from(vec!["FUTURES"])),
             Arc::new(StringArray::from(vec!["FUTURES"])),
+        ],
+    )
+    .expect("valid raw batch")
+}
+
+fn raw_batch_with_route_dim_conflict() -> RecordBatch {
+    let ts0 = 1_700_000_000_000_000_000;
+    let ts1 = ts0 + 1_000_000_000;
+    let sample_id0 = sample_id_of(ts0, 7, "BTC-USDT", Venue::MexcFut, Venue::BingxFut);
+    let sample_id1 = sample_id_of(ts1, 8, "BTC-USDT", Venue::MexcFut, Venue::BingxFut);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ts_ns", DataType::UInt64, false),
+        Field::new("cycle_seq", DataType::UInt32, false),
+        Field::new("schema_version", DataType::UInt16, false),
+        Field::new("sample_id", DataType::Utf8, false),
+        Field::new("symbol_id", DataType::UInt32, false),
+        Field::new("symbol_name", DataType::Utf8, false),
+        Field::new("canonical_symbol", DataType::Utf8, false),
+        Field::new("route_id", DataType::Utf8, false),
+        Field::new("buy_venue", DataType::Utf8, false),
+        Field::new("sell_venue", DataType::Utf8, false),
+        Field::new("buy_market", DataType::Utf8, false),
+        Field::new("sell_market", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(UInt64Array::from(vec![ts0, ts1])),
+            Arc::new(UInt32Array::from(vec![7, 8])),
+            Arc::new(UInt16Array::from(vec![
+                RAW_SAMPLE_SCHEMA_VERSION,
+                RAW_SAMPLE_SCHEMA_VERSION,
+            ])),
+            Arc::new(StringArray::from(vec![sample_id0, sample_id1])),
+            Arc::new(UInt32Array::from(vec![42, 42])),
+            Arc::new(StringArray::from(vec!["BTC-USDT", "BTC-USDT"])),
+            Arc::new(StringArray::from(vec!["", "BTC-USDT"])),
+            Arc::new(StringArray::from(vec![
+                "BTC-USDT|mexc:FUTURES->bingx:FUTURES",
+                "BTC-USDT|mexc:FUTURES->bingx:FUTURES",
+            ])),
+            Arc::new(StringArray::from(vec!["mexc", "mexc"])),
+            Arc::new(StringArray::from(vec!["bingx", "bingx"])),
+            Arc::new(StringArray::from(vec!["FUTURES", "FUTURES"])),
+            Arc::new(StringArray::from(vec!["FUTURES", "FUTURES"])),
         ],
     )
     .expect("valid raw batch")
@@ -221,6 +276,110 @@ fn storage_v2_sidecar_materializes_fact_and_route_dim_without_touching_v1() {
 }
 
 #[test]
+fn storage_v2_sidecar_reconstructs_logical_batch_equal_to_v1() {
+    let sample_id = sample_id_of(
+        1_700_000_000_000_000_000,
+        7,
+        "BTC-USDT",
+        Venue::MexcFut,
+        Venue::BingxFut,
+    );
+    let batch = raw_batch(&sample_id, "BTC-USDT|mexc:FUTURES->bingx:FUTURES");
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("raw-source.parquet");
+    let out_dir = dir.path().join("v2");
+    write_parquet(&source, &batch);
+
+    let manifest = materialize_parquet_file_to_storage_v2_sidecar(
+        &source,
+        DatasetKind::RawSamples,
+        &out_dir,
+        &StorageV2MaterializeConfig::default(),
+    )
+    .expect("materialize v2 sidecar");
+
+    let reconstructed =
+        read_storage_v2_sidecar_as_logical_batches(&manifest, DatasetKind::RawSamples)
+            .expect("read v2 as logical v1");
+
+    assert_eq!(reconstructed.len(), 1);
+    assert_eq!(
+        format!("{:?}", reconstructed[0].schema()),
+        format!("{:?}", batch.schema())
+    );
+    assert_eq!(reconstructed[0], batch);
+}
+
+#[test]
+fn storage_v2_sidecar_preserves_empty_canonical_symbol_losslessly() {
+    let sample_id = sample_id_of(
+        1_700_000_000_000_000_000,
+        7,
+        "BTC-USDT",
+        Venue::MexcFut,
+        Venue::BingxFut,
+    );
+    let batch = raw_batch_with_symbol(
+        &sample_id,
+        "BTC-USDT|mexc:FUTURES->bingx:FUTURES",
+        "BTC-USDT",
+        "",
+    );
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("raw-source.parquet");
+    let out_dir = dir.path().join("v2");
+    write_parquet(&source, &batch);
+
+    let manifest = materialize_parquet_file_to_storage_v2_sidecar(
+        &source,
+        DatasetKind::RawSamples,
+        &out_dir,
+        &StorageV2MaterializeConfig::default(),
+    )
+    .expect("materialize v2 sidecar");
+
+    let reconstructed =
+        read_storage_v2_sidecar_as_logical_batches(&manifest, DatasetKind::RawSamples)
+            .expect("read v2 as logical v1");
+
+    assert_eq!(reconstructed[0], batch);
+}
+
+#[test]
+fn storage_v2_sidecar_equivalence_gate_compares_v1_and_reconstructed_v2() {
+    let sample_id = sample_id_of(
+        1_700_000_000_000_000_000,
+        7,
+        "BTC-USDT",
+        Venue::MexcFut,
+        Venue::BingxFut,
+    );
+    let batch = raw_batch(&sample_id, "BTC-USDT|mexc:FUTURES->bingx:FUTURES");
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("raw-source.parquet");
+    let out_dir = dir.path().join("v2");
+    write_parquet(&source, &batch);
+
+    let manifest = materialize_parquet_file_to_storage_v2_sidecar(
+        &source,
+        DatasetKind::RawSamples,
+        &out_dir,
+        &StorageV2MaterializeConfig::default(),
+    )
+    .expect("materialize v2 sidecar");
+
+    let equivalence =
+        verify_storage_v2_sidecar_equivalence(&source, &manifest, DatasetKind::RawSamples)
+            .expect("verify v1/v2 equivalence");
+
+    assert_eq!(equivalence.status, StorageV2ShadowStatus::Green);
+    assert_eq!(equivalence.source_rows, 1);
+    assert_eq!(equivalence.reconstructed_rows, 1);
+    assert_eq!(equivalence.mismatched_batches, 0);
+    assert_eq!(equivalence.issues, Vec::<String>::new());
+}
+
+#[test]
 fn storage_v2_sidecar_refuses_contract_mismatch() {
     let batch = raw_batch(
         "00000000000000000000000000000000",
@@ -240,5 +399,25 @@ fn storage_v2_sidecar_refuses_contract_mismatch() {
     .expect_err("bad sample_id must block sidecar publication");
 
     assert!(err.to_string().contains("sample_id_mismatches=1"));
+    assert!(!out_dir.exists() || std::fs::read_dir(&out_dir).unwrap().next().is_none());
+}
+
+#[test]
+fn storage_v2_sidecar_refuses_route_dim_identity_conflict() {
+    let batch = raw_batch_with_route_dim_conflict();
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("conflict-raw-source.parquet");
+    let out_dir = dir.path().join("v2");
+    write_parquet(&source, &batch);
+
+    let err = materialize_parquet_file_to_storage_v2_sidecar(
+        &source,
+        DatasetKind::RawSamples,
+        &out_dir,
+        &StorageV2MaterializeConfig::default(),
+    )
+    .expect_err("route_dim identity drift must block lossless sidecar publication");
+
+    assert!(err.to_string().contains("route_dim_conflicts=1"));
     assert!(!out_dir.exists() || std::fs::read_dir(&out_dir).unwrap().next().is_none());
 }

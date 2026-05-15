@@ -17,7 +17,10 @@ use arrow_array::{
     Array, ArrayRef, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use parquet::arrow::{arrow_reader::ParquetRecordBatchReaderBuilder, ArrowWriter};
+use parquet::arrow::{
+    arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchReaderBuilder},
+    ArrowWriter,
+};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -129,6 +132,8 @@ pub struct StorageV2SidecarManifest {
     pub source_parquet_path: String,
     pub fact_parquet_path: String,
     pub route_dim_parquet_path: String,
+    #[serde(default)]
+    pub logical_schema_fields: Vec<String>,
     pub source_row_count: u64,
     pub fact_row_count: u64,
     pub route_dim_row_count: u64,
@@ -167,6 +172,30 @@ pub struct StorageV2MaterializationReport {
     pub v2_total_bytes: u64,
     pub reduction_bytes: u64,
     pub issues: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageV2EquivalenceReport {
+    pub status: StorageV2ShadowStatus,
+    pub source_parquet_path: String,
+    pub fact_parquet_path: String,
+    pub route_dim_parquet_path: String,
+    pub source_rows: u64,
+    pub reconstructed_rows: u64,
+    pub source_batches: u64,
+    pub reconstructed_batches: u64,
+    pub mismatched_batches: u64,
+    pub issues: Vec<String>,
+}
+
+pub struct StorageV2SidecarLogicalReader {
+    dataset_kind: DatasetKind,
+    logical_schema_fields: Vec<String>,
+    route_dim: BTreeMap<u32, RouteDimEntry>,
+    fact_reader: ParquetRecordBatchReader,
+    expected_rows: u64,
+    rows_read: u64,
+    finished: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -456,6 +485,12 @@ pub fn materialize_parquet_file_to_storage_v2_sidecar(
         .with_context(|| format!("open source {}", source_path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(input)
         .with_context(|| format!("build source reader {}", source_path.display()))?;
+    let logical_schema_fields: Vec<String> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect();
     let mut reader = builder
         .build()
         .with_context(|| format!("read source {}", source_path.display()))?;
@@ -528,6 +563,7 @@ pub fn materialize_parquet_file_to_storage_v2_sidecar(
         source_parquet_path: source_path.display().to_string(),
         fact_parquet_path: fact_path.display().to_string(),
         route_dim_parquet_path: route_dim_path.display().to_string(),
+        logical_schema_fields,
         source_row_count: source_audit.rows,
         fact_row_count,
         route_dim_row_count: route_dim.len() as u64,
@@ -575,6 +611,363 @@ pub fn materialize_parquet_file_to_storage_v2_sidecar(
     })
 }
 
+pub fn read_storage_v2_sidecar_as_logical_batches(
+    manifest: &StorageV2SidecarManifest,
+    dataset_kind: DatasetKind,
+) -> Result<Vec<RecordBatch>> {
+    open_storage_v2_sidecar_logical_reader(manifest, dataset_kind)?.collect()
+}
+
+pub fn open_storage_v2_sidecar_logical_reader(
+    manifest: &StorageV2SidecarManifest,
+    dataset_kind: DatasetKind,
+) -> Result<StorageV2SidecarLogicalReader> {
+    if manifest.dataset_kind != dataset_kind.as_str() {
+        anyhow::bail!(
+            "manifest dataset_kind={} does not match requested {}",
+            manifest.dataset_kind,
+            dataset_kind.as_str()
+        );
+    }
+    if manifest.logical_schema_fields.is_empty() {
+        anyhow::bail!(
+            "storage_v2 manifest missing logical_schema_fields: {}",
+            manifest.source_parquet_path
+        );
+    }
+
+    let route_dim = read_route_dim_parquet(Path::new(&manifest.route_dim_parquet_path))?;
+    if route_dim.len() as u64 != manifest.route_dim_row_count {
+        anyhow::bail!(
+            "route_dim row count mismatch: manifest={} actual={}",
+            manifest.route_dim_row_count,
+            route_dim.len()
+        );
+    }
+
+    let fact_file = File::open(&manifest.fact_parquet_path)
+        .with_context(|| format!("open fact {}", manifest.fact_parquet_path))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(fact_file)
+        .with_context(|| format!("build fact reader {}", manifest.fact_parquet_path))?;
+    let fact_reader = builder
+        .build()
+        .with_context(|| format!("read fact {}", manifest.fact_parquet_path))?;
+
+    Ok(StorageV2SidecarLogicalReader {
+        dataset_kind,
+        logical_schema_fields: manifest.logical_schema_fields.clone(),
+        route_dim,
+        fact_reader,
+        expected_rows: manifest.fact_row_count,
+        rows_read: 0,
+        finished: false,
+    })
+}
+
+impl Iterator for StorageV2SidecarLogicalReader {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.fact_reader.next() {
+            Some(Ok(fact_batch)) => {
+                let logical = reconstruct_logical_batch_from_v2_fact(
+                    self.dataset_kind,
+                    &fact_batch,
+                    &self.route_dim,
+                    &self.logical_schema_fields,
+                );
+                if let Ok(batch) = &logical {
+                    self.rows_read = self.rows_read.saturating_add(batch.num_rows() as u64);
+                }
+                Some(logical)
+            }
+            Some(Err(e)) => Some(Err(e).context("read storage_v2 fact batch")),
+            None if !self.finished => {
+                self.finished = true;
+                if self.rows_read != self.expected_rows {
+                    Some(Err(anyhow::anyhow!(
+                        "fact row count mismatch: manifest={} actual={}",
+                        self.expected_rows,
+                        self.rows_read
+                    )))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    }
+}
+
+pub fn verify_storage_v2_sidecar_equivalence(
+    source_path: &Path,
+    manifest: &StorageV2SidecarManifest,
+    dataset_kind: DatasetKind,
+) -> Result<StorageV2EquivalenceReport> {
+    let mut reconstructed_reader = open_storage_v2_sidecar_logical_reader(manifest, dataset_kind)?;
+    let source_file = File::open(source_path)
+        .with_context(|| format!("open source for equivalence {}", source_path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(source_file)
+        .with_context(|| format!("build source equivalence reader {}", source_path.display()))?;
+    let mut source_reader = builder
+        .build()
+        .with_context(|| format!("read source equivalence {}", source_path.display()))?;
+
+    let mut source_rows = 0u64;
+    let mut reconstructed_rows = 0u64;
+    let mut source_batches = 0u64;
+    let mut reconstructed_batches = 0u64;
+    let mut mismatched_batches = 0u64;
+    let mut issues = Vec::new();
+
+    for (idx, maybe_source_batch) in (&mut source_reader).enumerate() {
+        let source_batch = maybe_source_batch
+            .with_context(|| format!("read source equivalence batch {}", source_path.display()))?;
+        source_batches = source_batches.saturating_add(1);
+        source_rows = source_rows.saturating_add(source_batch.num_rows() as u64);
+        match reconstructed_reader.next() {
+            Some(Ok(reconstructed_batch)) if reconstructed_batch == source_batch => {
+                reconstructed_batches = reconstructed_batches.saturating_add(1);
+                reconstructed_rows =
+                    reconstructed_rows.saturating_add(reconstructed_batch.num_rows() as u64);
+            }
+            Some(Ok(reconstructed_batch)) => {
+                reconstructed_batches = reconstructed_batches.saturating_add(1);
+                reconstructed_rows =
+                    reconstructed_rows.saturating_add(reconstructed_batch.num_rows() as u64);
+                mismatched_batches = mismatched_batches.saturating_add(1);
+                issues.push(format!(
+                    "batch {idx} mismatch: source_rows={} reconstructed_rows={}",
+                    source_batch.num_rows(),
+                    reconstructed_batch.num_rows()
+                ));
+            }
+            Some(Err(e)) => {
+                mismatched_batches = mismatched_batches.saturating_add(1);
+                issues.push(format!("reconstructed batch {idx} error: {e}"));
+            }
+            None => {
+                mismatched_batches = mismatched_batches.saturating_add(1);
+                issues.push(format!("missing reconstructed batch {idx}"));
+            }
+        }
+    }
+    loop {
+        match reconstructed_reader.next() {
+            Some(Ok(batch)) => {
+                reconstructed_batches = reconstructed_batches.saturating_add(1);
+                reconstructed_rows = reconstructed_rows.saturating_add(batch.num_rows() as u64);
+                mismatched_batches = mismatched_batches.saturating_add(1);
+                issues.push(format!(
+                    "extra reconstructed batch {} rows={}",
+                    reconstructed_batches - 1,
+                    batch.num_rows()
+                ));
+            }
+            Some(Err(e)) => {
+                mismatched_batches = mismatched_batches.saturating_add(1);
+                issues.push(format!("extra reconstructed batch error: {e}"));
+            }
+            None => break,
+        }
+    }
+    if source_rows != reconstructed_rows {
+        issues.push(format!(
+            "row count mismatch: source={} reconstructed={}",
+            source_rows, reconstructed_rows
+        ));
+    }
+
+    let status = if issues.is_empty() {
+        StorageV2ShadowStatus::Green
+    } else {
+        StorageV2ShadowStatus::Red
+    };
+    Ok(StorageV2EquivalenceReport {
+        status,
+        source_parquet_path: source_path.display().to_string(),
+        fact_parquet_path: manifest.fact_parquet_path.clone(),
+        route_dim_parquet_path: manifest.route_dim_parquet_path.clone(),
+        source_rows,
+        reconstructed_rows,
+        source_batches,
+        reconstructed_batches,
+        mismatched_batches,
+        issues,
+    })
+}
+
+fn reconstruct_logical_batch_from_v2_fact(
+    dataset_kind: DatasetKind,
+    fact_batch: &RecordBatch,
+    route_dim: &BTreeMap<u32, RouteDimEntry>,
+    logical_schema_fields: &[String],
+) -> Result<RecordBatch> {
+    let route_keys = u32_col(fact_batch, "route_key")?;
+    let timestamps = u64_col(fact_batch, dataset_kind.timestamp_column())?;
+    let cycle_seq = u32_col(fact_batch, "cycle_seq")?;
+
+    let mut fields = Vec::with_capacity(logical_schema_fields.len());
+    let mut arrays = Vec::with_capacity(logical_schema_fields.len());
+
+    for name in logical_schema_fields {
+        if let Some(field) = virtualized_field(name) {
+            fields.push(field);
+            arrays.push(build_virtualized_array(
+                name, route_keys, timestamps, cycle_seq, route_dim,
+            )?);
+            continue;
+        }
+
+        let idx = fact_batch
+            .schema()
+            .index_of(name)
+            .with_context(|| format!("fact missing logical field '{name}'"))?;
+        fields.push(fact_batch.schema().field(idx).as_ref().clone());
+        arrays.push(fact_batch.column(idx).clone());
+    }
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .context("reconstruct storage_v2 logical batch")
+}
+
+fn build_virtualized_array(
+    name: &str,
+    route_keys: &UInt32Array,
+    timestamps: &UInt64Array,
+    cycle_seq: &UInt32Array,
+    route_dim: &BTreeMap<u32, RouteDimEntry>,
+) -> Result<ArrayRef> {
+    match name {
+        "sample_id" => {
+            let mut values = Vec::with_capacity(route_keys.len());
+            for row in 0..route_keys.len() {
+                let entry = route_dim_entry_for_key(route_dim, route_keys, row)?;
+                let buy_venue = parse_venue(&entry.buy_venue, &entry.buy_market)?;
+                let sell_venue = parse_venue(&entry.sell_venue, &entry.sell_market)?;
+                let symbol_for_id = if entry.canonical_symbol.is_empty() {
+                    entry.symbol_name.as_str()
+                } else {
+                    entry.canonical_symbol.as_str()
+                };
+                values.push(sample_id_of(
+                    timestamps.value(row),
+                    cycle_seq.value(row),
+                    symbol_for_id,
+                    buy_venue,
+                    sell_venue,
+                ));
+            }
+            Ok(Arc::new(StringArray::from(values)) as ArrayRef)
+        }
+        "route_id" => string_array_from_route_dim(route_dim, route_keys, |entry| &entry.route_id),
+        "symbol_name" => {
+            string_array_from_route_dim(route_dim, route_keys, |entry| &entry.symbol_name)
+        }
+        "canonical_symbol" => {
+            string_array_from_route_dim(route_dim, route_keys, |entry| &entry.canonical_symbol)
+        }
+        "buy_venue" => string_array_from_route_dim(route_dim, route_keys, |entry| &entry.buy_venue),
+        "sell_venue" => {
+            string_array_from_route_dim(route_dim, route_keys, |entry| &entry.sell_venue)
+        }
+        "buy_market" => {
+            string_array_from_route_dim(route_dim, route_keys, |entry| &entry.buy_market)
+        }
+        "sell_market" => {
+            string_array_from_route_dim(route_dim, route_keys, |entry| &entry.sell_market)
+        }
+        "symbol_id" => {
+            let mut values = Vec::with_capacity(route_keys.len());
+            for row in 0..route_keys.len() {
+                values.push(route_dim_entry_for_key(route_dim, route_keys, row)?.symbol_id);
+            }
+            Ok(Arc::new(UInt32Array::from(values)) as ArrayRef)
+        }
+        _ => anyhow::bail!("unsupported virtualized field '{name}'"),
+    }
+}
+
+fn string_array_from_route_dim(
+    route_dim: &BTreeMap<u32, RouteDimEntry>,
+    route_keys: &UInt32Array,
+    f: impl Fn(&RouteDimEntry) -> &String,
+) -> Result<ArrayRef> {
+    let mut values = Vec::with_capacity(route_keys.len());
+    for row in 0..route_keys.len() {
+        values.push(f(route_dim_entry_for_key(route_dim, route_keys, row)?).clone());
+    }
+    Ok(Arc::new(StringArray::from(values)) as ArrayRef)
+}
+
+fn route_dim_entry_for_key<'a>(
+    route_dim: &'a BTreeMap<u32, RouteDimEntry>,
+    route_keys: &UInt32Array,
+    row: usize,
+) -> Result<&'a RouteDimEntry> {
+    if route_keys.is_null(row) {
+        anyhow::bail!("route_key is null at row {}", row + 1);
+    }
+    let route_key = route_keys.value(row);
+    route_dim
+        .get(&route_key)
+        .with_context(|| format!("route_key {route_key} missing from route_dim"))
+}
+
+fn read_route_dim_parquet(path: &Path) -> Result<BTreeMap<u32, RouteDimEntry>> {
+    let file = File::open(path).with_context(|| format!("open route_dim {}", path.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("build route_dim reader {}", path.display()))?;
+    let mut reader = builder
+        .build()
+        .with_context(|| format!("read route_dim {}", path.display()))?;
+    let mut route_dim = BTreeMap::new();
+
+    for maybe_batch in &mut reader {
+        let batch =
+            maybe_batch.with_context(|| format!("read route_dim batch {}", path.display()))?;
+        let route_key = u32_col(&batch, "route_key")?;
+        let route_id = string_col(&batch, "route_id")?;
+        let symbol_name = string_col(&batch, "symbol_name")?;
+        let canonical_symbol = string_col(&batch, "canonical_symbol")?;
+        let symbol_id = u32_col(&batch, "symbol_id")?;
+        let buy_venue = string_col(&batch, "buy_venue")?;
+        let sell_venue = string_col(&batch, "sell_venue")?;
+        let buy_market = string_col(&batch, "buy_market")?;
+        let sell_market = string_col(&batch, "sell_market")?;
+        for row in 0..batch.num_rows() {
+            if route_key.is_null(row)
+                || route_id.is_null(row)
+                || symbol_name.is_null(row)
+                || canonical_symbol.is_null(row)
+                || symbol_id.is_null(row)
+                || buy_venue.is_null(row)
+                || sell_venue.is_null(row)
+                || buy_market.is_null(row)
+                || sell_market.is_null(row)
+            {
+                anyhow::bail!("route_dim required field is null at row {}", row + 1);
+            }
+            let entry = RouteDimEntry {
+                route_id: route_id.value(row).to_string(),
+                symbol_name: symbol_name.value(row).to_string(),
+                canonical_symbol: canonical_symbol.value(row).to_string(),
+                symbol_id: symbol_id.value(row),
+                buy_venue: buy_venue.value(row).to_string(),
+                sell_venue: sell_venue.value(row).to_string(),
+                buy_market: buy_market.value(row).to_string(),
+                sell_market: sell_market.value(row).to_string(),
+            };
+            if let Some(existing) = route_dim.insert(route_key.value(row), entry.clone()) {
+                if existing != entry {
+                    anyhow::bail!("conflicting duplicate route_key {}", route_key.value(row));
+                }
+            }
+        }
+    }
+    Ok(route_dim)
+}
+
 fn build_fact_batch(
     dataset_kind: DatasetKind,
     batch: &RecordBatch,
@@ -596,15 +989,12 @@ fn build_fact_batch(
                 .try_into()
                 .context("too many routes for u32 route_key")?;
             route_id_to_key.insert(route_id, next);
-            route_dim.insert(next, entry);
+            route_dim.insert(next, entry.clone());
             next
         };
         if let Some(existing) = route_dim.get(&route_key) {
-            if existing.route_id != columns.route_id.value(row) {
-                let expected = route_dim_entry_for_row(&columns, row)?;
-                if existing != &expected {
-                    anyhow::bail!("route_dim conflict for route_key={route_key}");
-                }
+            if existing != &entry {
+                anyhow::bail!("route_dim conflict for route_key={route_key}");
             }
         }
         route_keys.push(route_key);
@@ -698,12 +1088,12 @@ fn route_dim_entry_for_row(columns: &BatchColumns<'_>, row: usize) -> Result<Rou
     Ok(RouteDimEntry {
         route_id: route_id_key(symbol_for_id, route_id),
         symbol_name: symbol_name.to_string(),
-        canonical_symbol: symbol_for_id.to_string(),
+        canonical_symbol: canonical_symbol.to_string(),
         symbol_id: columns.symbol_id.value(row),
         buy_venue: buy_venue.as_str().to_string(),
         sell_venue: sell_venue.as_str().to_string(),
-        buy_market: buy_venue.market().as_str().to_string(),
-        sell_market: sell_venue.market().as_str().to_string(),
+        buy_market: columns.buy_market.value(row).to_string(),
+        sell_market: columns.sell_market.value(row).to_string(),
     })
 }
 
@@ -785,6 +1175,17 @@ fn virtualized_columns() -> &'static [&'static str] {
 
 fn is_virtualized_column(name: &str) -> bool {
     virtualized_columns().contains(&name)
+}
+
+fn virtualized_field(name: &str) -> Option<Field> {
+    match name {
+        "sample_id" | "route_id" | "symbol_name" | "canonical_symbol" | "buy_venue"
+        | "sell_venue" | "buy_market" | "sell_market" => {
+            Some(Field::new(name, DataType::Utf8, false))
+        }
+        "symbol_id" => Some(Field::new(name, DataType::UInt32, false)),
+        _ => None,
+    }
 }
 
 fn analyze_single_file_into_dataset(
@@ -919,12 +1320,12 @@ fn analyze_record_batch_inner_with_digest(
         let route_entry = RouteDimEntry {
             route_id: expected_route_id.clone(),
             symbol_name: symbol_name.to_string(),
-            canonical_symbol: symbol_for_id.to_string(),
+            canonical_symbol: canonical_symbol.to_string(),
             symbol_id,
             buy_venue: buy_venue.as_str().to_string(),
             sell_venue: sell_venue.as_str().to_string(),
-            buy_market: buy_venue.market().as_str().to_string(),
-            sell_market: sell_venue.market().as_str().to_string(),
+            buy_market: buy_market.to_string(),
+            sell_market: sell_market.to_string(),
         };
         if let Some(existing) = route_dim.get(&expected_route_id) {
             if existing != &route_entry {

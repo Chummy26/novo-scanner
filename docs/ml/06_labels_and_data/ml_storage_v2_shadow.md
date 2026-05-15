@@ -67,6 +67,23 @@ Essa etapa nao substitui writer, nao altera a coleta e nao remove o Parquet v1.
 Ela existe para medir compressao real e validar contrato antes de qualquer
 migracao.
 
+## Loader logico V2
+
+O V2 agora tambem possui reader logico:
+
+- carrega `route_dim.parquet`, que e pequeno por arquivo;
+- le `fact.parquet` em streaming, batch a batch;
+- reconstroi `sample_id`, `route_id` e identidade de rota no mesmo schema
+  logico do v1;
+- valida contagem de linhas contra o manifesto;
+- possui gate de equivalencia `v1 parquet -> v2 fact+route_dim -> batch logico`
+  para comparar o batch reconstruido com o batch v1 original.
+
+Esse e o gate necessario para o V2 virar formato principal sem reduzir dados:
+o trainer deve consumir o schema logico reconstruido, nao depender da forma
+fisica compactada. O Parquet v1 pode continuar como shadow ate runs longos
+provarem equivalencia completa.
+
 ## Benchmarks reais
 
 Benchmark materializado em dois snapshots ja auditados:
