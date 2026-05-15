@@ -32,6 +32,7 @@ pub struct RunAuditInput {
     pub label_shutdown: LabelShutdownAudit,
     pub writers: Vec<WriterAudit>,
     pub preexisting_issues: Vec<String>,
+    pub operational: OperationalAudit,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -51,6 +52,26 @@ pub struct WriterAudit {
     pub compaction_failed: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperationalAudit {
+    pub ml_cycle_queue_full_total: u64,
+    pub full_cycle_over_budget_total: u64,
+    pub ml_background_over_budget_total: u64,
+    pub ml_cycle_queue_depth_current: i64,
+    pub ml_cycle_queue_events_current: i64,
+    pub ml_cycle_batch_inflight_current: i64,
+    pub ml_cycle_events_inflight_current: i64,
+    pub full_cycle_budget_ns: u64,
+    pub full_cycle_p99_ns: u64,
+    pub full_cycle_max_ns: u64,
+    pub ml_background_p99_ns: u64,
+    pub ml_background_max_ns: u64,
+    pub ml_cycle_queue_wait_ops_total: u64,
+    pub ml_cycle_queue_wait_ns_total: u64,
+    pub process_working_set_bytes: u64,
+    pub process_private_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunAuditReport {
     pub run_id: String,
@@ -64,6 +85,7 @@ pub struct RunAuditReport {
     pub parquet_enabled: bool,
     pub cycles_started: u64,
     pub label_shutdown: LabelShutdownAudit,
+    pub operational: OperationalAudit,
     pub writers: Vec<WriterAudit>,
     pub datasets: BTreeMap<String, DatasetRunSummary>,
     pub total_projected_7d_bytes: u64,
@@ -174,6 +196,57 @@ fn build_run_audit(input: &RunAuditInput) -> Result<RunAuditReport> {
             ));
         }
     }
+    if input.operational.ml_cycle_queue_full_total != 0 {
+        issues.push(format!(
+            "operational backpressure: ml_cycle_queue_full_total={}",
+            input.operational.ml_cycle_queue_full_total
+        ));
+    }
+    if input.operational.full_cycle_over_budget_total != 0 {
+        issues.push(format!(
+            "operational latency: full_cycle_over_budget_total={} budget_ns={} full_cycle_p99_ns={} full_cycle_max_ns={}",
+            input.operational.full_cycle_over_budget_total,
+            input.operational.full_cycle_budget_ns,
+            input.operational.full_cycle_p99_ns,
+            input.operational.full_cycle_max_ns
+        ));
+    } else if input.operational.full_cycle_budget_ns > 0
+        && input.operational.full_cycle_max_ns > input.operational.full_cycle_budget_ns
+    {
+        issues.push(format!(
+            "operational latency: full_cycle_max_ns={} exceeds budget_ns={} with over_budget counter at 0",
+            input.operational.full_cycle_max_ns, input.operational.full_cycle_budget_ns
+        ));
+    }
+    if input.operational.ml_background_over_budget_total != 0 {
+        issues.push(format!(
+            "operational latency: ml_background_over_budget_total={} budget_ns={} ml_background_p99_ns={} ml_background_max_ns={}",
+            input.operational.ml_background_over_budget_total,
+            input.operational.full_cycle_budget_ns,
+            input.operational.ml_background_p99_ns,
+            input.operational.ml_background_max_ns
+        ));
+    } else if input.operational.full_cycle_budget_ns > 0
+        && input.operational.ml_background_max_ns > input.operational.full_cycle_budget_ns
+    {
+        issues.push(format!(
+            "operational latency: ml_background_max_ns={} exceeds budget_ns={} with over_budget counter at 0",
+            input.operational.ml_background_max_ns, input.operational.full_cycle_budget_ns
+        ));
+    }
+    if input.operational.ml_cycle_queue_depth_current != 0
+        || input.operational.ml_cycle_queue_events_current != 0
+        || input.operational.ml_cycle_batch_inflight_current != 0
+        || input.operational.ml_cycle_events_inflight_current != 0
+    {
+        issues.push(format!(
+            "operational drain mismatch: queue_depth={} queue_events={} inflight_batches={} inflight_events={}",
+            input.operational.ml_cycle_queue_depth_current,
+            input.operational.ml_cycle_queue_events_current,
+            input.operational.ml_cycle_batch_inflight_current,
+            input.operational.ml_cycle_events_inflight_current
+        ));
+    }
 
     let mut datasets = BTreeMap::new();
     let dataset_roots = [
@@ -246,6 +319,7 @@ fn build_run_audit(input: &RunAuditInput) -> Result<RunAuditReport> {
         parquet_enabled: input.parquet_enabled,
         cycles_started: input.cycles_started,
         label_shutdown: input.label_shutdown,
+        operational: input.operational.clone(),
         writers: input.writers.clone(),
         datasets,
         total_projected_7d_bytes,
@@ -631,6 +705,7 @@ mod tests {
                 compaction_failed: 0,
             }],
             preexisting_issues: Vec::new(),
+            operational: OperationalAudit::default(),
         };
 
         let report = write_run_audit(input).expect("audit report");
@@ -678,6 +753,7 @@ mod tests {
                 compaction_failed: 0,
             }],
             preexisting_issues: Vec::new(),
+            operational: OperationalAudit::default(),
         };
 
         let report = write_run_audit(input).expect("audit report");
@@ -690,5 +766,146 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.contains("raw_samples row mismatch: disk_rows=1")));
+    }
+
+    #[test]
+    fn audit_marks_operational_backpressure_unhealthy() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let input = RunAuditInput {
+            run_id: "scanner-777-test".to_string(),
+            pid: 777,
+            started_ns: 1,
+            ended_ns: 1_000_000_001,
+            root_dir: tmp.path().join("ml"),
+            raw_root: tmp.path().join("raw_samples"),
+            accepted_root: tmp.path().join("accepted_samples"),
+            labeled_root: tmp.path().join("labeled_trades"),
+            parquet_enabled: true,
+            strict_lossless: true,
+            cycles_started: 10,
+            label_shutdown: LabelShutdownAudit {
+                closed_total: 0,
+                sent_total: 0,
+                censored_total: 0,
+                dropped_channel_closed_total: 0,
+            },
+            writers: Vec::new(),
+            preexisting_issues: Vec::new(),
+            operational: OperationalAudit {
+                ml_cycle_queue_full_total: 1,
+                full_cycle_over_budget_total: 0,
+                ml_background_over_budget_total: 0,
+                ..OperationalAudit::default()
+            },
+        };
+
+        let report = write_run_audit(input).expect("audit report");
+
+        assert_eq!(report.verdict, RunAuditVerdict::Red);
+        assert_eq!(report.operational.ml_cycle_queue_full_total, 1);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.contains("ml_cycle_queue_full_total=1")));
+    }
+
+    #[test]
+    fn audit_marks_operational_latency_and_drain_unhealthy() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let input = RunAuditInput {
+            run_id: "scanner-778-test".to_string(),
+            pid: 778,
+            started_ns: 1,
+            ended_ns: 1_000_000_001,
+            root_dir: tmp.path().join("ml"),
+            raw_root: tmp.path().join("raw_samples"),
+            accepted_root: tmp.path().join("accepted_samples"),
+            labeled_root: tmp.path().join("labeled_trades"),
+            parquet_enabled: true,
+            strict_lossless: true,
+            cycles_started: 10,
+            label_shutdown: LabelShutdownAudit {
+                closed_total: 0,
+                sent_total: 0,
+                censored_total: 0,
+                dropped_channel_closed_total: 0,
+            },
+            writers: Vec::new(),
+            preexisting_issues: Vec::new(),
+            operational: OperationalAudit {
+                full_cycle_over_budget_total: 2,
+                ml_background_over_budget_total: 3,
+                ml_cycle_queue_depth_current: 1,
+                ml_cycle_queue_events_current: 12,
+                ml_cycle_batch_inflight_current: 1,
+                ml_cycle_events_inflight_current: 7,
+                full_cycle_budget_ns: 150_000_000,
+                full_cycle_p99_ns: 180_000_000,
+                full_cycle_max_ns: 220_000_000,
+                ml_background_p99_ns: 170_000_000,
+                ml_background_max_ns: 210_000_000,
+                ..OperationalAudit::default()
+            },
+        };
+
+        let report = write_run_audit(input).expect("audit report");
+
+        assert_eq!(report.verdict, RunAuditVerdict::Red);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.contains("full_cycle_over_budget_total=2")));
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.contains("ml_background_over_budget_total=3")));
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.contains("operational drain mismatch")));
+    }
+
+    #[test]
+    fn audit_marks_latency_snapshot_over_budget_unhealthy_even_without_counter() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let input = RunAuditInput {
+            run_id: "scanner-779-test".to_string(),
+            pid: 779,
+            started_ns: 1,
+            ended_ns: 1_000_000_001,
+            root_dir: tmp.path().join("ml"),
+            raw_root: tmp.path().join("raw_samples"),
+            accepted_root: tmp.path().join("accepted_samples"),
+            labeled_root: tmp.path().join("labeled_trades"),
+            parquet_enabled: true,
+            strict_lossless: true,
+            cycles_started: 10,
+            label_shutdown: LabelShutdownAudit {
+                closed_total: 0,
+                sent_total: 0,
+                censored_total: 0,
+                dropped_channel_closed_total: 0,
+            },
+            writers: Vec::new(),
+            preexisting_issues: Vec::new(),
+            operational: OperationalAudit {
+                full_cycle_budget_ns: 150_000_000,
+                full_cycle_max_ns: 151_000_000,
+                ml_background_max_ns: 152_000_000,
+                ..OperationalAudit::default()
+            },
+        };
+
+        let report = write_run_audit(input).expect("audit report");
+
+        assert_eq!(report.verdict, RunAuditVerdict::Red);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.contains("full_cycle_max_ns=151000000 exceeds")));
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.contains("ml_background_max_ns=152000000 exceeds")));
     }
 }

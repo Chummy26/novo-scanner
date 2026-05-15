@@ -63,8 +63,8 @@ pub use raw_sample::{
 };
 pub use raw_writer::{RawSampleWriter, RawWriterConfig, RawWriterHandle, RawWriterSendError};
 pub use run_audit::{
-    write_run_audit, LabelShutdownAudit, RunAuditInput, RunAuditReport, RunAuditVerdict,
-    WriterAudit,
+    write_run_audit, LabelShutdownAudit, OperationalAudit, RunAuditInput, RunAuditReport,
+    RunAuditVerdict, WriterAudit,
 };
 pub use sample::{AcceptedSample, ACCEPTED_SAMPLE_SCHEMA_VERSION};
 pub use writer::{JsonlWriter, WriterConfig, WriterHandle, WriterSendError};

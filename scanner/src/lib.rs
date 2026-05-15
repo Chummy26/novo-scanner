@@ -35,9 +35,10 @@ use crate::ml::feature_store::HotQueryCache;
 use crate::ml::metrics::MlPrometheusMetrics;
 use crate::ml::persistence::{
     compact_existing_jsonl_in_tree, write_run_audit, DatasetKind, JsonlWriter, LabelResolver,
-    LabelShutdownAudit, LabeledJsonlWriter, LabeledWriterConfig, ParquetCompactionConfig,
-    RawSampleWriter, RawWriterConfig, ResolverConfig, RouteDecimator, RouteRanking, RunAuditInput,
-    RunAuditVerdict, WriterAudit, WriterConfig, WriterHandle, WriterSendError,
+    LabelShutdownAudit, LabeledJsonlWriter, LabeledWriterConfig, OperationalAudit,
+    ParquetCompactionConfig, RawSampleWriter, RawWriterConfig, ResolverConfig, RouteDecimator,
+    RouteRanking, RunAuditInput, RunAuditVerdict, WriterAudit, WriterConfig, WriterHandle,
+    WriterSendError,
 };
 use crate::ml::retention::{
     sweep_datasets, DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy,
@@ -476,6 +477,64 @@ fn label_priority_target_coverage_from_ml_config(ml: &config::MlConfig) -> f64 {
 
 fn label_priority_rerank_interval_s_from_ml_config(ml: &config::MlConfig) -> u64 {
     ml.raw_rerank_interval_s.max(60)
+}
+
+fn operational_audit_from_metrics(metrics: &obs::Metrics) -> OperationalAudit {
+    metrics.refresh_process_memory();
+
+    let full_cycle_p99_ns = {
+        let hist = metrics.full_cycle_hist.lock();
+        if hist.len() == 0 {
+            0
+        } else {
+            hist.value_at_quantile(0.99)
+        }
+    };
+    let ml_background_p99_ns = {
+        let hist = metrics.ml_background_hist.lock();
+        if hist.len() == 0 {
+            0
+        } else {
+            hist.value_at_quantile(0.99)
+        }
+    };
+
+    let mut queue_wait_ops_total = 0u64;
+    let mut queue_wait_ns_total = 0u64;
+    for shard_index in 0..ML_CYCLE_MAX_SHARDS {
+        let shard = shard_index.to_string();
+        queue_wait_ops_total = queue_wait_ops_total.saturating_add(
+            metrics
+                .ml_cycle_stage_ops_total
+                .with_label_values(&[shard.as_str(), "queue_wait"])
+                .get(),
+        );
+        queue_wait_ns_total = queue_wait_ns_total.saturating_add(
+            metrics
+                .ml_cycle_stage_ns_total
+                .with_label_values(&[shard.as_str(), "queue_wait"])
+                .get(),
+        );
+    }
+
+    OperationalAudit {
+        ml_cycle_queue_full_total: metrics.ml_cycle_queue_full_total.get(),
+        full_cycle_over_budget_total: metrics.full_cycle_over_budget_total.get(),
+        ml_background_over_budget_total: metrics.ml_background_over_budget_total.get(),
+        ml_cycle_queue_depth_current: metrics.ml_cycle_queue_depth_current.get(),
+        ml_cycle_queue_events_current: metrics.ml_cycle_queue_events_current.get(),
+        ml_cycle_batch_inflight_current: metrics.ml_cycle_batch_inflight_current.get(),
+        ml_cycle_events_inflight_current: metrics.ml_cycle_events_inflight_current.get(),
+        full_cycle_budget_ns: metrics.full_cycle_budget_ns.get().max(0) as u64,
+        full_cycle_p99_ns,
+        full_cycle_max_ns: metrics.full_cycle_max_ns.get().max(0) as u64,
+        ml_background_p99_ns,
+        ml_background_max_ns: metrics.ml_background_max_ns.get().max(0) as u64,
+        ml_cycle_queue_wait_ops_total: queue_wait_ops_total,
+        ml_cycle_queue_wait_ns_total: queue_wait_ns_total,
+        process_working_set_bytes: metrics.process_working_set_bytes.get().max(0) as u64,
+        process_private_bytes: metrics.process_private_bytes.get().max(0) as u64,
+    }
 }
 
 fn parquet_compaction_from_ml_config(
@@ -1321,6 +1380,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             },
             writers,
             preexisting_issues,
+            operational: operational_audit_from_metrics(obs::Metrics::init()),
         });
         match audit_report {
             Ok(report) => {
