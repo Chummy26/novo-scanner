@@ -56,6 +56,9 @@ logs/
 **/data/ml/
 !**/data/ml/README.md
 !**/data/ml/.gitkeep
+**/data/ml_v2/
+!**/data/ml_v2/README.md
+!**/data/ml_v2/.gitkeep
 **/data/ml_backups/
 !**/data/ml_backups/README.md
 !**/data/ml_backups/.gitkeep
