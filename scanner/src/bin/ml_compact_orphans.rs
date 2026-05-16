@@ -6,13 +6,13 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use clap::Parser;
-use scanner::ml::persistence::{DatasetKind, ParquetCompactionConfig};
+use scanner::ml::persistence::{DatasetKind, ParquetCompactionConfig, StorageV2CompactionConfig};
 
 #[derive(Debug, Parser)]
 #[command(
     author,
     version,
-    about = "Compacta JSONL órfãos de data/ml para Parquet/ZSTD com manifesto validado"
+    about = "Compacta JSONL órfãos de data/ml para V2 primário com equivalência validada"
 )]
 struct Cli {
     /// Diretório raiz de data/ml.
@@ -30,6 +30,22 @@ struct Cli {
     /// Nível ZSTD do Parquet.
     #[arg(long, default_value_t = 3)]
     zstd_level: i32,
+
+    /// Desativa publicação V2 e mantém a compactação manual em Parquet V1.
+    #[arg(long)]
+    disable_storage_v2: bool,
+
+    /// Diretório raiz do storage V2 gerado por compactação manual.
+    #[arg(long, default_value = "data/ml_v2")]
+    storage_v2_output_dir: PathBuf,
+
+    /// Mantém o Parquet V1 staging após publicar V2 com equivalência Green.
+    #[arg(long)]
+    keep_v1_parquet: bool,
+
+    /// Nível ZSTD dos arquivos V2.
+    #[arg(long, default_value_t = 3)]
+    storage_v2_zstd_level: i32,
 
     /// Executa continuamente, compactando arquivos elegíveis a cada intervalo.
     #[arg(long)]
@@ -57,15 +73,11 @@ fn main() -> anyhow::Result<()> {
     if !(1..=22).contains(&cli.zstd_level) {
         anyhow::bail!("--zstd-level must be in [1, 22]");
     }
+    if !(1..=22).contains(&cli.storage_v2_zstd_level) {
+        anyhow::bail!("--storage-v2-zstd-level must be in [1, 22]");
+    }
 
-    let cfg = ParquetCompactionConfig {
-        enabled: true,
-        delete_jsonl_after_success: !cli.keep_jsonl,
-        batch_size: cli.batch_size,
-        zstd_level: cli.zstd_level,
-        rotation_interval_s: 600,
-        storage_v2: Default::default(),
-    };
+    let cfg = compaction_config_from_cli(&cli);
 
     loop {
         let total = compact_once(
@@ -83,6 +95,23 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn compaction_config_from_cli(cli: &Cli) -> ParquetCompactionConfig {
+    ParquetCompactionConfig {
+        enabled: true,
+        delete_jsonl_after_success: !cli.keep_jsonl,
+        batch_size: cli.batch_size,
+        zstd_level: cli.zstd_level,
+        rotation_interval_s: 600,
+        storage_v2: StorageV2CompactionConfig {
+            enabled: !cli.disable_storage_v2,
+            output_root: cli.storage_v2_output_dir.clone(),
+            verify_equivalence: true,
+            delete_v1_parquet_after_success: !cli.keep_v1_parquet,
+            zstd_level: cli.storage_v2_zstd_level,
+        },
+    }
 }
 
 fn compact_once(
@@ -364,6 +393,34 @@ mod tests {
         assert_eq!(compacted, 0);
         assert!(jsonl.exists());
         assert!(!jsonl.with_extension("parquet").exists());
+    }
+
+    #[test]
+    fn cli_defaults_match_primary_storage_v2_policy() {
+        let cli = Cli::parse_from(["ml_compact_orphans"]);
+        let cfg = compaction_config_from_cli(&cli);
+
+        assert!(cfg.storage_v2.enabled);
+        assert_eq!(cfg.storage_v2.output_root, PathBuf::from("data/ml_v2"));
+        assert!(cfg.storage_v2.verify_equivalence);
+        assert!(cfg.storage_v2.delete_v1_parquet_after_success);
+        assert_eq!(cfg.storage_v2.zstd_level, 3);
+    }
+
+    #[test]
+    fn cli_can_keep_legacy_v1_for_manual_recovery() {
+        let cli = Cli::parse_from([
+            "ml_compact_orphans",
+            "--disable-storage-v2",
+            "--keep-jsonl",
+            "--keep-v1-parquet",
+        ]);
+        let cfg = compaction_config_from_cli(&cli);
+
+        assert!(!cfg.delete_jsonl_after_success);
+        assert!(!cfg.storage_v2.enabled);
+        assert!(cfg.storage_v2.verify_equivalence);
+        assert!(!cfg.storage_v2.delete_v1_parquet_after_success);
     }
 }
 
