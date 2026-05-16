@@ -28,6 +28,9 @@ use crate::types::{now_ns, SymbolId, Venue};
 
 const DEFAULT_INTERVAL_SECS: u64 = 60;
 const DEFAULT_WARMUP_SECS: u64 = 120;
+const GREEN_RECEIVING_COVERAGE_PCT: f64 = 80.0;
+const P1_RECEIVING_COVERAGE_PCT: f64 = 20.0;
+const P1_ZERO_LIVE_STREAK_SNAPSHOTS: usize = 5;
 
 #[derive(Debug, Clone)]
 pub struct ExchangeConnectivityPlan {
@@ -40,7 +43,7 @@ pub struct ExchangeConnectivityPlan {
 struct VenuePlan {
     venue: Venue,
     enabled: bool,
-    planned_symbols: Vec<SymbolId>,
+    expected_symbols: Vec<SymbolId>,
 }
 
 #[derive(Clone)]
@@ -72,9 +75,10 @@ pub struct VenueConnectivitySnapshot {
     pub venue: String,
     pub market: String,
     pub enabled: bool,
-    pub planned_symbols: u32,
-    pub active_symbols: u32,
+    pub expected_symbols: u32,
+    pub receiving_symbols: u32,
     pub stale_symbols: u32,
+    pub live_symbols: u32,
     pub min_book_age_ms: Option<u64>,
     pub max_book_age_ms: Option<u64>,
     pub frame_total_exchange: u64,
@@ -118,13 +122,21 @@ pub struct VenueConnectivitySummary {
     pub venue: String,
     pub market: String,
     pub enabled: bool,
-    pub planned_symbols: u32,
+    pub coverage_status: String,
+    pub expected_symbols: u32,
     pub samples_after_warmup: usize,
-    pub first_active_symbols: u32,
-    pub last_active_symbols: u32,
-    pub max_active_symbols: u32,
+    pub first_receiving_symbols: u32,
+    pub last_receiving_symbols: u32,
+    pub max_receiving_symbols: u32,
+    pub first_live_symbols: u32,
+    pub last_live_symbols: u32,
+    pub max_live_symbols: u32,
     pub last_stale_symbols: u32,
     pub max_stale_symbols: u32,
+    pub last_receiving_coverage_pct: f64,
+    pub last_live_coverage_pct: f64,
+    pub tail_zero_receiving_snapshots: usize,
+    pub tail_zero_live_snapshots: usize,
     pub min_book_age_ms: Option<u64>,
     pub max_book_age_ms: Option<u64>,
     pub first_frame_total_exchange: u64,
@@ -137,14 +149,14 @@ pub fn build_plan(cfg: &Config, universe: &SymbolUniverse) -> ExchangeConnectivi
         .iter()
         .copied()
         .map(|venue| {
-            let planned_symbols = universe.per_venue[venue.idx()]
+            let expected_symbols = universe.per_venue[venue.idx()]
                 .values()
                 .copied()
                 .collect::<Vec<_>>();
             VenuePlan {
                 venue,
                 enabled: venue_enabled_for_runtime(cfg, venue),
-                planned_symbols,
+                expected_symbols,
             }
         })
         .collect::<Vec<_>>();
@@ -378,7 +390,9 @@ impl ExchangeConnectivityMonitor {
             issues,
             venues: venue_summaries,
             limitations: vec![
-                "plannedSymbols is the discovered subscription plan per venue, not an exchange ACK count".to_string(),
+                "expectedSymbols is the discovered subscription plan per venue, not an exchange ACK count".to_string(),
+                "receivingSymbols counts symbols that received at least one book update; liveSymbols counts receiving symbols that are not stale at the snapshot time".to_string(),
+                format!("coverageStatus=green requires receiving coverage >= {GREEN_RECEIVING_COVERAGE_PCT:.0}% and at least one live symbol; P1 requires no receiving symbols, receiving coverage < {P1_RECEIVING_COVERAGE_PCT:.0}%, or zero live symbols for {P1_ZERO_LIVE_STREAK_SNAPSHOTS} consecutive stable snapshots"),
                 "frameTotalExchange comes from the existing Prometheus venue label and is exchange-level; spot/futures markets share the same exchange counter label".to_string(),
                 "this report is operational-only and is intentionally not part of raw/accepted/labeled ML datasets".to_string(),
             ],
@@ -393,17 +407,17 @@ fn snapshot_venue(
     metrics: &Metrics,
     now: u64,
 ) -> VenueConnectivitySnapshot {
-    let mut active_symbols = 0u32;
+    let mut receiving_symbols = 0u32;
     let mut stale_symbols = 0u32;
     let mut min_book_age_ms: Option<u64> = None;
     let mut max_book_age_ms: Option<u64> = None;
 
-    for &symbol_id in &venue_plan.planned_symbols {
+    for &symbol_id in &venue_plan.expected_symbols {
         let slot = store.slot(venue_plan.venue, symbol_id);
         if slot.is_uninitialized() {
             continue;
         }
-        active_symbols = active_symbols.saturating_add(1);
+        receiving_symbols = receiving_symbols.saturating_add(1);
         let cell = stale.cell(venue_plan.venue, symbol_id);
         let age_ms = cell.age_ms(now);
         if is_stale_for(venue_plan.venue, cell, now) {
@@ -417,9 +431,10 @@ fn snapshot_venue(
         venue: venue_plan.venue.as_str().to_string(),
         market: venue_plan.venue.market().as_str().to_string(),
         enabled: venue_plan.enabled,
-        planned_symbols: venue_plan.planned_symbols.len().min(u32::MAX as usize) as u32,
-        active_symbols,
+        expected_symbols: venue_plan.expected_symbols.len().min(u32::MAX as usize) as u32,
+        receiving_symbols,
         stale_symbols,
+        live_symbols: receiving_symbols.saturating_sub(stale_symbols),
         min_book_age_ms,
         max_book_age_ms,
         frame_total_exchange: metrics
@@ -435,30 +450,113 @@ fn summarize_venue(
 ) -> VenueConnectivitySummary {
     let first = records.first().copied();
     let last = records.last().copied();
-    let max_active_symbols = records.iter().map(|r| r.active_symbols).max().unwrap_or(0);
+    let max_receiving_symbols = records
+        .iter()
+        .map(|r| r.receiving_symbols)
+        .max()
+        .unwrap_or(0);
+    let max_live_symbols = records.iter().map(|r| r.live_symbols).max().unwrap_or(0);
     let max_stale_symbols = records.iter().map(|r| r.stale_symbols).max().unwrap_or(0);
     let min_book_age_ms = records.iter().filter_map(|r| r.min_book_age_ms).min();
     let max_book_age_ms = records.iter().filter_map(|r| r.max_book_age_ms).max();
     let first_frame_total_exchange = first.map(|r| r.frame_total_exchange).unwrap_or(0);
     let last_frame_total_exchange = last.map(|r| r.frame_total_exchange).unwrap_or(0);
+    let expected_symbols = venue_plan.expected_symbols.len().min(u32::MAX as usize) as u32;
+    let last_receiving_symbols = last.map(|r| r.receiving_symbols).unwrap_or(0);
+    let last_live_symbols = last.map(|r| r.live_symbols).unwrap_or(0);
+    let last_receiving_coverage_pct = coverage_pct(last_receiving_symbols, expected_symbols);
+    let last_live_coverage_pct = coverage_pct(last_live_symbols, expected_symbols);
+    let tail_zero_receiving_snapshots = count_trailing(records, |r| r.receiving_symbols == 0);
+    let tail_zero_live_snapshots = count_trailing(records, |r| r.live_symbols == 0);
+    let coverage_status = venue_coverage_status(
+        venue_plan.enabled,
+        expected_symbols,
+        records.len(),
+        max_receiving_symbols,
+        last_receiving_symbols,
+        last_live_symbols,
+        last_receiving_coverage_pct,
+        tail_zero_live_snapshots,
+    );
 
     VenueConnectivitySummary {
         venue: venue_plan.venue.as_str().to_string(),
         market: venue_plan.venue.market().as_str().to_string(),
         enabled: venue_plan.enabled,
-        planned_symbols: venue_plan.planned_symbols.len().min(u32::MAX as usize) as u32,
+        coverage_status,
+        expected_symbols,
         samples_after_warmup: records.len(),
-        first_active_symbols: first.map(|r| r.active_symbols).unwrap_or(0),
-        last_active_symbols: last.map(|r| r.active_symbols).unwrap_or(0),
-        max_active_symbols,
+        first_receiving_symbols: first.map(|r| r.receiving_symbols).unwrap_or(0),
+        last_receiving_symbols,
+        max_receiving_symbols,
+        first_live_symbols: first.map(|r| r.live_symbols).unwrap_or(0),
+        last_live_symbols,
+        max_live_symbols,
         last_stale_symbols: last.map(|r| r.stale_symbols).unwrap_or(0),
         max_stale_symbols,
+        last_receiving_coverage_pct,
+        last_live_coverage_pct,
+        tail_zero_receiving_snapshots,
+        tail_zero_live_snapshots,
         min_book_age_ms,
         max_book_age_ms,
         first_frame_total_exchange,
         last_frame_total_exchange,
         frame_delta_exchange: last_frame_total_exchange.saturating_sub(first_frame_total_exchange),
     }
+}
+
+fn coverage_pct(numerator: u32, denominator: u32) -> f64 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    (numerator as f64 / denominator as f64) * 100.0
+}
+
+fn count_trailing<F>(records: &[&VenueConnectivitySnapshot], predicate: F) -> usize
+where
+    F: Fn(&VenueConnectivitySnapshot) -> bool,
+{
+    records
+        .iter()
+        .rev()
+        .take_while(|record| predicate(record))
+        .count()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn venue_coverage_status(
+    enabled: bool,
+    expected_symbols: u32,
+    stable_samples: usize,
+    max_receiving_symbols: u32,
+    last_receiving_symbols: u32,
+    last_live_symbols: u32,
+    last_receiving_coverage_pct: f64,
+    tail_zero_live_snapshots: usize,
+) -> String {
+    if !enabled {
+        return "disabled".to_string();
+    }
+    if expected_symbols == 0 {
+        return "no_symbols".to_string();
+    }
+    if stable_samples == 0 {
+        return "warmup_only".to_string();
+    }
+    if max_receiving_symbols == 0 || last_receiving_symbols == 0 {
+        return "down".to_string();
+    }
+    if last_receiving_coverage_pct < P1_RECEIVING_COVERAGE_PCT {
+        return "severe_partial".to_string();
+    }
+    if tail_zero_live_snapshots >= P1_ZERO_LIVE_STREAK_SNAPSHOTS {
+        return "stale_down".to_string();
+    }
+    if last_live_symbols == 0 || last_receiving_coverage_pct < GREEN_RECEIVING_COVERAGE_PCT {
+        return "partial".to_string();
+    }
+    "green".to_string()
 }
 
 fn classify_venue(summary: &VenueConnectivitySummary, issues: &mut Vec<ConnectivityIssue>) {
@@ -468,12 +566,12 @@ fn classify_venue(summary: &VenueConnectivitySummary, issues: &mut Vec<Connectiv
     let venue = Some(summary.venue.clone());
     let market = Some(summary.market.clone());
 
-    if summary.planned_symbols == 0 {
+    if summary.expected_symbols == 0 {
         issues.push(ConnectivityIssue {
             severity: "P2".to_string(),
             venue,
             market,
-            message: "enabled venue has zero planned symbols after discovery".to_string(),
+            message: "enabled venue has zero expected symbols after discovery".to_string(),
         });
         return;
     }
@@ -486,34 +584,69 @@ fn classify_venue(summary: &VenueConnectivitySummary, issues: &mut Vec<Connectiv
         });
         return;
     }
-    if summary.max_active_symbols == 0 {
+    if summary.max_receiving_symbols == 0 {
         issues.push(ConnectivityIssue {
             severity: "P1".to_string(),
             venue,
             market,
-            message: "enabled venue never produced an active book after warmup".to_string(),
+            message: "enabled venue never received a book after warmup".to_string(),
         });
         return;
     }
-    if summary.last_active_symbols == 0 {
+    if summary.last_receiving_symbols == 0 {
         issues.push(ConnectivityIssue {
             severity: "P1".to_string(),
             venue,
             market,
             message:
-                "enabled venue had active books during the run but ended with zero active books"
+                "enabled venue received books during the run but ended with zero receiving symbols"
                     .to_string(),
         });
         return;
     }
-    if summary.last_stale_symbols >= summary.last_active_symbols && summary.last_active_symbols > 0
-    {
+    if summary.last_receiving_coverage_pct < P1_RECEIVING_COVERAGE_PCT {
+        issues.push(ConnectivityIssue {
+            severity: "P1".to_string(),
+            venue,
+            market,
+            message: format!(
+                "receiving coverage {:.1}% is below P1 threshold {:.1}%",
+                summary.last_receiving_coverage_pct, P1_RECEIVING_COVERAGE_PCT
+            ),
+        });
+        return;
+    }
+    if summary.tail_zero_live_snapshots >= P1_ZERO_LIVE_STREAK_SNAPSHOTS {
+        issues.push(ConnectivityIssue {
+            severity: "P1".to_string(),
+            venue,
+            market,
+            message: format!(
+                "zero live symbols for {} consecutive stable snapshots",
+                summary.tail_zero_live_snapshots
+            ),
+        });
+        return;
+    }
+    if summary.last_live_symbols == 0 {
         issues.push(ConnectivityIssue {
             severity: "P2".to_string(),
             venue,
             market,
-            message: "all active books for this venue were stale in the final stable snapshot"
+            message: "venue received books, but zero live symbols in the final stable snapshot"
                 .to_string(),
+        });
+        return;
+    }
+    if summary.last_receiving_coverage_pct < GREEN_RECEIVING_COVERAGE_PCT {
+        issues.push(ConnectivityIssue {
+            severity: "P2".to_string(),
+            venue,
+            market,
+            message: format!(
+                "receiving coverage {:.1}% is below green threshold {:.1}%",
+                summary.last_receiving_coverage_pct, GREEN_RECEIVING_COVERAGE_PCT
+            ),
         });
     }
 }
@@ -607,7 +740,7 @@ mod tests {
             .find(|v| v.venue == Venue::KucoinSpot)
             .expect("kucoin spot plan");
         assert!(!kucoin.enabled);
-        assert_eq!(kucoin.planned_symbols.len(), 1);
+        assert_eq!(kucoin.expected_symbols.len(), 1);
     }
 
     #[test]
@@ -618,7 +751,7 @@ mod tests {
             venues: vec![VenuePlan {
                 venue: Venue::BinanceSpot,
                 enabled: true,
-                planned_symbols: vec![SymbolId(0)],
+                expected_symbols: vec![SymbolId(0)],
             }],
         };
         let monitor = ExchangeConnectivityMonitor::new(
@@ -636,9 +769,10 @@ mod tests {
                 venue: "binance".to_string(),
                 market: "SPOT".to_string(),
                 enabled: true,
-                planned_symbols: 1,
-                active_symbols: 0,
+                expected_symbols: 1,
+                receiving_symbols: 0,
                 stale_symbols: 0,
+                live_symbols: 0,
                 min_book_age_ms: None,
                 max_book_age_ms: None,
                 frame_total_exchange: 0,
@@ -650,7 +784,92 @@ mod tests {
         assert!(report
             .issues
             .iter()
-            .any(|issue| issue.message.contains("never produced an active book")));
+            .any(|issue| issue.message.contains("never received a book")));
+    }
+
+    #[test]
+    fn summary_flags_partial_receiving_coverage_as_p2() {
+        let plan = ExchangeConnectivityPlan {
+            interval_secs: 60,
+            warmup_secs: 120,
+            venues: vec![VenuePlan {
+                venue: Venue::GateFut,
+                enabled: true,
+                expected_symbols: (0..10).map(SymbolId).collect(),
+            }],
+        };
+        let monitor = ExchangeConnectivityMonitor::new(
+            "test-run".to_string(),
+            1_000_000_000,
+            PathBuf::from("target/test-connectivity"),
+            plan,
+        );
+        let snapshots = vec![ExchangeConnectivitySnapshot {
+            run_id: "test-run".to_string(),
+            ts_ns: 130_000_000_000,
+            elapsed_s: 129.0,
+            label: "periodic".to_string(),
+            venues: vec![VenueConnectivitySnapshot {
+                venue: "gate".to_string(),
+                market: "FUTURES".to_string(),
+                enabled: true,
+                expected_symbols: 10,
+                receiving_symbols: 7,
+                stale_symbols: 1,
+                live_symbols: 6,
+                min_book_age_ms: Some(1),
+                max_book_age_ms: Some(1000),
+                frame_total_exchange: 10,
+            }],
+        }];
+
+        let report = monitor.build_report(&snapshots);
+        assert_eq!(report.status, ConnectivityStatus::P2);
+        assert_eq!(report.venues[0].coverage_status, "partial");
+        assert_eq!(report.venues[0].last_receiving_coverage_pct, 70.0);
+    }
+
+    #[test]
+    fn summary_escalates_zero_live_streak_to_p1() {
+        let plan = ExchangeConnectivityPlan {
+            interval_secs: 60,
+            warmup_secs: 120,
+            venues: vec![VenuePlan {
+                venue: Venue::XtSpot,
+                enabled: true,
+                expected_symbols: vec![SymbolId(0)],
+            }],
+        };
+        let monitor = ExchangeConnectivityMonitor::new(
+            "test-run".to_string(),
+            1_000_000_000,
+            PathBuf::from("target/test-connectivity"),
+            plan,
+        );
+        let snapshots = (0..P1_ZERO_LIVE_STREAK_SNAPSHOTS)
+            .map(|i| ExchangeConnectivitySnapshot {
+                run_id: "test-run".to_string(),
+                ts_ns: 130_000_000_000 + i as u64 * 60_000_000_000,
+                elapsed_s: 129.0 + i as f64 * 60.0,
+                label: "periodic".to_string(),
+                venues: vec![VenueConnectivitySnapshot {
+                    venue: "xt".to_string(),
+                    market: "SPOT".to_string(),
+                    enabled: true,
+                    expected_symbols: 1,
+                    receiving_symbols: 1,
+                    stale_symbols: 1,
+                    live_symbols: 0,
+                    min_book_age_ms: Some(60_000),
+                    max_book_age_ms: Some(60_000),
+                    frame_total_exchange: 10 + i as u64,
+                }],
+            })
+            .collect::<Vec<_>>();
+
+        let report = monitor.build_report(&snapshots);
+        assert_eq!(report.status, ConnectivityStatus::P1);
+        assert_eq!(report.venues[0].coverage_status, "stale_down");
     }
 
     #[test]
@@ -661,7 +880,7 @@ mod tests {
             venues: vec![VenuePlan {
                 venue: Venue::KucoinFut,
                 enabled: false,
-                planned_symbols: vec![SymbolId(0)],
+                expected_symbols: vec![SymbolId(0)],
             }],
         };
         let monitor = ExchangeConnectivityMonitor::new(

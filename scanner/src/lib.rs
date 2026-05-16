@@ -16,7 +16,7 @@ pub use config::Config;
 pub use error::{Error, Result};
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -61,6 +61,19 @@ const WRITER_MAX_BLOCKING_THREADS: usize = 2;
 #[inline]
 fn should_mark_sample_recommended(rec: &crate::ml::contract::Recommendation) -> bool {
     matches!(rec, crate::ml::contract::Recommendation::Trade(_))
+}
+
+fn runtime_abs_path(path: &Path) -> PathBuf {
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn ml_root_from_dataset_dir(dataset_dir: &Path) -> PathBuf {
+    dataset_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dataset_dir.to_path_buf())
 }
 
 fn enqueue_accepted_sample(
@@ -771,9 +784,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Arc::clone(&vol),
         Arc::clone(&store),
     );
-    let exchange_connectivity_dir = std::env::current_dir()
-        .map(|cwd| cwd.join("data/ml/runs").join(&run_id))
-        .unwrap_or_else(|_| PathBuf::from("data/ml/runs").join(&run_id));
+
+    let mut raw_writer_cfg = RawWriterConfig::default();
+    raw_writer_cfg.parquet = parquet_compaction.clone();
+    raw_writer_cfg.rotation_interval = dataset_rotation_interval;
+    let raw_writer_abs = runtime_abs_path(&raw_writer_cfg.data_dir);
+    let ml_root_dir = ml_root_from_dataset_dir(&raw_writer_abs);
+    let exchange_connectivity_dir = ml_root_dir.join("runs").join(&run_id);
     let exchange_connectivity_monitor = exchange_connectivity::ExchangeConnectivityMonitor::new(
         run_id.clone(),
         run_started_ns,
@@ -805,12 +822,6 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // Fix pós-auditoria: log ABSOLUTO do path data_dir no startup.
     // Default é relativo ("data/ml/..."), dependendo do CWD — primeira
     // coleta podia "sumir" silenciosamente no disco errado.
-    let mut raw_writer_cfg = RawWriterConfig::default();
-    raw_writer_cfg.parquet = parquet_compaction.clone();
-    raw_writer_cfg.rotation_interval = dataset_rotation_interval;
-    let raw_writer_abs = std::env::current_dir()
-        .map(|cwd| cwd.join(&raw_writer_cfg.data_dir))
-        .unwrap_or_else(|_| raw_writer_cfg.data_dir.clone());
     info!(
         abs_path = %raw_writer_abs.display(),
         cap = raw_writer_cfg.channel_capacity,
@@ -833,9 +844,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let mut labeled_writer_cfg = LabeledWriterConfig::default();
     labeled_writer_cfg.parquet = parquet_compaction.clone();
     labeled_writer_cfg.rotation_interval = dataset_rotation_interval;
-    let labeled_writer_abs = std::env::current_dir()
-        .map(|cwd| cwd.join(&labeled_writer_cfg.data_dir))
-        .unwrap_or_else(|_| labeled_writer_cfg.data_dir.clone());
+    let labeled_writer_abs = runtime_abs_path(&labeled_writer_cfg.data_dir);
     info!(
         abs_path = %labeled_writer_abs.display(),
         cap = labeled_writer_cfg.channel_capacity,
@@ -1092,9 +1101,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     let mut writer_cfg = WriterConfig::default();
     writer_cfg.parquet = parquet_compaction;
     writer_cfg.rotation_interval = dataset_rotation_interval;
-    let writer_abs = std::env::current_dir()
-        .map(|cwd| cwd.join(&writer_cfg.data_dir))
-        .unwrap_or_else(|_| writer_cfg.data_dir.clone());
+    let writer_abs = runtime_abs_path(&writer_cfg.data_dir);
     info!(
         abs_path = %writer_abs.display(),
         cap = writer_cfg.channel_capacity,
@@ -1513,9 +1520,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             pid: std::process::id(),
             started_ns: run_started_ns,
             ended_ns: now_ns(),
-            root_dir: std::env::current_dir()
-                .map(|cwd| cwd.join("data/ml"))
-                .unwrap_or_else(|_| PathBuf::from("data/ml")),
+            root_dir: ml_root_dir.clone(),
             raw_root: raw_writer_abs.clone(),
             accepted_root: writer_abs.clone(),
             labeled_root: labeled_writer_abs.clone(),
@@ -1940,7 +1945,7 @@ mod tests {
         Recommendation, RouteId, TradeReason, TradeSetup,
     };
     use crate::types::{SymbolId, Venue};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     fn mk_route() -> RouteId {
@@ -2206,6 +2211,20 @@ mod tests {
         assert!(
             result.is_err(),
             "rotation_interval_s > 1h manteria JSONL quente grande demais"
+        );
+    }
+
+    #[test]
+    fn ml_root_dir_is_derived_from_dataset_writer_dir() {
+        assert_eq!(
+            super::ml_root_from_dataset_dir(Path::new("data/ml/raw_samples")),
+            PathBuf::from("data/ml")
+        );
+        assert_eq!(
+            super::ml_root_from_dataset_dir(Path::new(
+                r"C:\collections\trainer\data\ml\raw_samples"
+            )),
+            PathBuf::from(r"C:\collections\trainer\data\ml")
         );
     }
 }
