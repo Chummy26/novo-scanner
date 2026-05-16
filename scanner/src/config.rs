@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::types::Venue;
@@ -142,6 +142,16 @@ pub struct MlConfig {
     #[serde(default)]
     pub parquet: MlParquetConfig,
 
+    /// Storage físico V2 para datasets ML.
+    ///
+    /// O V2 não altera a população do dataset: ele materializa os mesmos
+    /// registros lógicos em `fact + route_dim + manifest`, valida a
+    /// reconstrução contra o Parquet V1 recém-compactado, e só então permite
+    /// remover o Parquet V1 pesado. O JSONL hot path e o contrato lógico do
+    /// trainer continuam idênticos.
+    #[serde(default)]
+    pub storage_v2: MlStorageV2Config,
+
     /// Janelas efetivas de treino/calibração/archive do modelo.
     /// Não deletam arquivos; definem a memória estatística que o
     /// trainer deve privilegiar.
@@ -167,6 +177,7 @@ impl Default for MlConfig {
             recommendation_cooldown_s: default_recommendation_cooldown_s(),
             retention: MlRetentionConfig::default(),
             parquet: MlParquetConfig::default(),
+            storage_v2: MlStorageV2Config::default(),
             windows: MlWindowConfig::default(),
         }
     }
@@ -265,6 +276,46 @@ impl Default for MlParquetConfig {
             batch_size: default_parquet_batch_size(),
             zstd_level: default_parquet_zstd_level(),
             strict_lossless: default_parquet_strict_lossless(),
+        }
+    }
+}
+
+/// Política de publicação do storage físico V2.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MlStorageV2Config {
+    /// Ativa publicação V2 após cada compactação V1 validada.
+    #[serde(default = "default_storage_v2_enabled")]
+    pub enabled: bool,
+
+    /// Diretório raiz do storage V2. A estrutura interna preserva
+    /// `raw_samples|accepted_samples|labeled_trades/year=/month=/day=/hour=`.
+    #[serde(default = "default_storage_v2_output_dir")]
+    pub output_dir: PathBuf,
+
+    /// Verifica `V1 Parquet == V2 reconstruído` antes de considerar a
+    /// publicação bem-sucedida.
+    #[serde(default = "default_storage_v2_verify_equivalence")]
+    pub verify_equivalence: bool,
+
+    /// Remove o Parquet V1 pesado após V2 Green. O manifesto V1 pequeno fica
+    /// como lineage/semântica auxiliar; a auditoria principal lê V2 quando
+    /// este modo está ativo.
+    #[serde(default = "default_storage_v2_delete_v1_parquet_after_success")]
+    pub delete_v1_parquet_after_success: bool,
+
+    /// Nível ZSTD usado nos arquivos V2.
+    #[serde(default = "default_storage_v2_zstd_level")]
+    pub zstd_level: i32,
+}
+
+impl Default for MlStorageV2Config {
+    fn default() -> Self {
+        Self {
+            enabled: default_storage_v2_enabled(),
+            output_dir: default_storage_v2_output_dir(),
+            verify_equivalence: default_storage_v2_verify_equivalence(),
+            delete_v1_parquet_after_success: default_storage_v2_delete_v1_parquet_after_success(),
+            zstd_level: default_storage_v2_zstd_level(),
         }
     }
 }
@@ -371,6 +422,21 @@ fn default_parquet_zstd_level() -> i32 {
 }
 fn default_parquet_strict_lossless() -> bool {
     true
+}
+fn default_storage_v2_enabled() -> bool {
+    true
+}
+fn default_storage_v2_output_dir() -> PathBuf {
+    PathBuf::from("data/ml_v2")
+}
+fn default_storage_v2_verify_equivalence() -> bool {
+    true
+}
+fn default_storage_v2_delete_v1_parquet_after_success() -> bool {
+    true
+}
+fn default_storage_v2_zstd_level() -> i32 {
+    3
 }
 fn default_train_window_days() -> u16 {
     90
@@ -595,6 +661,10 @@ mod tests {
         assert_eq!(cfg.ml.parquet.rotation_interval_s, 600);
         assert_eq!(cfg.ml.parquet.zstd_level, 3);
         assert!(cfg.ml.parquet.strict_lossless);
+        assert!(cfg.ml.storage_v2.enabled);
+        assert_eq!(cfg.ml.storage_v2.output_dir, PathBuf::from("data/ml_v2"));
+        assert!(cfg.ml.storage_v2.verify_equivalence);
+        assert!(cfg.ml.storage_v2.delete_v1_parquet_after_success);
         assert_eq!(cfg.ml.windows.train_window_days, 90);
         assert_eq!(cfg.ml.label_background_decimation_mod, 10);
         assert_eq!(cfg.ml.label_observation_channel_capacity, 32_768);
@@ -653,6 +723,13 @@ batch_size = 8192
 zstd_level = 6
 strict_lossless = false
 
+[ml.storage_v2]
+enabled = true
+output_dir = "target/test-ml-v2"
+verify_equivalence = true
+delete_v1_parquet_after_success = true
+zstd_level = 4
+
 [ml.windows]
 train_window_days = 120
 calibration_window_days = 30
@@ -671,6 +748,14 @@ archive_reference_days = 500
         assert_eq!(cfg.ml.parquet.batch_size, 8192);
         assert_eq!(cfg.ml.parquet.zstd_level, 6);
         assert!(!cfg.ml.parquet.strict_lossless);
+        assert!(cfg.ml.storage_v2.enabled);
+        assert_eq!(
+            cfg.ml.storage_v2.output_dir,
+            PathBuf::from("target/test-ml-v2")
+        );
+        assert!(cfg.ml.storage_v2.verify_equivalence);
+        assert!(cfg.ml.storage_v2.delete_v1_parquet_after_success);
+        assert_eq!(cfg.ml.storage_v2.zstd_level, 4);
         assert_eq!(cfg.ml.windows.train_window_days, 120);
         assert_eq!(cfg.ml.windows.calibration_window_days, 30);
         assert_eq!(cfg.ml.windows.archive_reference_days, 500);

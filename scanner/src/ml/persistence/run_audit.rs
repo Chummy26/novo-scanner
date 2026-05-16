@@ -12,9 +12,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use arrow_array::{Array, RecordBatch, StringArray, UInt32Array};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::{Deserialize, Serialize};
 
-use crate::ml::persistence::parquet_compactor::ParquetManifest;
+use crate::ml::persistence::parquet_compactor::{DatasetKind, ParquetManifest};
+use crate::ml::persistence::storage_v2::{
+    open_storage_v2_sidecar_logical_reader, StorageV2SidecarManifest,
+};
 
 #[derive(Debug, Clone)]
 pub struct RunAuditInput {
@@ -26,6 +30,8 @@ pub struct RunAuditInput {
     pub raw_root: PathBuf,
     pub accepted_root: PathBuf,
     pub labeled_root: PathBuf,
+    pub storage_v2_root: Option<PathBuf>,
+    pub storage_v2_primary: bool,
     pub parquet_enabled: bool,
     pub strict_lossless: bool,
     pub cycles_started: u64,
@@ -83,6 +89,7 @@ pub struct RunAuditReport {
     pub issues: Vec<String>,
     pub strict_lossless: bool,
     pub parquet_enabled: bool,
+    pub storage_v2_primary: bool,
     pub cycles_started: u64,
     pub label_shutdown: LabelShutdownAudit,
     pub operational: OperationalAudit,
@@ -126,6 +133,12 @@ pub struct DatasetRunSummary {
 struct ManifestWithPath {
     path: PathBuf,
     manifest: ParquetManifest,
+}
+
+#[derive(Debug, Clone)]
+struct StorageV2ManifestWithPath {
+    path: PathBuf,
+    manifest: StorageV2SidecarManifest,
 }
 
 #[derive(Debug, Clone)]
@@ -258,8 +271,50 @@ fn build_run_audit(input: &RunAuditInput) -> Result<RunAuditReport> {
         let manifests =
             collect_current_run_manifests(root, input.pid, input.started_ns, input.ended_ns)
                 .with_context(|| format!("collect manifests for {dataset}"))?;
-        let mut summary = summarize_manifests(&manifests, duration_s, input.cycles_started)?;
-        let manifested_sources = manifest_source_jsonl_file_names(&manifests);
+        let storage_v2_manifests = if input.storage_v2_primary {
+            match input.storage_v2_root.as_ref() {
+                Some(storage_v2_root) => collect_current_run_storage_v2_manifests(
+                    &storage_v2_root.join(dataset),
+                    input.pid,
+                    input.started_ns,
+                    input.ended_ns,
+                )
+                .with_context(|| format!("collect storage_v2 manifests for {dataset}"))?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let use_storage_v2 = input.storage_v2_primary && !storage_v2_manifests.is_empty();
+        let storage_v2_sources = storage_v2_manifest_source_jsonl_file_names(&storage_v2_manifests);
+        let manifest_summary_inputs: Vec<ManifestWithPath> = if use_storage_v2 {
+            manifests
+                .iter()
+                .filter(|item| {
+                    manifest_source_jsonl_file_name(&item.manifest)
+                        .map(|name| !storage_v2_sources.contains(&name))
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect()
+        } else {
+            manifests.clone()
+        };
+        let mut summary =
+            summarize_manifests(&manifest_summary_inputs, duration_s, input.cycles_started)?;
+        if use_storage_v2 {
+            let storage_v2_summary = summarize_storage_v2_manifests(
+                &storage_v2_manifests,
+                duration_s,
+                input.cycles_started,
+            )?;
+            merge_dataset_summary(&mut summary, &storage_v2_summary);
+            finalize_summary(&mut summary, duration_s, input.cycles_started);
+        }
+        let mut manifested_sources = manifest_source_jsonl_file_names(&manifests);
+        manifested_sources.extend(storage_v2_manifest_source_jsonl_file_names(
+            &storage_v2_manifests,
+        ));
         let jsonl_files = collect_current_run_jsonl_files(
             root,
             dataset,
@@ -281,7 +336,16 @@ fn build_run_audit(input: &RunAuditInput) -> Result<RunAuditReport> {
         if summary.jsonl_rows > 0 {
             summary.duplicate_check_status = "skipped_jsonl_present".to_string();
         } else if summary.rows <= MAX_EXACT_DUPLICATE_ROWS {
-            match exact_duplicate_count(dataset, &manifests) {
+            let duplicate_result = exact_duplicate_count_combined(
+                dataset,
+                &manifest_summary_inputs,
+                if use_storage_v2 {
+                    &storage_v2_manifests
+                } else {
+                    &[]
+                },
+            );
+            match duplicate_result {
                 Ok(n) => {
                     summary.duplicate_keys_exact = Some(n);
                     summary.duplicate_check_status = "exact".to_string();
@@ -317,6 +381,7 @@ fn build_run_audit(input: &RunAuditInput) -> Result<RunAuditReport> {
         issues,
         strict_lossless: input.strict_lossless,
         parquet_enabled: input.parquet_enabled,
+        storage_v2_primary: input.storage_v2_primary,
         cycles_started: input.cycles_started,
         label_shutdown: input.label_shutdown,
         operational: input.operational.clone(),
@@ -372,6 +437,46 @@ fn collect_current_run_manifests(
     Ok(out)
 }
 
+fn collect_current_run_storage_v2_manifests(
+    root: &Path,
+    pid: u32,
+    started_ns: u64,
+    ended_ns: u64,
+) -> Result<Vec<StorageV2ManifestWithPath>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let pid_marker = format!("-{}_", pid);
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).with_context(|| format!("read_dir {}", dir.display()))? {
+            let entry = entry.with_context(|| format!("read_dir entry {}", dir.display()))?;
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !name.ends_with(".storage_v2.manifest.json") {
+                continue;
+            }
+            let file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
+            let manifest: StorageV2SidecarManifest = serde_json::from_reader(file)
+                .with_context(|| format!("parse {}", path.display()))?;
+            let source_name = storage_v2_source_file_name(&manifest);
+            if source_name.contains(&pid_marker)
+                && storage_v2_manifest_overlaps_run_window(&manifest, started_ns, ended_ns)
+            {
+                out.push(StorageV2ManifestWithPath { path, manifest });
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn manifest_overlaps_run_window(
     manifest: &ParquetManifest,
     started_ns: u64,
@@ -384,6 +489,17 @@ fn manifest_overlaps_run_window(
         return false;
     };
     max_ts >= started_ns && min_ts <= ended_ns
+}
+
+fn storage_v2_manifest_overlaps_run_window(
+    manifest: &StorageV2SidecarManifest,
+    started_ns: u64,
+    ended_ns: u64,
+) -> bool {
+    match (manifest.min_timestamp_ns, manifest.max_timestamp_ns) {
+        (Some(min_ts), Some(max_ts)) => max_ts >= started_ns && min_ts <= ended_ns,
+        _ => true,
+    }
 }
 
 fn summarize_manifests(
@@ -408,6 +524,87 @@ fn summarize_manifests(
             &mut summary.schema_versions,
             &m.semantic_stats.schema_versions,
         );
+        merge_str_counts(
+            &mut summary.sample_decisions,
+            &m.semantic_stats.sample_decisions,
+        );
+        merge_u32_counts(&mut summary.horizons_s, &m.semantic_stats.horizons_s);
+        merge_str_counts(&mut summary.outcomes, &m.semantic_stats.outcomes);
+        merge_str_counts(
+            &mut summary.censor_reasons,
+            &m.semantic_stats.censor_reasons,
+        );
+        merge_u32_counts(
+            &mut summary.label_floor_hit_lengths,
+            &m.semantic_stats.label_floor_hit_lengths,
+        );
+        summary
+            .label_floor_values
+            .extend(m.semantic_stats.label_floor_values.iter().cloned());
+    }
+    finalize_summary(&mut summary, duration_s, cycles_started);
+    Ok(summary)
+}
+
+fn summarize_storage_v2_manifests(
+    manifests: &[StorageV2ManifestWithPath],
+    duration_s: f64,
+    cycles_started: u64,
+) -> Result<DatasetRunSummary> {
+    let mut summary = DatasetRunSummary::default();
+    summary.parquet_files = manifests.len().saturating_mul(2) as u64;
+    summary.files = summary.parquet_files;
+    for item in manifests {
+        let m = &item.manifest;
+        let manifest_bytes = fs::metadata(&item.path)
+            .with_context(|| format!("metadata {}", item.path.display()))?
+            .len();
+        let fact_bytes = fs::metadata(&m.fact_parquet_path)
+            .with_context(|| format!("metadata {}", m.fact_parquet_path))?
+            .len();
+        let route_dim_bytes = fs::metadata(&m.route_dim_parquet_path)
+            .with_context(|| format!("metadata {}", m.route_dim_parquet_path))?
+            .len();
+        let actual_fact_rows = parquet_row_count(Path::new(&m.fact_parquet_path))
+            .with_context(|| format!("validate fact {}", m.fact_parquet_path))?;
+        if actual_fact_rows != m.fact_row_count {
+            anyhow::bail!(
+                "storage_v2 fact row count mismatch {}: manifest={} actual={}",
+                m.fact_parquet_path,
+                m.fact_row_count,
+                actual_fact_rows
+            );
+        }
+        let actual_route_dim_rows = parquet_row_count(Path::new(&m.route_dim_parquet_path))
+            .with_context(|| format!("validate route_dim {}", m.route_dim_parquet_path))?;
+        if actual_route_dim_rows != m.route_dim_row_count {
+            anyhow::bail!(
+                "storage_v2 route_dim row count mismatch {}: manifest={} actual={}",
+                m.route_dim_parquet_path,
+                m.route_dim_row_count,
+                actual_route_dim_rows
+            );
+        }
+        summary.rows = summary.rows.saturating_add(m.fact_row_count);
+        summary.parquet_bytes = summary
+            .parquet_bytes
+            .saturating_add(fact_bytes)
+            .saturating_add(route_dim_bytes)
+            .saturating_add(manifest_bytes);
+        merge_minmax(
+            &mut summary.min_timestamp_ns,
+            &mut summary.max_timestamp_ns,
+            m.min_timestamp_ns,
+            m.max_timestamp_ns,
+        );
+        if m.semantic_stats.schema_versions.is_empty() && m.schema_version != 0 {
+            *summary.schema_versions.entry(m.schema_version).or_insert(0) += m.fact_row_count;
+        } else {
+            merge_u16_counts(
+                &mut summary.schema_versions,
+                &m.semantic_stats.schema_versions,
+            );
+        }
         merge_str_counts(
             &mut summary.sample_decisions,
             &m.semantic_stats.sample_decisions,
@@ -463,18 +660,81 @@ fn finalize_summary(summary: &mut DatasetRunSummary, duration_s: f64, cycles_sta
     summary.projected_7d_bytes = ((total_bytes as f64) / duration_s * 604_800.0).round() as u64;
 }
 
+fn merge_dataset_summary(dst: &mut DatasetRunSummary, src: &DatasetRunSummary) {
+    dst.files = dst.files.saturating_add(src.files);
+    dst.rows = dst.rows.saturating_add(src.rows);
+    dst.parquet_files = dst.parquet_files.saturating_add(src.parquet_files);
+    dst.parquet_bytes = dst.parquet_bytes.saturating_add(src.parquet_bytes);
+    dst.jsonl_files = dst.jsonl_files.saturating_add(src.jsonl_files);
+    dst.jsonl_rows = dst.jsonl_rows.saturating_add(src.jsonl_rows);
+    dst.jsonl_bytes = dst.jsonl_bytes.saturating_add(src.jsonl_bytes);
+    merge_minmax(
+        &mut dst.min_timestamp_ns,
+        &mut dst.max_timestamp_ns,
+        src.min_timestamp_ns,
+        src.max_timestamp_ns,
+    );
+    merge_u16_counts(&mut dst.schema_versions, &src.schema_versions);
+    merge_str_counts(&mut dst.sample_decisions, &src.sample_decisions);
+    merge_u32_counts(&mut dst.horizons_s, &src.horizons_s);
+    merge_str_counts(&mut dst.outcomes, &src.outcomes);
+    merge_str_counts(&mut dst.censor_reasons, &src.censor_reasons);
+    merge_u32_counts(
+        &mut dst.label_floor_hit_lengths,
+        &src.label_floor_hit_lengths,
+    );
+    dst.label_floor_values
+        .extend(src.label_floor_values.iter().cloned());
+}
+
 fn manifest_source_jsonl_file_names(manifests: &[ManifestWithPath]) -> BTreeSet<String> {
     manifests
         .iter()
+        .filter_map(|item| manifest_source_jsonl_file_name(&item.manifest))
+        .collect()
+}
+
+fn manifest_source_jsonl_file_name(manifest: &ParquetManifest) -> Option<String> {
+    manifest
+        .source_jsonl_path
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .map(ToString::to_string)
+}
+
+fn storage_v2_manifest_source_jsonl_file_names(
+    manifests: &[StorageV2ManifestWithPath],
+) -> BTreeSet<String> {
+    manifests
+        .iter()
         .filter_map(|item| {
-            item.manifest
-                .source_jsonl_path
-                .replace('\\', "/")
-                .rsplit('/')
-                .next()
-                .map(ToString::to_string)
+            if item.manifest.source_jsonl_path.is_empty() {
+                None
+            } else {
+                item.manifest
+                    .source_jsonl_path
+                    .replace('\\', "/")
+                    .rsplit('/')
+                    .next()
+                    .map(ToString::to_string)
+            }
         })
         .collect()
+}
+
+fn storage_v2_source_file_name(manifest: &StorageV2SidecarManifest) -> String {
+    let source = if manifest.source_jsonl_path.is_empty() {
+        &manifest.source_parquet_path
+    } else {
+        &manifest.source_jsonl_path
+    };
+    source
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn collect_current_run_jsonl_files(
@@ -565,8 +825,39 @@ fn jsonl_overlaps_run_window(stats: &JsonlRunFile, started_ns: u64, ended_ns: u6
     }
 }
 
-fn exact_duplicate_count(dataset: &str, manifests: &[ManifestWithPath]) -> Result<u64> {
+fn parquet_row_count(path: &Path) -> Result<u64> {
+    let file =
+        File::open(path).with_context(|| format!("open parquet metadata {}", path.display()))?;
+    let reader = SerializedFileReader::new(file)
+        .with_context(|| format!("read parquet metadata {}", path.display()))?;
+    Ok(reader.metadata().file_metadata().num_rows().max(0) as u64)
+}
+
+fn exact_duplicate_count_combined(
+    dataset: &str,
+    manifests: &[ManifestWithPath],
+    storage_v2_manifests: &[StorageV2ManifestWithPath],
+) -> Result<u64> {
+    let dataset_kind = dataset_kind_for_name(dataset)?;
     let mut seen = HashSet::<String>::new();
+    let mut duplicates = 0u64;
+    duplicates = duplicates.saturating_add(exact_duplicate_count_into_seen(
+        dataset, manifests, &mut seen,
+    )?);
+    duplicates = duplicates.saturating_add(exact_duplicate_count_storage_v2_into_seen(
+        dataset,
+        dataset_kind,
+        storage_v2_manifests,
+        &mut seen,
+    )?);
+    Ok(duplicates)
+}
+
+fn exact_duplicate_count_into_seen(
+    dataset: &str,
+    manifests: &[ManifestWithPath],
+    seen: &mut HashSet<String>,
+) -> Result<u64> {
     let mut duplicates = 0u64;
     for item in manifests {
         let parquet_path = PathBuf::from(&item.manifest.parquet_path);
@@ -580,12 +871,41 @@ fn exact_duplicate_count(dataset: &str, manifests: &[ManifestWithPath]) -> Resul
         for maybe_batch in &mut reader {
             let batch = maybe_batch
                 .with_context(|| format!("read parquet batch {}", parquet_path.display()))?;
-            duplicates = duplicates.saturating_add(duplicate_count_in_batch(
-                dataset, &batch, &mut seen, &item.path,
-            )?);
+            duplicates = duplicates
+                .saturating_add(duplicate_count_in_batch(dataset, &batch, seen, &item.path)?);
         }
     }
     Ok(duplicates)
+}
+
+fn exact_duplicate_count_storage_v2_into_seen(
+    dataset: &str,
+    dataset_kind: DatasetKind,
+    manifests: &[StorageV2ManifestWithPath],
+    seen: &mut HashSet<String>,
+) -> Result<u64> {
+    let mut duplicates = 0u64;
+    for item in manifests {
+        let mut reader = open_storage_v2_sidecar_logical_reader(&item.manifest, dataset_kind)
+            .with_context(|| format!("open storage_v2 logical reader {}", item.path.display()))?;
+        for maybe_batch in &mut reader {
+            let batch = maybe_batch.with_context(|| {
+                format!("read storage_v2 logical batch {}", item.path.display())
+            })?;
+            duplicates = duplicates
+                .saturating_add(duplicate_count_in_batch(dataset, &batch, seen, &item.path)?);
+        }
+    }
+    Ok(duplicates)
+}
+
+fn dataset_kind_for_name(dataset: &str) -> Result<DatasetKind> {
+    match dataset {
+        "raw_samples" => Ok(DatasetKind::RawSamples),
+        "accepted_samples" => Ok(DatasetKind::AcceptedSamples),
+        "labeled_trades" => Ok(DatasetKind::LabeledTrades),
+        _ => anyhow::bail!("unknown dataset kind '{dataset}'"),
+    }
 }
 
 fn duplicate_count_in_batch(
@@ -676,6 +996,51 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    fn write_raw_jsonl(path: &std::path::Path, ts_ns: u64, cycle_seq: u32) {
+        use crate::ml::persistence::sample_id::sample_id_of;
+        use crate::types::Venue;
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create raw parent");
+        }
+        let sample_id = sample_id_of(
+            ts_ns,
+            cycle_seq,
+            "BTC-USDT",
+            Venue::MexcFut,
+            Venue::BingxFut,
+        );
+        let mut file = File::create(path).expect("create raw jsonl");
+        writeln!(
+            file,
+            r#"{{"ts_ns":{},"cycle_seq":{},"schema_version":11,"scanner_version":"0.1.0","sample_id":"{}","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":{},"route_active_until_ns":null,"route_n_snapshots":{}}}"#,
+            ts_ns, cycle_seq, sample_id, ts_ns, cycle_seq
+        )
+        .expect("write raw jsonl");
+    }
+
+    fn find_file_with_suffix(root: &std::path::Path, suffix: &str) -> PathBuf {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).expect("read dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(|name| name.ends_with(suffix))
+                {
+                    return path;
+                }
+            }
+        }
+        panic!(
+            "file with suffix {suffix} not found under {}",
+            root.display()
+        );
+    }
+
     #[test]
     fn audit_marks_mismatched_shutdown_unhealthy_without_touching_data() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -688,6 +1053,8 @@ mod tests {
             raw_root: tmp.path().join("raw_samples"),
             accepted_root: tmp.path().join("accepted_samples"),
             labeled_root: tmp.path().join("labeled_trades"),
+            storage_v2_root: None,
+            storage_v2_primary: false,
             parquet_enabled: true,
             strict_lossless: true,
             cycles_started: 10,
@@ -736,6 +1103,8 @@ mod tests {
             raw_root,
             accepted_root: tmp.path().join("accepted_samples"),
             labeled_root: tmp.path().join("labeled_trades"),
+            storage_v2_root: None,
+            storage_v2_primary: false,
             parquet_enabled: false,
             strict_lossless: true,
             cycles_started: 10,
@@ -769,6 +1138,231 @@ mod tests {
     }
 
     #[test]
+    fn audit_reads_storage_v2_primary_as_logical_dataset() {
+        use crate::ml::persistence::parquet_compactor::{
+            compact_jsonl_file, ParquetCompactionConfig, StorageV2CompactionConfig,
+        };
+        use crate::ml::persistence::sample_id::sample_id_of;
+        use crate::types::Venue;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let raw_root = tmp
+            .path()
+            .join("raw_samples/year=2026/month=05/day=16/hour=00");
+        fs::create_dir_all(&raw_root).expect("create raw partition");
+        let jsonl = raw_root.join("raw-scanner-4242_1_part-000000.jsonl");
+        let sample_id = sample_id_of(1, 1, "BTC-USDT", Venue::MexcFut, Venue::BingxFut);
+        let mut file = File::create(&jsonl).expect("create jsonl");
+        writeln!(
+            file,
+            r#"{{"ts_ns":1,"cycle_seq":1,"schema_version":11,"scanner_version":"0.1.0","sample_id":"{}","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1}}"#,
+            sample_id
+        )
+        .expect("write jsonl");
+        drop(file);
+
+        let storage_v2_root = tmp.path().join("ml_v2");
+        let cfg = ParquetCompactionConfig {
+            storage_v2: StorageV2CompactionConfig {
+                enabled: true,
+                output_root: storage_v2_root.clone(),
+                verify_equivalence: true,
+                delete_v1_parquet_after_success: true,
+                zstd_level: 3,
+            },
+            ..ParquetCompactionConfig::default()
+        };
+        compact_jsonl_file(&jsonl, DatasetKind::RawSamples, &cfg)
+            .expect("compact")
+            .expect("published");
+
+        let input = RunAuditInput {
+            run_id: "scanner-4242-v2".to_string(),
+            pid: 4242,
+            started_ns: 1,
+            ended_ns: 2,
+            root_dir: tmp.path().join("ml"),
+            raw_root: tmp.path().join("raw_samples"),
+            accepted_root: tmp.path().join("accepted_samples"),
+            labeled_root: tmp.path().join("labeled_trades"),
+            storage_v2_root: Some(storage_v2_root),
+            storage_v2_primary: true,
+            parquet_enabled: true,
+            strict_lossless: true,
+            cycles_started: 1,
+            label_shutdown: LabelShutdownAudit {
+                closed_total: 0,
+                sent_total: 0,
+                censored_total: 0,
+                dropped_channel_closed_total: 0,
+            },
+            writers: vec![WriterAudit {
+                dataset_kind: "raw_samples".to_string(),
+                total_written: 1,
+                total_dropped: 0,
+                compaction_succeeded: 1,
+                compaction_failed: 0,
+            }],
+            preexisting_issues: Vec::new(),
+            operational: OperationalAudit::default(),
+        };
+
+        let report = write_run_audit(input).expect("audit report");
+
+        assert_eq!(report.verdict, RunAuditVerdict::Green);
+        assert!(report.storage_v2_primary);
+        let raw = report.datasets.get("raw_samples").expect("raw summary");
+        assert_eq!(raw.rows, 1);
+        assert_eq!(raw.jsonl_rows, 0);
+        assert_eq!(raw.duplicate_keys_exact, Some(0));
+        assert_eq!(raw.schema_versions.get(&11), Some(&1));
+        assert_eq!(raw.sample_decisions.get("accept"), Some(&1));
+    }
+
+    #[test]
+    fn audit_storage_v2_primary_includes_v1_manifest_without_double_counting() {
+        use crate::ml::persistence::parquet_compactor::{
+            compact_jsonl_file, ParquetCompactionConfig, StorageV2CompactionConfig,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let raw_root = tmp
+            .path()
+            .join("raw_samples/year=2026/month=05/day=16/hour=00");
+        let v2_jsonl = raw_root.join("raw-scanner-4242_1_part-000000.jsonl");
+        let v1_jsonl = raw_root.join("raw-scanner-4242_2_part-000000.jsonl");
+        write_raw_jsonl(&v2_jsonl, 1, 1);
+        write_raw_jsonl(&v1_jsonl, 2, 2);
+
+        let storage_v2_root = tmp.path().join("ml_v2");
+        let v2_cfg = ParquetCompactionConfig {
+            storage_v2: StorageV2CompactionConfig {
+                enabled: true,
+                output_root: storage_v2_root.clone(),
+                verify_equivalence: true,
+                delete_v1_parquet_after_success: true,
+                zstd_level: 3,
+            },
+            ..ParquetCompactionConfig::default()
+        };
+        compact_jsonl_file(&v2_jsonl, DatasetKind::RawSamples, &v2_cfg)
+            .expect("compact v2")
+            .expect("v2 published");
+        compact_jsonl_file(
+            &v1_jsonl,
+            DatasetKind::RawSamples,
+            &ParquetCompactionConfig::default(),
+        )
+        .expect("compact v1")
+        .expect("v1 published");
+
+        let input = RunAuditInput {
+            run_id: "scanner-4242-mixed".to_string(),
+            pid: 4242,
+            started_ns: 1,
+            ended_ns: 3,
+            root_dir: tmp.path().join("ml"),
+            raw_root: tmp.path().join("raw_samples"),
+            accepted_root: tmp.path().join("accepted_samples"),
+            labeled_root: tmp.path().join("labeled_trades"),
+            storage_v2_root: Some(storage_v2_root),
+            storage_v2_primary: true,
+            parquet_enabled: true,
+            strict_lossless: true,
+            cycles_started: 2,
+            label_shutdown: LabelShutdownAudit {
+                closed_total: 0,
+                sent_total: 0,
+                censored_total: 0,
+                dropped_channel_closed_total: 0,
+            },
+            writers: vec![WriterAudit {
+                dataset_kind: "raw_samples".to_string(),
+                total_written: 2,
+                total_dropped: 0,
+                compaction_succeeded: 2,
+                compaction_failed: 0,
+            }],
+            preexisting_issues: Vec::new(),
+            operational: OperationalAudit::default(),
+        };
+
+        let report = write_run_audit(input).expect("audit report");
+
+        assert_eq!(report.verdict, RunAuditVerdict::Green);
+        let raw = report.datasets.get("raw_samples").expect("raw summary");
+        assert_eq!(raw.rows, 2);
+        assert_eq!(raw.jsonl_rows, 0);
+        assert_eq!(raw.duplicate_keys_exact, Some(0));
+        assert_eq!(raw.schema_versions.get(&11), Some(&2));
+    }
+
+    #[test]
+    fn audit_storage_v2_primary_rejects_missing_sidecar_even_when_duplicate_check_skips() {
+        use crate::ml::persistence::parquet_compactor::{
+            compact_jsonl_file, ParquetCompactionConfig, StorageV2CompactionConfig,
+        };
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let raw_root = tmp
+            .path()
+            .join("raw_samples/year=2026/month=05/day=16/hour=00");
+        let jsonl = raw_root.join("raw-scanner-4242_3_part-000000.jsonl");
+        write_raw_jsonl(&jsonl, 3, 3);
+
+        let storage_v2_root = tmp.path().join("ml_v2");
+        let cfg = ParquetCompactionConfig {
+            storage_v2: StorageV2CompactionConfig {
+                enabled: true,
+                output_root: storage_v2_root.clone(),
+                verify_equivalence: true,
+                delete_v1_parquet_after_success: true,
+                zstd_level: 3,
+            },
+            ..ParquetCompactionConfig::default()
+        };
+        compact_jsonl_file(&jsonl, DatasetKind::RawSamples, &cfg)
+            .expect("compact")
+            .expect("v2 published");
+        let fact_sidecar = find_file_with_suffix(&storage_v2_root, ".fact.parquet");
+        fs::remove_file(fact_sidecar).expect("remove fact sidecar");
+
+        let input = RunAuditInput {
+            run_id: "scanner-4242-v2-missing".to_string(),
+            pid: 4242,
+            started_ns: 1,
+            ended_ns: 4,
+            root_dir: tmp.path().join("ml"),
+            raw_root: tmp.path().join("raw_samples"),
+            accepted_root: tmp.path().join("accepted_samples"),
+            labeled_root: tmp.path().join("labeled_trades"),
+            storage_v2_root: Some(storage_v2_root),
+            storage_v2_primary: true,
+            parquet_enabled: true,
+            strict_lossless: true,
+            cycles_started: 1,
+            label_shutdown: LabelShutdownAudit {
+                closed_total: 0,
+                sent_total: 0,
+                censored_total: 0,
+                dropped_channel_closed_total: 0,
+            },
+            writers: vec![WriterAudit {
+                dataset_kind: "raw_samples".to_string(),
+                total_written: 1,
+                total_dropped: 0,
+                compaction_succeeded: 1,
+                compaction_failed: 0,
+            }],
+            preexisting_issues: Vec::new(),
+            operational: OperationalAudit::default(),
+        };
+
+        let err = write_run_audit(input).expect_err("missing V2 sidecar must fail audit");
+        assert!(format!("{err:#}").contains("fact.parquet"));
+    }
+
+    #[test]
     fn audit_marks_operational_backpressure_unhealthy() {
         let tmp = tempfile::tempdir().expect("tmp");
         let input = RunAuditInput {
@@ -780,6 +1374,8 @@ mod tests {
             raw_root: tmp.path().join("raw_samples"),
             accepted_root: tmp.path().join("accepted_samples"),
             labeled_root: tmp.path().join("labeled_trades"),
+            storage_v2_root: None,
+            storage_v2_primary: false,
             parquet_enabled: true,
             strict_lossless: true,
             cycles_started: 10,
@@ -821,6 +1417,8 @@ mod tests {
             raw_root: tmp.path().join("raw_samples"),
             accepted_root: tmp.path().join("accepted_samples"),
             labeled_root: tmp.path().join("labeled_trades"),
+            storage_v2_root: None,
+            storage_v2_primary: false,
             parquet_enabled: true,
             strict_lossless: true,
             cycles_started: 10,
@@ -877,6 +1475,8 @@ mod tests {
             raw_root: tmp.path().join("raw_samples"),
             accepted_root: tmp.path().join("accepted_samples"),
             labeled_root: tmp.path().join("labeled_trades"),
+            storage_v2_root: None,
+            storage_v2_primary: false,
             parquet_enabled: true,
             strict_lossless: true,
             cycles_started: 10,

@@ -23,6 +23,11 @@ use serde::{Deserialize, Serialize};
 use crate::ml::persistence::labeled_trade::LABELED_TRADE_SCHEMA_VERSION;
 use crate::ml::persistence::raw_sample::RAW_SAMPLE_SCHEMA_VERSION;
 use crate::ml::persistence::sample::ACCEPTED_SAMPLE_SCHEMA_VERSION;
+use crate::ml::persistence::storage_v2::{
+    materialize_parquet_file_to_storage_v2_sidecar, remove_storage_v2_sidecar_files,
+    verify_storage_v2_sidecar_equivalence, StorageV2MaterializeConfig, StorageV2ShadowStatus,
+    StorageV2SidecarManifest,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatasetKind {
@@ -40,7 +45,7 @@ impl DatasetKind {
         }
     }
 
-    fn expected_schema_version(self) -> u16 {
+    pub(crate) fn expected_schema_version(self) -> u16 {
         match self {
             DatasetKind::AcceptedSamples => ACCEPTED_SAMPLE_SCHEMA_VERSION,
             DatasetKind::RawSamples => RAW_SAMPLE_SCHEMA_VERSION,
@@ -48,7 +53,7 @@ impl DatasetKind {
         }
     }
 
-    fn timestamp_column(self) -> &'static str {
+    pub(crate) fn timestamp_column(self) -> &'static str {
         match self {
             DatasetKind::AcceptedSamples | DatasetKind::RawSamples => "ts_ns",
             DatasetKind::LabeledTrades => "ts_emit_ns",
@@ -63,6 +68,28 @@ pub struct ParquetCompactionConfig {
     pub batch_size: usize,
     pub zstd_level: i32,
     pub rotation_interval_s: u64,
+    pub storage_v2: StorageV2CompactionConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct StorageV2CompactionConfig {
+    pub enabled: bool,
+    pub output_root: PathBuf,
+    pub verify_equivalence: bool,
+    pub delete_v1_parquet_after_success: bool,
+    pub zstd_level: i32,
+}
+
+impl Default for StorageV2CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            output_root: PathBuf::from("data/ml_v2"),
+            verify_equivalence: true,
+            delete_v1_parquet_after_success: false,
+            zstd_level: 3,
+        }
+    }
 }
 
 impl Default for ParquetCompactionConfig {
@@ -73,6 +100,7 @@ impl Default for ParquetCompactionConfig {
             batch_size: 4096,
             zstd_level: 3,
             rotation_interval_s: 600,
+            storage_v2: StorageV2CompactionConfig::default(),
         }
     }
 }
@@ -195,11 +223,32 @@ pub fn compact_jsonl_file(
                 validate_source_still_matches(jsonl_path, source_fingerprint).with_context(
                     || {
                         format!(
-                            "validate duplicate source before removal {}",
+                            "validate duplicate source before storage_v2 publication {}",
                             jsonl_path.display()
                         )
                     },
                 )?;
+            }
+            let storage_v2_manifest =
+                publish_storage_v2_if_enabled(&parquet_path, &manifest_path, dataset_kind, cfg)
+                    .with_context(|| {
+                        format!(
+                            "publish storage_v2 for existing parquet {}",
+                            parquet_path.display()
+                        )
+                    })?;
+            if cfg.delete_jsonl_after_success {
+                if let Err(e) = validate_source_still_matches(jsonl_path, source_fingerprint) {
+                    if let Some(manifest) = &storage_v2_manifest {
+                        let _ = remove_storage_v2_sidecar_files(manifest);
+                    }
+                    return Err(e).with_context(|| {
+                        format!(
+                            "source changed during duplicate publication; preserved {}",
+                            jsonl_path.display()
+                        )
+                    });
+                }
                 fs::remove_file(jsonl_path).with_context(|| {
                     format!(
                         "remove duplicate source after validated existing publication {}",
@@ -362,9 +411,20 @@ pub fn compact_jsonl_file(
         cfg,
     );
     publish_parquet_with_manifest(&temp_parquet_path, &parquet_path, &manifest, &manifest_path)?;
+    let storage_v2_manifest =
+        publish_storage_v2_if_enabled(&parquet_path, &manifest_path, dataset_kind, cfg)
+            .with_context(|| {
+                format!(
+                    "publish storage_v2 for compacted parquet {}",
+                    parquet_path.display()
+                )
+            })?;
 
     if cfg.delete_jsonl_after_success {
         if let Err(e) = validate_source_still_matches(jsonl_path, source_fingerprint) {
+            if let Some(manifest) = &storage_v2_manifest {
+                let _ = remove_storage_v2_sidecar_files(manifest);
+            }
             let _ = fs::remove_file(&manifest_path);
             let _ = fs::remove_file(&parquet_path);
             return Err(e).with_context(|| {
@@ -379,6 +439,86 @@ pub fn compact_jsonl_file(
     }
 
     Ok(Some(parquet_path))
+}
+
+fn publish_storage_v2_if_enabled(
+    parquet_path: &Path,
+    manifest_path: &Path,
+    dataset_kind: DatasetKind,
+    cfg: &ParquetCompactionConfig,
+) -> Result<Option<StorageV2SidecarManifest>> {
+    let storage_v2 = &cfg.storage_v2;
+    if !storage_v2.enabled {
+        return Ok(None);
+    }
+    if storage_v2.delete_v1_parquet_after_success && !storage_v2.verify_equivalence {
+        anyhow::bail!(
+            "ml.storage_v2.delete_v1_parquet_after_success requires verify_equivalence=true"
+        );
+    }
+
+    let out_dir =
+        storage_v2_partition_dir_for_source(parquet_path, dataset_kind, &storage_v2.output_root);
+    let materialize_cfg = StorageV2MaterializeConfig {
+        zstd_level: storage_v2.zstd_level,
+        overwrite_existing: true,
+    };
+    let sidecar_manifest = materialize_parquet_file_to_storage_v2_sidecar(
+        parquet_path,
+        dataset_kind,
+        &out_dir,
+        &materialize_cfg,
+    )?;
+
+    if storage_v2.verify_equivalence {
+        verify_storage_v2_equivalence_or_cleanup(parquet_path, &sidecar_manifest, dataset_kind)?;
+    }
+
+    if storage_v2.delete_v1_parquet_after_success {
+        remove_file_if_exists(parquet_path).with_context(|| {
+            format!(
+                "remove V1 parquet after storage_v2 publication {}",
+                parquet_path.display()
+            )
+        })?;
+        if !manifest_path.exists() {
+            anyhow::bail!(
+                "V1 manifest missing after storage_v2 publication: {}",
+                manifest_path.display()
+            );
+        }
+    }
+
+    Ok(Some(sidecar_manifest))
+}
+
+fn verify_storage_v2_equivalence_or_cleanup(
+    parquet_path: &Path,
+    sidecar_manifest: &StorageV2SidecarManifest,
+    dataset_kind: DatasetKind,
+) -> Result<()> {
+    let equivalence =
+        match verify_storage_v2_sidecar_equivalence(parquet_path, sidecar_manifest, dataset_kind) {
+            Ok(equivalence) => equivalence,
+            Err(e) => {
+                let _ = remove_storage_v2_sidecar_files(sidecar_manifest);
+                return Err(e).with_context(|| {
+                    format!(
+                        "storage_v2 equivalence errored for {}",
+                        parquet_path.display()
+                    )
+                });
+            }
+        };
+    if equivalence.status != StorageV2ShadowStatus::Green {
+        let _ = remove_storage_v2_sidecar_files(sidecar_manifest);
+        anyhow::bail!(
+            "storage_v2 equivalence failed for {}: {:?}",
+            parquet_path.display(),
+            equivalence.issues
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -476,6 +616,28 @@ fn remove_file_if_exists(path: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
+}
+
+fn storage_v2_partition_dir_for_source(
+    source_path: &Path,
+    dataset_kind: DatasetKind,
+    output_root: &Path,
+) -> PathBuf {
+    let mut out = output_root.join(dataset_kind.as_str());
+    let mut append = false;
+    if let Some(parent) = source_path.parent() {
+        for component in parent.components() {
+            let text = component.as_os_str().to_string_lossy();
+            if text == dataset_kind.as_str() {
+                append = true;
+                continue;
+            }
+            if append {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+    out
 }
 
 fn write_and_validate_manifest_temp(manifest: &ParquetManifest, path: &Path) -> Result<PathBuf> {
@@ -1895,6 +2057,186 @@ mod tests {
         let manifest = read_manifest(&parquet);
         assert_eq!(manifest.source_row_count, 2);
         assert_eq!(manifest.parquet_row_count, 2);
+    }
+
+    #[test]
+    fn compactor_can_publish_storage_v2_primary_and_remove_v1_parquet() {
+        use crate::ml::persistence::sample_id::sample_id_of;
+        use crate::types::Venue;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("raw-scanner-4242_1_part-000000.jsonl");
+        let sample_id = sample_id_of(1, 1, "BTC-USDT", Venue::MexcFut, Venue::BingxFut);
+        write_lines(
+            &jsonl,
+            &[&format!(
+                r#"{{"ts_ns":1,"cycle_seq":1,"schema_version":11,"scanner_version":"0.1.0","sample_id":"{}","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":1,"route_active_until_ns":null,"route_n_snapshots":1}}"#,
+                sample_id
+            )],
+        );
+        let storage_v2_root = tmp.path().join("ml_v2");
+        let cfg = ParquetCompactionConfig {
+            storage_v2: StorageV2CompactionConfig {
+                enabled: true,
+                output_root: storage_v2_root.clone(),
+                verify_equivalence: true,
+                delete_v1_parquet_after_success: true,
+                zstd_level: 3,
+            },
+            ..ParquetCompactionConfig::default()
+        };
+
+        let parquet = compact_jsonl_file(&jsonl, DatasetKind::RawSamples, &cfg)
+            .expect("compact")
+            .expect("parquet publication path");
+
+        assert!(!jsonl.exists(), "JSONL deve ser removido apos sucesso");
+        assert!(
+            !parquet.exists(),
+            "Parquet V1 pesado deve ser removido no modo V2 primary"
+        );
+        assert!(
+            manifest_path_for(&parquet).exists(),
+            "manifesto V1 pequeno fica como lineage"
+        );
+        let v2_dir = storage_v2_root.join("raw_samples");
+        assert!(v2_dir
+            .join("raw-scanner-4242_1_part-000000.fact.parquet")
+            .exists());
+        assert!(v2_dir
+            .join("raw-scanner-4242_1_part-000000.route_dim.parquet")
+            .exists());
+        assert!(v2_dir
+            .join("raw-scanner-4242_1_part-000000.storage_v2.manifest.json")
+            .exists());
+    }
+
+    #[test]
+    fn compactor_rejects_v2_primary_without_equivalence() {
+        use crate::ml::persistence::sample_id::sample_id_of;
+        use crate::types::Venue;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("raw-scanner-4242_3_part-000000.jsonl");
+        let sample_id = sample_id_of(3, 3, "BTC-USDT", Venue::MexcFut, Venue::BingxFut);
+        write_lines(
+            &jsonl,
+            &[&format!(
+                r#"{{"ts_ns":3,"cycle_seq":3,"schema_version":11,"scanner_version":"0.1.0","sample_id":"{}","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":3,"route_active_until_ns":null,"route_n_snapshots":3}}"#,
+                sample_id
+            )],
+        );
+        let cfg = ParquetCompactionConfig {
+            storage_v2: StorageV2CompactionConfig {
+                enabled: true,
+                output_root: tmp.path().join("ml_v2"),
+                verify_equivalence: false,
+                delete_v1_parquet_after_success: true,
+                zstd_level: 3,
+            },
+            ..ParquetCompactionConfig::default()
+        };
+
+        let err = compact_jsonl_file(&jsonl, DatasetKind::RawSamples, &cfg)
+            .expect_err("primary V2 without equivalence must fail");
+
+        assert!(format!("{err:#}")
+            .contains("delete_v1_parquet_after_success requires verify_equivalence=true"));
+        assert!(jsonl.exists());
+    }
+
+    #[test]
+    fn storage_v2_equivalence_error_cleans_sidecars() {
+        use crate::ml::persistence::sample_id::sample_id_of;
+        use crate::types::Venue;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("raw-scanner-4242_4_part-000000.jsonl");
+        let sample_id = sample_id_of(4, 4, "BTC-USDT", Venue::MexcFut, Venue::BingxFut);
+        write_lines(
+            &jsonl,
+            &[&format!(
+                r#"{{"ts_ns":4,"cycle_seq":4,"schema_version":11,"scanner_version":"0.1.0","sample_id":"{}","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":4,"route_active_until_ns":null,"route_n_snapshots":4}}"#,
+                sample_id
+            )],
+        );
+        let v1_cfg = ParquetCompactionConfig {
+            delete_jsonl_after_success: false,
+            storage_v2: StorageV2CompactionConfig::default(),
+            ..ParquetCompactionConfig::default()
+        };
+        let parquet = compact_jsonl_file(&jsonl, DatasetKind::RawSamples, &v1_cfg)
+            .expect("v1 compact")
+            .expect("parquet");
+        let v2_dir = tmp.path().join("ml_v2/raw_samples");
+        let manifest = materialize_parquet_file_to_storage_v2_sidecar(
+            &parquet,
+            DatasetKind::RawSamples,
+            &v2_dir,
+            &StorageV2MaterializeConfig::default(),
+        )
+        .expect("materialize v2");
+        assert!(Path::new(&manifest.fact_parquet_path).exists());
+        assert!(Path::new(&manifest.route_dim_parquet_path).exists());
+        fs::remove_file(&manifest.route_dim_parquet_path).expect("remove route_dim");
+
+        let err =
+            verify_storage_v2_equivalence_or_cleanup(&parquet, &manifest, DatasetKind::RawSamples)
+                .expect_err("missing route_dim must fail equivalence");
+
+        assert!(format!("{err:#}").contains("storage_v2 equivalence errored"));
+        assert!(!Path::new(&manifest.fact_parquet_path).exists());
+        assert!(!Path::new(&manifest.route_dim_parquet_path).exists());
+    }
+
+    #[test]
+    fn compactor_recovers_existing_v1_publication_into_storage_v2_primary() {
+        use crate::ml::persistence::sample_id::sample_id_of;
+        use crate::types::Venue;
+
+        let tmp = tempfile::tempdir().expect("tmp");
+        let jsonl = tmp.path().join("raw-scanner-4242_2_part-000000.jsonl");
+        let sample_id = sample_id_of(2, 2, "BTC-USDT", Venue::MexcFut, Venue::BingxFut);
+        write_lines(
+            &jsonl,
+            &[&format!(
+                r#"{{"ts_ns":2,"cycle_seq":2,"schema_version":11,"scanner_version":"0.1.0","sample_id":"{}","runtime_config_hash":"0000000000000001","symbol_id":7,"symbol_name":"BTC-USDT","canonical_symbol":"BTC-USDT","route_id":"BTC-USDT|mexc:FUTURES->bingx:FUTURES","buy_venue":"mexc","sell_venue":"bingx","buy_market":"FUTURES","sell_market":"FUTURES","entry_spread":2.0,"exit_spread":-1.0,"buy_vol24":1000000.0,"sell_vol24":1000000.0,"sample_decision":"accept","sampling_tier":"priority","sampling_probability":1.0,"sampling_probability_kind":"conditional_priority","route_first_seen_ns":1,"route_last_seen_ns":2,"route_active_until_ns":null,"route_n_snapshots":2}}"#,
+                sample_id
+            )],
+        );
+        let v1_only_cfg = ParquetCompactionConfig {
+            delete_jsonl_after_success: false,
+            storage_v2: StorageV2CompactionConfig::default(),
+            ..ParquetCompactionConfig::default()
+        };
+        let parquet = compact_jsonl_file(&jsonl, DatasetKind::RawSamples, &v1_only_cfg)
+            .expect("v1 compact")
+            .expect("parquet");
+        assert!(jsonl.exists());
+        assert!(parquet.exists());
+
+        let storage_v2_root = tmp.path().join("ml_v2");
+        let v2_primary_cfg = ParquetCompactionConfig {
+            storage_v2: StorageV2CompactionConfig {
+                enabled: true,
+                output_root: storage_v2_root.clone(),
+                verify_equivalence: true,
+                delete_v1_parquet_after_success: true,
+                zstd_level: 3,
+            },
+            ..ParquetCompactionConfig::default()
+        };
+        let retry_parquet = compact_jsonl_file(&jsonl, DatasetKind::RawSamples, &v2_primary_cfg)
+            .expect("recover to v2")
+            .expect("parquet path");
+
+        assert_eq!(retry_parquet, parquet);
+        assert!(!jsonl.exists());
+        assert!(!parquet.exists());
+        assert!(manifest_path_for(&parquet).exists());
+        assert!(storage_v2_root
+            .join("raw_samples/raw-scanner-4242_2_part-000000.storage_v2.manifest.json")
+            .exists());
     }
 
     #[test]

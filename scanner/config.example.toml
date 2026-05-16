@@ -108,6 +108,17 @@ zstd_level = 3
 # JSONL source files are preserved on failure.
 strict_lossless = true
 
+[ml.storage_v2]
+# Final storage format for closed ML partitions. The scanner still writes
+# JSONL in the hot path and first builds a validated V1 Parquet as a staging
+# artifact; V2 is then materialized as fact + route_dim + manifest, checked
+# against V1, and the heavy V1 Parquet is removed after success.
+enabled = true
+output_dir = "data/ml_v2"
+verify_equivalence = true
+delete_v1_parquet_after_success = true
+zstd_level = 3
+
 [ml.windows]
 # Statistical memory of the model/trainer. These windows do not delete
 # files. They declare the intended lookback:

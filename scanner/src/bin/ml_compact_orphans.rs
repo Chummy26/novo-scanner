@@ -64,6 +64,7 @@ fn main() -> anyhow::Result<()> {
         batch_size: cli.batch_size,
         zstd_level: cli.zstd_level,
         rotation_interval_s: 600,
+        storage_v2: Default::default(),
     };
 
     loop {
@@ -349,6 +350,7 @@ mod tests {
             batch_size: 1,
             zstd_level: 3,
             rotation_interval_s: 600,
+            storage_v2: Default::default(),
         };
         let compacted = compact_existing_jsonl_in_tree_min_age(
             &root,

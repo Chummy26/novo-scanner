@@ -23,7 +23,7 @@ Streams:
 - `accepted_samples` (`AcceptedSample` v10): candidatos aceitos pelo trigger.
   `was_recommended` indica se o baseline/modelo emitiu `TradeSetup`; também
   carrega config hash, tier/probabilidade de amostragem e lifecycle.
-- `labeled_trades` (`LabeledTrade` v11): um registro por
+- `labeled_trades` (`LabeledTrade` v12): um registro por
   `(sample_id, horizon_s)`, com `outcome in {realized, miss, censored}`.
   O resolver cria labels para candidates limpos. No foreground, isso inclui
   `sample_decision != "accept"`; no background abaixo do threshold visual,
@@ -62,4 +62,8 @@ Invariantes do trainer:
   deve explodir cada registro para a unidade
   `(sample_id, horizon_s, floor_pct)`, derivando `floor_outcome` por floor.
   Helper canônico:
-  `python scanner/scripts/explode_label_floor_hits.py data/ml/labeled_trades -o labeled_floors.jsonl`.
+  `python scanner/scripts/explode_label_floor_hits.py data/ml_v2/labeled_trades -o labeled_floors.jsonl`.
+  Em `ml_storage_v2`, a entrada deve ser o diretório V2 ou o
+  `*.storage_v2.manifest.json`; ler `*.fact.parquet` diretamente é inválido
+  porque `sample_id`, `route_id` e a identidade de rota são colunas lógicas
+  reconstruídas a partir de `route_dim`.

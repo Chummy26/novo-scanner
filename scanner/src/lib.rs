@@ -37,8 +37,8 @@ use crate::ml::persistence::{
     compact_existing_jsonl_in_tree, write_run_audit, DatasetKind, JsonlWriter, LabelResolver,
     LabelShutdownAudit, LabeledJsonlWriter, LabeledWriterConfig, OperationalAudit,
     ParquetCompactionConfig, RawSampleWriter, RawWriterConfig, ResolverConfig, RouteDecimator,
-    RouteRanking, RunAuditInput, RunAuditVerdict, WriterAudit, WriterConfig, WriterHandle,
-    WriterSendError,
+    RouteRanking, RunAuditInput, RunAuditVerdict, StorageV2CompactionConfig, WriterAudit,
+    WriterConfig, WriterHandle, WriterSendError,
 };
 use crate::ml::retention::{
     sweep_datasets, DatasetRetentionPolicy, ManagedDataset, ModelWindowPolicy,
@@ -547,12 +547,27 @@ fn parquet_compaction_from_ml_config(
     if !(1..=22).contains(&ml.parquet.zstd_level) {
         anyhow::bail!("ml.parquet.zstd_level must be in [1, 22]");
     }
+    if !(1..=22).contains(&ml.storage_v2.zstd_level) {
+        anyhow::bail!("ml.storage_v2.zstd_level must be in [1, 22]");
+    }
+    if ml.storage_v2.delete_v1_parquet_after_success && !ml.storage_v2.verify_equivalence {
+        anyhow::bail!(
+            "ml.storage_v2.delete_v1_parquet_after_success requires ml.storage_v2.verify_equivalence=true"
+        );
+    }
     Ok(ParquetCompactionConfig {
         enabled: ml.parquet.enabled,
         delete_jsonl_after_success: ml.parquet.delete_jsonl_after_success,
         batch_size: ml.parquet.batch_size,
         zstd_level: ml.parquet.zstd_level,
         rotation_interval_s: ml.parquet.rotation_interval_s,
+        storage_v2: StorageV2CompactionConfig {
+            enabled: ml.storage_v2.enabled,
+            output_root: ml.storage_v2.output_dir.clone(),
+            verify_equivalence: ml.storage_v2.verify_equivalence,
+            delete_v1_parquet_after_success: ml.storage_v2.delete_v1_parquet_after_success,
+            zstd_level: ml.storage_v2.zstd_level,
+        },
     })
 }
 
@@ -1027,7 +1042,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     // `ml.windows` para escolher lookback/calibração.
     {
         let retention_policy = DatasetRetentionPolicy::from(&cfg.ml.retention);
-        let managed = vec![
+        let mut managed = vec![
             ManagedDataset {
                 name: "raw_samples",
                 root: raw_writer_abs.clone(),
@@ -1044,6 +1059,25 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 retention_days: cfg.ml.retention.labeled_retention_days,
             },
         ];
+        if cfg.ml.storage_v2.enabled {
+            managed.extend([
+                ManagedDataset {
+                    name: "raw_samples_v2",
+                    root: cfg.ml.storage_v2.output_dir.join("raw_samples"),
+                    retention_days: cfg.ml.retention.raw_retention_days,
+                },
+                ManagedDataset {
+                    name: "accepted_samples_v2",
+                    root: cfg.ml.storage_v2.output_dir.join("accepted_samples"),
+                    retention_days: cfg.ml.retention.accepted_retention_days,
+                },
+                ManagedDataset {
+                    name: "labeled_trades_v2",
+                    root: cfg.ml.storage_v2.output_dir.join("labeled_trades"),
+                    retention_days: cfg.ml.retention.labeled_retention_days,
+                },
+            ]);
+        }
         retention_policy
             .validate(&managed)
             .map_err(|e| Error::Config(format!("ml.retention: {}", e)))?;
@@ -1370,6 +1404,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             raw_root: raw_writer_abs.clone(),
             accepted_root: writer_abs.clone(),
             labeled_root: labeled_writer_abs.clone(),
+            storage_v2_root: Some(cfg.ml.storage_v2.output_dir.clone()),
+            storage_v2_primary: cfg.ml.storage_v2.enabled
+                && cfg.ml.storage_v2.delete_v1_parquet_after_success,
             parquet_enabled: cfg.ml.parquet.enabled,
             strict_lossless: cfg.ml.parquet.strict_lossless,
             cycles_started: ml_server.cycles_started(),
@@ -1765,6 +1802,7 @@ mod tests {
         Recommendation, RouteId, TradeReason, TradeSetup,
     };
     use crate::types::{SymbolId, Venue};
+    use std::path::PathBuf;
     use std::time::Duration;
 
     fn mk_route() -> RouteId {
@@ -1997,6 +2035,8 @@ mod tests {
         ml.parquet.delete_jsonl_after_success = true;
         ml.parquet.batch_size = 8192;
         ml.parquet.zstd_level = 6;
+        ml.storage_v2.output_dir = PathBuf::from("target/test-ml-v2");
+        ml.storage_v2.zstd_level = 4;
 
         let parquet = super::parquet_compaction_from_ml_config(&ml).expect("parquet cfg");
         let rotation =
@@ -2007,6 +2047,14 @@ mod tests {
         assert_eq!(parquet.batch_size, 8192);
         assert_eq!(parquet.zstd_level, 6);
         assert_eq!(parquet.rotation_interval_s, 300);
+        assert!(parquet.storage_v2.enabled);
+        assert_eq!(
+            parquet.storage_v2.output_root,
+            PathBuf::from("target/test-ml-v2")
+        );
+        assert!(parquet.storage_v2.verify_equivalence);
+        assert!(parquet.storage_v2.delete_v1_parquet_after_success);
+        assert_eq!(parquet.storage_v2.zstd_level, 4);
         assert_eq!(rotation.as_secs(), 300);
     }
 

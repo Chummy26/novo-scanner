@@ -16,7 +16,10 @@
 //! # Escolha de formato: JSONL no hot path, Parquet/ZSTD após fechamento
 //!
 //! O scanner continua escrevendo **JSONL append-only** no hot path e
-//! compacta cada arquivo fechado para **Parquet/ZSTD**. Racional:
+//! compacta cada arquivo fechado para **Parquet/ZSTD**. Quando
+//! `ml.storage_v2.enabled=true`, esse Parquet V1 é uma etapa transitória
+//! validada: o compactor publica `fact + route_dim + manifest`, verifica a
+//! reconstrução lógica e pode remover o Parquet V1 pesado. Racional:
 //!
 //! 1. **Persistência simples e robusta** durante o ciclo atual — só
 //!    append/flush no arquivo aberto.
@@ -24,10 +27,13 @@
 //!    e melhor leitura offline para treino/auditoria.
 //! 3. **Mesmo schema lógico** entre produtor e consumidor — o compactor lê
 //!    o JSONL já emitido e grava Parquet sem reabrir a semântica do dataset.
+//! 4. **V2 sem redução de dados** — colunas determinísticas/repetidas são
+//!    virtualizadas, mas o leitor lógico reconstrói `sample_id`, `route_id`
+//!    e identidade de rota antes do trainer.
 //!
 //! O produtor (`MlServer`) continua agnóstico ao formato final. A camada de
 //! persistência é que decide se a partição fechada fica em `.jsonl`,
-//! `.parquet`, ou ambos.
+//! Parquet V1, ou storage V2 lógico.
 
 pub mod label_resolver;
 pub mod labeled_trade;
@@ -55,6 +61,7 @@ pub use labeled_writer::{
 };
 pub use parquet_compactor::{
     compact_existing_jsonl_in_tree, compact_jsonl_file, DatasetKind, ParquetCompactionConfig,
+    StorageV2CompactionConfig,
 };
 pub use route_ranking::{RouteRanking, RouteScore};
 pub use sample_id::sample_id_of;

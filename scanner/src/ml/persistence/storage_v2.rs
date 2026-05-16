@@ -1,11 +1,10 @@
 //! Auditoria shadow para `ml_storage_v2`.
 //!
-//! Este módulo implementa a primeira fase segura do storage v2: ele **não**
-//! substitui o writer canônico, **não** remove colunas físicas e **não** altera
-//! frequência, labels, horizontes ou floors. Ele lê Parquets v1 fechados,
-//! reconstrói o contrato lógico que seria virtualizado no v2 (`sample_id`,
-//! `route_id` e dimensão estática de rota), e gera métricas/erros antes de
-//! qualquer migração.
+//! O V2 não altera frequência, labels, horizontes ou floors. Ele lê Parquets
+//! V1 fechados, materializa `fact + route_dim + manifest`, e reconstrói o
+//! contrato lógico virtualizado (`sample_id`, `route_id` e dimensão estática
+//! de rota). Em modo primário, o compactor só remove o Parquet V1 pesado
+//! depois que a equivalência `V1 == V2 reconstruído` fica Green.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -27,7 +26,9 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde::{Deserialize, Serialize};
 
 use crate::ml::contract::RouteId;
-use crate::ml::persistence::parquet_compactor::DatasetKind;
+use crate::ml::persistence::parquet_compactor::{
+    DatasetKind, DatasetSemanticStats, ParquetManifest,
+};
 use crate::ml::persistence::sample_id::{route_id_key, sample_id_of};
 use crate::ml::persistence::{
     ACCEPTED_SAMPLE_SCHEMA_VERSION, LABELED_TRADE_SCHEMA_VERSION, RAW_SAMPLE_SCHEMA_VERSION,
@@ -130,16 +131,30 @@ pub struct StorageV2SidecarManifest {
     pub manifest_version: u16,
     pub dataset_kind: String,
     pub source_parquet_path: String,
+    #[serde(default)]
+    pub source_manifest_path: String,
+    #[serde(default)]
+    pub source_jsonl_path: String,
     pub fact_parquet_path: String,
     pub route_dim_parquet_path: String,
     #[serde(default)]
     pub logical_schema_fields: Vec<String>,
+    #[serde(default)]
+    pub logical_field_nullable: BTreeMap<String, bool>,
+    #[serde(default)]
+    pub schema_version: u16,
     pub source_row_count: u64,
     pub fact_row_count: u64,
     pub route_dim_row_count: u64,
     pub source_file_bytes: u64,
     pub fact_file_bytes: u64,
     pub route_dim_file_bytes: u64,
+    #[serde(default)]
+    pub min_timestamp_ns: Option<u64>,
+    #[serde(default)]
+    pub max_timestamp_ns: Option<u64>,
+    #[serde(default)]
+    pub semantic_stats: DatasetSemanticStats,
     pub logical_required_digest_kind: String,
     pub logical_required_digest_hex: String,
     pub sample_id_algorithm_version: String,
@@ -191,6 +206,7 @@ pub struct StorageV2EquivalenceReport {
 pub struct StorageV2SidecarLogicalReader {
     dataset_kind: DatasetKind,
     logical_schema_fields: Vec<String>,
+    logical_field_nullable: BTreeMap<String, bool>,
     route_dim: BTreeMap<u32, RouteDimEntry>,
     fact_reader: ParquetRecordBatchReader,
     expected_rows: u64,
@@ -473,6 +489,8 @@ pub fn materialize_parquet_file_to_storage_v2_sidecar(
     let temp_fact_path = fact_path.with_extension("fact.parquet.tmp");
     let temp_route_dim_path = route_dim_path.with_extension("route_dim.parquet.tmp");
     let temp_manifest_path = manifest_path.with_extension("manifest.json.tmp");
+    let source_manifest_path = source_path.with_extension("parquet.manifest.json");
+    let source_manifest = read_source_parquet_manifest_if_present(&source_manifest_path)?;
 
     prepare_output_path(&fact_path, cfg.overwrite_existing)?;
     prepare_output_path(&route_dim_path, cfg.overwrite_existing)?;
@@ -490,6 +508,12 @@ pub fn materialize_parquet_file_to_storage_v2_sidecar(
         .fields()
         .iter()
         .map(|field| field.name().to_string())
+        .collect();
+    let logical_field_nullable: BTreeMap<String, bool> = builder
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| (field.name().to_string(), field.is_nullable()))
         .collect();
     let mut reader = builder
         .build()
@@ -561,15 +585,38 @@ pub fn materialize_parquet_file_to_storage_v2_sidecar(
         manifest_version: 1,
         dataset_kind: dataset_kind.as_str().to_string(),
         source_parquet_path: source_path.display().to_string(),
+        source_manifest_path: source_manifest
+            .as_ref()
+            .map(|_| source_manifest_path.display().to_string())
+            .unwrap_or_default(),
+        source_jsonl_path: source_manifest
+            .as_ref()
+            .map(|manifest| manifest.source_jsonl_path.clone())
+            .unwrap_or_default(),
         fact_parquet_path: fact_path.display().to_string(),
         route_dim_parquet_path: route_dim_path.display().to_string(),
         logical_schema_fields,
+        logical_field_nullable,
+        schema_version: source_manifest
+            .as_ref()
+            .map(|manifest| manifest.schema_version)
+            .unwrap_or_else(|| dataset_kind.expected_schema_version()),
         source_row_count: source_audit.rows,
         fact_row_count,
         route_dim_row_count: route_dim.len() as u64,
         source_file_bytes,
         fact_file_bytes,
         route_dim_file_bytes,
+        min_timestamp_ns: source_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.min_timestamp_ns),
+        max_timestamp_ns: source_manifest
+            .as_ref()
+            .and_then(|manifest| manifest.max_timestamp_ns),
+        semantic_stats: source_manifest
+            .as_ref()
+            .map(|manifest| manifest.semantic_stats.clone())
+            .unwrap_or_default(),
         logical_required_digest_kind: source_audit.logical_required_digest_kind,
         logical_required_digest_hex: source_audit.logical_required_digest_hex,
         sample_id_algorithm_version: SAMPLE_ID_ALGORITHM_VERSION.to_string(),
@@ -582,33 +629,36 @@ pub fn materialize_parquet_file_to_storage_v2_sidecar(
     };
     write_sidecar_manifest_temp(&manifest, &temp_manifest_path)?;
 
-    fs::rename(&temp_fact_path, &fact_path).with_context(|| {
-        format!(
-            "publish {} -> {}",
-            temp_fact_path.display(),
-            fact_path.display()
-        )
-    })?;
-    fs::rename(&temp_route_dim_path, &route_dim_path).with_context(|| {
-        format!(
-            "publish {} -> {}",
-            temp_route_dim_path.display(),
-            route_dim_path.display()
-        )
-    })?;
-    fs::rename(&temp_manifest_path, &manifest_path).with_context(|| {
-        format!(
-            "publish {} -> {}",
-            temp_manifest_path.display(),
-            manifest_path.display()
-        )
-    })?;
+    publish_sidecar_files(
+        &temp_fact_path,
+        &fact_path,
+        &temp_route_dim_path,
+        &route_dim_path,
+        &temp_manifest_path,
+        &manifest_path,
+    )?;
 
     Ok(StorageV2SidecarManifest {
         fact_parquet_path: fact_path.display().to_string(),
         route_dim_parquet_path: route_dim_path.display().to_string(),
         ..manifest
     })
+}
+
+pub fn remove_storage_v2_sidecar_files(manifest: &StorageV2SidecarManifest) -> Result<()> {
+    remove_file_if_exists(Path::new(&manifest.fact_parquet_path))
+        .with_context(|| format!("remove {}", manifest.fact_parquet_path))?;
+    remove_file_if_exists(Path::new(&manifest.route_dim_parquet_path))
+        .with_context(|| format!("remove {}", manifest.route_dim_parquet_path))?;
+    let manifest_path = sidecar_manifest_path_for_source(
+        Path::new(&manifest.source_parquet_path),
+        Path::new(&manifest.fact_parquet_path)
+            .parent()
+            .unwrap_or_else(|| Path::new(".")),
+    );
+    remove_file_if_exists(&manifest_path)
+        .with_context(|| format!("remove {}", manifest_path.display()))?;
+    Ok(())
 }
 
 pub fn read_storage_v2_sidecar_as_logical_batches(
@@ -656,6 +706,7 @@ pub fn open_storage_v2_sidecar_logical_reader(
     Ok(StorageV2SidecarLogicalReader {
         dataset_kind,
         logical_schema_fields: manifest.logical_schema_fields.clone(),
+        logical_field_nullable: manifest.logical_field_nullable.clone(),
         route_dim,
         fact_reader,
         expected_rows: manifest.fact_row_count,
@@ -675,6 +726,7 @@ impl Iterator for StorageV2SidecarLogicalReader {
                     &fact_batch,
                     &self.route_dim,
                     &self.logical_schema_fields,
+                    &self.logical_field_nullable,
                 );
                 if let Ok(batch) = &logical {
                     self.rows_read = self.rows_read.saturating_add(batch.num_rows() as u64);
@@ -802,6 +854,7 @@ fn reconstruct_logical_batch_from_v2_fact(
     fact_batch: &RecordBatch,
     route_dim: &BTreeMap<u32, RouteDimEntry>,
     logical_schema_fields: &[String],
+    logical_field_nullable: &BTreeMap<String, bool>,
 ) -> Result<RecordBatch> {
     let route_keys = u32_col(fact_batch, "route_key")?;
     let timestamps = u64_col(fact_batch, dataset_kind.timestamp_column())?;
@@ -811,7 +864,9 @@ fn reconstruct_logical_batch_from_v2_fact(
     let mut arrays = Vec::with_capacity(logical_schema_fields.len());
 
     for name in logical_schema_fields {
-        if let Some(field) = virtualized_field(name) {
+        if let Some(field) =
+            virtualized_field(name, *logical_field_nullable.get(name).unwrap_or(&false))
+        {
             fields.push(field);
             arrays.push(build_virtualized_array(
                 name, route_keys, timestamps, cycle_seq, route_dim,
@@ -1144,6 +1199,66 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn publish_sidecar_files(
+    temp_fact_path: &Path,
+    fact_path: &Path,
+    temp_route_dim_path: &Path,
+    route_dim_path: &Path,
+    temp_manifest_path: &Path,
+    manifest_path: &Path,
+) -> Result<()> {
+    if let Err(e) = fs::rename(temp_fact_path, fact_path) {
+        let _ = remove_file_if_exists(temp_fact_path);
+        let _ = remove_file_if_exists(temp_route_dim_path);
+        let _ = remove_file_if_exists(temp_manifest_path);
+        return Err(e).with_context(|| {
+            format!(
+                "publish {} -> {}",
+                temp_fact_path.display(),
+                fact_path.display()
+            )
+        });
+    }
+
+    if let Err(e) = fs::rename(temp_route_dim_path, route_dim_path) {
+        let _ = remove_file_if_exists(fact_path);
+        let _ = remove_file_if_exists(temp_route_dim_path);
+        let _ = remove_file_if_exists(temp_manifest_path);
+        return Err(e).with_context(|| {
+            format!(
+                "publish {} -> {}",
+                temp_route_dim_path.display(),
+                route_dim_path.display()
+            )
+        });
+    }
+
+    if let Err(e) = fs::rename(temp_manifest_path, manifest_path) {
+        let _ = remove_file_if_exists(fact_path);
+        let _ = remove_file_if_exists(route_dim_path);
+        let _ = remove_file_if_exists(temp_manifest_path);
+        return Err(e).with_context(|| {
+            format!(
+                "publish {} -> {}",
+                temp_manifest_path.display(),
+                manifest_path.display()
+            )
+        });
+    }
+
+    Ok(())
+}
+
+fn read_source_parquet_manifest_if_present(path: &Path) -> Result<Option<ParquetManifest>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let manifest: ParquetManifest =
+        serde_json::from_reader(file).with_context(|| format!("parse {}", path.display()))?;
+    Ok(Some(manifest))
+}
+
 fn write_sidecar_manifest_temp(manifest: &StorageV2SidecarManifest, path: &Path) -> Result<()> {
     {
         let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
@@ -1177,13 +1292,13 @@ fn is_virtualized_column(name: &str) -> bool {
     virtualized_columns().contains(&name)
 }
 
-fn virtualized_field(name: &str) -> Option<Field> {
+fn virtualized_field(name: &str, nullable: bool) -> Option<Field> {
     match name {
         "sample_id" | "route_id" | "symbol_name" | "canonical_symbol" | "buy_venue"
         | "sell_venue" | "buy_market" | "sell_market" => {
-            Some(Field::new(name, DataType::Utf8, false))
+            Some(Field::new(name, DataType::Utf8, nullable))
         }
-        "symbol_id" => Some(Field::new(name, DataType::UInt32, false)),
+        "symbol_id" => Some(Field::new(name, DataType::UInt32, nullable)),
         _ => None,
     }
 }
@@ -1701,18 +1816,5 @@ impl LogicalDigest {
 
     fn hex(&self) -> String {
         format!("{:016x}", self.hash)
-    }
-}
-
-trait DatasetKindExt {
-    fn timestamp_column(self) -> &'static str;
-}
-
-impl DatasetKindExt for DatasetKind {
-    fn timestamp_column(self) -> &'static str {
-        match self {
-            DatasetKind::AcceptedSamples | DatasetKind::RawSamples => "ts_ns",
-            DatasetKind::LabeledTrades => "ts_emit_ns",
-        }
     }
 }
