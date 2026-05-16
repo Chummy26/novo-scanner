@@ -14,6 +14,7 @@
 //! [`super::writer::hour_key_for_ns`] e a rotação por intervalo é o mesmo
 //! mecanismo do writer de `AcceptedSample`.
 
+use std::collections::BTreeMap;
 use std::fs::{self, create_dir_all, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -26,7 +27,9 @@ use crate::ml::persistence::parquet_compactor::{
     compact_jsonl_file, DatasetKind, ParquetCompactionConfig, ParquetManifest,
 };
 use crate::ml::persistence::raw_sample::RawSample;
-use crate::ml::persistence::writer::{hour_key_for_ns, rotation_key_for_ns, rotation_start_ns_for};
+use crate::ml::persistence::writer::{
+    hour_key_for_ns, rotation_interval_ns, rotation_key_for_ns, rotation_start_ns_for,
+};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -118,15 +121,21 @@ pub enum RawWriterSendError {
 pub struct RawSampleWriter {
     cfg: RawWriterConfig,
     rx: mpsc::Receiver<RawWriterCommand>,
-    current_rotation_key: Option<String>,
-    writer: Option<BufWriter<std::fs::File>>,
-    current_path: Option<PathBuf>,
-    lines_since_flush: usize,
+    open_files: BTreeMap<String, OpenRawJsonlFile>,
+    latest_rotation_start_ns: Option<u64>,
+    file_sequence: u64,
     total_written: u64,
     total_dropped: u64,
     compaction_tasks: Vec<tokio::task::JoinHandle<anyhow::Result<Option<PathBuf>>>>,
     compaction_succeeded: u64,
     compaction_failed: u64,
+}
+
+struct OpenRawJsonlFile {
+    writer: BufWriter<std::fs::File>,
+    path: PathBuf,
+    rotation_start_ns: u64,
+    lines_since_flush: usize,
 }
 
 impl RawSampleWriter {
@@ -135,10 +144,9 @@ impl RawSampleWriter {
         let writer = Self {
             cfg,
             rx,
-            current_rotation_key: None,
-            writer: None,
-            current_path: None,
-            lines_since_flush: 0,
+            open_files: BTreeMap::new(),
+            latest_rotation_start_ns: None,
+            file_sequence: 0,
             total_written: 0,
             total_dropped: 0,
             compaction_tasks: Vec::new(),
@@ -169,7 +177,7 @@ impl RawSampleWriter {
                     match maybe_sample {
                         Some(RawWriterCommand::Write(sample)) => self.write_one(sample).await,
                         Some(RawWriterCommand::Seal { reply }) => {
-                            self.close_current_file();
+                            self.close_all_files();
                             self.await_pending_compactions().await;
                             let _ = reply.send(self.stats());
                         }
@@ -179,7 +187,7 @@ impl RawSampleWriter {
                                 "ML raw-sample writer encerrando (canal fechado)"
                             );
                             self.periodic_flush();
-                            self.close_current_file();
+                            self.close_all_files();
                             self.await_pending_compactions().await;
                             break;
                         }
@@ -191,16 +199,26 @@ impl RawSampleWriter {
 
     async fn write_one(&mut self, sample: RawSample) {
         let rotation_key = rotation_key_for_ns(sample.ts_ns, self.cfg.rotation_interval);
-        if self.current_rotation_key.as_deref() != Some(rotation_key.as_str()) {
-            self.close_current_file();
-            self.reap_finished_compactions().await;
+        let rotation_start_ns = rotation_start_ns_for(sample.ts_ns, self.cfg.rotation_interval);
+        self.latest_rotation_start_ns = Some(
+            self.latest_rotation_start_ns
+                .map_or(rotation_start_ns, |latest| latest.max(rotation_start_ns)),
+        );
+
+        if !self.open_files.contains_key(&rotation_key) {
             let hour_key = hour_key_for_ns(sample.ts_ns);
-            let rotation_start_ns = rotation_start_ns_for(sample.ts_ns, self.cfg.rotation_interval);
-            match self.open_writer_for_hour(&hour_key, rotation_start_ns) {
+            let file_sequence = self.next_file_sequence();
+            match self.open_writer_for_hour(&hour_key, rotation_start_ns, file_sequence) {
                 Ok((w, path)) => {
-                    self.writer = Some(w);
-                    self.current_path = Some(path);
-                    self.current_rotation_key = Some(rotation_key);
+                    self.open_files.insert(
+                        rotation_key.clone(),
+                        OpenRawJsonlFile {
+                            writer: w,
+                            path,
+                            rotation_start_ns,
+                            lines_since_flush: 0,
+                        },
+                    );
                 }
                 Err(e) => {
                     self.total_dropped = self.total_dropped.saturating_add(1);
@@ -209,54 +227,78 @@ impl RawSampleWriter {
             }
         }
 
-        let Some(writer) = self.writer.as_mut() else {
+        let Some(open_file) = self.open_files.get_mut(&rotation_key) else {
             self.total_dropped = self.total_dropped.saturating_add(1);
             panic!("ML raw writer strict-lossless violation: writer missing after rotation");
         };
 
         let line = sample.to_json_line();
-        if let Err(e) = writeln!(writer, "{}", line) {
+        if let Err(e) = writeln!(open_file.writer, "{}", line) {
             self.total_dropped = self.total_dropped.saturating_add(1);
             panic!("ML raw writer strict-lossless violation: failed to write sample: {e}");
         }
 
         self.total_written = self.total_written.saturating_add(1);
-        self.lines_since_flush = self.lines_since_flush.saturating_add(1);
+        open_file.lines_since_flush = open_file.lines_since_flush.saturating_add(1);
 
-        if self.lines_since_flush >= self.cfg.flush_after_n {
-            if let Err(e) = writer.flush() {
+        if open_file.lines_since_flush >= self.cfg.flush_after_n {
+            if let Err(e) = open_file.writer.flush() {
                 panic!("ML raw writer strict-lossless violation: failed to flush sample: {e}");
             }
-            self.lines_since_flush = 0;
+            open_file.lines_since_flush = 0;
         }
+
+        self.close_sealable_files();
     }
 
     fn periodic_flush(&mut self) {
-        if let Some(w) = self.writer.as_mut() {
-            if let Err(e) = w.flush() {
+        for open_file in self.open_files.values_mut() {
+            if let Err(e) = open_file.writer.flush() {
                 panic!("ML raw writer strict-lossless violation: periodic flush failed: {e}");
             }
-            self.lines_since_flush = 0;
+            open_file.lines_since_flush = 0;
+        }
+        self.close_sealable_files();
+    }
+
+    fn close_sealable_files(&mut self) {
+        let Some(latest) = self.latest_rotation_start_ns else {
+            return;
+        };
+        let interval_ns = rotation_interval_ns(self.cfg.rotation_interval);
+        let keys_to_close: Vec<String> = self
+            .open_files
+            .iter()
+            .filter_map(|(key, open_file)| {
+                let close_before_latest =
+                    open_file.rotation_start_ns.saturating_add(interval_ns) < latest;
+                close_before_latest.then_some(key.clone())
+            })
+            .collect();
+        for key in keys_to_close {
+            if let Some(open_file) = self.open_files.remove(&key) {
+                self.close_open_file(open_file);
+            }
         }
     }
 
-    fn close_current_file(&mut self) {
-        if let Some(mut w) = self.writer.take() {
-            if let Err(e) = w.flush() {
-                panic!("ML raw writer strict-lossless violation: close flush failed: {e}");
-            }
+    fn close_all_files(&mut self) {
+        let files = std::mem::take(&mut self.open_files);
+        for (_, open_file) in files {
+            self.close_open_file(open_file);
         }
-        let Some(path) = self.current_path.take() else {
-            return;
-        };
-        self.current_rotation_key = None;
-        self.lines_since_flush = 0;
+    }
 
+    fn close_open_file(&mut self, mut open_file: OpenRawJsonlFile) {
+        if let Err(e) = open_file.writer.flush() {
+            panic!("ML raw writer strict-lossless violation: close flush failed: {e}");
+        }
         if !self.cfg.parquet.enabled {
             return;
         }
 
         let parquet_cfg = self.cfg.parquet.clone();
+        let path = open_file.path;
         let handle = tokio::task::spawn_blocking(move || {
             let result = compact_jsonl_file(&path, DatasetKind::RawSamples, &parquet_cfg);
             match &result {
@@ -286,6 +328,12 @@ impl RawSampleWriter {
             result
         });
         self.compaction_tasks.push(handle);
+    }
+
+    fn next_file_sequence(&mut self) -> u64 {
+        let sequence = self.file_sequence;
+        self.file_sequence = self.file_sequence.saturating_add(1);
+        sequence
     }
 
     async fn await_pending_compactions(&mut self) {
@@ -341,6 +389,7 @@ impl RawSampleWriter {
         &self,
         hour_key: &str,
         rotation_start_ns: u64,
+        file_sequence: u64,
     ) -> std::io::Result<(BufWriter<std::fs::File>, PathBuf)> {
         let dir_path = self.cfg.data_dir.join(hour_key);
         create_dir_all(&dir_path)?;
@@ -350,8 +399,8 @@ impl RawSampleWriter {
             .unwrap_or(0);
         let rotation_start_s = rotation_start_ns / 1_000_000_000;
         let filename = format!(
-            "{}_{}_part-{}.jsonl",
-            self.cfg.file_prefix, start_ts, rotation_start_s
+            "{}_{}_part-{}_seg-{}.jsonl",
+            self.cfg.file_prefix, start_ts, rotation_start_s, file_sequence
         );
         let path = dir_path.join(filename);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
@@ -533,6 +582,72 @@ mod tests {
             jsonl_files.is_empty(),
             "jsonl intermediário do raw writer deve ser removido após compactação"
         );
+    }
+
+    #[tokio::test]
+    async fn writer_keeps_adjacent_rotation_buckets_open_until_seal() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let cfg = RawWriterConfig {
+            data_dir: tmp.path().to_path_buf(),
+            channel_capacity: 16,
+            flush_after_n: 1,
+            flush_interval: Duration::from_secs(60),
+            file_prefix: "rawtest".into(),
+            rotation_interval: Duration::from_secs(600),
+            parquet: ParquetCompactionConfig::default(),
+        };
+        let (writer, handle) = RawSampleWriter::create(cfg);
+        let task = tokio::spawn(writer.run());
+
+        let route = mk_route();
+        let base = 1_745_157_600u64 * 1_000_000_000;
+        for (cycle_seq, ts_ns) in [
+            (0, base),
+            (1, base + 600_000_000_000),
+            (2, base + 1_000_000_000),
+            (3, base + 601_000_000_000),
+        ] {
+            handle
+                .try_send(RawSample::new(
+                    ts_ns,
+                    cycle_seq,
+                    route,
+                    "BTC-USDT",
+                    2.0,
+                    -1.0,
+                    1e6,
+                    1e6,
+                    SampleDecision::Accept,
+                ))
+                .expect("send raw sample");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stats = handle.seal_current_file().await.expect("seal raw writer");
+        assert_eq!(stats.total_written, 4);
+        assert_eq!(stats.compaction_succeeded, 2);
+        assert_eq!(stats.compaction_failed, 0);
+
+        let hour14 = tmp.path().join("year=2025/month=04/day=20/hour=14");
+        let parquet_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("parquet")).then_some(p)
+            })
+            .collect();
+        let jsonl_files: Vec<_> = std::fs::read_dir(&hour14)
+            .unwrap()
+            .filter_map(|e| {
+                let p = e.ok()?.path();
+                (p.extension().and_then(|s| s.to_str()) == Some("jsonl")).then_some(p)
+            })
+            .collect();
+        assert_eq!(parquet_files.len(), 2);
+        assert!(jsonl_files.is_empty());
+
+        drop(handle);
+        task.await.expect("task join");
     }
 
     #[tokio::test]

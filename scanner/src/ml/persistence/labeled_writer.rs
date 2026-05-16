@@ -6,6 +6,7 @@
 //! Default `data_dir = data/ml/labeled_trades`. Nome de arquivo
 //! `labeled-{hostname}-{pid}_{start_ts}.jsonl`.
 
+use std::collections::BTreeMap;
 use std::fs::{self, create_dir_all, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
@@ -18,7 +19,9 @@ use crate::ml::persistence::labeled_trade::LabeledTrade;
 use crate::ml::persistence::parquet_compactor::{
     compact_jsonl_file, DatasetKind, ParquetCompactionConfig, ParquetManifest,
 };
-use crate::ml::persistence::writer::{hour_key_for_ns, rotation_key_for_ns, rotation_start_ns_for};
+use crate::ml::persistence::writer::{
+    hour_key_for_ns, rotation_interval_ns, rotation_key_for_ns, rotation_start_ns_for,
+};
 
 #[derive(Debug, Clone)]
 pub struct LabeledWriterConfig {
@@ -105,15 +108,21 @@ pub enum LabeledWriterSendError {
 pub struct LabeledJsonlWriter {
     cfg: LabeledWriterConfig,
     rx: mpsc::Receiver<LabeledWriterCommand>,
-    current_rotation_key: Option<String>,
-    writer: Option<BufWriter<std::fs::File>>,
-    current_path: Option<PathBuf>,
-    lines_since_flush: usize,
+    open_files: BTreeMap<String, OpenLabeledJsonlFile>,
+    latest_rotation_start_ns: Option<u64>,
+    file_sequence: u64,
     total_written: u64,
     total_dropped: u64,
     compaction_tasks: Vec<tokio::task::JoinHandle<anyhow::Result<Option<PathBuf>>>>,
     compaction_succeeded: u64,
     compaction_failed: u64,
+}
+
+struct OpenLabeledJsonlFile {
+    writer: BufWriter<std::fs::File>,
+    path: PathBuf,
+    rotation_start_ns: u64,
+    lines_since_flush: usize,
 }
 
 impl LabeledJsonlWriter {
@@ -123,10 +132,9 @@ impl LabeledJsonlWriter {
             Self {
                 cfg,
                 rx,
-                current_rotation_key: None,
-                writer: None,
-                current_path: None,
-                lines_since_flush: 0,
+                open_files: BTreeMap::new(),
+                latest_rotation_start_ns: None,
+                file_sequence: 0,
                 total_written: 0,
                 total_dropped: 0,
                 compaction_tasks: Vec::new(),
@@ -158,7 +166,7 @@ impl LabeledJsonlWriter {
                     match maybe {
                         Some(LabeledWriterCommand::Write(l)) => self.write_one(l).await,
                         Some(LabeledWriterCommand::Seal { reply }) => {
-                            self.close_current_file();
+                            self.close_all_files();
                             self.await_pending_compactions().await;
                             let _ = reply.send(self.stats());
                         }
@@ -168,7 +176,7 @@ impl LabeledJsonlWriter {
                                 "ML labeled-trade writer encerrando (canal fechado)"
                             );
                             self.periodic_flush();
-                            self.close_current_file();
+                            self.close_all_files();
                             self.await_pending_compactions().await;
                             break;
                         }
@@ -184,17 +192,27 @@ impl LabeledJsonlWriter {
             .map(|d| d.as_nanos().min(u64::MAX as u128) as u64)
             .unwrap_or(label.closed_ts_ns);
         let rotation_key = rotation_key_for_ns(label.closed_ts_ns, self.cfg.rotation_interval);
-        if self.current_rotation_key.as_deref() != Some(rotation_key.as_str()) {
-            self.close_current_file();
-            self.reap_finished_compactions().await;
+        let rotation_start_ns =
+            rotation_start_ns_for(label.closed_ts_ns, self.cfg.rotation_interval);
+        self.latest_rotation_start_ns = Some(
+            self.latest_rotation_start_ns
+                .map_or(rotation_start_ns, |latest| latest.max(rotation_start_ns)),
+        );
+
+        if !self.open_files.contains_key(&rotation_key) {
             let hour_key = hour_key_for_ns(label.closed_ts_ns);
-            let rotation_start_ns =
-                rotation_start_ns_for(label.closed_ts_ns, self.cfg.rotation_interval);
-            match self.open_writer_for_hour(&hour_key, rotation_start_ns) {
+            let file_sequence = self.next_file_sequence();
+            match self.open_writer_for_hour(&hour_key, rotation_start_ns, file_sequence) {
                 Ok((w, path)) => {
-                    self.writer = Some(w);
-                    self.current_path = Some(path);
-                    self.current_rotation_key = Some(rotation_key);
+                    self.open_files.insert(
+                        rotation_key.clone(),
+                        OpenLabeledJsonlFile {
+                            writer: w,
+                            path,
+                            rotation_start_ns,
+                            lines_since_flush: 0,
+                        },
+                    );
                 }
                 Err(e) => {
                     self.total_dropped = self.total_dropped.saturating_add(1);
@@ -202,51 +220,74 @@ impl LabeledJsonlWriter {
                 }
             }
         }
-        let Some(writer) = self.writer.as_mut() else {
+        let Some(open_file) = self.open_files.get_mut(&rotation_key) else {
             self.total_dropped = self.total_dropped.saturating_add(1);
             panic!("labeled writer strict-lossless violation: writer missing after rotation");
         };
         let line = label.to_json_line();
-        if let Err(e) = writeln!(writer, "{}", line) {
+        if let Err(e) = writeln!(open_file.writer, "{}", line) {
             self.total_dropped = self.total_dropped.saturating_add(1);
             panic!("labeled writer strict-lossless violation: failed to write sample: {e}");
         }
         self.total_written = self.total_written.saturating_add(1);
-        self.lines_since_flush = self.lines_since_flush.saturating_add(1);
-        if self.lines_since_flush >= self.cfg.flush_after_n {
-            if let Err(e) = writer.flush() {
+        open_file.lines_since_flush = open_file.lines_since_flush.saturating_add(1);
+        if open_file.lines_since_flush >= self.cfg.flush_after_n {
+            if let Err(e) = open_file.writer.flush() {
                 panic!("labeled writer strict-lossless violation: failed to flush sample: {e}");
             }
-            self.lines_since_flush = 0;
+            open_file.lines_since_flush = 0;
         }
+        self.close_sealable_files();
     }
 
     fn periodic_flush(&mut self) {
-        if let Some(w) = self.writer.as_mut() {
-            if let Err(e) = w.flush() {
+        for open_file in self.open_files.values_mut() {
+            if let Err(e) = open_file.writer.flush() {
                 panic!("labeled writer strict-lossless violation: periodic flush failed: {e}");
             }
-            self.lines_since_flush = 0;
+            open_file.lines_since_flush = 0;
+        }
+        self.close_sealable_files();
+    }
+
+    fn close_sealable_files(&mut self) {
+        let Some(latest) = self.latest_rotation_start_ns else {
+            return;
+        };
+        let interval_ns = rotation_interval_ns(self.cfg.rotation_interval);
+        let keys_to_close: Vec<String> = self
+            .open_files
+            .iter()
+            .filter_map(|(key, open_file)| {
+                let close_before_latest =
+                    open_file.rotation_start_ns.saturating_add(interval_ns) < latest;
+                close_before_latest.then_some(key.clone())
+            })
+            .collect();
+        for key in keys_to_close {
+            if let Some(open_file) = self.open_files.remove(&key) {
+                self.close_open_file(open_file);
+            }
         }
     }
 
-    fn close_current_file(&mut self) {
-        if let Some(mut w) = self.writer.take() {
-            if let Err(e) = w.flush() {
-                panic!("labeled writer strict-lossless violation: close flush failed: {e}");
-            }
+    fn close_all_files(&mut self) {
+        let files = std::mem::take(&mut self.open_files);
+        for (_, open_file) in files {
+            self.close_open_file(open_file);
         }
-        let Some(path) = self.current_path.take() else {
-            return;
-        };
-        self.current_rotation_key = None;
-        self.lines_since_flush = 0;
+    }
 
+    fn close_open_file(&mut self, mut open_file: OpenLabeledJsonlFile) {
+        if let Err(e) = open_file.writer.flush() {
+            panic!("labeled writer strict-lossless violation: close flush failed: {e}");
+        }
         if !self.cfg.parquet.enabled {
             return;
         }
 
         let parquet_cfg = self.cfg.parquet.clone();
+        let path = open_file.path;
         let handle = tokio::task::spawn_blocking(move || {
             let result = compact_jsonl_file(&path, DatasetKind::LabeledTrades, &parquet_cfg);
             match &result {
@@ -276,6 +317,12 @@ impl LabeledJsonlWriter {
             result
         });
         self.compaction_tasks.push(handle);
+    }
+
+    fn next_file_sequence(&mut self) -> u64 {
+        let sequence = self.file_sequence;
+        self.file_sequence = self.file_sequence.saturating_add(1);
+        sequence
     }
 
     async fn await_pending_compactions(&mut self) {
@@ -331,6 +378,7 @@ impl LabeledJsonlWriter {
         &self,
         hour_key: &str,
         rotation_start_ns: u64,
+        file_sequence: u64,
     ) -> std::io::Result<(BufWriter<std::fs::File>, PathBuf)> {
         let dir_path = self.cfg.data_dir.join(hour_key);
         create_dir_all(&dir_path)?;
@@ -340,8 +388,8 @@ impl LabeledJsonlWriter {
             .unwrap_or(0);
         let rotation_start_s = rotation_start_ns / 1_000_000_000;
         let filename = format!(
-            "{}_{}_part-{}.jsonl",
-            self.cfg.file_prefix, start_ts, rotation_start_s
+            "{}_{}_part-{}_seg-{}.jsonl",
+            self.cfg.file_prefix, start_ts, rotation_start_s, file_sequence
         );
         let path = dir_path.join(filename);
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
