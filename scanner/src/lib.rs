@@ -5,6 +5,7 @@ pub mod config;
 pub mod decode;
 pub mod discovery;
 pub mod error;
+pub mod exchange_connectivity;
 pub mod ml;
 pub mod normalize;
 pub mod obs;
@@ -770,6 +771,22 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         Arc::clone(&vol),
         Arc::clone(&store),
     );
+    let exchange_connectivity_dir = std::env::current_dir()
+        .map(|cwd| cwd.join("data/ml/runs").join(&run_id))
+        .unwrap_or_else(|_| PathBuf::from("data/ml/runs").join(&run_id));
+    let exchange_connectivity_monitor = exchange_connectivity::ExchangeConnectivityMonitor::new(
+        run_id.clone(),
+        run_started_ns,
+        exchange_connectivity_dir,
+        exchange_connectivity::build_plan(&cfg, &universe),
+    );
+    let (exchange_connectivity_shutdown_tx, exchange_connectivity_shutdown_rx) =
+        tokio::sync::watch::channel(false);
+    let exchange_connectivity_task = exchange_connectivity_monitor.spawn(
+        Arc::clone(&store),
+        Arc::clone(&stale),
+        exchange_connectivity_shutdown_rx,
+    );
 
     // --- ML recomendador (M1.7) ---
     // Módulo `ml` roda inline no loop do spread engine — baseline A3 tem
@@ -1307,6 +1324,41 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             engine_shutdown.store(true, Ordering::Relaxed);
             if let Err(e) = engine_task.await {
                 warn!(error = %e, "spread engine task terminou com erro durante shutdown cooperativo");
+            }
+        }
+        match exchange_connectivity::stop_monitor_and_write_report(
+            &exchange_connectivity_monitor,
+            exchange_connectivity_shutdown_tx,
+            exchange_connectivity_task,
+            &store,
+            &stale,
+        )
+        .await
+        {
+            Ok(report) => {
+                info!(
+                    run_id = %report.run_id,
+                    status = ?report.status,
+                    issues = report.issues.len(),
+                    dir = %exchange_connectivity_monitor.output_dir().display(),
+                    "exchange connectivity report concluído"
+                );
+                for issue in report.issues.iter().take(8) {
+                    warn!(
+                        severity = %issue.severity,
+                        venue = issue.venue.as_deref().unwrap_or(""),
+                        market = issue.market.as_deref().unwrap_or(""),
+                        message = %issue.message,
+                        "exchange connectivity issue"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    dir = %exchange_connectivity_monitor.output_dir().display(),
+                    "falha escrevendo exchange connectivity report"
+                );
             }
         }
         adapter_tasks
