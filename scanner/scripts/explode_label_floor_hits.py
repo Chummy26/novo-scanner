@@ -75,6 +75,9 @@ def resolve_manifest_path(manifest_path: Path, raw: str) -> Path:
     candidate = manifest_path.parent / path
     if candidate.exists():
         return candidate
+    sibling = manifest_path.parent / path.name
+    if sibling.exists():
+        return sibling
     return path
 
 

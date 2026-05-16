@@ -326,17 +326,14 @@ pub fn build_storage_v2_shadow_report_with_limit(
             ..StorageV2DatasetAudit::default()
         };
         let mut digest = LogicalDigest::new(kind);
-        let mut route_dim = BTreeMap::new();
         if let Some(max_files) = max_files_per_dataset {
             paths.truncate(max_files);
         }
         for path in paths {
-            let file_audit =
-                analyze_single_file_into_dataset(&path, kind, &mut route_dim, &mut digest)
-                    .with_context(|| format!("storage_v2 shadow {}", path.display()))?;
+            let file_audit = analyze_single_file_into_dataset(&path, kind, &mut digest)
+                .with_context(|| format!("storage_v2 shadow {}", path.display()))?;
             merge_dataset_into_dataset(&mut dataset, &file_audit);
         }
-        dataset.route_dim_rows = route_dim.len() as u64;
         dataset.logical_required_digest_hex = digest.hex();
         finalize_dataset_audit(&mut dataset);
         issues.extend(
@@ -1306,7 +1303,6 @@ fn virtualized_field(name: &str, nullable: bool) -> Option<Field> {
 fn analyze_single_file_into_dataset(
     path: &Path,
     dataset_kind: DatasetKind,
-    route_dim: &mut BTreeMap<String, RouteDimEntry>,
     digest: &mut LogicalDigest,
 ) -> Result<StorageV2DatasetAudit> {
     let mut audit = StorageV2DatasetAudit {
@@ -1334,9 +1330,10 @@ fn analyze_single_file_into_dataset(
         .build()
         .with_context(|| format!("read parquet {}", path.display()))?;
     let parquet_rows = parquet_row_count(path).unwrap_or(0);
+    let mut route_dim = BTreeMap::new();
     for maybe_batch in &mut reader {
         let batch = maybe_batch.with_context(|| format!("read batch {}", path.display()))?;
-        match analyze_record_batch_inner_with_digest(dataset_kind, &batch, route_dim, digest) {
+        match analyze_record_batch_inner_with_digest(dataset_kind, &batch, &mut route_dim, digest) {
             Ok(batch_audit) => merge_batch_into_dataset(&mut audit, &batch_audit),
             Err(e) => {
                 if audit.rows == 0 {
@@ -1349,6 +1346,7 @@ fn analyze_single_file_into_dataset(
             }
         }
     }
+    audit.route_dim_rows = route_dim.len() as u64;
     finalize_dataset_audit(&mut audit);
     Ok(audit)
 }
@@ -1548,6 +1546,7 @@ fn merge_dataset_into_dataset(dst: &mut StorageV2DatasetAudit, src: &StorageV2Da
     dst.route_identity_physical_bytes = dst
         .route_identity_physical_bytes
         .saturating_add(src.route_identity_physical_bytes);
+    dst.route_dim_rows = dst.route_dim_rows.saturating_add(src.route_dim_rows);
     dst.route_dim_conflicts = dst
         .route_dim_conflicts
         .saturating_add(src.route_dim_conflicts);
