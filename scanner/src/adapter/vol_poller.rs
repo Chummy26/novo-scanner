@@ -8,13 +8,15 @@ use std::time::Duration;
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use crate::adapter::{wait_for_shutdown, AdapterShutdown};
 use crate::broadcast::VolStore;
 use crate::discovery::SymbolUniverse;
 use crate::types::Venue;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(60);
+const POLL_TIMEOUT: Duration = Duration::from_secs(45);
 
-pub async fn run(universe: Arc<SymbolUniverse>, vol: Arc<VolStore>) {
+pub async fn run(universe: Arc<SymbolUniverse>, vol: Arc<VolStore>, mut shutdown: AdapterShutdown) {
     let http = reqwest::Client::builder()
         .user_agent("scanner/0.1 vol-poller")
         .timeout(Duration::from_secs(15))
@@ -24,27 +26,44 @@ pub async fn run(universe: Arc<SymbolUniverse>, vol: Arc<VolStore>) {
     // Initial immediate poll, then interval.
     let mut tick = tokio::time::interval(POLL_INTERVAL);
     loop {
-        tick.tick().await;
-        let u = Arc::clone(&universe);
-        let v = Arc::clone(&vol);
-        let h = http.clone();
-        tokio::spawn(async move {
+        tokio::select! {
+            _ = tick.tick() => {}
+            requested = wait_for_shutdown(&mut shutdown) => {
+                if requested {
+                    return;
+                }
+            }
+        }
+
+        let poll_all = async {
             tokio::join!(
-                poll_binance_spot(&h, &u, &v),
-                poll_binance_fut(&h, &u, &v),
-                poll_bingx_spot(&h, &u, &v),
-                poll_bingx_fut(&h, &u, &v),
-                poll_bitget_spot(&h, &u, &v),
-                poll_bitget_fut(&h, &u, &v),
-                poll_gate_fut(&h, &u, &v),
-                poll_kucoin_spot(&h, &u, &v),
-                poll_kucoin_fut(&h, &u, &v),
-                poll_mexc_spot(&h, &u, &v),
-                poll_mexc_fut(&h, &u, &v),
-                poll_xt_spot(&h, &u, &v),
-                poll_xt_fut(&h, &u, &v),
+                poll_binance_spot(&http, &universe, &vol),
+                poll_binance_fut(&http, &universe, &vol),
+                poll_bingx_spot(&http, &universe, &vol),
+                poll_bingx_fut(&http, &universe, &vol),
+                poll_bitget_spot(&http, &universe, &vol),
+                poll_bitget_fut(&http, &universe, &vol),
+                poll_gate_fut(&http, &universe, &vol),
+                poll_kucoin_spot(&http, &universe, &vol),
+                poll_kucoin_fut(&http, &universe, &vol),
+                poll_mexc_spot(&http, &universe, &vol),
+                poll_mexc_fut(&http, &universe, &vol),
+                poll_xt_spot(&http, &universe, &vol),
+                poll_xt_fut(&http, &universe, &vol),
             );
-        });
+        };
+        tokio::select! {
+            result = tokio::time::timeout(POLL_TIMEOUT, poll_all) => {
+                if result.is_err() {
+                    warn!(timeout_s = POLL_TIMEOUT.as_secs(), "vol-poller cycle timed out");
+                }
+            }
+            requested = wait_for_shutdown(&mut shutdown) => {
+                if requested {
+                    return;
+                }
+            }
+        }
     }
 }
 

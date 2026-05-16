@@ -14,6 +14,7 @@ pub mod types;
 pub use config::Config;
 pub use error::{Error, Result};
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -54,6 +55,7 @@ use crate::types::now_ns;
 const ML_CYCLE_CHANNEL_CAPACITY: usize = 2;
 const ML_CYCLE_BUFFER_RECYCLE_CAPACITY: usize = 4;
 const ML_CYCLE_MAX_SHARDS: usize = 32;
+const WRITER_MAX_BLOCKING_THREADS: usize = 2;
 
 #[inline]
 fn should_mark_sample_recommended(rec: &crate::ml::contract::Recommendation) -> bool {
@@ -212,6 +214,7 @@ where
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
+                    .max_blocking_threads(WRITER_MAX_BLOCKING_THREADS)
                     .build()
                     .unwrap_or_else(|e| {
                         panic!(
@@ -230,6 +233,72 @@ where
         .unwrap_or_else(|e| {
             panic!("writer thread strict-lossless violation: failed to spawn {name}: {e}")
         });
+}
+
+struct AdapterTasks {
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    join_set: tokio::task::JoinSet<()>,
+}
+
+impl AdapterTasks {
+    fn new() -> Self {
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+        Self {
+            shutdown_tx,
+            join_set: tokio::task::JoinSet::new(),
+        }
+    }
+
+    fn shutdown_rx(&self) -> adapter::AdapterShutdown {
+        self.shutdown_tx.subscribe()
+    }
+
+    fn spawn<F>(&mut self, name: &'static str, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.join_set.spawn(async move {
+            fut.await;
+            info!(adapter = name, "adapter task exited");
+        });
+    }
+
+    async fn shutdown_and_join(mut self, timeout: Duration) {
+        let _ = self.shutdown_tx.send(true);
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    warn!(
+                        timeout_ms = timeout.as_millis() as u64,
+                        "adapter shutdown timeout; aborting remaining adapter tasks"
+                    );
+                    self.join_set.abort_all();
+                    while let Some(result) = self.join_set.join_next().await {
+                        if let Err(e) = result {
+                            if !e.is_cancelled() {
+                                warn!(error = %e, "adapter task failed while aborting");
+                            }
+                        }
+                    }
+                    break;
+                }
+                result = self.join_set.join_next() => {
+                    match result {
+                        Some(Ok(())) => {}
+                        Some(Err(e)) => {
+                            if !e.is_cancelled() {
+                                warn!(error = %e, "adapter task failed during shutdown");
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[inline]
@@ -694,22 +763,13 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     }
 
     // --- Adapters ---
-    spawn_adapters(
+    let adapter_tasks = spawn_adapters(
         &cfg,
         Arc::clone(&universe),
         Arc::clone(&stale),
         Arc::clone(&vol),
         Arc::clone(&store),
     );
-
-    // --- REST vol poller (fills VolStore for venues whose WS omits 24h vol) ---
-    {
-        let u = Arc::clone(&universe);
-        let v = Arc::clone(&vol);
-        tokio::spawn(async move {
-            adapter::vol_poller::run(u, v).await;
-        });
-    }
 
     // --- ML recomendador (M1.7) ---
     // Módulo `ml` roda inline no loop do spread engine — baseline A3 tem
@@ -1249,6 +1309,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 warn!(error = %e, "spread engine task terminou com erro durante shutdown cooperativo");
             }
         }
+        adapter_tasks
+            .shutdown_and_join(Duration::from_secs(10))
+            .await;
         label_sweeper_task.abort();
         if let Err(e) = label_sweeper_task.await {
             if !e.is_cancelled() {
@@ -1459,8 +1522,8 @@ fn spawn_adapters(
     stale: Arc<StaleTable>,
     vol: Arc<VolStore>,
     store: Arc<BookStore>,
-) {
-    let _ = vol; // consumed below per-venue where applicable
+) -> AdapterTasks {
+    let mut tasks = AdapterTasks::new();
     use crate::types::Venue;
 
     if cfg.venues.is_enabled(Venue::BinanceSpot) {
@@ -1469,8 +1532,9 @@ fn spawn_adapters(
             Arc::clone(&stale),
         );
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("binance-spot", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("binance-spot adapter exited: {}", e);
             }
         });
@@ -1482,8 +1546,9 @@ fn spawn_adapters(
             Arc::clone(&vol),
         );
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("gate-spot", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("gate-spot adapter exited: {}", e);
             }
         });
@@ -1495,8 +1560,9 @@ fn spawn_adapters(
             cfg.bitget_mode,
         );
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("bitget-spot", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("bitget-spot adapter exited: {}", e);
             }
         });
@@ -1508,8 +1574,9 @@ fn spawn_adapters(
             cfg.bitget_mode,
         );
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("bitget-fut", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("bitget-fut adapter exited: {}", e);
             }
         });
@@ -1521,8 +1588,9 @@ fn spawn_adapters(
             Arc::clone(&vol),
         );
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("mexc-fut", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("mexc-fut adapter exited: {}", e);
             }
         });
@@ -1530,8 +1598,9 @@ fn spawn_adapters(
     if cfg.venues.is_enabled(Venue::GateFut) {
         let a = adapter::gate_fut::GateFutAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("gate-fut", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("gate-fut adapter exited: {}", e);
             }
         });
@@ -1540,8 +1609,9 @@ fn spawn_adapters(
         let a =
             adapter::binance_fut::BinanceFutAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("binance-fut", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("binance-fut adapter exited: {}", e);
             }
         });
@@ -1551,8 +1621,9 @@ fn spawn_adapters(
         let a =
             adapter::bingx_spot::BingxSpotAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("bingx-spot", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("bingx-spot adapter exited: {}", e);
             }
         });
@@ -1560,8 +1631,9 @@ fn spawn_adapters(
     if cfg.venues.is_enabled(Venue::BingxFut) {
         let a = adapter::bingx_fut::BingxFutAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("bingx-fut", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("bingx-fut adapter exited: {}", e);
             }
         });
@@ -1573,8 +1645,9 @@ fn spawn_adapters(
             Arc::clone(&vol),
         );
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("xt-spot", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("xt-spot adapter exited: {}", e);
             }
         });
@@ -1586,8 +1659,9 @@ fn spawn_adapters(
             Arc::clone(&vol),
         );
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("xt-fut", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("xt-fut adapter exited: {}", e);
             }
         });
@@ -1597,8 +1671,9 @@ fn spawn_adapters(
     {
         let a = adapter::kucoin::KucoinAdapter::new(Arc::clone(&universe), Arc::clone(&stale));
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("kucoin-spot", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("kucoin-spot adapter exited: {}", e);
             }
         });
@@ -1612,8 +1687,9 @@ fn spawn_adapters(
             Arc::clone(&vol),
         );
         let store = Arc::clone(&store);
-        tokio::spawn(async move {
-            if let Err(e) = a.run(&store).await {
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("kucoin-fut", async move {
+            if let Err(e) = a.run(store, shutdown).await {
                 warn!("kucoin-fut adapter exited: {}", e);
             }
         });
@@ -1625,13 +1701,23 @@ fn spawn_adapters(
         let u = Arc::clone(&universe);
         let st = Arc::clone(&stale);
         let s = Arc::clone(&store);
-        tokio::spawn(async move {
-            adapter::mexc_spot_rest::run(u, st, s).await;
+        let shutdown = tasks.shutdown_rx();
+        tasks.spawn("mexc-spot-rest", async move {
+            adapter::mexc_spot_rest::run(u, st, s, shutdown).await;
         });
     }
 
+    // REST vol poller fills VolStore for venues whose WS omits 24h volume.
+    let u = Arc::clone(&universe);
+    let v = Arc::clone(&vol);
+    let shutdown = tasks.shutdown_rx();
+    tasks.spawn("vol-poller", async move {
+        adapter::vol_poller::run(u, v, shutdown).await;
+    });
+
     // All 14 venues covered: Binance Spot+Fut, MEXC Spot(REST)+Fut,
     // BingX Spot+Fut, Gate Spot+Fut, KuCoin Spot+Fut, XT Spot+Fut, Bitget Spot+Fut.
+    tasks
 }
 
 async fn run_spread_engine(

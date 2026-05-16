@@ -19,10 +19,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use quick_protobuf::BytesReader;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-use crate::adapter::reconnect::BackoffPolicy;
-use crate::adapter::Adapter;
+use crate::adapter::{reconnect::BackoffPolicy, run_reconnecting, Adapter, AdapterShutdown};
 use crate::book::BookStore;
 use crate::discovery::SymbolUniverse;
 use crate::error::{Error, Result};
@@ -54,19 +53,11 @@ impl Adapter for MexcSpotAdapter {
         Venue::MexcSpot
     }
 
-    async fn run(&self, store: &BookStore) -> Result<()> {
-        let backoff = BackoffPolicy::STANDARD;
-        let mut attempt: u32 = 0;
-        loop {
-            match self.run_once(store).await {
-                Ok(()) => attempt = 0,
-                Err(e) => {
-                    warn!(venue = "mexc-spot", attempt, "run_once failed: {}", e);
-                    tokio::time::sleep(backoff.delay(attempt)).await;
-                    attempt = attempt.saturating_add(1);
-                }
-            }
-        }
+    async fn run(&self, store: Arc<BookStore>, shutdown: AdapterShutdown) -> Result<()> {
+        run_reconnecting("mexc-spot", BackoffPolicy::STANDARD, shutdown, || {
+            self.run_once(&store)
+        })
+        .await
     }
 }
 

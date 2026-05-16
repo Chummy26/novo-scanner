@@ -16,8 +16,9 @@ use futures_util::{SinkExt, StreamExt};
 use sonic_rs::JsonValueTrait;
 use tracing::{debug, info, warn};
 
-use crate::adapter::reconnect::BackoffPolicy;
-use crate::adapter::Adapter;
+use crate::adapter::{
+    reconnect::BackoffPolicy, run_reconnecting, wait_for_shutdown, Adapter, AdapterShutdown,
+};
 use crate::book::BookStore;
 use crate::decode::GzipDecoder;
 use crate::discovery::SymbolUniverse;
@@ -52,7 +53,7 @@ impl Adapter for BingxSpotAdapter {
         Venue::BingxSpot
     }
 
-    async fn run(&self, store: &BookStore) -> Result<()> {
+    async fn run(&self, store: Arc<BookStore>, shutdown: AdapterShutdown) -> Result<()> {
         // Partition venue symbols into shards of up to 200.
         let all: Vec<String> = self.universe.per_venue[Venue::BingxSpot.idx()]
             .keys()
@@ -60,9 +61,8 @@ impl Adapter for BingxSpotAdapter {
             .collect();
         if all.is_empty() {
             warn!("bingx-spot: no symbols in universe; adapter idle");
-            // Sleep forever — no symbols means no subscriptions. Return Ok so
-            // the task parks instead of spamming reconnect.
-            futures::future::pending::<()>().await;
+            let mut shutdown = shutdown;
+            wait_for_shutdown(&mut shutdown).await;
             return Ok(());
         }
         info!(
@@ -78,25 +78,16 @@ impl Adapter for BingxSpotAdapter {
             let url = self.url.clone();
             let universe = Arc::clone(&self.universe);
             let stale = Arc::clone(&self.stale);
-            // Safety: the store outlives every adapter (owned by the runtime).
-            // We coerce the `&BookStore` into a raw pointer that the spawned task
-            // dereferences — this avoids forcing `'static` on the callsite.
-            // Caller contract: run() blocks until Ctrl-C, so `store` never drops.
-            let store_ptr = store as *const BookStore as usize;
+            let store = Arc::clone(&store);
+            let shutdown = shutdown.clone();
             let h = tokio::spawn(async move {
-                let store = unsafe { &*(store_ptr as *const BookStore) };
-                let backoff = BackoffPolicy::STANDARD;
-                let mut attempt: u32 = 0;
-                loop {
-                    let r = run_shard(&url, &shard, &universe, &stale, store).await;
-                    match r {
-                        Ok(()) => attempt = 0,
-                        Err(e) => {
-                            warn!(shard = i, attempt, "bingx-spot shard failed: {}", e);
-                            tokio::time::sleep(backoff.delay(attempt)).await;
-                            attempt = attempt.saturating_add(1);
-                        }
-                    }
+                if let Err(e) =
+                    run_reconnecting("bingx-spot", BackoffPolicy::STANDARD, shutdown, || {
+                        run_shard(&url, &shard, &universe, &stale, &store)
+                    })
+                    .await
+                {
+                    warn!(shard = i, "bingx-spot shard exited with error: {}", e);
                 }
             });
             handles.push(h);

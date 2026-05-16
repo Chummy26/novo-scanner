@@ -10,10 +10,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-use crate::adapter::reconnect::BackoffPolicy;
-use crate::adapter::Adapter;
+use crate::adapter::{reconnect::BackoffPolicy, run_reconnecting, Adapter, AdapterShutdown};
 use crate::book::BookStore;
 use crate::config::BitgetMode;
 use crate::discovery::SymbolUniverse;
@@ -52,19 +51,11 @@ impl Adapter for BitgetFutAdapter {
         Venue::BitgetFut
     }
 
-    async fn run(&self, store: &BookStore) -> Result<()> {
-        let backoff = BackoffPolicy::BITGET;
-        let mut attempt = 0u32;
-        loop {
-            match self.run_once(store).await {
-                Ok(()) => attempt = 0,
-                Err(e) => {
-                    warn!(venue = "bitget-fut", attempt, "run_once failed: {}", e);
-                    tokio::time::sleep(backoff.delay(attempt)).await;
-                    attempt = attempt.saturating_add(1);
-                }
-            }
-        }
+    async fn run(&self, store: Arc<BookStore>, shutdown: AdapterShutdown) -> Result<()> {
+        run_reconnecting("bitget-fut", BackoffPolicy::BITGET, shutdown, || {
+            self.run_once(&store)
+        })
+        .await
     }
 }
 

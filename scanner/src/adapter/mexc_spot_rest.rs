@@ -19,6 +19,7 @@ use serde::Deserialize;
 use sonic_rs::{JsonContainerTrait, JsonValueTrait};
 use tracing::{debug, info, warn};
 
+use crate::adapter::{wait_for_shutdown, AdapterShutdown};
 use crate::book::BookStore;
 use crate::discovery::SymbolUniverse;
 use crate::obs::Metrics;
@@ -28,7 +29,12 @@ use crate::types::{now_ns, Price, Qty, Venue};
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 const ENDPOINT: &str = "https://api.mexc.com/api/v3/ticker/bookTicker";
 
-pub async fn run(universe: Arc<SymbolUniverse>, stale: Arc<StaleTable>, store: Arc<BookStore>) {
+pub async fn run(
+    universe: Arc<SymbolUniverse>,
+    stale: Arc<StaleTable>,
+    store: Arc<BookStore>,
+    mut shutdown: AdapterShutdown,
+) {
     let http = reqwest::Client::builder()
         .user_agent("scanner/0.1 mexc-spot-rest")
         .timeout(Duration::from_secs(10))
@@ -40,8 +46,25 @@ pub async fn run(universe: Arc<SymbolUniverse>, stale: Arc<StaleTable>, store: A
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut consecutive_fails = 0u32;
     loop {
-        tick.tick().await;
-        match poll_once(&http, &universe, &stale, &store).await {
+        tokio::select! {
+            _ = tick.tick() => {}
+            requested = wait_for_shutdown(&mut shutdown) => {
+                if requested {
+                    return;
+                }
+            }
+        }
+
+        let poll_result = tokio::select! {
+            result = poll_once(&http, &universe, &stale, &store) => result,
+            requested = wait_for_shutdown(&mut shutdown) => {
+                if requested {
+                    return;
+                }
+                continue;
+            }
+        };
+        match poll_result {
             Ok(n) => {
                 if consecutive_fails > 0 {
                     info!(

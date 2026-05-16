@@ -22,10 +22,9 @@ use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use sonic_rs::JsonValueTrait;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-use crate::adapter::reconnect::BackoffPolicy;
-use crate::adapter::Adapter;
+use crate::adapter::{reconnect::BackoffPolicy, run_reconnecting, Adapter, AdapterShutdown};
 use crate::book::BookStore;
 use crate::decode::{gzip::sniff_format, GzipDecoder};
 use crate::discovery::SymbolUniverse;
@@ -63,19 +62,11 @@ impl Adapter for XtSpotAdapter {
         Venue::XtSpot
     }
 
-    async fn run(&self, store: &BookStore) -> Result<()> {
-        let backoff = BackoffPolicy::STANDARD;
-        let mut attempt: u32 = 0;
-        loop {
-            match self.run_once(store).await {
-                Ok(()) => attempt = 0,
-                Err(e) => {
-                    warn!(venue = "xt-spot", attempt, "run_once failed: {}", e);
-                    tokio::time::sleep(backoff.delay(attempt)).await;
-                    attempt = attempt.saturating_add(1);
-                }
-            }
-        }
+    async fn run(&self, store: Arc<BookStore>, shutdown: AdapterShutdown) -> Result<()> {
+        run_reconnecting("xt-spot", BackoffPolicy::STANDARD, shutdown, || {
+            self.run_once(&store)
+        })
+        .await
     }
 }
 
