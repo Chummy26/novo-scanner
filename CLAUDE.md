@@ -78,6 +78,20 @@ A solução correta para esse paradoxo é esta: os valores numéricos emitidos p
 
 O objetivo correto é outro: em cada instante `t0`, usando apenas o histórico disponível até `t0` da própria rota, avaliar se a entrada observada agora merece recomendação. Quando houver evidência suficiente, o modelo deve emitir uma recomendação concreta e calibrada no formato `{enter, exit, lucro_bruto, P, T, IC}`. Aqui, `exit` não significa a saída única ou ótima em sentido absoluto; significa uma **saída-alvo recomendada**, condicional à entrada atual e ao estado atual da rota.
 
+### EntryContextT0 para leitura da entrada
+
+`EntryContextT0` é a forma segura de expor a ideia de `entry_quality`: um diagnóstico point-in-time e decomponível da força relativa de `S_entrada(t0)` contra o histórico da própria rota. Ele responde apenas se a entrada atual parece excepcional ou normal para aquela rota.
+
+`EntryContextT0` não é label, não é gate de recomendação, não é `P_hit`, não escolhe `exit_target` e não substitui os componentes crus de `FeaturesT0`. Ele pode usar ranks, distâncias contra mediana/p95, escala robusta, cobertura de histórico e tempo vivo, sempre calculados antes de atualizar o cache com a observação de `t0`. Exequibilidade da saída (`p_exit_ge_label_floor_minus_entry_*`) permanece separada como Teste 2.
+
+### ExitTargetPolicy para output operacional único
+
+Coleta e primeiro treino não precisam escolher um `exit_target` único. O primeiro trainer pode operar em modo **EstimatorOnly**: estimar, por `floor` e horizonte, `P_hit`, `T`, `P_censor`, quantis e `IC`, sem declarar uma utility final.
+
+Quando o contrato público ou a UI exigir um `TradeSetup` primário único, a escolha de `exit_target` deve ser feita por uma `ExitTargetPolicy` versionada, conforme a skill canônica. A policy escolhe entre candidatos já estimados usando fronteira de Pareto e função de utilidade bruta declarada sobre lucro bruto, probabilidade, tempo, censura e incerteza.
+
+Essa escolha é decisão operacional auditável, não label novo e não verdade universal da rota. O dataset deve permitir treinar e auditar múltiplos floors/horizontes; a policy decide qual setup apresentar como primário (`conservador`, `balanceado` ou `agressivo`, quando aplicável). Trocar a policy muda a recomendação, não a identidade matemática da estratégia nem os labels históricos.
+
 Se minutos depois surgir uma entrada ainda melhor, isso caracteriza uma **nova oportunidade** dentro da mesma trajetória, não uma contradição lógica da recomendação anterior. Ainda assim, o modelo continua sendo cobrado empiricamente por precisão, calibração e utilidade econômica: recomendar cedo demais de forma recorrente continua sendo erro do modelo.
 
 Abstenção continua sendo resposta válida e obrigatória quando não houver oportunidade suficientemente forte, evidência suficiente ou confiança suficiente. O modelo não deve forçar recomendação em todo snapshot; deve recomendar apenas quando a oportunidade atual, comparada ao histórico point-in-time da rota, justificar convicção operacional.

@@ -18,7 +18,12 @@ em `06_labels_and_data/`.
   comparar candidatos e declarar vencedor sem confundir hipotese com decisao.
 - `00_research/current_collection_review_2026-05-03.md` audita o run de coleta
   ativo em 2026-05-03 e transforma os achados em proximos passos pos-coleta.
+- `07_decision_policy/exit_target_policy_checklist.md` lista as perguntas de
+  decisao antes de publicar um `TradeSetup` primario unico a partir de
+  multiplos candidatos de saida.
+- `07_decision_policy/entry_context_t0_checklist.md` formaliza a versao segura
+  de `entry_quality`: diagnostico PIT decomponivel da forca relativa da entrada,
+  sem virar label, gate ou policy.
 - `06_labels_and_data/label_schema.md` descreve os três streams persistidos.
 - `06_labels_and_data/data_lineage.md` descreve origem, ordem point-in-time e
   campos que não pertencem ao objetivo do modelo.
-

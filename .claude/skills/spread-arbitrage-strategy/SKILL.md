@@ -306,6 +306,8 @@ Esses testes são separados no sentido econômico — perguntam coisas diferente
 
 Operacionalmente: o spread de entrada atual está significativamente acima da média/mediana das últimas 24h da rota? Se a média típica é 0.2% e o atual é 5%, o teste passa folgado. Se a média típica é 4% e o atual é 5%, o teste *praticamente não passa* — o "5%" é normal para essa rota, não é oportunidade.
 
+**EntryContextT0 / entry quality.** A forma correta de materializar esse teste para modelo ou UI é um contexto decomponível, não um score opaco. Ele pode expor percentis de `S_entrada(t0)` em janelas point-in-time, distância contra mediana/p95, escala robusta, cobertura do histórico e tempo vivo da oportunidade. Não pode usar futuro, não pode virar label, não pode decidir `[ENTER]` sozinho e não deve misturar a exequibilidade de saída do Teste 2 no mesmo número.
+
 ### Teste 2 — Exequibilidade da saída
 A trajetória histórica de `S_saída` passa por valores favoráveis o suficiente, e com frequência suficiente?
 
@@ -369,7 +371,7 @@ Isso cria paradoxos adicionais que precisam ser ensinados separadamente:
 
 9. **Paradoxo da censura.** Se a rota some, o par fica dormente ou a coleta termina antes do horizonte, não se deve chamar automaticamente de erro. O correto é separar `realized`, `miss` e `censored`; caso contrário, `P_hit` fica enviesado.
 
-10. **Paradoxo do setup único.** Pode existir uma fronteira de Pareto entre lucro bruto, probabilidade e tempo: um setup conservador, um médio e um agressivo podem ser todos defensáveis. Emitir um único `TradeSetup` é uma escolha de política/utility, não uma verdade universal sobre a rota.
+10. **Paradoxo do setup único.** Pode existir uma fronteira de Pareto entre lucro bruto, probabilidade, tempo, censura e incerteza: um setup conservador, um médio e um agressivo podem ser todos defensáveis. Emitir um único `TradeSetup` é uma escolha de política/utility, não uma verdade universal sobre a rota.
 
 11. **Paradoxo observacional vs. intervencional.** O histórico mostra spreads cotados observados. Uma execução real pode alterar o preço efetivo, especialmente quando tamanho, latência e competição entram em cena. Por isso o scanner e a skill continuam trabalhando com spread bruto cotado; validação operacional real pertence a shadow mode e métricas pós-execução.
 
@@ -393,6 +395,97 @@ depois de t₀:
 ```
 
 Esse bloco é a versão "nível modelo" da regra de dois testes: ele preserva a intuição humana, mas impede que o dataset ou a UI transformem hindsight, amostragem, repetição ou proxy marginal em recomendação forte.
+
+### 4.2 ExitTargetPolicy — política para setup primário único
+
+`ExitTargetPolicy` é a política auditável que escolhe qual `exit_target` apresentar **quando o contrato público ou a UI exigem um `TradeSetup` primário único** e o modelo estima múltiplas saídas possíveis para a mesma entrada `enter = S_entrada(t0)`.
+
+Esta política existe para separar duas coisas que não podem ser misturadas:
+
+- **Estimação estatística:** estimar, para vários thresholds de `S_saída`, a distribuição condicional de `P_hit`, `T_hit`, `P_censor` e incerteza usando apenas informação point-in-time.
+- **Decisão operacional:** escolher um setup entre candidatos igualmente plausíveis segundo uma função de utilidade bruta declarada.
+
+Coleta e primeiro treino **não dependem** de uma `ExitTargetPolicy` final. O primeiro trainer pode operar em modo **EstimatorOnly**: aprender `P_hit`, `T_hit`, `P_censor`, quantis e `IC` por `floor` e horizonte, preservando a curva de candidatos sem escolher uma utility final.
+
+O modelo não "descobre" a saída correta absoluta. Ele produz estimativas condicionais para uma grade ou conjunto de candidatos de saída; quando um setup único precisa ser publicado, a `ExitTargetPolicy` escolhe o candidato que melhor atende à preferência configurada. Portanto, `exit_target` no output operacional é **uma decisão de policy versionada**, não label supervisionado novo, não oracle e não verdade universal da rota.
+
+#### Candidatos de saída
+
+Para uma entrada aceita em `t0`, cada candidato `c` representa uma proposição falsificável:
+
+```
+c = (exit_threshold, horizon_h)
+lucro_bruto_alvo(c) = enter + exit_threshold
+P_hit(c) = P[existe t1 em (t0, t0+h] tal que S_saida(t1) >= exit_threshold]
+T_hit(c) = distribuicao do tempo ate first-hit, condicional a hit
+P_censor(c) = probabilidade de censura antes de resolver a janela
+IC(c) = incerteza honesta sobre P_hit / quantis relevantes
+```
+
+O conjunto de candidatos pode vir de uma grade de `label_floor`, de quantis previstos de `S_saída`, de uma curva `P(realize | floor)` ou de outra parametrização equivalente. O requisito estrutural é que cada candidato seja avaliável sem olhar o futuro e auditável depois contra o label correspondente.
+
+#### Fronteira de Pareto dos setups
+
+Antes de escolher um setup único, a política deve remover candidatos dominados.
+
+Um candidato `A` domina `B` quando, para a mesma entrada e família de horizonte comparável:
+
+- `lucro_bruto_alvo(A) >= lucro_bruto_alvo(B)`;
+- `P_hit(A) >= P_hit(B)`;
+- `T_hit(A) <= T_hit(B)`;
+- `P_censor(A) <= P_censor(B)`;
+- `incerteza(A) <= incerteza(B)`;
+- e pelo menos uma dessas desigualdades é estrita.
+
+Candidatos não-dominados formam a fronteira de Pareto. Se dois candidatos estão nessa fronteira, nenhum é "mais correto" em sentido absoluto: um pode ser conservador (maior `P`, menor lucro), outro balanceado, outro agressivo (maior lucro, menor `P` ou maior `T`). Isso formaliza o paradoxo do setup único.
+
+#### Função de utilidade bruta
+
+Quando a UI ou o contrato público exige um único `TradeSetup`, a escolha precisa vir de uma função de utilidade bruta versionada, monotônica e auditável.
+
+Requisitos mínimos:
+
+- A utilidade aumenta com `lucro_bruto_alvo` e `P_hit`.
+- A utilidade diminui com `T_hit`, `P_censor` e largura do `IC`.
+- Deve haver pisos duros configuráveis para lucro bruto mínimo, probabilidade mínima, confiança mínima e horizonte máximo.
+- Micro-spreads com `P` alto não podem vencer por construção; o floor de lucro bruto existe para bloquear esse reward hacking.
+- A função opera apenas sobre lucro bruto cotado (`enter + exit`), nunca sobre fees, funding, slippage, tamanho, margem ou PnL líquido.
+
+Forma abstrata aceitável:
+
+```
+U(c) = reward(lucro_bruto_alvo, P_hit)
+       - penalidade_tempo(T_hit)
+       - penalidade_censura(P_censor)
+       - penalidade_incerteza(IC)
+```
+
+A fórmula concreta é discricionária, mas precisa ser nomeada, versionada e persistida com a recomendação (`exit_target_policy_name`, versão, parâmetros relevantes e `runtime_config_hash`). Trocar a utility muda a política de decisão; não muda a identidade da estratégia nem reescreve labels passados. A ausência dessa policy bloqueia apenas a publicação de um `TradeSetup` primário único, não a coleta nem o treino de estimadores.
+
+#### Output permitido
+
+A política pode expor mais de um setup para o operador:
+
+- **conservador:** maior `P_hit`, menor lucro bruto alvo;
+- **balanceado:** melhor utilidade padrão;
+- **agressivo:** maior lucro bruto alvo ainda dentro de confiança aceitável.
+
+Se o produto precisar de uma linha única de scanning, o setup primário deve ser o candidato escolhido pela `ExitTargetPolicy` configurada. Os demais podem aparecer como contexto no painel de detalhe, nunca como labels concorrentes.
+
+Se nenhum candidato não-dominado passar os pisos mínimos, a saída correta é `Abstain`, com motivo tipado (`NO_OPPORTUNITY`, `LOW_CONFIDENCE`, `INSUFFICIENT_DATA`, `LONG_TAIL` ou `COOLDOWN`).
+
+#### Auditoria mínima
+
+Toda recomendação ativa deve permitir reconstruir:
+
+- candidatos considerados ou a grade/política que os gerou;
+- fronteira de Pareto antes da escolha final;
+- função de utilidade usada e sua versão;
+- candidato escolhido e razão numérica da escolha;
+- outcome posterior (`realized`, `miss`, `censored`) contra o threshold emitido;
+- calibração de `P_hit` por faixa de score, horizonte e perfil de setup.
+
+Sem essa separação, o sistema fica ambíguo: `exit = -1.0%` pode ser escolhido por ser mais provável, `exit = 0.0%` por ser mais lucrativo, ou `exit = -0.5%` por equilíbrio. Todas podem ser decisões válidas, mas só são auditáveis se a política de escolha estiver explícita.
 
 ### Por que ~24h, e não outra janela
 
