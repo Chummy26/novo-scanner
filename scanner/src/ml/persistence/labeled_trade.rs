@@ -214,10 +214,6 @@ pub struct FeaturesT0 {
 /// rota?", sempre a partir de campos PIT ja preservados em [`FeaturesT0`].
 pub const ENTRY_CONTEXT_T0_FORMULA_VERSION: &str = "entry_context_t0/v1";
 
-/// Piso padrao usado apenas para classificar a leitura derivada como pronta.
-/// O gate real de candidatura continua versionado em config/runtime metadata.
-pub const DEFAULT_ENTRY_CONTEXT_MIN_OBSERVATIONS: u32 = 500;
-
 /// Estado da leitura derivada de entrada.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -248,17 +244,10 @@ pub struct EntryContextT0 {
 }
 
 impl FeaturesT0 {
-    /// Deriva um contexto explicavel da entrada usando o piso padrao.
-    pub fn entry_context_t0(&self, entry_locked_pct: f32, ts_emit_ns: u64) -> EntryContextT0 {
-        self.entry_context_t0_with_min_history(
-            entry_locked_pct,
-            ts_emit_ns,
-            DEFAULT_ENTRY_CONTEXT_MIN_OBSERVATIONS,
-        )
-    }
-
-    /// Deriva a leitura de entrada com `min_history` explicito para testes,
-    /// replay ou trainers que usem outro piso por versao de config.
+    /// Deriva a leitura de entrada com `min_history` explicito.
+    ///
+    /// O caller deve passar o piso da configuracao que gerou o run; usar um
+    /// default global aqui criaria divergencia silenciosa se o gate mudar.
     pub fn entry_context_t0_with_min_history(
         &self,
         entry_locked_pct: f32,
@@ -469,9 +458,12 @@ impl LabeledTrade {
     ///
     /// Nao altera o JSON persistido e nao participa do label; e apenas uma
     /// forma padronizada de expor os componentes PIT ja materializados.
-    pub fn entry_context_t0(&self) -> EntryContextT0 {
-        self.features_t0
-            .entry_context_t0(self.entry_locked_pct, self.ts_emit_ns)
+    pub fn entry_context_t0_with_min_history(&self, min_history: u32) -> EntryContextT0 {
+        self.features_t0.entry_context_t0_with_min_history(
+            self.entry_locked_pct,
+            self.ts_emit_ns,
+            min_history,
+        )
     }
 
     /// Serializa para linha JSON (sem newline).
@@ -989,7 +981,7 @@ mod tests {
     #[test]
     fn entry_context_t0_is_derived_from_pit_entry_features() {
         let l = mk_label();
-        let ctx = l.entry_context_t0();
+        let ctx = l.entry_context_t0_with_min_history(500);
 
         assert_eq!(ctx.formula_version, ENTRY_CONTEXT_T0_FORMULA_VERSION);
         assert_eq!(ctx.status, EntryContextStatus::Ready);
@@ -1010,7 +1002,7 @@ mod tests {
         l.features_t0.n_cache_observations_at_t0 = 120;
         l.features_t0.entry_rank_percentile_24h = None;
 
-        let ctx = l.entry_context_t0();
+        let ctx = l.entry_context_t0_with_min_history(500);
 
         assert_eq!(ctx.status, EntryContextStatus::InsufficientHistory);
         assert_eq!(ctx.entry_rank_percentile_24h, None);

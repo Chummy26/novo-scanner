@@ -33,6 +33,7 @@ nao escolhe `exit_target` e nao substitui `P_hit` calibrado.
 - Expor como diagnostico decomponivel para UI, auditoria ou trainer.
 - Marcar cold-start como `insufficient_history` em vez de imputar score `0`.
 - Versionar a formula derivada quando houver agregado ou apresentacao publica.
+- Usar o `min_history` da configuracao do run, nao um default global embutido.
 
 ## Proibido
 
@@ -72,8 +73,8 @@ Antes de usar em UI ou trainer:
 
 - A derivacao foi feita antes de atualizar o cache com a observacao de `t0`?
 - A formula tem nome/versao?
+- O `min_history` veio da configuracao/fingerprint do run?
 - Cold-start fica tipado?
 - O campo nao mistura Teste 1 com Teste 2?
 - O trainer ainda consegue acessar todos os componentes crus?
 - A mudanca nao altera schema de label nem popula novos labels?
-

@@ -67,7 +67,7 @@ onde:
 - `exit` = threshold de `S_saída(t1)` recomendado para essa entrada e para esse estado atual
 - `lucro_bruto` = `enter + exit`, sempre em termos de spread bruto cotado
 - `P` = probabilidade de `S_saída(t1)` atingir o threshold `exit` dentro do horizonte considerado, condicionada ao estado disponível em `t0` e calibrada empiricamente
-- `T` = tempo esperado até `S_saída(t1)` atingir o threshold `exit`, condicionado ao estado disponível em `t0`
+- `T` = distribuição/quantis do tempo até `S_saída(t1)` atingir o threshold `exit`, condicionado ao estado disponível em `t0`; no contrato público, `t_hit` deve declarar quando é condicional a `realized_within_horizon`
 - `IC` = intervalo de confiança honesto sobre a recomendação
 
 Importante: entradas e saídas são variáveis. Não existe um par único universalmente correto de `enter` e `exit` para uma rota. Como a skill mostra, diferentes operadores podem entrar e sair em pontos distintos da mesma trajetória e obter PnL diferentes sem violar a estratégia.
@@ -100,13 +100,15 @@ Abstenção continua sendo resposta válida e obrigatória quando não houver op
 
 O output é estruturado em dois níveis de leitura: linha de scanning (decisão go/no-go em <1s) e painel de detalhe (deep-read sob demanda).
 
+Contrato operacional atual: `docs/ml/07_decision_policy/trade_recommendation_output_contract_v2_3.json`. Este arquivo é a especificação de payload para replay, UI/serving e auditoria; esta seção mantém apenas o norte conceitual.
+
 Princípios de representação:
 
 - `enter` é ponto único: valor cotado de `S_entrada(t0)` no instante da recomendação (preço observado top-of-book, não estimativa).
-- `exit` é reportado como distribuição/quantis, não como ponto ótimo absoluto: `S_saída(t1)` é amostra estocástica da trajetória futura (skill §3.2/§3.3), então ponto único sem incerteza é desonesto epistemicamente.
+- `exit` público é `exit_target_pct`: um threshold probabilístico selecionado por `ExitTargetPolicy`, não ponto ótimo absoluto, não ordem exata e não oracle. Evidências de distribuição/quantis devem aparecer em `candidate_curve`, `exit_context_t0`, `t_hit` e logs de curva completa.
 - `T` é distribuição com `P_censura` explícito: censura é primeira ordem (skill §6: rota pode sumir antes do horizonte); omiti-la distorce o risco de recomendação.
-- `lucro_bruto` é derivado de `enter + exit_q50`; não duplica incerteza.
-- `IC` é construído por método distribution-free (conformal prediction ou equivalente), nunca por Wald ingênuo.
+- `lucro_bruto` alvo/threshold é derivado de `enter + exit_target`; estimativa central só deve aparecer quando houver modelo próprio, em campo separado como `gross_central_pct`.
+- `IC` precisa declarar método, cobertura, escopo de calibração e cutoff temporal. Métodos conformal/distribution-free, IPCW/bootstrap ou equivalente são aceitáveis se a cobertura empírica for auditada; Wald ingênuo não é aceitável.
 - Nenhuma prosa qualitativa deve aparecer se não for derivada deterministicamente dos números.
 
 Status categórico (badge primário do scanning):
@@ -129,8 +131,9 @@ Convenções:
 
 - `enter@X%` = `S_entrada(t0)` cotado em `t0`; não é instrução de limit order.
 - `exit>=Y%` = threshold a partir do qual `S_saída(t1)` é favorável; é alvo probabilístico, não ordem exata.
-- `L = enter + exit_q50`, sempre em termos de lucro bruto cotado.
+- `L = enter + exit_target`, sempre em termos de lucro bruto cotado alvo/threshold.
 - `T~` = mediana condicional do tempo até o threshold.
+- O payload canônico usa `FUTURES_PERP`; a UI pode abreviar para `FUT` apenas como apresentação.
 
 Painel de detalhe (expandido sob demanda) expõe os quantis de `exit` e `T`, `P_censura`, `IC` com método declarado e os Testes 1/2 da skill §4 derivados deterministicamente dos números.
 

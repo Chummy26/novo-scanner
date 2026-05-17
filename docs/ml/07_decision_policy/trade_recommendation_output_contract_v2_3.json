@@ -1,0 +1,295 @@
+{
+  "output_contract_version": "trade_recommendation/v2.3",
+  "recommendation_id": "rec_01HX...",
+  "prediction_id": "pred_01HX...",
+  "recommendation": "ENTER_OPPORTUNITY",
+  "badge": "ENTER",
+  "abstain_reason": null,
+  "serving_mode": "POLICY_SELECTED",
+  "calibration_status": "OK",
+  "scope": {
+    "type": "GROSS_SPREAD_RECOMMENDATION",
+    "execution_instruction": false,
+    "not_in_scope": [
+      "fees",
+      "funding",
+      "slippage",
+      "size",
+      "margin",
+      "fill",
+      "stop",
+      "net_pnl"
+    ]
+  },
+  "snapshot_t0_ns": 1770000000000000000,
+  "ts_emit_ns": 1770000000123000000,
+  "entry_signal_valid_until_ns": 1770000030000000000,
+  "validity_scope": "ENTRY_SIGNAL_ONLY",
+  "prediction_window": {
+    "start_ns": 1770000000000000000,
+    "end_ns": 1770003600000000000,
+    "horizon_s": 3600,
+    "window_semantics": "FIRST_HIT_WITHIN_WINDOW",
+    "window": "(snapshot_t0_ns, snapshot_t0_ns + horizon_s]"
+  },
+  "dataset_join": {
+    "sample_id": "sid_01HX...",
+    "route_id": "ETH-USDT:binance:SPOT->mexc:FUTURES_PERP",
+    "ts_emit_ns": 1770000000123000000,
+    "runtime_config_hash": "bf942a4dd0ff5f62",
+    "label_schema_version": 12,
+    "storage_contract": "ml_storage_v2",
+    "logical_dataset": "labeled_trades"
+  },
+  "opportunity_identity": {
+    "opportunity_instance_id": "opp_01HX...",
+    "dedupe_key": "ETH-USDT:binance_spot:mexc_perp:entry_bucket_3.4:exit_-2.2:h3600:policy_v1",
+    "dedupe_window_s": 30,
+    "cooldown_until_ns": 1770000060000000000,
+    "replaces_recommendation_id": null
+  },
+  "route": {
+    "route_id": "ETH-USDT:binance:SPOT->mexc:FUTURES_PERP",
+    "canonical_symbol": "ETH-USDT",
+    "buy_venue": "binance",
+    "sell_venue": "mexc",
+    "buy_market": "SPOT",
+    "sell_market": "FUTURES_PERP"
+  },
+  "model_metadata": {
+    "model_family": "forward_labeled_ecdf",
+    "model_version": "fl_ecdf_v1.0.0",
+    "model_artifact_hash": "sha256:...",
+    "calibrator_version": "isotonic_v1.0.0",
+    "calibrator_artifact_hash": "sha256:...",
+    "feature_schema_version": 12,
+    "feature_snapshot_id": "fs_01HX...",
+    "feature_vector_hash": "sha256:...",
+    "feature_formula_version": "features_t0/v12",
+    "output_policy_version": "gross_utility_v1.0.0",
+    "policy_config_hash": "sha256:...",
+    "runtime_config_hash": "bf942a4dd0ff5f62",
+    "training_cutoff_ns": 1769971200000000000,
+    "training_data_window": {
+      "train_start_ns": 1769366400000000000,
+      "train_end_ns": 1769884800000000000,
+      "calibration_start_ns": 1769884800000000000,
+      "calibration_end_ns": 1769971200000000000,
+      "purge_s": 28800,
+      "embargo_s": 28800
+    }
+  },
+  "snapshot_t0": {
+    "entry_locked_pct": 3.4,
+    "exit_start_pct": -4.4,
+    "gross_if_closed_now_pct": -1.0,
+    "gross_if_closed_now_semantics": "same_timestamp_identity_diagnostic"
+  },
+  "entry_context_t0": {
+    "formula_version": "entry_context_t0/v1",
+    "semantics": "point_in_time_entry_quality_not_model_probability",
+    "status": "READY",
+    "window_readiness": {
+      "1h": {
+        "status": "READY",
+        "coverage_s": 3600,
+        "observations": 820
+      },
+      "24h": {
+        "status": "READY",
+        "coverage_s": 86400,
+        "observations": 18420
+      },
+      "7d": {
+        "status": "READY",
+        "coverage_s": 604800,
+        "observations": 119420
+      }
+    },
+    "entry_rank_quantile_1h": 0.992,
+    "entry_rank_quantile_24h": 0.978,
+    "entry_rank_quantile_7d": 0.961,
+    "entry_distance_to_p50_24h_pp": 2.85,
+    "entry_distance_to_p95_24h_pp": 0.42,
+    "entry_distance_to_p95_7d_pp": 0.18,
+    "entry_robust_z_24h": 3.1,
+    "current_opportunity_alive_at_t0_s": 42,
+    "route_history_observations_at_t0": 18420
+  },
+  "exit_context_t0": {
+    "formula_version": "exit_context_t0/v1",
+    "status": "READY",
+    "semantics": "point_in_time_historical_exit_evidence_not_model_probability",
+    "history_window_s": 86400,
+    "exit_p50_24h_pct": -3.1,
+    "exit_p75_24h_pct": -2.2,
+    "exit_p95_24h_pct": -0.9,
+    "selected_exit_target_pct": -2.2,
+    "historical_point_freq_exit_ge_selected_target_24h": 0.25,
+    "historical_first_hit_rate_ge_selected_target_24h": 0.34,
+    "historical_conditional_t_hit_p50_s": 980,
+    "historical_support_n": 18420,
+    "recent_censor_rate_24h": 0.04
+  },
+  "candidate_generation": {
+    "source": "GROSS_FLOOR_GRID",
+    "grid_version": "label_floors_v1",
+    "gross_floors_pct": [
+      0.3,
+      0.5,
+      0.8,
+      1.2,
+      2.0,
+      3.0
+    ],
+    "horizons_s": [
+      900,
+      1800,
+      3600,
+      7200,
+      14400,
+      28800
+    ],
+    "candidate_curve_scope": "UI_NON_DOMINATED_SUBSET",
+    "candidate_curve_complete": false,
+    "full_curve_candidate_count": 36,
+    "full_curve_hash": "sha256:...",
+    "full_curve_storage_uri": "shadow_candidate_curve/rec_01HX...",
+    "selected_from_full_curve": true,
+    "interpolation": null
+  },
+  "decision_gates": {
+    "policy_version": "decision_gates_v1",
+    "min_gross_floor_pct": 0.8,
+    "min_p_hit": 0.6,
+    "max_p_censor": 0.1,
+    "max_p_hit_interval_width": 0.2,
+    "max_t_hit_conditional_p75_s": 3600
+  },
+  "candidate_curve": [
+    {
+      "candidate_id": "c2",
+      "target_source": {
+        "type": "GROSS_FLOOR_GRID",
+        "gross_floor_pct": 1.2
+      },
+      "event_definition": {
+        "event": "FIRST_HIT",
+        "predicate": "S_saida(t) >= exit_target_pct",
+        "window": "(snapshot_t0_ns, snapshot_t0_ns + horizon_s]",
+        "gross_floor_formula": "entry_locked_pct + exit_target_pct",
+        "label_schema_version": 12
+      },
+      "exit_target_semantics": "probabilistic_threshold_not_limit_order_not_oracle",
+      "horizon_s": 3600,
+      "exit_target_pct": -2.2,
+      "gross_floor_pct": 1.2,
+      "gross_threshold_pct": 1.2,
+      "gross_central_pct": null,
+      "p_hit": 0.64,
+      "p_hit_interval": {
+        "lower": 0.56,
+        "upper": 0.71,
+        "interval_type": "confidence_interval",
+        "method": "ipcw_bootstrap",
+        "coverage": 0.95,
+        "calibration_scope": "symbol_cluster_by_horizon_floor",
+        "calibration_window": "rolling_7d",
+        "calibration_cutoff_ns": 1769971200000000000,
+        "n_calibration": 52210
+      },
+      "calibration_diagnostics": {
+        "score_bin": [
+          0.6,
+          0.7
+        ],
+        "bin_n": 8421,
+        "bin_empirical_hit_rate": 0.63,
+        "bin_mean_predicted_p_hit": 0.64,
+        "bin_brier": 0.218,
+        "rolling_ece": 0.027,
+        "reliability_window": "rolling_7d"
+      },
+      "censoring_treatment": {
+        "method": "IPCW_KAPLAN_MEIER",
+        "censor_reasons": [
+          "RouteDormant",
+          "IncompleteWindow",
+          "CollectorShutdown"
+        ],
+        "assumption": "conditionally_independent_given_route_window",
+        "ipcw_weight_mean": 1.08,
+        "ipcw_weight_p95": 1.42,
+        "ipcw_weight_max": 2.1,
+        "effective_n_after_weighting": 7400,
+        "weight_stability": "OK"
+      },
+      "t_hit": {
+        "conditional_on": "realized_within_horizon",
+        "p50_s": 980,
+        "p75_s": 2100,
+        "support_n_hits": 33421
+      },
+      "p_censor": 0.05,
+      "support": {
+        "n_calibration": 52210,
+        "n_hits": 33421,
+        "effective_n": 7400
+      },
+      "pareto_status": "NON_DOMINATED",
+      "dominated_by": null,
+      "utility_score": 0.74,
+      "utility_score_scale": "higher_is_better_0_to_1",
+      "gate_results": {
+        "gross_floor": {
+          "value_pct": 1.2,
+          "min_pct": 0.8,
+          "result": "PASS"
+        },
+        "p_hit": {
+          "value": 0.64,
+          "min": 0.6,
+          "result": "PASS"
+        },
+        "p_censor": {
+          "value": 0.05,
+          "max": 0.1,
+          "result": "PASS"
+        },
+        "p_hit_interval_width": {
+          "value": 0.15,
+          "max": 0.2,
+          "result": "PASS"
+        },
+        "t_hit_conditional_p75_s": {
+          "value": 2100,
+          "max": 3600,
+          "result": "PASS"
+        }
+      },
+      "profile": "balanced"
+    }
+  ],
+  "exit_target_policy": {
+    "mode": "UTILITY_SELECTED",
+    "policy_name": "gross_utility",
+    "policy_version": "v1.0.0",
+    "policy_config_hash": "sha256:...",
+    "selected_candidate_id": "c2",
+    "selection_reason": "highest utility among non-dominated candidates passing all gates"
+  },
+  "primary_setup": {
+    "source_candidate_id": "c2",
+    "projection_of_candidate": true,
+    "enter_pct": 3.4,
+    "exit_target_pct": -2.2,
+    "gross_floor_pct": 1.2,
+    "gross_threshold_pct": 1.2,
+    "gross_central_pct": null,
+    "p_hit": 0.64,
+    "horizon_s": 3600,
+    "p_censor": 0.05,
+    "t_hit_conditional_p50_s": 980,
+    "t_hit_conditional_p75_s": 2100
+  }
+}
