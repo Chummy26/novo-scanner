@@ -24,6 +24,9 @@ em `06_labels_and_data/`.
 - `07_decision_policy/entry_context_t0_checklist.md` formaliza a versao segura
   de `entry_quality`: diagnostico PIT decomponivel da forca relativa da entrada,
   sem virar label, gate ou policy.
+- `07_decision_policy/trade_recommendation_output_contract_v2_3.json` registra
+  o contrato operacional de output `trade_recommendation/v2.3` para replay,
+  auditoria e integracao futura da UI/serving.
 - `06_labels_and_data/label_schema.md` descreve os três streams persistidos.
 - `06_labels_and_data/data_lineage.md` descreve origem, ordem point-in-time e
   campos que não pertencem ao objetivo do modelo.
