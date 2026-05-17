@@ -207,6 +207,105 @@ pub struct FeaturesT0 {
     pub route_n_snapshots: Option<u64>,
 }
 
+/// Versao da leitura derivada de entrada em t0.
+///
+/// Nao e schema persistido nem policy de trade. O objetivo e dar a trainer/UI
+/// uma visao auditavel da pergunta: "o entry atual e excepcional para esta
+/// rota?", sempre a partir de campos PIT ja preservados em [`FeaturesT0`].
+pub const ENTRY_CONTEXT_T0_FORMULA_VERSION: &str = "entry_context_t0/v1";
+
+/// Piso padrao usado apenas para classificar a leitura derivada como pronta.
+/// O gate real de candidatura continua versionado em config/runtime metadata.
+pub const DEFAULT_ENTRY_CONTEXT_MIN_OBSERVATIONS: u32 = 500;
+
+/// Estado da leitura derivada de entrada.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryContextStatus {
+    Ready,
+    InsufficientHistory,
+}
+
+/// Diagnostico derivado e decomponivel da qualidade relativa da entrada.
+///
+/// Este struct deliberadamente nao inclui `p_exit_ge_*`, outcome, first-hit,
+/// audit fields ou qualquer campo futuro. Exequibilidade de saida e outra
+/// dimensao do modelo; misturar as duas em um score unico esconderia a
+/// fronteira entre Teste 1 e Teste 2 da skill canonica.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct EntryContextT0 {
+    pub formula_version: &'static str,
+    pub status: EntryContextStatus,
+    pub entry_rank_percentile_1h: Option<f32>,
+    pub entry_rank_percentile_24h: Option<f32>,
+    pub entry_distance_to_p50_24h_pct: Option<f32>,
+    pub entry_distance_to_p95_24h_pct: Option<f32>,
+    pub entry_distance_to_p95_7d_pct: Option<f32>,
+    pub entry_robust_z_24h: Option<f32>,
+    pub n_cache_observations_at_t0: u32,
+    pub history_coverage_s: Option<u32>,
+    pub time_alive_at_t0_s: Option<u32>,
+}
+
+impl FeaturesT0 {
+    /// Deriva um contexto explicavel da entrada usando o piso padrao.
+    pub fn entry_context_t0(&self, entry_locked_pct: f32, ts_emit_ns: u64) -> EntryContextT0 {
+        self.entry_context_t0_with_min_history(
+            entry_locked_pct,
+            ts_emit_ns,
+            DEFAULT_ENTRY_CONTEXT_MIN_OBSERVATIONS,
+        )
+    }
+
+    /// Deriva a leitura de entrada com `min_history` explicito para testes,
+    /// replay ou trainers que usem outro piso por versao de config.
+    pub fn entry_context_t0_with_min_history(
+        &self,
+        entry_locked_pct: f32,
+        ts_emit_ns: u64,
+        min_history: u32,
+    ) -> EntryContextT0 {
+        let history_coverage_s =
+            if self.oldest_cache_ts_ns > 0 && ts_emit_ns >= self.oldest_cache_ts_ns {
+                let seconds = (ts_emit_ns - self.oldest_cache_ts_ns) / 1_000_000_000;
+                Some(seconds.min(u32::MAX as u64) as u32)
+            } else {
+                None
+            };
+
+        let entry_robust_z_24h = match (self.entry_minus_p50_24h, self.entry_mad_robust_24h) {
+            (Some(delta), Some(scale))
+                if delta.is_finite() && scale.is_finite() && scale.abs() > 1e-6 =>
+            {
+                Some(delta / scale)
+            }
+            _ => None,
+        };
+
+        let status = if self.n_cache_observations_at_t0 >= min_history
+            && self.entry_rank_percentile_24h.is_some()
+        {
+            EntryContextStatus::Ready
+        } else {
+            EntryContextStatus::InsufficientHistory
+        };
+
+        EntryContextT0 {
+            formula_version: ENTRY_CONTEXT_T0_FORMULA_VERSION,
+            status,
+            entry_rank_percentile_1h: self.entry_rank_percentile_1h,
+            entry_rank_percentile_24h: self.entry_rank_percentile_24h,
+            entry_distance_to_p50_24h_pct: self.entry_minus_p50_24h,
+            entry_distance_to_p95_24h_pct: self.entry_p95_24h.map(|p95| entry_locked_pct - p95),
+            entry_distance_to_p95_7d_pct: self.entry_p95_7d.map(|p95| entry_locked_pct - p95),
+            entry_robust_z_24h,
+            n_cache_observations_at_t0: self.n_cache_observations_at_t0,
+            history_coverage_s,
+            time_alive_at_t0_s: self.time_alive_at_t0_s,
+        }
+    }
+}
+
 /// Metadados de policy (auditoria, não target do modelo — correção A1/P3).
 ///
 /// Fix A6 + C4 + D2: v6 adiciona contadores de `RouteRanking` para IPW
@@ -366,6 +465,15 @@ pub struct LabeledTrade {
 }
 
 impl LabeledTrade {
+    /// Leitura derivada da forca relativa da entrada em t0.
+    ///
+    /// Nao altera o JSON persistido e nao participa do label; e apenas uma
+    /// forma padronizada de expor os componentes PIT ja materializados.
+    pub fn entry_context_t0(&self) -> EntryContextT0 {
+        self.features_t0
+            .entry_context_t0(self.entry_locked_pct, self.ts_emit_ns)
+    }
+
     /// Serializa para linha JSON (sem newline).
     ///
     /// Schema v6 — renomes A10, novos campos C3/C13/C2, PolicyMetadata
@@ -876,6 +984,37 @@ mod tests {
         assert!(v["features_t0"].get("sell_vol24").is_none());
         assert!(v["features_t0"].get("log_min_vol24_usd").is_none());
         assert!(v["features_t0"].get("vol_ratio").is_none());
+    }
+
+    #[test]
+    fn entry_context_t0_is_derived_from_pit_entry_features() {
+        let l = mk_label();
+        let ctx = l.entry_context_t0();
+
+        assert_eq!(ctx.formula_version, ENTRY_CONTEXT_T0_FORMULA_VERSION);
+        assert_eq!(ctx.status, EntryContextStatus::Ready);
+        assert_eq!(ctx.entry_rank_percentile_1h, Some(0.70));
+        assert_eq!(ctx.entry_rank_percentile_24h, Some(0.75));
+        assert_eq!(ctx.entry_distance_to_p50_24h_pct, Some(0.5));
+        assert_eq!(ctx.entry_distance_to_p95_24h_pct, Some(-0.5));
+        assert!((ctx.entry_distance_to_p95_7d_pct.unwrap() + 0.9).abs() < 1e-6);
+        assert!((ctx.entry_robust_z_24h.unwrap() - 1.25).abs() < 1e-6);
+        assert_eq!(ctx.n_cache_observations_at_t0, 850);
+        assert_eq!(ctx.history_coverage_s, Some(86_400));
+        assert_eq!(ctx.time_alive_at_t0_s, Some(42));
+    }
+
+    #[test]
+    fn entry_context_t0_marks_cold_start_without_imputing_quality() {
+        let mut l = mk_label();
+        l.features_t0.n_cache_observations_at_t0 = 120;
+        l.features_t0.entry_rank_percentile_24h = None;
+
+        let ctx = l.entry_context_t0();
+
+        assert_eq!(ctx.status, EntryContextStatus::InsufficientHistory);
+        assert_eq!(ctx.entry_rank_percentile_24h, None);
+        assert_eq!(ctx.n_cache_observations_at_t0, 120);
     }
 
     #[test]
