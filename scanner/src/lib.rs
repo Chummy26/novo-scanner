@@ -53,7 +53,11 @@ use crate::spread::engine::{
 };
 use crate::types::now_ns;
 
-const ML_CYCLE_CHANNEL_CAPACITY: usize = 2;
+// Capacity is intentionally larger than the steady-state one-batch backlog.
+// A 24h run can see short OS/disk/runtime pauses in the low-second range; at
+// 150ms cadence, 64 slots absorb ~9.6s per shard without changing per-route
+// FIFO semantics or dropping supervised observations.
+const ML_CYCLE_CHANNEL_CAPACITY: usize = 64;
 const ML_CYCLE_BUFFER_RECYCLE_CAPACITY: usize = 4;
 const ML_CYCLE_MAX_SHARDS: usize = 32;
 const WRITER_MAX_BLOCKING_THREADS: usize = 2;
