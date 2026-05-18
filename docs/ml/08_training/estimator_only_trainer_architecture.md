@@ -78,6 +78,12 @@ O binário grava:
   `(prediction_scope, horizon_s, floor_pct)`. O scorecard de teste usa a
   probabilidade calibrada somente quando a célula tem suporte mínimo; caso
   contrário, registra fallback cru e bloqueia promoção.
+- `bootstrap_interval_audit.json`: auditoria do intervalo de confiança
+  `temporal_block_bootstrap_km_percentile_95`, calculado em passe separado
+  apenas para as linhas elegíveis do artefato. O passe usa blocos temporais de
+  30 min sobre o split de treino, 128 réplicas determinísticas e dedupe próprio.
+  Se alguma linha elegível cair para o IC diagnóstico antigo, a promoção fica
+  bloqueada.
 - `monotonicity_projection.json`: auditoria da projeção isotônica aplicada ao
   artefato preditivo. Ela registra curvas ajustadas, deltas e exemplos; não
   altera o dataset supervisionado nem remove observações.
@@ -101,6 +107,12 @@ O binário grava:
 - `corpus_manifest.json`: contrato do corpus consumido, com manifestos V2,
   versões de `sample_id`, política de route-dim, horizontes/floors esperados e
   digests dos manifestos fonte.
+- `contract_output_mapping.json`: contrato machine-readable entre o artefato do
+  trainer e o payload público `trade_recommendation/v2.3`. Ele declara
+  explicitamente que `candidate_curve[].p_hit` deve vir de
+  `EstimatorRow.p_hit_serving` e que `primary_setup.p_hit` é apenas o `p_hit` do
+  candidato selecionado pela policy, nunca recomputado a partir de `p_hit_km` ou
+  `p_hit_calibrated_raw`.
 - `sources.jsonl`: manifestos V2 consumidos, digests, versões e contagens.
 - `_SUCCESS`: marcador escrito apenas depois da publicação dos artefatos.
 
@@ -128,21 +140,23 @@ manter `promotion_allowed=false` quando:
 - há qualquer issue de auditoria;
 - há conflito de duplicata supervisionada por `(sample_id, horizon_s, floor_pct)`;
 - o teste temporal não tem linhas completas suficientes;
+- alguma linha elegível não recebeu IC bootstrap/conformal por bloco;
 - alguma célula `(prediction_scope, horizon_s, floor_pct)` não tem suporte de
   calibração suficiente;
 - a projeção final de serving ajustou qualquer célula sem calibração aplicada;
-- o intervalo de incerteza ainda for diagnóstico e não usar
-  bootstrap/conformal por bloco.
+- o intervalo de incerteza ainda for diagnóstico.
 
-O próximo marco é trocar o IC diagnóstico por bootstrap/conformal por bloco,
-avaliar beta/conformal sobre a calibração existente e comparar o EstimatorOnly
-contra LightGBM/XGBoost sem misturar corpus incompatível.
+O próximo marco é fixar o contrato público end-to-end e comparar o
+EstimatorOnly contra LightGBM/XGBoost sem misturar corpus incompatível, depois
+que uma coleta longa deixar as células 28800s prontas.
 
 ## Bloqueios intencionais atuais
 
-A versão `v0.1.1` gera estimadores diagnósticos, mas não deve ser promovida para
+A versão `v0.1.2` gera estimadores diagnósticos, mas não deve ser promovida para
 recomendação ativa enquanto:
 
-- o intervalo de incerteza ainda não usar bootstrap/conformal por bloco;
-- a auditoria pós-projeção ainda encontrar violação de monotonicidade na curva
-  `floor × horizon`, especialmente na probabilidade final de serving.
+- o intervalo de incerteza tiver fallback diagnóstico em qualquer linha elegível;
+- a projeção final de serving precisar ajustar células sem calibração aplicada;
+- a auditoria pós-projeção encontrar violação de monotonicidade na curva
+  `floor × horizon`, especialmente na probabilidade final de serving;
+- alguma célula de calibração de 28800s não tiver suporte mínimo.

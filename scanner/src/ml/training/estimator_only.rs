@@ -19,10 +19,11 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
 const NS_PER_S: u64 = 1_000_000_000;
-const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.1.1";
+const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.1.2";
 const MODEL_FAMILY: &str = "forward_labeled_ecdf";
 const OUTPUT_CONTRACT_VERSION: &str = "trade_recommendation/v2.3";
-const CI_METHOD: &str = "kaplan_meier_loglog_greenwood_95";
+const CI_METHOD: &str = "temporal_block_bootstrap_km_percentile_95";
+const FALLBACK_CI_METHOD: &str = "kaplan_meier_loglog_greenwood_95";
 const PROMOTION_INTERVAL_REQUIREMENT: &str = "block_bootstrap_or_conformal_interval";
 const STATE_BUCKET_VERSION: &str = "pit_state_bucket/v2";
 const PREDICTION_METHOD: &str = "route_serving_monotone_km_shrunk_to_global_pit_state_km";
@@ -44,6 +45,9 @@ const STORAGE_V2_LOGICAL_DIGEST_KIND: &str = "fnv1a64_storage_v2_logical_require
 const TRAINER_SUPERVISED_DIGEST_KIND: &str = "fnv1a128_estimator_supervised_fields_v1";
 const EXPECTED_FLOOR_BP: &[i32] = &[30, 50, 80, 120, 200, 300];
 const EXPECTED_HORIZONS_S: &[u32] = &[900, 1800, 3600, 7200, 14400, 28800];
+const BLOCK_BOOTSTRAP_BLOCK_S: u64 = 1_800;
+const BLOCK_BOOTSTRAP_REPLICATES: usize = 128;
+const BLOCK_BOOTSTRAP_MIN_BLOCKS: usize = 3;
 const SUPERVISED_DEDUPE_KEY_ALGORITHM: &str =
     "fnv1a128(sample_id,horizon_s)_complete_floor_vector_v1";
 const SUPERVISED_DEDUPE_FINGERPRINT_ALGORITHM: &str =
@@ -336,7 +340,7 @@ impl GroupStats {
             t_hit_conditional_p25_s: quantile_from_counts(&self.event_counts, 0.25),
             t_hit_conditional_p50_s: quantile_from_counts(&self.event_counts, 0.50),
             t_hit_conditional_p75_s: quantile_from_counts(&self.event_counts, 0.75),
-            ci_method: CI_METHOD.to_string(),
+            ci_method: FALLBACK_CI_METHOD.to_string(),
             sampling_probability_invalid: self.sampling_probability_invalid,
         }
     }
@@ -417,6 +421,7 @@ impl DedupeAudit {
 #[derive(Debug, Serialize)]
 struct DedupeReport {
     training_aggregation: DedupeAudit,
+    bootstrap_interval: DedupeAudit,
     calibration_fit: DedupeAudit,
     scoring_scorecard: DedupeAudit,
 }
@@ -517,6 +522,106 @@ struct AggregateUpdate<'a> {
     floor_bp: i32,
     outcome: FloorOutcome,
     label_pi: Option<f32>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct BootstrapBlockStats {
+    n_total: u64,
+    event_counts: BTreeMap<u32, u64>,
+    censor_before_horizon_counts: BTreeMap<u32, u64>,
+}
+
+impl BootstrapBlockStats {
+    fn update(&mut self, row: FloorOutcome, horizon_s: u32) {
+        self.n_total = self.n_total.saturating_add(1);
+        match row.outcome {
+            FloorOutcomeKind::Realized => {
+                *self.event_counts.entry(row.duration_s).or_insert(0) += 1;
+            }
+            FloorOutcomeKind::Miss => {}
+            FloorOutcomeKind::Censored => {
+                if row.duration_s < horizon_s {
+                    *self
+                        .censor_before_horizon_counts
+                        .entry(row.duration_s)
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    fn merge_into(
+        &self,
+        n_total: &mut u64,
+        event_counts: &mut BTreeMap<u32, u64>,
+        censor_before_horizon_counts: &mut BTreeMap<u32, u64>,
+    ) {
+        *n_total = n_total.saturating_add(self.n_total);
+        for (&duration_s, &count) in &self.event_counts {
+            *event_counts.entry(duration_s).or_insert(0) += count;
+        }
+        for (&duration_s, &count) in &self.censor_before_horizon_counts {
+            *censor_before_horizon_counts.entry(duration_s).or_insert(0) += count;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct BootstrapAccumulator {
+    blocks: BTreeMap<u64, BootstrapBlockStats>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BootstrapInterval {
+    lower: f64,
+    upper: f64,
+    n_blocks: usize,
+    n_replicates: usize,
+}
+
+impl BootstrapAccumulator {
+    fn update(&mut self, block_id: u64, outcome: FloorOutcome, horizon_s: u32) {
+        self.blocks
+            .entry(block_id)
+            .or_default()
+            .update(outcome, horizon_s);
+    }
+
+    fn interval(&self, seed: u128, point_estimate: f64) -> Option<BootstrapInterval> {
+        let blocks = self.blocks.values().collect::<Vec<_>>();
+        if blocks.len() < BLOCK_BOOTSTRAP_MIN_BLOCKS || BLOCK_BOOTSTRAP_REPLICATES == 0 {
+            return None;
+        }
+        let mut samples = Vec::with_capacity(BLOCK_BOOTSTRAP_REPLICATES);
+        for rep in 0..BLOCK_BOOTSTRAP_REPLICATES {
+            let mut n_total = 0u64;
+            let mut event_counts = BTreeMap::<u32, u64>::new();
+            let mut censor_counts = BTreeMap::<u32, u64>::new();
+            for draw in 0..blocks.len() {
+                let idx = bootstrap_sample_index(seed, rep, draw, blocks.len());
+                blocks[idx].merge_into(&mut n_total, &mut event_counts, &mut censor_counts);
+            }
+            if let Some(p) = kaplan_meier_from_parts(n_total, &event_counts, &censor_counts).p_hit {
+                samples.push(p);
+            }
+        }
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let lower = percentile_sorted(&samples, 0.025)
+            .min(point_estimate)
+            .clamp(0.0, 1.0);
+        let upper = percentile_sorted(&samples, 0.975)
+            .max(point_estimate)
+            .clamp(0.0, 1.0);
+        Some(BootstrapInterval {
+            lower,
+            upper,
+            n_blocks: blocks.len(),
+            n_replicates: samples.len(),
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -750,6 +855,49 @@ struct AggregateBuildStats {
     groups_without_p_hit: u64,
     groups_by_level: BTreeMap<String, u64>,
     prediction_eligible_by_level: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BootstrapIntervalAudit {
+    enabled: bool,
+    method: String,
+    fallback_method: String,
+    block_s: u64,
+    min_blocks: usize,
+    requested_replicates: usize,
+    eligible_rows: u64,
+    ready_rows: u64,
+    fallback_rows: u64,
+    missing_accumulator_rows: u64,
+    insufficient_block_rows: u64,
+    min_observed_blocks: Option<usize>,
+    max_observed_blocks: Option<usize>,
+    min_replicates_used: Option<usize>,
+    max_replicates_used: Option<usize>,
+    examples: Vec<String>,
+}
+
+impl Default for BootstrapIntervalAudit {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            method: CI_METHOD.to_string(),
+            fallback_method: FALLBACK_CI_METHOD.to_string(),
+            block_s: BLOCK_BOOTSTRAP_BLOCK_S,
+            min_blocks: BLOCK_BOOTSTRAP_MIN_BLOCKS,
+            requested_replicates: BLOCK_BOOTSTRAP_REPLICATES,
+            eligible_rows: 0,
+            ready_rows: 0,
+            fallback_rows: 0,
+            missing_accumulator_rows: 0,
+            insufficient_block_rows: 0,
+            min_observed_blocks: None,
+            max_observed_blocks: None,
+            min_replicates_used: None,
+            max_replicates_used: None,
+            examples: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1176,6 +1324,7 @@ struct TrainerManifest {
     source_manifests: Vec<SourceManifestSummary>,
     estimator_rows: usize,
     aggregate_build_stats: AggregateBuildStats,
+    bootstrap_interval_audit: BootstrapIntervalAudit,
     calibration: CalibrationSuite,
     dedupe_audit: DedupeReport,
     monotonicity_projection: MonotonicityProjectionAudit,
@@ -1185,6 +1334,18 @@ struct TrainerManifest {
     promotion_allowed: bool,
     promotion_blockers: Vec<String>,
     artifacts: BTreeMap<String, ArtifactInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContractOutputMapping {
+    output_contract_version: String,
+    serving_mode: String,
+    candidate_curve_p_hit_source: String,
+    primary_setup_p_hit_source: String,
+    p_hit_interval_source: String,
+    public_probability_field: String,
+    intermediate_probability_fields_not_public: Vec<String>,
+    promotion_requires: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1345,6 +1506,15 @@ pub fn run(cli: Cli) -> Result<()> {
 
     let (mut estimator_rows, aggregate_build_stats) =
         build_prediction_surface(&aggregates, cli.min_support);
+    let mut bootstrap_dedupe = DedupeTracker::new("bootstrap_interval");
+    let bootstrap_interval_audit = process_bootstrap_interval_pass(
+        &manifests,
+        &split,
+        &cli,
+        &mut estimator_rows,
+        &mut bootstrap_dedupe,
+    )?;
+    let bootstrap_dedupe_audit = bootstrap_dedupe.into_audit();
     let monotonicity_projection = apply_monotonicity_projection(&mut estimator_rows);
     let raw_index = build_prediction_index(&estimator_rows);
     let mut calibration_dedupe = DedupeTracker::new("calibration_fit");
@@ -1371,6 +1541,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let scoring_dedupe_audit = scoring_dedupe.into_audit();
     let dedupe_report = DedupeReport {
         training_aggregation: training_dedupe_audit,
+        bootstrap_interval: bootstrap_dedupe_audit,
         calibration_fit: calibration_dedupe_audit,
         scoring_scorecard: scoring_dedupe_audit,
     };
@@ -1380,6 +1551,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let promotion_blockers = promotion_blockers(
         &audit,
         &dedupe_report,
+        &bootstrap_interval_audit,
         &calibration_suite,
         &scorecards,
         &monotonicity_audit,
@@ -1399,6 +1571,9 @@ pub fn run(cli: Cli) -> Result<()> {
     let calibration_artifact = write_json(&calibration_path, &calibration_suite)?;
     let dedupe_path = out_dir.join("duplicate_audit.json");
     let dedupe_artifact = write_json(&dedupe_path, &dedupe_report)?;
+    let bootstrap_interval_path = out_dir.join("bootstrap_interval_audit.json");
+    let bootstrap_interval_artifact =
+        write_json(&bootstrap_interval_path, &bootstrap_interval_audit)?;
     let monotonicity_projection_path = out_dir.join("monotonicity_projection.json");
     let monotonicity_projection_artifact =
         write_json(&monotonicity_projection_path, &monotonicity_projection)?;
@@ -1413,6 +1588,10 @@ pub fn run(cli: Cli) -> Result<()> {
     let corpus_manifest = build_corpus_manifest(&manifests, &source_summaries, &trainer_run_id);
     let corpus_manifest_path = out_dir.join("corpus_manifest.json");
     let corpus_manifest_artifact = write_json(&corpus_manifest_path, &corpus_manifest)?;
+    let contract_output_mapping = build_contract_output_mapping();
+    let contract_output_mapping_path = out_dir.join("contract_output_mapping.json");
+    let contract_output_mapping_artifact =
+        write_json(&contract_output_mapping_path, &contract_output_mapping)?;
 
     let mut artifacts = BTreeMap::new();
     artifacts.insert("estimator_table".to_string(), estimator_artifact);
@@ -1420,6 +1599,10 @@ pub fn run(cli: Cli) -> Result<()> {
     artifacts.insert("scorecard".to_string(), scorecard_artifact);
     artifacts.insert("calibration_model".to_string(), calibration_artifact);
     artifacts.insert("duplicate_audit".to_string(), dedupe_artifact);
+    artifacts.insert(
+        "bootstrap_interval_audit".to_string(),
+        bootstrap_interval_artifact,
+    );
     artifacts.insert(
         "monotonicity_projection".to_string(),
         monotonicity_projection_artifact,
@@ -1430,6 +1613,10 @@ pub fn run(cli: Cli) -> Result<()> {
     );
     artifacts.insert("sources".to_string(), sources_artifact);
     artifacts.insert("corpus_manifest".to_string(), corpus_manifest_artifact);
+    artifacts.insert(
+        "contract_output_mapping".to_string(),
+        contract_output_mapping_artifact,
+    );
 
     let manifest = TrainerManifest {
         trainer_version: TRAINER_VERSION.to_string(),
@@ -1451,6 +1638,7 @@ pub fn run(cli: Cli) -> Result<()> {
         source_manifests: source_summaries,
         estimator_rows: estimator_rows.len(),
         aggregate_build_stats,
+        bootstrap_interval_audit,
         calibration: calibration_suite,
         dedupe_audit: dedupe_report,
         monotonicity_projection,
@@ -1991,6 +2179,331 @@ fn build_prediction_surface(
             })
     });
     (rows, build)
+}
+
+fn process_bootstrap_interval_pass(
+    manifests: &[ManifestRecord],
+    split: &TemporalSplit,
+    cli: &Cli,
+    rows: &mut [EstimatorRow],
+    dedupe: &mut DedupeTracker,
+) -> Result<BootstrapIntervalAudit> {
+    let mut audit = BootstrapIntervalAudit {
+        eligible_rows: rows.len() as u64,
+        ..BootstrapIntervalAudit::default()
+    };
+    let row_index = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| estimator_row_key(row).map(|key| (key, idx)))
+        .collect::<HashMap<_, _>>();
+    let mut accumulators = HashMap::<AggregationKey, BootstrapAccumulator>::new();
+    let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
+    for rec in manifests {
+        if rows_left == 0 {
+            break;
+        }
+        let mut reader =
+            open_storage_v2_sidecar_logical_reader(&rec.manifest, DatasetKind::LabeledTrades)
+                .with_context(|| format!("open logical V2 reader {}", rec.path.display()))?;
+        for batch in &mut reader {
+            if rows_left == 0 {
+                break;
+            }
+            let batch = batch?;
+            let view = BatchView::new(&batch)?;
+            let n = batch.num_rows().min(rows_left as usize);
+            rows_left -= n as u64;
+            process_bootstrap_interval_batch(
+                &view,
+                n,
+                split,
+                &row_index,
+                &mut accumulators,
+                dedupe,
+            )?;
+        }
+    }
+
+    for row in rows {
+        let Some(key) = estimator_row_key(row) else {
+            audit.fallback_rows = audit.fallback_rows.saturating_add(1);
+            push_bootstrap_interval_example(&mut audit, "invalid_estimator_row_key", row, None);
+            continue;
+        };
+        let Some(point_estimate) = row.p_hit_km_raw else {
+            audit.fallback_rows = audit.fallback_rows.saturating_add(1);
+            push_bootstrap_interval_example(&mut audit, "missing_point_estimate", row, None);
+            continue;
+        };
+        let Some(acc) = accumulators.get(&key) else {
+            audit.fallback_rows = audit.fallback_rows.saturating_add(1);
+            audit.missing_accumulator_rows = audit.missing_accumulator_rows.saturating_add(1);
+            row.ci_method = format!("{FALLBACK_CI_METHOD};bootstrap_missing_accumulator");
+            push_bootstrap_interval_example(&mut audit, "missing_accumulator", row, None);
+            continue;
+        };
+        let block_count = acc.blocks.len();
+        audit.min_observed_blocks = Some(
+            audit
+                .min_observed_blocks
+                .map(|current| current.min(block_count))
+                .unwrap_or(block_count),
+        );
+        audit.max_observed_blocks = Some(
+            audit
+                .max_observed_blocks
+                .map(|current| current.max(block_count))
+                .unwrap_or(block_count),
+        );
+        let Some(interval) = acc.interval(bootstrap_seed_for_key(&key), point_estimate) else {
+            audit.fallback_rows = audit.fallback_rows.saturating_add(1);
+            audit.insufficient_block_rows = audit.insufficient_block_rows.saturating_add(1);
+            row.ci_method = format!(
+                "{FALLBACK_CI_METHOD};bootstrap_insufficient_blocks observed_blocks={block_count} min_blocks={BLOCK_BOOTSTRAP_MIN_BLOCKS}"
+            );
+            push_bootstrap_interval_example(
+                &mut audit,
+                "insufficient_blocks",
+                row,
+                Some(block_count),
+            );
+            continue;
+        };
+        audit.ready_rows = audit.ready_rows.saturating_add(1);
+        audit.min_replicates_used = Some(
+            audit
+                .min_replicates_used
+                .map(|current| current.min(interval.n_replicates))
+                .unwrap_or(interval.n_replicates),
+        );
+        audit.max_replicates_used = Some(
+            audit
+                .max_replicates_used
+                .map(|current| current.max(interval.n_replicates))
+                .unwrap_or(interval.n_replicates),
+        );
+        audit.min_observed_blocks = Some(
+            audit
+                .min_observed_blocks
+                .map(|current| current.min(interval.n_blocks))
+                .unwrap_or(interval.n_blocks),
+        );
+        audit.max_observed_blocks = Some(
+            audit
+                .max_observed_blocks
+                .map(|current| current.max(interval.n_blocks))
+                .unwrap_or(interval.n_blocks),
+        );
+        row.p_hit_ci_lower_raw = Some(interval.lower);
+        row.p_hit_ci_upper_raw = Some(interval.upper);
+        row.p_hit_ci_lower = Some(interval.lower);
+        row.p_hit_ci_upper = Some(interval.upper);
+        row.ci_method = CI_METHOD.to_string();
+    }
+    audit.fallback_rows = audit.eligible_rows.saturating_sub(audit.ready_rows);
+    Ok(audit)
+}
+
+fn process_bootstrap_interval_batch(
+    view: &BatchView<'_>,
+    n_rows: usize,
+    split: &TemporalSplit,
+    row_index: &HashMap<AggregationKey, usize>,
+    accumulators: &mut HashMap<AggregationKey, BootstrapAccumulator>,
+    dedupe: &mut DedupeTracker,
+) -> Result<()> {
+    for row in 0..n_rows {
+        let ts = required_u64(view.ts_emit_ns, row, "ts_emit_ns")?;
+        if split.assign(ts) != SplitName::Train {
+            continue;
+        }
+        let sample_decision = required_str(view.sample_decision, row, "sample_decision")?;
+        let route_id = required_str(view.route_id, row, "route_id")?;
+        let sample_id = required_str(view.sample_id, row, "sample_id")?;
+        let horizon_s = required_u32(view.horizon_s, row, "horizon_s")?;
+        let hits = floor_hit_range(view.label_floor_hits, row)?;
+        let floor_count = hits.len() as u64;
+        let dedupe_key = supervised_dedupe_row_key(sample_id, horizon_s);
+        let dedupe_fingerprint =
+            supervised_dedupe_row_fingerprint(view, row, hits.clone(), horizon_s)?;
+        if dedupe.observe(
+            dedupe_key,
+            dedupe_fingerprint,
+            SplitName::Train,
+            sample_id,
+            route_id,
+            floor_count,
+        ) != DedupeDecision::Unique
+        {
+            continue;
+        }
+        let block_id = bootstrap_block_id(ts);
+        for hit_idx in hits {
+            let floor_pct =
+                required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
+            let floor_bp = floor_to_bp(floor_pct);
+            let state_bucket = state_bucket_for_floor(view, row, floor_pct);
+            let outcome = floor_outcome(view, row, hit_idx, horizon_s)?;
+            update_bootstrap_interval_aggregate(
+                row_index,
+                accumulators,
+                BootstrapAggregateUpdate {
+                    scope: "all",
+                    route_id,
+                    state_bucket: &state_bucket,
+                    horizon_s,
+                    floor_bp,
+                    outcome,
+                    block_id,
+                },
+            );
+            update_bootstrap_interval_aggregate(
+                row_index,
+                accumulators,
+                BootstrapAggregateUpdate {
+                    scope: sample_decision,
+                    route_id,
+                    state_bucket: &state_bucket,
+                    horizon_s,
+                    floor_bp,
+                    outcome,
+                    block_id,
+                },
+            );
+            if sample_decision != "accept" {
+                update_bootstrap_interval_aggregate(
+                    row_index,
+                    accumulators,
+                    BootstrapAggregateUpdate {
+                        scope: "background",
+                        route_id,
+                        state_bucket: &state_bucket,
+                        horizon_s,
+                        floor_bp,
+                        outcome,
+                        block_id,
+                    },
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BootstrapAggregateUpdate<'a> {
+    scope: &'a str,
+    route_id: &'a str,
+    state_bucket: &'a str,
+    horizon_s: u32,
+    floor_bp: i32,
+    outcome: FloorOutcome,
+    block_id: u64,
+}
+
+fn update_bootstrap_interval_aggregate(
+    row_index: &HashMap<AggregationKey, usize>,
+    accumulators: &mut HashMap<AggregationKey, BootstrapAccumulator>,
+    update: BootstrapAggregateUpdate<'_>,
+) {
+    for (level, entity) in [
+        (AggregationLevel::Route, update.route_id),
+        (AggregationLevel::GlobalState, update.state_bucket),
+        (AggregationLevel::Global, "*"),
+    ] {
+        let key = AggregationKey {
+            scope: update.scope.to_string(),
+            level,
+            entity: entity.to_string(),
+            horizon_s: update.horizon_s,
+            floor_bp: update.floor_bp,
+        };
+        if row_index.contains_key(&key) {
+            accumulators.entry(key).or_default().update(
+                update.block_id,
+                update.outcome,
+                update.horizon_s,
+            );
+        }
+    }
+}
+
+fn estimator_row_key(row: &EstimatorRow) -> Option<AggregationKey> {
+    let level = match row.aggregation_level.as_str() {
+        "route" => AggregationLevel::Route,
+        "global_state" => AggregationLevel::GlobalState,
+        "global" => AggregationLevel::Global,
+        _ => return None,
+    };
+    Some(AggregationKey {
+        scope: row.population_scope.clone(),
+        level,
+        entity: row.entity_key.clone(),
+        horizon_s: row.horizon_s,
+        floor_bp: floor_to_bp(row.floor_pct),
+    })
+}
+
+fn bootstrap_block_id(ts_ns: u64) -> u64 {
+    ts_ns / (BLOCK_BOOTSTRAP_BLOCK_S.saturating_mul(NS_PER_S)).max(1)
+}
+
+fn bootstrap_seed_for_key(key: &AggregationKey) -> u128 {
+    let mut state = FNV_OFFSET_128;
+    fnv1a_update(&mut state, b"bootstrap_interval_seed_v1");
+    update_hash_str(&mut state, &key.scope);
+    update_hash_str(&mut state, key.level.as_str());
+    update_hash_str(&mut state, &key.entity);
+    update_hash_u32(&mut state, key.horizon_s);
+    update_hash_i32(&mut state, key.floor_bp);
+    state
+}
+
+fn bootstrap_sample_index(seed: u128, rep: usize, draw: usize, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let mut state = seed;
+    fnv1a_update(&mut state, b"bootstrap_draw_v1");
+    update_hash_u64(&mut state, rep as u64);
+    update_hash_u64(&mut state, draw as u64);
+    (state % n as u128) as usize
+}
+
+fn percentile_sorted(values: &[f64], q: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let q = q.clamp(0.0, 1.0);
+    let idx = ((values.len() as f64 * q).ceil() as usize)
+        .saturating_sub(1)
+        .min(values.len().saturating_sub(1));
+    values[idx]
+}
+
+fn push_bootstrap_interval_example(
+    audit: &mut BootstrapIntervalAudit,
+    reason: &str,
+    row: &EstimatorRow,
+    block_count: Option<usize>,
+) {
+    if audit.examples.len() >= 50 {
+        return;
+    }
+    audit.examples.push(format!(
+        "reason={} scope={} level={} entity={} horizon_s={} floor_bp={} n_total={} n_complete={} p_hit={:?} observed_blocks={:?}",
+        reason,
+        row.population_scope,
+        row.aggregation_level,
+        row.entity_key,
+        row.horizon_s,
+        floor_to_bp(row.floor_pct),
+        row.n_total,
+        row.n_complete,
+        row.p_hit_km_raw,
+        block_count
+    ));
 }
 
 fn apply_monotonicity_projection(rows: &mut [EstimatorRow]) -> MonotonicityProjectionAudit {
@@ -3746,7 +4259,19 @@ fn floor_hit_range(list: &ListArray, row: usize) -> Result<std::ops::Range<usize
 }
 
 fn kaplan_meier(stats: &GroupStats) -> KmEstimate {
-    if stats.n_total == 0 {
+    kaplan_meier_from_parts(
+        stats.n_total,
+        &stats.event_counts,
+        &stats.censor_before_horizon_counts,
+    )
+}
+
+fn kaplan_meier_from_parts(
+    n_total: u64,
+    event_counts: &BTreeMap<u32, u64>,
+    censor_before_horizon_counts: &BTreeMap<u32, u64>,
+) -> KmEstimate {
+    if n_total == 0 {
         return KmEstimate {
             p_hit: None,
             ci_lower: None,
@@ -3754,13 +4279,13 @@ fn kaplan_meier(stats: &GroupStats) -> KmEstimate {
         };
     }
     let mut times = BTreeMap::<u32, (u64, u64)>::new();
-    for (&t, &d) in &stats.event_counts {
+    for (&t, &d) in event_counts {
         times.entry(t).or_default().0 = d;
     }
-    for (&t, &c) in &stats.censor_before_horizon_counts {
+    for (&t, &c) in censor_before_horizon_counts {
         times.entry(t).or_default().1 = c;
     }
-    let mut at_risk = stats.n_total as f64;
+    let mut at_risk = n_total as f64;
     let mut survival = 1.0f64;
     let mut greenwood = 0.0f64;
     for (_time, (events, censors)) in times {
@@ -3934,13 +4459,16 @@ fn push_monotonicity_example(audit: &mut MonotonicityAudit, example: String) {
     }
 }
 
-fn uncertainty_interval_ready_for_promotion() -> bool {
-    CI_METHOD.contains("bootstrap") || CI_METHOD.contains("conformal")
+fn uncertainty_interval_ready_for_promotion(audit: &BootstrapIntervalAudit) -> bool {
+    audit.ready_rows > 0
+        && audit.fallback_rows == 0
+        && (audit.method.contains("bootstrap") || audit.method.contains("conformal"))
 }
 
 fn promotion_blockers(
     audit: &DatasetAudit,
     dedupe: &DedupeReport,
+    bootstrap_intervals: &BootstrapIntervalAudit,
     calibration: &CalibrationSuite,
     scorecards: &BTreeMap<String, ScoreStats>,
     monotonicity: &MonotonicityAudit,
@@ -3984,13 +4512,19 @@ fn promotion_blockers(
     if scorecards.values().all(|score| score.n_complete == 0) {
         blockers.push("no_complete_test_rows_for_scorecard".to_string());
     }
-    if !uncertainty_interval_ready_for_promotion() {
+    if !uncertainty_interval_ready_for_promotion(bootstrap_intervals) {
         blockers.push(format!(
-            "uncertainty_interval_not_promotion_ready method={} required={}",
-            CI_METHOD, PROMOTION_INTERVAL_REQUIREMENT
+            "uncertainty_interval_not_promotion_ready method={} ready_rows={} fallback_rows={} required={}",
+            bootstrap_intervals.method,
+            bootstrap_intervals.ready_rows,
+            bootstrap_intervals.fallback_rows,
+            PROMOTION_INTERVAL_REQUIREMENT
         ));
     }
-    if !dedupe.training_aggregation.enabled || !dedupe.scoring_scorecard.enabled {
+    if !dedupe.training_aggregation.enabled
+        || !dedupe.bootstrap_interval.enabled
+        || !dedupe.scoring_scorecard.enabled
+    {
         blockers.push("supervised_dedupe_disabled".to_string());
     }
     if dedupe.training_aggregation.duplicate_conflict_floor_keys > 0 {
@@ -4003,6 +4537,12 @@ fn promotion_blockers(
         blockers.push(format!(
             "calibration_duplicate_conflict_floor_keys={}",
             dedupe.calibration_fit.duplicate_conflict_floor_keys
+        ));
+    }
+    if dedupe.bootstrap_interval.duplicate_conflict_floor_keys > 0 {
+        blockers.push(format!(
+            "bootstrap_interval_duplicate_conflict_floor_keys={}",
+            dedupe.bootstrap_interval.duplicate_conflict_floor_keys
         ));
     }
     if dedupe.scoring_scorecard.duplicate_conflict_floor_keys > 0 {
@@ -4574,6 +5114,31 @@ fn build_corpus_manifest(
     }
 }
 
+fn build_contract_output_mapping() -> ContractOutputMapping {
+    ContractOutputMapping {
+        output_contract_version: OUTPUT_CONTRACT_VERSION.to_string(),
+        serving_mode: "POLICY_SELECTED_AFTER_FULL_CURVE_PROJECTION".to_string(),
+        candidate_curve_p_hit_source: "EstimatorRow.p_hit_serving".to_string(),
+        primary_setup_p_hit_source:
+            "selected candidate_curve[].p_hit; never recompute from p_hit_km or p_hit_calibrated_raw"
+                .to_string(),
+        p_hit_interval_source: "EstimatorRow.p_hit_ci_lower/p_hit_ci_upper with ci_method".to_string(),
+        public_probability_field: "p_hit_serving".to_string(),
+        intermediate_probability_fields_not_public: vec![
+            "p_hit_km_raw".to_string(),
+            "p_hit_km".to_string(),
+            "p_hit_calibrated_raw".to_string(),
+        ],
+        promotion_requires: vec![
+            "bootstrap_or_conformal_interval_ready_for_all_eligible_rows".to_string(),
+            "serving_probability_projection_has_zero_monotonicity_violations".to_string(),
+            "no_uncalibrated_raw_fallback_adjusted_by_serving_projection".to_string(),
+            "all_calibration_cells_ready".to_string(),
+            "temporal_split_not_diagnostic".to_string(),
+        ],
+    }
+}
+
 fn unix_s() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4797,6 +5362,57 @@ mod tests {
     }
 
     #[test]
+    fn contract_mapping_declares_serving_probability_as_public_p_hit() {
+        let mapping = build_contract_output_mapping();
+
+        assert_eq!(mapping.output_contract_version, OUTPUT_CONTRACT_VERSION);
+        assert_eq!(mapping.public_probability_field, "p_hit_serving");
+        assert_eq!(
+            mapping.candidate_curve_p_hit_source,
+            "EstimatorRow.p_hit_serving"
+        );
+        assert!(mapping
+            .primary_setup_p_hit_source
+            .contains("selected candidate_curve[].p_hit"));
+        assert!(mapping
+            .intermediate_probability_fields_not_public
+            .contains(&"p_hit_km".to_string()));
+        assert!(mapping
+            .intermediate_probability_fields_not_public
+            .contains(&"p_hit_calibrated_raw".to_string()));
+    }
+
+    #[test]
+    fn temporal_block_bootstrap_interval_uses_multiple_blocks_and_contains_point_estimate() {
+        let mut acc = BootstrapAccumulator::default();
+        for block in 0..4 {
+            acc.update(
+                block,
+                FloorOutcome {
+                    outcome: FloorOutcomeKind::Realized,
+                    duration_s: 10,
+                },
+                900,
+            );
+            acc.update(
+                block,
+                FloorOutcome {
+                    outcome: FloorOutcomeKind::Miss,
+                    duration_s: 900,
+                },
+                900,
+            );
+        }
+
+        let interval = acc.interval(123, 0.50).unwrap();
+
+        assert_eq!(interval.n_blocks, 4);
+        assert_eq!(interval.n_replicates, BLOCK_BOOTSTRAP_REPLICATES);
+        assert!(interval.lower <= 0.50);
+        assert!(interval.upper >= 0.50);
+    }
+
+    #[test]
     fn promotion_blocks_diagnostic_greenwood_interval() {
         let mut audit = DatasetAudit::default();
         audit.runtime_config_hashes.insert("cfg".to_string(), 1);
@@ -4815,9 +5431,11 @@ mod tests {
 
         let dedupe = DedupeReport {
             training_aggregation: DedupeAudit::new("training_aggregation"),
+            bootstrap_interval: DedupeAudit::new("bootstrap_interval"),
             calibration_fit: DedupeAudit::new("calibration_fit"),
             scoring_scorecard: DedupeAudit::new("scoring_scorecard"),
         };
+        let bootstrap_intervals = BootstrapIntervalAudit::default();
         let calibration = CalibrationSuite {
             calibrator_version: CALIBRATOR_VERSION.to_string(),
             method: CALIBRATOR_METHOD.to_string(),
@@ -4865,6 +5483,7 @@ mod tests {
         let blockers = promotion_blockers(
             &audit,
             &dedupe,
+            &bootstrap_intervals,
             &calibration,
             &scorecards,
             &monotonicity,
