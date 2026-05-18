@@ -31,6 +31,10 @@ const ARTIFACT_DIGEST_KIND: &str = "fnv1a128_file_v1";
 const STORAGE_V2_LOGICAL_DIGEST_KIND: &str = "fnv1a64_storage_v2_logical_required_v1";
 const EXPECTED_FLOOR_BP: &[i32] = &[30, 50, 80, 120, 200, 300];
 const EXPECTED_HORIZONS_S: &[u32] = &[900, 1800, 3600, 7200, 14400, 28800];
+const SUPERVISED_DEDUPE_KEY_ALGORITHM: &str =
+    "fnv1a128(sample_id,horizon_s)_complete_floor_vector_v1";
+const SUPERVISED_DEDUPE_FINGERPRINT_ALGORITHM: &str =
+    "fnv1a128(supervised_outcome_and_bucket_fields_for_all_floors)_v1";
 
 const FNV_OFFSET_128: u128 = 0x6c62272e07bb014262b821756295c58d;
 const FNV_PRIME_128: u128 = 0x0000000001000000000000000000013b;
@@ -328,6 +332,158 @@ struct FloorOutcome {
     duration_s: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SupervisedDedupeRowKey {
+    digest: u128,
+    horizon_s: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SupervisedDedupeFingerprint {
+    digest: u128,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupeDecision {
+    Unique,
+    DuplicateExact,
+    DuplicateConflict,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DedupeAudit {
+    stage: String,
+    enabled: bool,
+    key_algorithm: String,
+    fingerprint_algorithm: String,
+    rows_seen: u64,
+    unique_rows: u64,
+    duplicate_exact_rows: u64,
+    duplicate_conflict_rows: u64,
+    floor_keys_seen: u64,
+    unique_floor_keys: u64,
+    duplicate_exact_floor_keys: u64,
+    duplicate_conflict_floor_keys: u64,
+    duplicate_exact_by_split: BTreeMap<String, u64>,
+    duplicate_conflict_by_split: BTreeMap<String, u64>,
+    examples: Vec<String>,
+}
+
+impl DedupeAudit {
+    fn new(stage: &str) -> Self {
+        Self {
+            stage: stage.to_string(),
+            enabled: true,
+            key_algorithm: SUPERVISED_DEDUPE_KEY_ALGORITHM.to_string(),
+            fingerprint_algorithm: SUPERVISED_DEDUPE_FINGERPRINT_ALGORITHM.to_string(),
+            rows_seen: 0,
+            unique_rows: 0,
+            duplicate_exact_rows: 0,
+            duplicate_conflict_rows: 0,
+            floor_keys_seen: 0,
+            unique_floor_keys: 0,
+            duplicate_exact_floor_keys: 0,
+            duplicate_conflict_floor_keys: 0,
+            duplicate_exact_by_split: BTreeMap::new(),
+            duplicate_conflict_by_split: BTreeMap::new(),
+            examples: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DedupeReport {
+    training_aggregation: DedupeAudit,
+    scoring_scorecard: DedupeAudit,
+}
+
+struct DedupeTracker {
+    seen: HashMap<SupervisedDedupeRowKey, SupervisedDedupeFingerprint>,
+    audit: DedupeAudit,
+}
+
+impl DedupeTracker {
+    fn new(stage: &str) -> Self {
+        Self {
+            seen: HashMap::new(),
+            audit: DedupeAudit::new(stage),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        key: SupervisedDedupeRowKey,
+        fingerprint: SupervisedDedupeFingerprint,
+        split: SplitName,
+        sample_id: &str,
+        route_id: &str,
+        floor_count: u64,
+    ) -> DedupeDecision {
+        self.audit.rows_seen = self.audit.rows_seen.saturating_add(1);
+        self.audit.floor_keys_seen = self.audit.floor_keys_seen.saturating_add(floor_count);
+        match self.seen.get(&key).copied() {
+            None => {
+                self.seen.insert(key, fingerprint);
+                self.audit.unique_rows = self.audit.unique_rows.saturating_add(1);
+                self.audit.unique_floor_keys =
+                    self.audit.unique_floor_keys.saturating_add(floor_count);
+                DedupeDecision::Unique
+            }
+            Some(existing) if existing == fingerprint => {
+                self.audit.duplicate_exact_rows = self.audit.duplicate_exact_rows.saturating_add(1);
+                self.audit.duplicate_exact_floor_keys = self
+                    .audit
+                    .duplicate_exact_floor_keys
+                    .saturating_add(floor_count);
+                inc_str(
+                    &mut self.audit.duplicate_exact_by_split,
+                    split_name_str(split),
+                );
+                if self.audit.examples.len() < 50 {
+                    self.audit.examples.push(format!(
+                        "exact_duplicate stage={} split={} sample_id={} route={} horizon_s={} floor_count={}",
+                        self.audit.stage,
+                        split_name_str(split),
+                        sample_id,
+                        route_id,
+                        key.horizon_s,
+                        floor_count
+                    ));
+                }
+                DedupeDecision::DuplicateExact
+            }
+            Some(_) => {
+                self.audit.duplicate_conflict_rows =
+                    self.audit.duplicate_conflict_rows.saturating_add(1);
+                self.audit.duplicate_conflict_floor_keys = self
+                    .audit
+                    .duplicate_conflict_floor_keys
+                    .saturating_add(floor_count);
+                inc_str(
+                    &mut self.audit.duplicate_conflict_by_split,
+                    split_name_str(split),
+                );
+                if self.audit.examples.len() < 50 {
+                    self.audit.examples.push(format!(
+                        "conflicting_duplicate stage={} split={} sample_id={} route={} horizon_s={} floor_count={}",
+                        self.audit.stage,
+                        split_name_str(split),
+                        sample_id,
+                        route_id,
+                        key.horizon_s,
+                        floor_count
+                    ));
+                }
+                DedupeDecision::DuplicateConflict
+            }
+        }
+    }
+
+    fn into_audit(self) -> DedupeAudit {
+        self.audit
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct AggregateUpdate<'a> {
     scope: &'a str,
@@ -563,10 +719,29 @@ struct TrainerManifest {
     source_manifests: Vec<SourceManifestSummary>,
     estimator_rows: usize,
     aggregate_build_stats: AggregateBuildStats,
+    dedupe_audit: DedupeReport,
     monotonicity_audit: MonotonicityAudit,
     promotion_allowed: bool,
     promotion_blockers: Vec<String>,
     artifacts: BTreeMap<String, ArtifactInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct CorpusManifest {
+    storage_contract: String,
+    logical_dataset: String,
+    output_contract_version: String,
+    trainer_version: String,
+    trainer_run_id: String,
+    manifests: usize,
+    source_fact_rows_total: u64,
+    min_timestamp_ns: Option<u64>,
+    max_timestamp_ns: Option<u64>,
+    expected_floor_bp: Vec<i32>,
+    expected_horizons_s: Vec<u32>,
+    sample_id_algorithm_versions: Vec<String>,
+    route_dim_key_policies: Vec<String>,
+    source_manifests: Vec<SourceManifestSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -644,15 +819,34 @@ pub fn run(cli: Cli) -> Result<()> {
 
     let mut audit = DatasetAudit::default();
     let mut aggregates = HashMap::<AggregationKey, GroupStats>::new();
-    process_training_pass(&manifests, &split, &cli, &mut audit, &mut aggregates)?;
+    let mut training_dedupe = DedupeTracker::new("training_aggregation");
+    process_training_pass(
+        &manifests,
+        &split,
+        &cli,
+        &mut audit,
+        &mut aggregates,
+        &mut training_dedupe,
+    )?;
 
     let (estimator_rows, aggregate_build_stats) =
         build_prediction_surface(&aggregates, cli.min_support);
     let index = build_prediction_index(&estimator_rows);
-    let scorecards = process_scoring_pass(&manifests, &split, &cli, &index)?;
+    let mut scoring_dedupe = DedupeTracker::new("scoring_scorecard");
+    let scorecards = process_scoring_pass(&manifests, &split, &cli, &index, &mut scoring_dedupe)?;
+    let dedupe_report = DedupeReport {
+        training_aggregation: training_dedupe.into_audit(),
+        scoring_scorecard: scoring_dedupe.into_audit(),
+    };
 
     let monotonicity_audit = monotonicity_audit(&estimator_rows);
-    let promotion_blockers = promotion_blockers(&audit, &scorecards, &monotonicity_audit, split);
+    let promotion_blockers = promotion_blockers(
+        &audit,
+        &dedupe_report,
+        &scorecards,
+        &monotonicity_audit,
+        split,
+    );
     let promotion_allowed = promotion_blockers.is_empty();
 
     let estimator_path = out_dir.join("estimator_table.jsonl");
@@ -661,15 +855,22 @@ pub fn run(cli: Cli) -> Result<()> {
     let audit_artifact = write_json(&audit_path, &audit)?;
     let scorecard_path = out_dir.join("scorecard.json");
     let scorecard_artifact = write_json(&scorecard_path, &scorecards)?;
+    let dedupe_path = out_dir.join("duplicate_audit.json");
+    let dedupe_artifact = write_json(&dedupe_path, &dedupe_report)?;
     let sources_path = out_dir.join("sources.jsonl");
     let source_summaries = source_manifest_summaries(&manifests)?;
     let sources_artifact = write_jsonl(&sources_path, &source_summaries)?;
+    let corpus_manifest = build_corpus_manifest(&manifests, &source_summaries, &trainer_run_id);
+    let corpus_manifest_path = out_dir.join("corpus_manifest.json");
+    let corpus_manifest_artifact = write_json(&corpus_manifest_path, &corpus_manifest)?;
 
     let mut artifacts = BTreeMap::new();
     artifacts.insert("estimator_table".to_string(), estimator_artifact);
     artifacts.insert("dataset_audit".to_string(), audit_artifact);
     artifacts.insert("scorecard".to_string(), scorecard_artifact);
+    artifacts.insert("duplicate_audit".to_string(), dedupe_artifact);
     artifacts.insert("sources".to_string(), sources_artifact);
+    artifacts.insert("corpus_manifest".to_string(), corpus_manifest_artifact);
 
     let manifest = TrainerManifest {
         trainer_version: TRAINER_VERSION.to_string(),
@@ -691,6 +892,7 @@ pub fn run(cli: Cli) -> Result<()> {
         source_manifests: source_summaries,
         estimator_rows: estimator_rows.len(),
         aggregate_build_stats,
+        dedupe_audit: dedupe_report,
         monotonicity_audit,
         promotion_allowed,
         promotion_blockers,
@@ -986,6 +1188,7 @@ fn process_training_pass(
     cli: &Cli,
     audit: &mut DatasetAudit,
     aggregates: &mut HashMap<AggregationKey, GroupStats>,
+    dedupe: &mut DedupeTracker,
 ) -> Result<()> {
     let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
     for rec in manifests {
@@ -1014,7 +1217,7 @@ fn process_training_pass(
             if should_verify_digest {
                 update_logical_digest_batch(&view, n, &mut logical_digest)?;
             }
-            process_train_batch(&view, n, split, audit, aggregates)?;
+            process_train_batch(&view, n, split, audit, aggregates, dedupe)?;
         }
         if should_verify_digest && manifest_rows_seen == rec.manifest.source_row_count {
             let digest_hex = logical_digest.hex();
@@ -1063,6 +1266,7 @@ fn process_train_batch(
     split: &TemporalSplit,
     audit: &mut DatasetAudit,
     aggregates: &mut HashMap<AggregationKey, GroupStats>,
+    dedupe: &mut DedupeTracker,
 ) -> Result<()> {
     for row in 0..n_rows {
         let ts = required_u64(view.ts_emit_ns, row, "ts_emit_ns")?;
@@ -1077,10 +1281,36 @@ fn process_train_batch(
         }
 
         let route_id = required_str(view.route_id, row, "route_id")?;
+        let sample_id = required_str(view.sample_id, row, "sample_id")?;
         let sample_decision = required_str(view.sample_decision, row, "sample_decision")?;
         let label_pi = optional_f32(view.label_sampling_probability, row)
             .or_else(|| optional_f32(Some(view.sampling_probability), row));
         let hits = floor_hit_range(view.label_floor_hits, row)?;
+        let floor_count = hits.len() as u64;
+        let dedupe_key = supervised_dedupe_row_key(sample_id, horizon_s);
+        let dedupe_fingerprint =
+            supervised_dedupe_row_fingerprint(view, row, hits.clone(), horizon_s)?;
+        match dedupe.observe(
+            dedupe_key,
+            dedupe_fingerprint,
+            split_name,
+            sample_id,
+            route_id,
+            floor_count,
+        ) {
+            DedupeDecision::Unique => {}
+            DedupeDecision::DuplicateExact => continue,
+            DedupeDecision::DuplicateConflict => {
+                push_audit_issue(
+                    audit,
+                    format!(
+                        "supervised_duplicate_conflict sample_id={} route={} horizon_s={} floor_count={}",
+                        sample_id, route_id, horizon_s, floor_count
+                    ),
+                );
+                continue;
+            }
+        }
         for hit_idx in hits {
             let floor_pct =
                 required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
@@ -1175,6 +1405,7 @@ fn process_scoring_pass(
     split: &TemporalSplit,
     cli: &Cli,
     index: &HashMap<AggregationKey, EstimatorRow>,
+    dedupe: &mut DedupeTracker,
 ) -> Result<BTreeMap<String, ScoreStats>> {
     let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
     let scopes = score_scopes(cli.prediction_scope);
@@ -1214,6 +1445,7 @@ fn process_scoring_pass(
                 index,
                 &scopes,
                 &mut scores,
+                dedupe,
             )?;
         }
     }
@@ -1231,6 +1463,7 @@ fn process_score_batch(
     index: &HashMap<AggregationKey, EstimatorRow>,
     scopes: &[PredictionScope],
     scores: &mut BTreeMap<String, ScoreAccumulator>,
+    dedupe: &mut DedupeTracker,
 ) -> Result<()> {
     for row in 0..n_rows {
         let ts = required_u64(view.ts_emit_ns, row, "ts_emit_ns")?;
@@ -1239,8 +1472,25 @@ fn process_score_batch(
         }
         let sample_decision = required_str(view.sample_decision, row, "sample_decision")?;
         let route_id = required_str(view.route_id, row, "route_id")?;
+        let sample_id = required_str(view.sample_id, row, "sample_id")?;
         let horizon_s = required_u32(view.horizon_s, row, "horizon_s")?;
-        for hit_idx in floor_hit_range(view.label_floor_hits, row)? {
+        let hits = floor_hit_range(view.label_floor_hits, row)?;
+        let floor_count = hits.len() as u64;
+        let dedupe_key = supervised_dedupe_row_key(sample_id, horizon_s);
+        let dedupe_fingerprint =
+            supervised_dedupe_row_fingerprint(view, row, hits.clone(), horizon_s)?;
+        if dedupe.observe(
+            dedupe_key,
+            dedupe_fingerprint,
+            SplitName::Test,
+            sample_id,
+            route_id,
+            floor_count,
+        ) != DedupeDecision::Unique
+        {
+            continue;
+        }
+        for hit_idx in hits {
             let floor_pct =
                 required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
             let floor_bp = floor_to_bp(floor_pct);
@@ -1281,6 +1531,98 @@ fn score_scopes(primary: PredictionScope) -> Vec<PredictionScope> {
     out.sort();
     out.dedup();
     out
+}
+
+fn supervised_dedupe_row_key(sample_id: &str, horizon_s: u32) -> SupervisedDedupeRowKey {
+    let mut state = FNV_OFFSET_128;
+    fnv1a_update(&mut state, b"supervised_dedupe_row_key_v1");
+    fnv1a_update(&mut state, sample_id.as_bytes());
+    fnv1a_update(&mut state, &horizon_s.to_le_bytes());
+    SupervisedDedupeRowKey {
+        digest: state,
+        horizon_s,
+    }
+}
+
+fn supervised_dedupe_row_fingerprint(
+    view: &BatchView<'_>,
+    row: usize,
+    hits: std::ops::Range<usize>,
+    horizon_s: u32,
+) -> Result<SupervisedDedupeFingerprint> {
+    let mut state = FNV_OFFSET_128;
+    fnv1a_update(&mut state, b"supervised_dedupe_row_fingerprint_v1");
+    update_hash_str(&mut state, required_str(view.route_id, row, "route_id")?);
+    update_hash_str(
+        &mut state,
+        required_str(view.sample_decision, row, "sample_decision")?,
+    );
+    update_hash_u64(
+        &mut state,
+        required_u64(view.ts_emit_ns, row, "ts_emit_ns")?,
+    );
+    update_hash_u32(&mut state, horizon_s);
+    update_hash_u64(
+        &mut state,
+        required_u64(view.observed_until_ns, row, "observed_until_ns")?,
+    );
+    update_hash_u64(
+        &mut state,
+        required_u64(
+            view.label_window_closed_at_ns,
+            row,
+            "label_window_closed_at_ns",
+        )?,
+    );
+    update_hash_u64(
+        &mut state,
+        required_u64(view.closed_ts_ns, row, "closed_ts_ns")?,
+    );
+    update_hash_u64(
+        &mut state,
+        required_u64(view.written_ts_ns, row, "written_ts_ns")?,
+    );
+    update_hash_optional_f32(
+        &mut state,
+        optional_f32(view.label_sampling_probability, row),
+    );
+    update_hash_optional_f32(
+        &mut state,
+        optional_f32(Some(view.sampling_probability), row),
+    );
+    update_hash_u32(&mut state, hits.len() as u32);
+    for hit_idx in hits {
+        let floor_pct = required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
+        let floor_bp = floor_to_bp(floor_pct);
+        let outcome = floor_outcome(view, row, hit_idx, horizon_s)?;
+        let state_bucket = state_bucket_for_floor(view, row, floor_pct);
+        update_hash_i32(&mut state, floor_bp);
+        update_hash_str(&mut state, &state_bucket);
+        update_hash_u32(&mut state, floor_outcome_kind_code(outcome.outcome));
+        update_hash_u32(&mut state, outcome.duration_s);
+        update_hash_optional_u64(
+            &mut state,
+            optional_u64(Some(view.hit_first_ts_ns), hit_idx),
+        );
+        update_hash_optional_u32(
+            &mut state,
+            optional_u32(Some(view.hit_t_to_first_s), hit_idx),
+        );
+        update_hash_optional_f32(
+            &mut state,
+            optional_f32(Some(view.hit_first_exit_pct), hit_idx),
+        );
+        update_hash_optional_bool(&mut state, optional_bool(Some(view.hit_realized), hit_idx));
+    }
+    Ok(SupervisedDedupeFingerprint { digest: state })
+}
+
+fn floor_outcome_kind_code(outcome: FloorOutcomeKind) -> u32 {
+    match outcome {
+        FloorOutcomeKind::Realized => 1,
+        FloorOutcomeKind::Miss => 2,
+        FloorOutcomeKind::Censored => 3,
+    }
 }
 
 fn update_aggregates(
@@ -2198,6 +2540,7 @@ fn push_monotonicity_example(audit: &mut MonotonicityAudit, example: String) {
 
 fn promotion_blockers(
     audit: &DatasetAudit,
+    dedupe: &DedupeReport,
     scorecards: &BTreeMap<String, ScoreStats>,
     monotonicity: &MonotonicityAudit,
     split: TemporalSplit,
@@ -2238,6 +2581,21 @@ fn promotion_blockers(
     if scorecards.values().all(|score| score.n_complete == 0) {
         blockers.push("no_complete_test_rows_for_scorecard".to_string());
     }
+    if !dedupe.training_aggregation.enabled || !dedupe.scoring_scorecard.enabled {
+        blockers.push("supervised_dedupe_disabled".to_string());
+    }
+    if dedupe.training_aggregation.duplicate_conflict_floor_keys > 0 {
+        blockers.push(format!(
+            "training_duplicate_conflict_floor_keys={}",
+            dedupe.training_aggregation.duplicate_conflict_floor_keys
+        ));
+    }
+    if dedupe.scoring_scorecard.duplicate_conflict_floor_keys > 0 {
+        blockers.push(format!(
+            "scoring_duplicate_conflict_floor_keys={}",
+            dedupe.scoring_scorecard.duplicate_conflict_floor_keys
+        ));
+    }
     if audit.label_floor_hit_lengths.len() != 1 || !audit.label_floor_hit_lengths.contains_key(&6) {
         blockers.push(format!(
             "label_floor_grid_not_exactly_six={:?}",
@@ -2269,7 +2627,6 @@ fn promotion_blockers(
             monotonicity.floor_monotonicity_violations
         ));
     }
-    blockers.push("exact_sample_horizon_floor_dedupe_not_yet_enabled".to_string());
     blockers.push("calibration_split_not_yet_used_for_isotonic_beta_or_conformal".to_string());
     blockers
 }
@@ -2369,6 +2726,33 @@ fn optional_f32(array: Option<&Float32Array>, row: usize) -> Option<f32> {
     }
 }
 
+fn optional_u32(array: Option<&UInt32Array>, row: usize) -> Option<u32> {
+    let array = array?;
+    if array.is_null(row) {
+        None
+    } else {
+        Some(array.value(row))
+    }
+}
+
+fn optional_u64(array: Option<&UInt64Array>, row: usize) -> Option<u64> {
+    let array = array?;
+    if array.is_null(row) {
+        None
+    } else {
+        Some(array.value(row))
+    }
+}
+
+fn optional_bool(array: Option<&BooleanArray>, row: usize) -> Option<bool> {
+    let array = array?;
+    if array.is_null(row) {
+        None
+    } else {
+        Some(array.value(row))
+    }
+}
+
 fn floor_to_bp(floor_pct: f32) -> i32 {
     (floor_pct * 100.0).round() as i32
 }
@@ -2387,6 +2771,68 @@ fn inc<K: Ord>(map: &mut BTreeMap<K, u64>, key: K) {
 
 fn inc_str(map: &mut BTreeMap<String, u64>, key: &str) {
     *map.entry(key.to_string()).or_insert(0) += 1;
+}
+
+fn update_hash_str(state: &mut u128, value: &str) {
+    fnv1a_update(state, b"str");
+    fnv1a_update(state, &(value.len() as u64).to_le_bytes());
+    fnv1a_update(state, value.as_bytes());
+}
+
+fn update_hash_u32(state: &mut u128, value: u32) {
+    fnv1a_update(state, b"u32");
+    fnv1a_update(state, &value.to_le_bytes());
+}
+
+fn update_hash_i32(state: &mut u128, value: i32) {
+    fnv1a_update(state, b"i32");
+    fnv1a_update(state, &value.to_le_bytes());
+}
+
+fn update_hash_u64(state: &mut u128, value: u64) {
+    fnv1a_update(state, b"u64");
+    fnv1a_update(state, &value.to_le_bytes());
+}
+
+fn update_hash_optional_u32(state: &mut u128, value: Option<u32>) {
+    match value {
+        Some(v) => {
+            fnv1a_update(state, b"some");
+            update_hash_u32(state, v);
+        }
+        None => fnv1a_update(state, b"none_u32"),
+    }
+}
+
+fn update_hash_optional_u64(state: &mut u128, value: Option<u64>) {
+    match value {
+        Some(v) => {
+            fnv1a_update(state, b"some");
+            update_hash_u64(state, v);
+        }
+        None => fnv1a_update(state, b"none_u64"),
+    }
+}
+
+fn update_hash_optional_f32(state: &mut u128, value: Option<f32>) {
+    match value {
+        Some(v) => {
+            fnv1a_update(state, b"some");
+            fnv1a_update(state, b"f32");
+            fnv1a_update(state, &v.to_bits().to_le_bytes());
+        }
+        None => fnv1a_update(state, b"none_f32"),
+    }
+}
+
+fn update_hash_optional_bool(state: &mut u128, value: Option<bool>) {
+    match value {
+        Some(v) => {
+            fnv1a_update(state, b"some");
+            fnv1a_update(state, &[u8::from(v)]);
+        }
+        None => fnv1a_update(state, b"none_bool"),
+    }
 }
 
 struct TrainerLogicalDigest {
@@ -2589,6 +3035,50 @@ fn source_manifest_summaries(manifests: &[ManifestRecord]) -> Result<Vec<SourceM
             })
         })
         .collect()
+}
+
+fn build_corpus_manifest(
+    manifests: &[ManifestRecord],
+    source_manifests: &[SourceManifestSummary],
+    trainer_run_id: &str,
+) -> CorpusManifest {
+    let sample_id_algorithm_versions = manifests
+        .iter()
+        .map(|rec| rec.manifest.sample_id_algorithm_version.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let route_dim_key_policies = manifests
+        .iter()
+        .map(|rec| rec.manifest.route_dim_key_policy.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    CorpusManifest {
+        storage_contract: "ml_storage_v2".to_string(),
+        logical_dataset: DatasetKind::LabeledTrades.as_str().to_string(),
+        output_contract_version: OUTPUT_CONTRACT_VERSION.to_string(),
+        trainer_version: TRAINER_VERSION.to_string(),
+        trainer_run_id: trainer_run_id.to_string(),
+        manifests: manifests.len(),
+        source_fact_rows_total: manifests
+            .iter()
+            .map(|rec| rec.manifest.fact_row_count)
+            .sum(),
+        min_timestamp_ns: manifests
+            .iter()
+            .filter_map(|rec| rec.manifest.min_timestamp_ns)
+            .min(),
+        max_timestamp_ns: manifests
+            .iter()
+            .filter_map(|rec| rec.manifest.max_timestamp_ns)
+            .max(),
+        expected_floor_bp: EXPECTED_FLOOR_BP.to_vec(),
+        expected_horizons_s: EXPECTED_HORIZONS_S.to_vec(),
+        sample_id_algorithm_versions,
+        route_dim_key_policies,
+        source_manifests: source_manifests.to_vec(),
+    }
 }
 
 fn unix_s() -> u64 {
@@ -2804,6 +3294,73 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn supervised_dedupe_skips_exact_duplicate_floor_key() {
+        let mut tracker = DedupeTracker::new("test");
+        let key = supervised_dedupe_row_key("sample-1", 900);
+        let fp = SupervisedDedupeFingerprint { digest: 42 };
+
+        assert_eq!(
+            tracker.observe(key, fp, SplitName::Train, "sample-1", "route-1", 6),
+            DedupeDecision::Unique
+        );
+        assert_eq!(
+            tracker.observe(key, fp, SplitName::Train, "sample-1", "route-1", 6),
+            DedupeDecision::DuplicateExact
+        );
+
+        let audit = tracker.into_audit();
+        assert_eq!(audit.rows_seen, 2);
+        assert_eq!(audit.unique_rows, 1);
+        assert_eq!(audit.duplicate_exact_rows, 1);
+        assert_eq!(audit.duplicate_conflict_rows, 0);
+        assert_eq!(audit.floor_keys_seen, 12);
+        assert_eq!(audit.unique_floor_keys, 6);
+        assert_eq!(audit.duplicate_exact_floor_keys, 6);
+        assert_eq!(audit.duplicate_conflict_floor_keys, 0);
+        assert_eq!(audit.duplicate_exact_by_split.get("train"), Some(&1));
+    }
+
+    #[test]
+    fn supervised_dedupe_flags_conflicting_duplicate_floor_key() {
+        let mut tracker = DedupeTracker::new("test");
+        let key = supervised_dedupe_row_key("sample-1", 900);
+
+        assert_eq!(
+            tracker.observe(
+                key,
+                SupervisedDedupeFingerprint { digest: 42 },
+                SplitName::Train,
+                "sample-1",
+                "route-1",
+                6,
+            ),
+            DedupeDecision::Unique
+        );
+        assert_eq!(
+            tracker.observe(
+                key,
+                SupervisedDedupeFingerprint { digest: 43 },
+                SplitName::Train,
+                "sample-1",
+                "route-1",
+                6,
+            ),
+            DedupeDecision::DuplicateConflict
+        );
+
+        let audit = tracker.into_audit();
+        assert_eq!(audit.rows_seen, 2);
+        assert_eq!(audit.unique_rows, 1);
+        assert_eq!(audit.duplicate_exact_rows, 0);
+        assert_eq!(audit.duplicate_conflict_rows, 1);
+        assert_eq!(audit.floor_keys_seen, 12);
+        assert_eq!(audit.unique_floor_keys, 6);
+        assert_eq!(audit.duplicate_exact_floor_keys, 0);
+        assert_eq!(audit.duplicate_conflict_floor_keys, 6);
+        assert_eq!(audit.duplicate_conflict_by_split.get("train"), Some(&1));
     }
 
     fn estimator_row(

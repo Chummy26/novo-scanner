@@ -60,6 +60,15 @@ O binário grava:
   Inclui também `aggregate_build_stats`, com contagem dos agregados descartados
   por baixo suporte. Esses agregados não são apagados do dataset fonte; eles
   apenas não entram no artefato preditivo porque o próprio índice não os usaria.
+- `duplicate_audit.json`: auditoria e dedupe determinístico da linha
+  supervisionada `(sample_id, horizon_s)` com fingerprint do vetor completo de
+  6 floors. Como `label_floor_hits[]` é obrigatório e completo, isso equivale
+  ao dedupe por `(sample_id, horizon_s, floor_pct)` para a estatística de treino
+  com bem menos memória. Duplicatas exatas são ignoradas; conflitos viram
+  blocker de promoção.
+- `corpus_manifest.json`: contrato do corpus consumido, com manifestos V2,
+  versões de `sample_id`, política de route-dim, horizontes/floors esperados e
+  digests dos manifestos fonte.
 - `sources.jsonl`: manifestos V2 consumidos, digests, versões e contagens.
 - `_SUCCESS`: marcador escrito apenas depois da publicação dos artefatos.
 
@@ -85,11 +94,12 @@ manter `promotion_allowed=false` quando:
 - o split temporal não suporta purge/embargo completo com teste maduro;
 - há mais de um `runtime_config_hash` supervisionado;
 - há qualquer issue de auditoria;
+- há conflito de duplicata supervisionada por `(sample_id, horizon_s, floor_pct)`;
 - o teste temporal não tem linhas completas suficientes.
 
 O próximo marco é trocar o IC diagnóstico por bootstrap/conformal por bloco,
-usar a calibração temporal para isotonic/beta e auditar dedupe exato antes de
-qualquer comparação contra LightGBM/XGBoost.
+usar a calibração temporal para isotonic/beta e comparar o EstimatorOnly contra
+LightGBM/XGBoost sem misturar corpus incompatível.
 
 ## Bloqueios intencionais atuais
 
@@ -97,5 +107,4 @@ A versão `v0.1.0` gera estimadores diagnósticos, mas não deve ser promovida p
 recomendação ativa enquanto:
 
 - o split de calibração ainda não alimentar isotonic/beta/conformal;
-- não houver dedupe exato por `(sample_id, horizon_s, floor_pct)`;
 - houver violação de monotonicidade na curva `floor × horizon`.
