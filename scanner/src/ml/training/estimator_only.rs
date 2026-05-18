@@ -23,6 +23,7 @@ const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.1.1";
 const MODEL_FAMILY: &str = "forward_labeled_ecdf";
 const OUTPUT_CONTRACT_VERSION: &str = "trade_recommendation/v2.3";
 const CI_METHOD: &str = "kaplan_meier_loglog_greenwood_95";
+const PROMOTION_INTERVAL_REQUIREMENT: &str = "block_bootstrap_or_conformal_interval";
 const STATE_BUCKET_VERSION: &str = "pit_state_bucket/v2";
 const PREDICTION_METHOD: &str = "route_monotone_km_shrunk_to_global_pit_state_km";
 const CALIBRATOR_VERSION: &str = "isotonic_complete_case_temporal/v0.1.0";
@@ -3415,6 +3416,10 @@ fn push_monotonicity_example(audit: &mut MonotonicityAudit, example: String) {
     }
 }
 
+fn uncertainty_interval_ready_for_promotion() -> bool {
+    CI_METHOD.contains("bootstrap") || CI_METHOD.contains("conformal")
+}
+
 fn promotion_blockers(
     audit: &DatasetAudit,
     dedupe: &DedupeReport,
@@ -3458,6 +3463,12 @@ fn promotion_blockers(
     }
     if scorecards.values().all(|score| score.n_complete == 0) {
         blockers.push("no_complete_test_rows_for_scorecard".to_string());
+    }
+    if !uncertainty_interval_ready_for_promotion() {
+        blockers.push(format!(
+            "uncertainty_interval_not_promotion_ready method={} required={}",
+            CI_METHOD, PROMOTION_INTERVAL_REQUIREMENT
+        ));
     }
     if !dedupe.training_aggregation.enabled || !dedupe.scoring_scorecard.enabled {
         blockers.push("supervised_dedupe_disabled".to_string());
@@ -4141,6 +4152,79 @@ mod tests {
         assert!(projection.rows_adjusted > 0);
         assert!(rows.iter().any(|row| row.p_hit_monotonicity_adjusted));
         assert!(rows.iter().all(|row| row.p_hit_km_raw.is_some()));
+    }
+
+    #[test]
+    fn promotion_blocks_diagnostic_greenwood_interval() {
+        let mut audit = DatasetAudit::default();
+        audit.runtime_config_hashes.insert("cfg".to_string(), 1);
+        audit
+            .schema_versions
+            .insert(LABELED_TRADE_SCHEMA_VERSION, 1);
+        audit.label_floor_hit_lengths.insert(6, 1);
+        for &floor_bp in EXPECTED_FLOOR_BP {
+            audit
+                .floor_values
+                .insert(format!("{:.6}", floor_bp as f32 / 100.0), 1);
+        }
+        for &horizon_s in EXPECTED_HORIZONS_S {
+            audit.horizons_s.insert(horizon_s, 1);
+        }
+
+        let dedupe = DedupeReport {
+            training_aggregation: DedupeAudit::new("training_aggregation"),
+            calibration_fit: DedupeAudit::new("calibration_fit"),
+            scoring_scorecard: DedupeAudit::new("scoring_scorecard"),
+        };
+        let calibration = CalibrationSuite {
+            calibrator_version: CALIBRATOR_VERSION.to_string(),
+            method: CALIBRATOR_METHOD.to_string(),
+            min_complete: MIN_CALIBRATION_COMPLETE,
+            diagnostic_only: false,
+            censoring_treatment: "test".to_string(),
+            cells_total: 1,
+            cells_ready: 1,
+            cells_not_ready: 0,
+            cells_not_ready_examples: Vec::new(),
+            cells: BTreeMap::new(),
+        };
+        let mut scorecards = BTreeMap::new();
+        scorecards.insert(
+            "accept".to_string(),
+            ScoreStats {
+                n_complete: 1,
+                ..ScoreStats::default()
+            },
+        );
+        let monotonicity = MonotonicityAudit::default();
+        let split = TemporalSplit {
+            min_ts_ns: 0,
+            max_ts_ns: 1,
+            train_end_ns: 0,
+            calibration_start_ns: 0,
+            calibration_end_ns: 0,
+            test_start_ns: 0,
+            max_horizon_s: 28_800,
+            requested_purge_s: 28_800,
+            requested_embargo_s: 28_800,
+            purge_s: 28_800,
+            embargo_s: 28_800,
+            data_span_s: 1,
+            diagnostic_only: false,
+        };
+
+        let blockers = promotion_blockers(
+            &audit,
+            &dedupe,
+            &calibration,
+            &scorecards,
+            &monotonicity,
+            split,
+        );
+
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker.starts_with("uncertainty_interval_not_promotion_ready")));
     }
 
     #[test]

@@ -111,7 +111,9 @@ manter `promotion_allowed=false` quando:
 - há conflito de duplicata supervisionada por `(sample_id, horizon_s, floor_pct)`;
 - o teste temporal não tem linhas completas suficientes;
 - alguma célula `(prediction_scope, horizon_s, floor_pct)` não tem suporte de
-  calibração suficiente.
+  calibração suficiente;
+- o intervalo de incerteza ainda for diagnóstico e não usar
+  bootstrap/conformal por bloco.
 
 O próximo marco é trocar o IC diagnóstico por bootstrap/conformal por bloco,
 avaliar beta/conformal sobre a calibração existente e comparar o EstimatorOnly
@@ -119,7 +121,7 @@ contra LightGBM/XGBoost sem misturar corpus incompatível.
 
 ## Bloqueios intencionais atuais
 
-A versão `v0.1.0` gera estimadores diagnósticos, mas não deve ser promovida para
+A versão `v0.1.1` gera estimadores diagnósticos, mas não deve ser promovida para
 recomendação ativa enquanto:
 
 - o intervalo de incerteza ainda não usar bootstrap/conformal por bloco;
