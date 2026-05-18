@@ -511,6 +511,30 @@ struct CalibrationFitAccumulator {
     buckets: BTreeMap<u64, CalibrationBucket>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CalibrationCellKey {
+    prediction_scope: String,
+    horizon_s: u32,
+    floor_bp: i32,
+}
+
+impl CalibrationCellKey {
+    fn new(scope: &str, horizon_s: u32, floor_bp: i32) -> Self {
+        Self {
+            prediction_scope: scope.to_string(),
+            horizon_s,
+            floor_bp,
+        }
+    }
+
+    fn as_artifact_key(&self) -> String {
+        format!(
+            "{}|h{}|floor_bp{}",
+            self.prediction_scope, self.horizon_s, self.floor_bp
+        )
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct CalibrationBucket {
     n: u64,
@@ -533,12 +557,20 @@ struct CalibrationSuite {
     min_complete: u64,
     diagnostic_only: bool,
     censoring_treatment: String,
-    scopes: BTreeMap<String, CalibrationModel>,
+    cells_total: u64,
+    cells_ready: u64,
+    cells_not_ready: u64,
+    cells_not_ready_examples: Vec<String>,
+    cells: BTreeMap<String, CalibrationModel>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct CalibrationModel {
     prediction_scope: String,
+    horizon_s: u32,
+    floor_pct: f32,
+    floor_bp: i32,
+    cell_key: String,
     status: String,
     n_rows: u64,
     n_predicted: u64,
@@ -566,6 +598,12 @@ struct CalibrationQuality {
     brier: Option<f64>,
     ece_10bin: Option<f64>,
     bins: Vec<ScoreBin>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CalibrationApplication {
+    probability: f64,
+    applied: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -655,6 +693,8 @@ struct ScoreStats {
     calibrator_version: Option<String>,
     calibration_status: Option<String>,
     calibration_n_complete: Option<u64>,
+    n_calibrated: u64,
+    n_raw_fallback: u64,
     decision_threshold: f64,
     shrinkage_k: f64,
     n_rows: u64,
@@ -697,13 +737,13 @@ impl ScoreAccumulator {
         prediction_scope: String,
         decision_threshold: f64,
         shrinkage_k: f64,
-        calibration: Option<&CalibrationModel>,
+        calibration_status: String,
+        calibration_n_complete: u64,
     ) -> Self {
-        let calibration_status = calibration.map(|model| model.status.clone());
-        let calibration_n_complete = calibration.map(|model| model.n_complete);
-        let probability_kind = match calibration_status.as_deref() {
-            Some("ok") => "calibrated_isotonic_complete_case",
-            _ => "raw_uncalibrated",
+        let probability_kind = if calibration_status == "ok" {
+            "cell_calibrated_isotonic_complete_case"
+        } else {
+            "mixed_cell_calibrated_or_raw_fallback"
         }
         .to_string();
         Self {
@@ -712,9 +752,9 @@ impl ScoreAccumulator {
                 prediction_method: PREDICTION_METHOD.to_string(),
                 state_bucket_version: STATE_BUCKET_VERSION.to_string(),
                 probability_kind,
-                calibrator_version: calibration.map(|_| CALIBRATOR_VERSION.to_string()),
-                calibration_status,
-                calibration_n_complete,
+                calibrator_version: Some(CALIBRATOR_VERSION.to_string()),
+                calibration_status: Some(calibration_status),
+                calibration_n_complete: Some(calibration_n_complete),
                 decision_threshold,
                 shrinkage_k,
                 ..ScoreStats::default()
@@ -723,12 +763,18 @@ impl ScoreAccumulator {
         }
     }
 
-    fn observe(&mut self, prediction: Option<f64>, outcome: FloorOutcomeKind) {
+    fn observe(&mut self, prediction: Option<CalibrationApplication>, outcome: FloorOutcomeKind) {
         self.stats.n_rows = self.stats.n_rows.saturating_add(1);
-        let Some(p) = prediction else {
+        let Some(prediction) = prediction else {
             self.stats.n_abstained = self.stats.n_abstained.saturating_add(1);
             return;
         };
+        let p = prediction.probability;
+        if prediction.applied {
+            self.stats.n_calibrated = self.stats.n_calibrated.saturating_add(1);
+        } else {
+            self.stats.n_raw_fallback = self.stats.n_raw_fallback.saturating_add(1);
+        }
         self.stats.n_predicted = self.stats.n_predicted.saturating_add(1);
         if outcome == FloorOutcomeKind::Censored {
             return;
@@ -818,17 +864,42 @@ impl CalibrationFitAccumulator {
 
 impl CalibrationSuite {
     fn from_accumulators(
-        accumulators: BTreeMap<String, CalibrationFitAccumulator>,
+        scopes: &[PredictionScope],
+        mut accumulators: BTreeMap<CalibrationCellKey, CalibrationFitAccumulator>,
         min_complete: u64,
     ) -> Self {
-        let scopes = accumulators
+        for scope in scopes {
+            for &horizon_s in EXPECTED_HORIZONS_S {
+                for &floor_bp in EXPECTED_FLOOR_BP {
+                    accumulators
+                        .entry(CalibrationCellKey::new(scope.as_str(), horizon_s, floor_bp))
+                        .or_default();
+                }
+            }
+        }
+        let cells = accumulators
             .into_iter()
-            .map(|(scope, acc)| {
-                let model = CalibrationModel::fit(scope.clone(), acc, min_complete);
-                (scope, model)
+            .map(|(key, acc)| {
+                let artifact_key = key.as_artifact_key();
+                let model = CalibrationModel::fit(key, acc, min_complete);
+                (artifact_key, model)
             })
             .collect::<BTreeMap<_, _>>();
-        let diagnostic_only = scopes.values().any(|model| model.status != "ok");
+        let cells_total = cells.len() as u64;
+        let cells_ready = cells.values().filter(|model| model.status == "ok").count() as u64;
+        let cells_not_ready = cells_total.saturating_sub(cells_ready);
+        let cells_not_ready_examples = cells
+            .values()
+            .filter(|model| model.status != "ok")
+            .take(20)
+            .map(|model| {
+                format!(
+                    "{} h={} floor_bp={} n_complete={}",
+                    model.prediction_scope, model.horizon_s, model.floor_bp, model.n_complete
+                )
+            })
+            .collect();
+        let diagnostic_only = cells_not_ready > 0;
         Self {
             calibrator_version: CALIBRATOR_VERSION.to_string(),
             method: CALIBRATOR_METHOD.to_string(),
@@ -836,23 +907,61 @@ impl CalibrationSuite {
             diagnostic_only,
             censoring_treatment:
                 "complete_case_for_calibration_only; censored_rows_excluded_from_fit".to_string(),
-            scopes,
+            cells_total,
+            cells_ready,
+            cells_not_ready,
+            cells_not_ready_examples,
+            cells,
         }
     }
 
-    fn model(&self, scope: &str) -> Option<&CalibrationModel> {
-        self.scopes.get(scope)
+    fn model(&self, scope: &str, horizon_s: u32, floor_bp: i32) -> Option<&CalibrationModel> {
+        self.cells
+            .get(&CalibrationCellKey::new(scope, horizon_s, floor_bp).as_artifact_key())
     }
 
-    fn calibrate(&self, scope: &str, raw_p: f64) -> f64 {
-        self.model(scope)
-            .map(|model| model.calibrate(raw_p))
-            .unwrap_or(raw_p)
+    fn scope_status(&self, scope: &str) -> (&'static str, u64) {
+        let mut complete = 0u64;
+        let mut not_ready = 0u64;
+        for model in self
+            .cells
+            .values()
+            .filter(|model| model.prediction_scope == scope)
+        {
+            complete = complete.saturating_add(model.n_complete);
+            if model.status != "ok" {
+                not_ready = not_ready.saturating_add(1);
+            }
+        }
+        if not_ready == 0 {
+            ("ok", complete)
+        } else {
+            ("partial_cell_support", complete)
+        }
+    }
+
+    fn calibrate(
+        &self,
+        scope: &str,
+        horizon_s: u32,
+        floor_bp: i32,
+        raw_p: f64,
+    ) -> CalibrationApplication {
+        match self.model(scope, horizon_s, floor_bp) {
+            Some(model) if model.status == "ok" => CalibrationApplication {
+                probability: model.calibrate(raw_p),
+                applied: true,
+            },
+            _ => CalibrationApplication {
+                probability: raw_p.clamp(0.0, 1.0),
+                applied: false,
+            },
+        }
     }
 }
 
 impl CalibrationModel {
-    fn fit(scope: String, acc: CalibrationFitAccumulator, min_complete: u64) -> Self {
+    fn fit(key: CalibrationCellKey, acc: CalibrationFitAccumulator, min_complete: u64) -> Self {
         let raw_quality = calibration_quality(&acc.buckets, None);
         let blocks = fit_isotonic_blocks(&acc.buckets);
         let knots = blocks
@@ -873,7 +982,11 @@ impl CalibrationModel {
         .to_string();
         let calibrated_quality = calibration_quality(&acc.buckets, Some(&knots));
         Self {
-            prediction_scope: scope,
+            prediction_scope: key.prediction_scope.clone(),
+            horizon_s: key.horizon_s,
+            floor_pct: key.floor_bp as f32 / 100.0,
+            floor_bp: key.floor_bp,
+            cell_key: key.as_artifact_key(),
             status,
             n_rows: acc.n_rows,
             n_predicted: acc.n_predicted,
@@ -1662,15 +1775,7 @@ fn process_calibration_pass(
 ) -> Result<CalibrationSuite> {
     let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
     let scopes = score_scopes(cli.prediction_scope);
-    let mut accumulators = scopes
-        .iter()
-        .map(|scope| {
-            (
-                scope.as_str().to_string(),
-                CalibrationFitAccumulator::default(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let mut accumulators = BTreeMap::<CalibrationCellKey, CalibrationFitAccumulator>::new();
     for rec in manifests {
         if rows_left == 0 {
             break;
@@ -1700,6 +1805,7 @@ fn process_calibration_pass(
     }
 
     Ok(CalibrationSuite::from_accumulators(
+        &scopes,
         accumulators,
         MIN_CALIBRATION_COMPLETE,
     ))
@@ -1712,7 +1818,7 @@ fn process_calibration_batch(
     shrinkage_k: f64,
     index: &HashMap<AggregationKey, EstimatorRow>,
     scopes: &[PredictionScope],
-    accumulators: &mut BTreeMap<String, CalibrationFitAccumulator>,
+    accumulators: &mut BTreeMap<CalibrationCellKey, CalibrationFitAccumulator>,
     dedupe: &mut DedupeTracker,
 ) -> Result<()> {
     for row in 0..n_rows {
@@ -1759,9 +1865,11 @@ fn process_calibration_batch(
                     floor_bp,
                     shrinkage_k,
                 );
-                if let Some(acc) = accumulators.get_mut(scope.as_str()) {
-                    acc.observe(prediction, outcome.outcome);
-                }
+                let key = CalibrationCellKey::new(scope.as_str(), horizon_s, floor_bp);
+                accumulators
+                    .entry(key)
+                    .or_default()
+                    .observe(prediction, outcome.outcome);
             }
         }
     }
@@ -1781,13 +1889,16 @@ fn process_scoring_pass(
     let mut scores = scopes
         .iter()
         .map(|scope| {
+            let (calibration_status, calibration_n_complete) =
+                calibration_suite.scope_status(scope.as_str());
             (
                 scope.as_str().to_string(),
                 ScoreAccumulator::new(
                     scope.as_str().to_string(),
                     cli.decision_threshold,
                     cli.shrinkage_k,
-                    calibration_suite.model(scope.as_str()),
+                    calibration_status.to_string(),
+                    calibration_n_complete,
                 ),
             )
         })
@@ -1881,7 +1992,7 @@ fn process_score_batch(
                     floor_bp,
                     shrinkage_k,
                 )
-                .map(|p| calibration_suite.calibrate(scope.as_str(), p));
+                .map(|p| calibration_suite.calibrate(scope.as_str(), horizon_s, floor_bp, p));
                 let key = scope.as_str();
                 if let Some(score) = scores.get_mut(key) {
                     score.observe(prediction, outcome.outcome);
@@ -3092,14 +3203,11 @@ fn promotion_blockers(
             dedupe.scoring_scorecard.duplicate_conflict_floor_keys
         ));
     }
-    let not_ready = calibration
-        .scopes
-        .values()
-        .filter(|model| model.status != "ok")
-        .map(|model| model.prediction_scope.clone())
-        .collect::<Vec<_>>();
-    if !not_ready.is_empty() {
-        blockers.push(format!("calibration_not_ready_scopes={not_ready:?}"));
+    if calibration.cells_not_ready > 0 {
+        blockers.push(format!(
+            "calibration_not_ready_cells={} examples={:?}",
+            calibration.cells_not_ready, calibration.cells_not_ready_examples
+        ));
     }
     if audit.label_floor_hit_lengths.len() != 1 || !audit.label_floor_hit_lengths.contains_key(&6) {
         blockers.push(format!(
@@ -3945,11 +4053,36 @@ mod tests {
     fn calibration_model_falls_back_when_support_is_low() {
         let mut acc = CalibrationFitAccumulator::default();
         acc.observe(Some(0.9), FloorOutcomeKind::Realized);
-        let model = CalibrationModel::fit("accept".to_string(), acc, 10);
+        let model = CalibrationModel::fit(CalibrationCellKey::new("accept", 900, 80), acc, 10);
 
         assert_eq!(model.status, "insufficient_calibration_support");
         assert_eq!(model.n_complete, 1);
         assert!((model.calibrate(0.42) - 0.42).abs() < 1e-12);
+    }
+
+    #[test]
+    fn calibration_suite_requires_support_per_horizon_floor_cell() {
+        let scopes = vec![PredictionScope::Accept];
+        let mut accumulators = BTreeMap::new();
+        let key = CalibrationCellKey::new("accept", 900, 80);
+        let mut acc = CalibrationFitAccumulator::default();
+        for _ in 0..10 {
+            acc.observe(Some(0.2), FloorOutcomeKind::Realized);
+        }
+        accumulators.insert(key, acc);
+
+        let suite = CalibrationSuite::from_accumulators(&scopes, accumulators, 10);
+
+        assert_eq!(suite.model("accept", 900, 80).unwrap().status, "ok");
+        assert_eq!(
+            suite.model("accept", 28_800, 300).unwrap().status,
+            "insufficient_calibration_support"
+        );
+        assert!(suite.cells_not_ready > 0);
+        assert_eq!(suite.scope_status("accept").0, "partial_cell_support");
+        let raw_fallback = suite.calibrate("accept", 28_800, 300, 0.42);
+        assert!(!raw_fallback.applied);
+        assert!((raw_fallback.probability - 0.42).abs() < 1e-12);
     }
 
     fn estimator_row(

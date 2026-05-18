@@ -59,10 +59,11 @@ O binário grava:
   estado PIT usado e o vetor completo de `label_floor_hits[]`; esse digest é
   separado do digest lógico V2 mínimo do storage.
 - `scorecard.json`: métricas diagnósticas no teste temporal;
-- `calibration_model.json`: calibrador isotônico (`PAVA`) ajustado somente no
-  split temporal de calibração, usando casos completos. O scorecard de teste
-  usa a probabilidade calibrada quando o escopo tem suporte mínimo; caso
-  contrário, o artefato declara fallback cru e bloqueia promoção.
+- `calibration_model.json`: calibradores isotônicos (`PAVA`) ajustados somente
+  no split temporal de calibração, usando casos completos, por célula
+  `(prediction_scope, horizon_s, floor_pct)`. O scorecard de teste usa a
+  probabilidade calibrada somente quando a célula tem suporte mínimo; caso
+  contrário, registra fallback cru e bloqueia promoção.
 - `trainer_manifest.json`: fingerprint do treino e blockers de promoção.
   Inclui também `aggregate_build_stats`, com contagem dos agregados descartados
   por baixo suporte. Esses agregados não são apagados do dataset fonte; eles
@@ -103,7 +104,8 @@ manter `promotion_allowed=false` quando:
 - há qualquer issue de auditoria;
 - há conflito de duplicata supervisionada por `(sample_id, horizon_s, floor_pct)`;
 - o teste temporal não tem linhas completas suficientes;
-- algum escopo não tem suporte de calibração suficiente.
+- alguma célula `(prediction_scope, horizon_s, floor_pct)` não tem suporte de
+  calibração suficiente.
 
 O próximo marco é trocar o IC diagnóstico por bootstrap/conformal por bloco,
 avaliar beta/conformal sobre a calibração existente e comparar o EstimatorOnly
