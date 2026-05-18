@@ -25,10 +25,15 @@ const OUTPUT_CONTRACT_VERSION: &str = "trade_recommendation/v2.3";
 const CI_METHOD: &str = "kaplan_meier_loglog_greenwood_95";
 const STATE_BUCKET_VERSION: &str = "pit_state_bucket/v2";
 const PREDICTION_METHOD: &str = "route_km_shrunk_to_global_pit_state_km";
+const CALIBRATOR_VERSION: &str = "isotonic_complete_case_temporal/v0.1.0";
+const CALIBRATOR_METHOD: &str = "isotonic_pava_complete_case_temporal";
+const MIN_CALIBRATION_COMPLETE: u64 = 1_000;
+const CALIBRATION_PROB_SCALE: f64 = 1_000_000_000_000.0;
 const EPS: f32 = 1e-4;
 const MAX_AUDIT_ISSUES: usize = 1_000;
 const ARTIFACT_DIGEST_KIND: &str = "fnv1a128_file_v1";
 const STORAGE_V2_LOGICAL_DIGEST_KIND: &str = "fnv1a64_storage_v2_logical_required_v1";
+const TRAINER_SUPERVISED_DIGEST_KIND: &str = "fnv1a128_estimator_supervised_fields_v1";
 const EXPECTED_FLOOR_BP: &[i32] = &[30, 50, 80, 120, 200, 300];
 const EXPECTED_HORIZONS_S: &[u32] = &[900, 1800, 3600, 7200, 14400, 28800];
 const SUPERVISED_DEDUPE_KEY_ALGORITHM: &str =
@@ -394,6 +399,7 @@ impl DedupeAudit {
 #[derive(Debug, Serialize)]
 struct DedupeReport {
     training_aggregation: DedupeAudit,
+    calibration_fit: DedupeAudit,
     scoring_scorecard: DedupeAudit,
 }
 
@@ -495,6 +501,73 @@ struct AggregateUpdate<'a> {
     label_pi: Option<f32>,
 }
 
+#[derive(Debug, Default)]
+struct CalibrationFitAccumulator {
+    n_rows: u64,
+    n_predicted: u64,
+    n_abstained: u64,
+    n_complete: u64,
+    n_censored: u64,
+    buckets: BTreeMap<u64, CalibrationBucket>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct CalibrationBucket {
+    n: u64,
+    hits: u64,
+}
+
+#[derive(Debug, Clone)]
+struct IsotonicBlock {
+    lower_key: u64,
+    upper_key: u64,
+    n: u64,
+    hits: u64,
+    calibrated_p: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CalibrationSuite {
+    calibrator_version: String,
+    method: String,
+    min_complete: u64,
+    diagnostic_only: bool,
+    censoring_treatment: String,
+    scopes: BTreeMap<String, CalibrationModel>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CalibrationModel {
+    prediction_scope: String,
+    status: String,
+    n_rows: u64,
+    n_predicted: u64,
+    n_abstained: u64,
+    n_complete: u64,
+    n_censored: u64,
+    unique_raw_scores: u64,
+    knots: Vec<CalibrationKnot>,
+    raw_quality: CalibrationQuality,
+    calibrated_quality: CalibrationQuality,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CalibrationKnot {
+    raw_lower: f64,
+    raw_upper: f64,
+    calibrated_p: f64,
+    n_complete: u64,
+    hits: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct CalibrationQuality {
+    n_complete: u64,
+    brier: Option<f64>,
+    ece_10bin: Option<f64>,
+    bins: Vec<ScoreBin>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct FirstHitAuditInput {
     hit_idx: usize,
@@ -556,6 +629,9 @@ struct DatasetAudit {
     feature_null_counts: BTreeMap<String, u64>,
     feature_nonfinite_counts: BTreeMap<String, u64>,
     split_rows: BTreeMap<String, u64>,
+    trainer_supervised_digest_kind: String,
+    trainer_supervised_digest_hex: String,
+    trainer_supervised_digest_rows: u64,
     issues: Vec<String>,
     issues_truncated: u64,
 }
@@ -575,6 +651,10 @@ struct ScoreStats {
     prediction_scope: String,
     prediction_method: String,
     state_bucket_version: String,
+    probability_kind: String,
+    calibrator_version: Option<String>,
+    calibration_status: Option<String>,
+    calibration_n_complete: Option<u64>,
     decision_threshold: f64,
     shrinkage_k: f64,
     n_rows: u64,
@@ -613,12 +693,28 @@ struct BinAccumulator {
 }
 
 impl ScoreAccumulator {
-    fn new(prediction_scope: String, decision_threshold: f64, shrinkage_k: f64) -> Self {
+    fn new(
+        prediction_scope: String,
+        decision_threshold: f64,
+        shrinkage_k: f64,
+        calibration: Option<&CalibrationModel>,
+    ) -> Self {
+        let calibration_status = calibration.map(|model| model.status.clone());
+        let calibration_n_complete = calibration.map(|model| model.n_complete);
+        let probability_kind = match calibration_status.as_deref() {
+            Some("ok") => "calibrated_isotonic_complete_case",
+            _ => "raw_uncalibrated",
+        }
+        .to_string();
         Self {
             stats: ScoreStats {
                 prediction_scope,
                 prediction_method: PREDICTION_METHOD.to_string(),
                 state_bucket_version: STATE_BUCKET_VERSION.to_string(),
+                probability_kind,
+                calibrator_version: calibration.map(|_| CALIBRATOR_VERSION.to_string()),
+                calibration_status,
+                calibration_n_complete,
                 decision_threshold,
                 shrinkage_k,
                 ..ScoreStats::default()
@@ -698,6 +794,113 @@ impl ScoreAccumulator {
     }
 }
 
+impl CalibrationFitAccumulator {
+    fn observe(&mut self, prediction: Option<f64>, outcome: FloorOutcomeKind) {
+        self.n_rows = self.n_rows.saturating_add(1);
+        let Some(p) = prediction else {
+            self.n_abstained = self.n_abstained.saturating_add(1);
+            return;
+        };
+        self.n_predicted = self.n_predicted.saturating_add(1);
+        if outcome == FloorOutcomeKind::Censored {
+            self.n_censored = self.n_censored.saturating_add(1);
+            return;
+        }
+        self.n_complete = self.n_complete.saturating_add(1);
+        let key = probability_key(p);
+        let bucket = self.buckets.entry(key).or_default();
+        bucket.n = bucket.n.saturating_add(1);
+        if outcome == FloorOutcomeKind::Realized {
+            bucket.hits = bucket.hits.saturating_add(1);
+        }
+    }
+}
+
+impl CalibrationSuite {
+    fn from_accumulators(
+        accumulators: BTreeMap<String, CalibrationFitAccumulator>,
+        min_complete: u64,
+    ) -> Self {
+        let scopes = accumulators
+            .into_iter()
+            .map(|(scope, acc)| {
+                let model = CalibrationModel::fit(scope.clone(), acc, min_complete);
+                (scope, model)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let diagnostic_only = scopes.values().any(|model| model.status != "ok");
+        Self {
+            calibrator_version: CALIBRATOR_VERSION.to_string(),
+            method: CALIBRATOR_METHOD.to_string(),
+            min_complete,
+            diagnostic_only,
+            censoring_treatment:
+                "complete_case_for_calibration_only; censored_rows_excluded_from_fit".to_string(),
+            scopes,
+        }
+    }
+
+    fn model(&self, scope: &str) -> Option<&CalibrationModel> {
+        self.scopes.get(scope)
+    }
+
+    fn calibrate(&self, scope: &str, raw_p: f64) -> f64 {
+        self.model(scope)
+            .map(|model| model.calibrate(raw_p))
+            .unwrap_or(raw_p)
+    }
+}
+
+impl CalibrationModel {
+    fn fit(scope: String, acc: CalibrationFitAccumulator, min_complete: u64) -> Self {
+        let raw_quality = calibration_quality(&acc.buckets, None);
+        let blocks = fit_isotonic_blocks(&acc.buckets);
+        let knots = blocks
+            .iter()
+            .map(|block| CalibrationKnot {
+                raw_lower: probability_from_key(block.lower_key),
+                raw_upper: probability_from_key(block.upper_key),
+                calibrated_p: block.calibrated_p,
+                n_complete: block.n,
+                hits: block.hits,
+            })
+            .collect::<Vec<_>>();
+        let status = if acc.n_complete >= min_complete && !knots.is_empty() {
+            "ok"
+        } else {
+            "insufficient_calibration_support"
+        }
+        .to_string();
+        let calibrated_quality = calibration_quality(&acc.buckets, Some(&knots));
+        Self {
+            prediction_scope: scope,
+            status,
+            n_rows: acc.n_rows,
+            n_predicted: acc.n_predicted,
+            n_abstained: acc.n_abstained,
+            n_complete: acc.n_complete,
+            n_censored: acc.n_censored,
+            unique_raw_scores: acc.buckets.len() as u64,
+            knots,
+            raw_quality,
+            calibrated_quality,
+        }
+    }
+
+    fn calibrate(&self, raw_p: f64) -> f64 {
+        if self.status != "ok" || self.knots.is_empty() {
+            return raw_p.clamp(0.0, 1.0);
+        }
+        let p = raw_p.clamp(0.0, 1.0);
+        for knot in &self.knots {
+            if p <= knot.raw_upper {
+                return knot.calibrated_p;
+            }
+        }
+        self.knots.last().map(|knot| knot.calibrated_p).unwrap_or(p)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct TrainerManifest {
     trainer_version: String,
@@ -719,6 +922,7 @@ struct TrainerManifest {
     source_manifests: Vec<SourceManifestSummary>,
     estimator_rows: usize,
     aggregate_build_stats: AggregateBuildStats,
+    calibration: CalibrationSuite,
     dedupe_audit: DedupeReport,
     monotonicity_audit: MonotonicityAudit,
     promotion_allowed: bool,
@@ -828,21 +1032,36 @@ pub fn run(cli: Cli) -> Result<()> {
         &mut aggregates,
         &mut training_dedupe,
     )?;
+    let training_dedupe_audit = training_dedupe.into_audit();
 
     let (estimator_rows, aggregate_build_stats) =
         build_prediction_surface(&aggregates, cli.min_support);
     let index = build_prediction_index(&estimator_rows);
+    let mut calibration_dedupe = DedupeTracker::new("calibration_fit");
+    let calibration_suite =
+        process_calibration_pass(&manifests, &split, &cli, &index, &mut calibration_dedupe)?;
+    let calibration_dedupe_audit = calibration_dedupe.into_audit();
     let mut scoring_dedupe = DedupeTracker::new("scoring_scorecard");
-    let scorecards = process_scoring_pass(&manifests, &split, &cli, &index, &mut scoring_dedupe)?;
+    let scorecards = process_scoring_pass(
+        &manifests,
+        &split,
+        &cli,
+        &index,
+        &calibration_suite,
+        &mut scoring_dedupe,
+    )?;
+    let scoring_dedupe_audit = scoring_dedupe.into_audit();
     let dedupe_report = DedupeReport {
-        training_aggregation: training_dedupe.into_audit(),
-        scoring_scorecard: scoring_dedupe.into_audit(),
+        training_aggregation: training_dedupe_audit,
+        calibration_fit: calibration_dedupe_audit,
+        scoring_scorecard: scoring_dedupe_audit,
     };
 
     let monotonicity_audit = monotonicity_audit(&estimator_rows);
     let promotion_blockers = promotion_blockers(
         &audit,
         &dedupe_report,
+        &calibration_suite,
         &scorecards,
         &monotonicity_audit,
         split,
@@ -855,6 +1074,8 @@ pub fn run(cli: Cli) -> Result<()> {
     let audit_artifact = write_json(&audit_path, &audit)?;
     let scorecard_path = out_dir.join("scorecard.json");
     let scorecard_artifact = write_json(&scorecard_path, &scorecards)?;
+    let calibration_path = out_dir.join("calibration_model.json");
+    let calibration_artifact = write_json(&calibration_path, &calibration_suite)?;
     let dedupe_path = out_dir.join("duplicate_audit.json");
     let dedupe_artifact = write_json(&dedupe_path, &dedupe_report)?;
     let sources_path = out_dir.join("sources.jsonl");
@@ -868,6 +1089,7 @@ pub fn run(cli: Cli) -> Result<()> {
     artifacts.insert("estimator_table".to_string(), estimator_artifact);
     artifacts.insert("dataset_audit".to_string(), audit_artifact);
     artifacts.insert("scorecard".to_string(), scorecard_artifact);
+    artifacts.insert("calibration_model".to_string(), calibration_artifact);
     artifacts.insert("duplicate_audit".to_string(), dedupe_artifact);
     artifacts.insert("sources".to_string(), sources_artifact);
     artifacts.insert("corpus_manifest".to_string(), corpus_manifest_artifact);
@@ -892,6 +1114,7 @@ pub fn run(cli: Cli) -> Result<()> {
         source_manifests: source_summaries,
         estimator_rows: estimator_rows.len(),
         aggregate_build_stats,
+        calibration: calibration_suite,
         dedupe_audit: dedupe_report,
         monotonicity_audit,
         promotion_allowed,
@@ -1191,6 +1414,7 @@ fn process_training_pass(
     dedupe: &mut DedupeTracker,
 ) -> Result<()> {
     let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
+    let mut supervised_digest = TrainerSupervisedDigest::new();
     for rec in manifests {
         if rows_left == 0 {
             break;
@@ -1217,6 +1441,7 @@ fn process_training_pass(
             if should_verify_digest {
                 update_logical_digest_batch(&view, n, &mut logical_digest)?;
             }
+            update_supervised_digest_batch(&view, n, &mut supervised_digest)?;
             process_train_batch(&view, n, split, audit, aggregates, dedupe)?;
         }
         if should_verify_digest && manifest_rows_seen == rec.manifest.source_row_count {
@@ -1240,6 +1465,9 @@ fn process_training_pass(
                 audit.logical_digest_skipped_manifests.saturating_add(1);
         }
     }
+    audit.trainer_supervised_digest_kind = TRAINER_SUPERVISED_DIGEST_KIND.to_string();
+    audit.trainer_supervised_digest_hex = supervised_digest.hex();
+    audit.trainer_supervised_digest_rows = supervised_digest.rows();
     Ok(())
 }
 
@@ -1256,6 +1484,31 @@ fn update_logical_digest_batch(
         digest.update_u32(required_u32(view.cycle_seq, row, "cycle_seq")?);
         digest.update_u16(required_u16(view.schema_version, row, "schema_version")?);
         digest.update_u32(required_u32(view.horizon_s, row, "horizon_s")?);
+    }
+    Ok(())
+}
+
+fn update_supervised_digest_batch(
+    view: &BatchView<'_>,
+    n_rows: usize,
+    digest: &mut TrainerSupervisedDigest,
+) -> Result<()> {
+    for row in 0..n_rows {
+        let sample_id = required_str(view.sample_id, row, "sample_id")?;
+        let horizon_s = required_u32(view.horizon_s, row, "horizon_s")?;
+        let hits = floor_hit_range(view.label_floor_hits, row)?;
+        let fingerprint = supervised_dedupe_row_fingerprint(view, row, hits, horizon_s)?;
+        digest.begin_row();
+        digest.update_str(sample_id);
+        digest.update_str(required_str(
+            view.runtime_config_hash,
+            row,
+            "runtime_config_hash",
+        )?);
+        digest.update_u16(required_u16(view.schema_version, row, "schema_version")?);
+        digest.update_u32(required_u32(view.cycle_seq, row, "cycle_seq")?);
+        digest.update_u32(horizon_s);
+        digest.update_u128(fingerprint.digest);
     }
     Ok(())
 }
@@ -1400,11 +1653,127 @@ fn build_prediction_surface(
     (rows, build)
 }
 
+fn process_calibration_pass(
+    manifests: &[ManifestRecord],
+    split: &TemporalSplit,
+    cli: &Cli,
+    index: &HashMap<AggregationKey, EstimatorRow>,
+    dedupe: &mut DedupeTracker,
+) -> Result<CalibrationSuite> {
+    let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
+    let scopes = score_scopes(cli.prediction_scope);
+    let mut accumulators = scopes
+        .iter()
+        .map(|scope| {
+            (
+                scope.as_str().to_string(),
+                CalibrationFitAccumulator::default(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for rec in manifests {
+        if rows_left == 0 {
+            break;
+        }
+        let mut reader =
+            open_storage_v2_sidecar_logical_reader(&rec.manifest, DatasetKind::LabeledTrades)
+                .with_context(|| format!("open logical V2 reader {}", rec.path.display()))?;
+        for batch in &mut reader {
+            if rows_left == 0 {
+                break;
+            }
+            let batch = batch?;
+            let view = BatchView::new(&batch)?;
+            let n = batch.num_rows().min(rows_left as usize);
+            rows_left -= n as u64;
+            process_calibration_batch(
+                &view,
+                n,
+                split,
+                cli.shrinkage_k,
+                index,
+                &scopes,
+                &mut accumulators,
+                dedupe,
+            )?;
+        }
+    }
+
+    Ok(CalibrationSuite::from_accumulators(
+        accumulators,
+        MIN_CALIBRATION_COMPLETE,
+    ))
+}
+
+fn process_calibration_batch(
+    view: &BatchView<'_>,
+    n_rows: usize,
+    split: &TemporalSplit,
+    shrinkage_k: f64,
+    index: &HashMap<AggregationKey, EstimatorRow>,
+    scopes: &[PredictionScope],
+    accumulators: &mut BTreeMap<String, CalibrationFitAccumulator>,
+    dedupe: &mut DedupeTracker,
+) -> Result<()> {
+    for row in 0..n_rows {
+        let ts = required_u64(view.ts_emit_ns, row, "ts_emit_ns")?;
+        if split.assign(ts) != SplitName::Calibration {
+            continue;
+        }
+        let sample_decision = required_str(view.sample_decision, row, "sample_decision")?;
+        let route_id = required_str(view.route_id, row, "route_id")?;
+        let sample_id = required_str(view.sample_id, row, "sample_id")?;
+        let horizon_s = required_u32(view.horizon_s, row, "horizon_s")?;
+        let hits = floor_hit_range(view.label_floor_hits, row)?;
+        let floor_count = hits.len() as u64;
+        let dedupe_key = supervised_dedupe_row_key(sample_id, horizon_s);
+        let dedupe_fingerprint =
+            supervised_dedupe_row_fingerprint(view, row, hits.clone(), horizon_s)?;
+        if dedupe.observe(
+            dedupe_key,
+            dedupe_fingerprint,
+            SplitName::Calibration,
+            sample_id,
+            route_id,
+            floor_count,
+        ) != DedupeDecision::Unique
+        {
+            continue;
+        }
+        for hit_idx in hits {
+            let floor_pct =
+                required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
+            let floor_bp = floor_to_bp(floor_pct);
+            let state_bucket = state_bucket_for_floor(view, row, floor_pct);
+            let outcome = floor_outcome(view, row, hit_idx, horizon_s)?;
+            for scope in scopes {
+                if !scope.includes_sample_decision(sample_decision) {
+                    continue;
+                }
+                let prediction = predict(
+                    index,
+                    *scope,
+                    route_id,
+                    &state_bucket,
+                    horizon_s,
+                    floor_bp,
+                    shrinkage_k,
+                );
+                if let Some(acc) = accumulators.get_mut(scope.as_str()) {
+                    acc.observe(prediction, outcome.outcome);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn process_scoring_pass(
     manifests: &[ManifestRecord],
     split: &TemporalSplit,
     cli: &Cli,
     index: &HashMap<AggregationKey, EstimatorRow>,
+    calibration_suite: &CalibrationSuite,
     dedupe: &mut DedupeTracker,
 ) -> Result<BTreeMap<String, ScoreStats>> {
     let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
@@ -1418,6 +1787,7 @@ fn process_scoring_pass(
                     scope.as_str().to_string(),
                     cli.decision_threshold,
                     cli.shrinkage_k,
+                    calibration_suite.model(scope.as_str()),
                 ),
             )
         })
@@ -1443,6 +1813,7 @@ fn process_scoring_pass(
                 split,
                 cli.shrinkage_k,
                 index,
+                calibration_suite,
                 &scopes,
                 &mut scores,
                 dedupe,
@@ -1461,6 +1832,7 @@ fn process_score_batch(
     split: &TemporalSplit,
     shrinkage_k: f64,
     index: &HashMap<AggregationKey, EstimatorRow>,
+    calibration_suite: &CalibrationSuite,
     scopes: &[PredictionScope],
     scores: &mut BTreeMap<String, ScoreAccumulator>,
     dedupe: &mut DedupeTracker,
@@ -1508,7 +1880,8 @@ fn process_score_batch(
                     horizon_s,
                     floor_bp,
                     shrinkage_k,
-                );
+                )
+                .map(|p| calibration_suite.calibrate(scope.as_str(), p));
                 let key = scope.as_str();
                 if let Some(score) = scores.get_mut(key) {
                     score.observe(prediction, outcome.outcome);
@@ -1623,6 +1996,122 @@ fn floor_outcome_kind_code(outcome: FloorOutcomeKind) -> u32 {
         FloorOutcomeKind::Miss => 2,
         FloorOutcomeKind::Censored => 3,
     }
+}
+
+fn probability_key(p: f64) -> u64 {
+    (p.clamp(0.0, 1.0) * CALIBRATION_PROB_SCALE).round() as u64
+}
+
+fn probability_from_key(key: u64) -> f64 {
+    (key as f64 / CALIBRATION_PROB_SCALE).clamp(0.0, 1.0)
+}
+
+fn fit_isotonic_blocks(buckets: &BTreeMap<u64, CalibrationBucket>) -> Vec<IsotonicBlock> {
+    let mut blocks = Vec::<IsotonicBlock>::new();
+    for (&key, bucket) in buckets {
+        if bucket.n == 0 {
+            continue;
+        }
+        blocks.push(IsotonicBlock {
+            lower_key: key,
+            upper_key: key,
+            n: bucket.n,
+            hits: bucket.hits,
+            calibrated_p: bucket.hits as f64 / bucket.n as f64,
+        });
+        while blocks.len() >= 2 {
+            let len = blocks.len();
+            if blocks[len - 2].calibrated_p <= blocks[len - 1].calibrated_p {
+                break;
+            }
+            let right = blocks.pop().expect("right block");
+            let left = blocks.pop().expect("left block");
+            let n = left.n.saturating_add(right.n);
+            let hits = left.hits.saturating_add(right.hits);
+            blocks.push(IsotonicBlock {
+                lower_key: left.lower_key,
+                upper_key: right.upper_key,
+                n,
+                hits,
+                calibrated_p: if n > 0 { hits as f64 / n as f64 } else { 0.0 },
+            });
+        }
+    }
+    blocks
+}
+
+fn calibration_quality(
+    buckets: &BTreeMap<u64, CalibrationBucket>,
+    knots: Option<&[CalibrationKnot]>,
+) -> CalibrationQuality {
+    let mut quality = CalibrationQuality {
+        bins: (0..10)
+            .map(|idx| ScoreBin {
+                bin_lower: idx as f64 / 10.0,
+                bin_upper: (idx + 1) as f64 / 10.0,
+                n: 0,
+                mean_predicted: None,
+                empirical_hit_rate: None,
+            })
+            .collect(),
+        ..CalibrationQuality::default()
+    };
+    let mut brier_sum = 0.0;
+    let mut bin_acc = [BinAccumulator::default(); 10];
+    for (&key, bucket) in buckets {
+        if bucket.n == 0 {
+            continue;
+        }
+        let raw_p = probability_from_key(key);
+        let p = knots
+            .map(|knots| calibrate_with_knots(knots, raw_p))
+            .unwrap_or(raw_p);
+        let y_mean = bucket.hits as f64 / bucket.n as f64;
+        let misses = bucket.n.saturating_sub(bucket.hits);
+        brier_sum += bucket.hits as f64 * (p - 1.0) * (p - 1.0) + misses as f64 * p * p;
+        quality.n_complete = quality.n_complete.saturating_add(bucket.n);
+        let bin = ((p * 10.0).floor() as usize).min(9);
+        bin_acc[bin].n = bin_acc[bin].n.saturating_add(bucket.n);
+        bin_acc[bin].pred_sum += p * bucket.n as f64;
+        bin_acc[bin].hit_sum += y_mean * bucket.n as f64;
+    }
+    if quality.n_complete > 0 {
+        quality.brier = Some(brier_sum / quality.n_complete as f64);
+        let mut ece = 0.0;
+        quality.bins.clear();
+        for (idx, acc) in bin_acc.iter().enumerate() {
+            let (mean_predicted, empirical_hit_rate) = if acc.n > 0 {
+                let mean = acc.pred_sum / acc.n as f64;
+                let hit = acc.hit_sum / acc.n as f64;
+                ece += (acc.n as f64 / quality.n_complete as f64) * (mean - hit).abs();
+                (Some(mean), Some(hit))
+            } else {
+                (None, None)
+            };
+            quality.bins.push(ScoreBin {
+                bin_lower: idx as f64 / 10.0,
+                bin_upper: (idx + 1) as f64 / 10.0,
+                n: acc.n,
+                mean_predicted,
+                empirical_hit_rate,
+            });
+        }
+        quality.ece_10bin = Some(ece);
+    }
+    quality
+}
+
+fn calibrate_with_knots(knots: &[CalibrationKnot], raw_p: f64) -> f64 {
+    if knots.is_empty() {
+        return raw_p.clamp(0.0, 1.0);
+    }
+    let p = raw_p.clamp(0.0, 1.0);
+    for knot in knots {
+        if p <= knot.raw_upper {
+            return knot.calibrated_p;
+        }
+    }
+    knots.last().map(|knot| knot.calibrated_p).unwrap_or(p)
 }
 
 fn update_aggregates(
@@ -2541,6 +3030,7 @@ fn push_monotonicity_example(audit: &mut MonotonicityAudit, example: String) {
 fn promotion_blockers(
     audit: &DatasetAudit,
     dedupe: &DedupeReport,
+    calibration: &CalibrationSuite,
     scorecards: &BTreeMap<String, ScoreStats>,
     monotonicity: &MonotonicityAudit,
     split: TemporalSplit,
@@ -2590,11 +3080,26 @@ fn promotion_blockers(
             dedupe.training_aggregation.duplicate_conflict_floor_keys
         ));
     }
+    if dedupe.calibration_fit.duplicate_conflict_floor_keys > 0 {
+        blockers.push(format!(
+            "calibration_duplicate_conflict_floor_keys={}",
+            dedupe.calibration_fit.duplicate_conflict_floor_keys
+        ));
+    }
     if dedupe.scoring_scorecard.duplicate_conflict_floor_keys > 0 {
         blockers.push(format!(
             "scoring_duplicate_conflict_floor_keys={}",
             dedupe.scoring_scorecard.duplicate_conflict_floor_keys
         ));
+    }
+    let not_ready = calibration
+        .scopes
+        .values()
+        .filter(|model| model.status != "ok")
+        .map(|model| model.prediction_scope.clone())
+        .collect::<Vec<_>>();
+    if !not_ready.is_empty() {
+        blockers.push(format!("calibration_not_ready_scopes={not_ready:?}"));
     }
     if audit.label_floor_hit_lengths.len() != 1 || !audit.label_floor_hit_lengths.contains_key(&6) {
         blockers.push(format!(
@@ -2627,7 +3132,6 @@ fn promotion_blockers(
             monotonicity.floor_monotonicity_violations
         ));
     }
-    blockers.push("calibration_split_not_yet_used_for_isotonic_beta_or_conformal".to_string());
     blockers
 }
 
@@ -2794,6 +3298,11 @@ fn update_hash_u64(state: &mut u128, value: u64) {
     fnv1a_update(state, &value.to_le_bytes());
 }
 
+fn update_hash_u128(state: &mut u128, value: u128) {
+    fnv1a_update(state, b"u128");
+    fnv1a_update(state, &value.to_le_bytes());
+}
+
 fn update_hash_optional_u32(state: &mut u128, value: Option<u32>) {
     match value {
         Some(v) => {
@@ -2838,6 +3347,57 @@ fn update_hash_optional_bool(state: &mut u128, value: Option<bool>) {
 struct TrainerLogicalDigest {
     hash: u64,
     row: u64,
+}
+
+struct TrainerSupervisedDigest {
+    hash: u128,
+    row: u64,
+}
+
+impl TrainerSupervisedDigest {
+    fn new() -> Self {
+        let mut digest = Self {
+            hash: FNV_OFFSET_128,
+            row: 0,
+        };
+        fnv1a_update(&mut digest.hash, b"estimator_supervised_digest_v1");
+        fnv1a_update(
+            &mut digest.hash,
+            DatasetKind::LabeledTrades.as_str().as_bytes(),
+        );
+        digest
+    }
+
+    fn begin_row(&mut self) {
+        self.row = self.row.saturating_add(1);
+        fnv1a_update(&mut self.hash, b"\x1esupervised_row");
+        update_hash_u64(&mut self.hash, self.row);
+    }
+
+    fn update_str(&mut self, value: &str) {
+        update_hash_str(&mut self.hash, value);
+    }
+
+    fn update_u16(&mut self, value: u16) {
+        fnv1a_update(&mut self.hash, b"u16");
+        fnv1a_update(&mut self.hash, &value.to_le_bytes());
+    }
+
+    fn update_u32(&mut self, value: u32) {
+        update_hash_u32(&mut self.hash, value);
+    }
+
+    fn update_u128(&mut self, value: u128) {
+        update_hash_u128(&mut self.hash, value);
+    }
+
+    fn rows(&self) -> u64 {
+        self.row
+    }
+
+    fn hex(&self) -> String {
+        format!("{:032x}", self.hash)
+    }
 }
 
 impl TrainerLogicalDigest {
@@ -3361,6 +3921,35 @@ mod tests {
         assert_eq!(audit.duplicate_exact_floor_keys, 0);
         assert_eq!(audit.duplicate_conflict_floor_keys, 6);
         assert_eq!(audit.duplicate_conflict_by_split.get("train"), Some(&1));
+    }
+
+    #[test]
+    fn isotonic_calibration_merges_decreasing_blocks() {
+        let mut buckets = BTreeMap::new();
+        buckets.insert(100, CalibrationBucket { n: 10, hits: 8 });
+        buckets.insert(200, CalibrationBucket { n: 10, hits: 2 });
+        buckets.insert(300, CalibrationBucket { n: 10, hits: 9 });
+
+        let blocks = fit_isotonic_blocks(&buckets);
+
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].lower_key, 100);
+        assert_eq!(blocks[0].upper_key, 200);
+        assert!((blocks[0].calibrated_p - 0.5).abs() < 1e-12);
+        assert_eq!(blocks[1].lower_key, 300);
+        assert_eq!(blocks[1].upper_key, 300);
+        assert!((blocks[1].calibrated_p - 0.9).abs() < 1e-12);
+    }
+
+    #[test]
+    fn calibration_model_falls_back_when_support_is_low() {
+        let mut acc = CalibrationFitAccumulator::default();
+        acc.observe(Some(0.9), FloorOutcomeKind::Realized);
+        let model = CalibrationModel::fit("accept".to_string(), acc, 10);
+
+        assert_eq!(model.status, "insufficient_calibration_support");
+        assert_eq!(model.n_complete, 1);
+        assert!((model.calibrate(0.42) - 0.42).abs() < 1e-12);
     }
 
     fn estimator_row(

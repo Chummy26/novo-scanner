@@ -54,8 +54,15 @@ O binário grava:
 - `estimator_table.jsonl`: superfície de predição elegível por suporte mínimo
   (`min_support`) em rota, estado PIT global e fallback global;
 - `dataset_audit.json`: invariantes de schema, floors, horizontes, hashes,
-  sampling, split e features PIT;
+  sampling, split e features PIT. Inclui também um digest supervisionado do
+  trainer sobre `sample_id`, `runtime_config_hash`, schema, horizonte, sampling,
+  estado PIT usado e o vetor completo de `label_floor_hits[]`; esse digest é
+  separado do digest lógico V2 mínimo do storage.
 - `scorecard.json`: métricas diagnósticas no teste temporal;
+- `calibration_model.json`: calibrador isotônico (`PAVA`) ajustado somente no
+  split temporal de calibração, usando casos completos. O scorecard de teste
+  usa a probabilidade calibrada quando o escopo tem suporte mínimo; caso
+  contrário, o artefato declara fallback cru e bloqueia promoção.
 - `trainer_manifest.json`: fingerprint do treino e blockers de promoção.
   Inclui também `aggregate_build_stats`, com contagem dos agregados descartados
   por baixo suporte. Esses agregados não são apagados do dataset fonte; eles
@@ -95,16 +102,17 @@ manter `promotion_allowed=false` quando:
 - há mais de um `runtime_config_hash` supervisionado;
 - há qualquer issue de auditoria;
 - há conflito de duplicata supervisionada por `(sample_id, horizon_s, floor_pct)`;
-- o teste temporal não tem linhas completas suficientes.
+- o teste temporal não tem linhas completas suficientes;
+- algum escopo não tem suporte de calibração suficiente.
 
 O próximo marco é trocar o IC diagnóstico por bootstrap/conformal por bloco,
-usar a calibração temporal para isotonic/beta e comparar o EstimatorOnly contra
-LightGBM/XGBoost sem misturar corpus incompatível.
+avaliar beta/conformal sobre a calibração existente e comparar o EstimatorOnly
+contra LightGBM/XGBoost sem misturar corpus incompatível.
 
 ## Bloqueios intencionais atuais
 
 A versão `v0.1.0` gera estimadores diagnósticos, mas não deve ser promovida para
 recomendação ativa enquanto:
 
-- o split de calibração ainda não alimentar isotonic/beta/conformal;
+- o intervalo de incerteza ainda não usar bootstrap/conformal por bloco;
 - houver violação de monotonicidade na curva `floor × horizon`.
