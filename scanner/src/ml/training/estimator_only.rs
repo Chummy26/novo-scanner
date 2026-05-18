@@ -28,10 +28,11 @@ const STATE_BUCKET_VERSION: &str = "pit_state_bucket/v2";
 const PREDICTION_METHOD: &str = "route_serving_monotone_km_shrunk_to_global_pit_state_km";
 const CALIBRATOR_VERSION: &str = "isotonic_complete_case_temporal/v0.1.0";
 const CALIBRATOR_METHOD: &str = "isotonic_pava_complete_case_temporal";
+const SERVING_CALIBRATOR_METHOD: &str = "scope_pooled_isotonic_with_cell_readiness_gate/v0.1.0";
 const MONOTONICITY_PROJECTION_METHOD: &str =
     "weighted_coordinate_isotonic_pava_horizon_floor/v0.1.0";
 const SERVING_PROBABILITY_PROJECTION_METHOD: &str =
-    "cell_calibrated_weighted_coordinate_isotonic_pava_horizon_floor/v0.1.0";
+    "scope_pooled_calibrated_weighted_coordinate_isotonic_pava_horizon_floor/v0.1.0";
 const MONOTONICITY_PROJECTION_MAX_ITERATIONS: u32 = 100;
 const MONOTONICITY_PROJECTION_TOLERANCE: f64 = 1e-12;
 const MIN_CALIBRATION_COMPLETE: u64 = 1_000;
@@ -528,6 +529,21 @@ struct CalibrationFitAccumulator {
     buckets: BTreeMap<u64, CalibrationBucket>,
 }
 
+impl CalibrationFitAccumulator {
+    fn merge_from(&mut self, other: &Self) {
+        self.n_rows = self.n_rows.saturating_add(other.n_rows);
+        self.n_predicted = self.n_predicted.saturating_add(other.n_predicted);
+        self.n_abstained = self.n_abstained.saturating_add(other.n_abstained);
+        self.n_complete = self.n_complete.saturating_add(other.n_complete);
+        self.n_censored = self.n_censored.saturating_add(other.n_censored);
+        for (&key, bucket) in &other.buckets {
+            let out = self.buckets.entry(key).or_default();
+            out.n = out.n.saturating_add(bucket.n);
+            out.hits = out.hits.saturating_add(bucket.hits);
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CalibrationCellKey {
     prediction_scope: String,
@@ -571,6 +587,7 @@ struct IsotonicBlock {
 struct CalibrationSuite {
     calibrator_version: String,
     method: String,
+    serving_method: String,
     min_complete: u64,
     diagnostic_only: bool,
     censoring_treatment: String,
@@ -578,7 +595,23 @@ struct CalibrationSuite {
     cells_ready: u64,
     cells_not_ready: u64,
     cells_not_ready_examples: Vec<String>,
+    scope_models: BTreeMap<String, ScopeCalibrationModel>,
     cells: BTreeMap<String, CalibrationModel>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ScopeCalibrationModel {
+    prediction_scope: String,
+    status: String,
+    n_rows: u64,
+    n_predicted: u64,
+    n_abstained: u64,
+    n_complete: u64,
+    n_censored: u64,
+    unique_raw_scores: u64,
+    knots: Vec<CalibrationKnot>,
+    raw_quality: CalibrationQuality,
+    calibrated_quality: CalibrationQuality,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -776,9 +809,9 @@ impl ScoreAccumulator {
         calibration_n_complete: u64,
     ) -> Self {
         let probability_kind = if calibration_status == "ok" {
-            "cell_calibrated_isotonic_complete_case"
+            "scope_pooled_isotonic_cell_ready_shape_preserving"
         } else {
-            "mixed_cell_calibrated_or_raw_fallback"
+            "mixed_scope_pooled_cell_ready_or_raw_fallback"
         }
         .to_string();
         Self {
@@ -912,6 +945,22 @@ impl CalibrationSuite {
                 }
             }
         }
+        let mut scope_accumulators = BTreeMap::<String, CalibrationFitAccumulator>::new();
+        for (key, acc) in &accumulators {
+            scope_accumulators
+                .entry(key.prediction_scope.clone())
+                .or_default()
+                .merge_from(acc);
+        }
+        let scope_models = scope_accumulators
+            .into_iter()
+            .map(|(scope, acc)| {
+                (
+                    scope.clone(),
+                    ScopeCalibrationModel::fit(scope, acc, min_complete),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let cells = accumulators
             .into_iter()
             .map(|(key, acc)| {
@@ -938,6 +987,7 @@ impl CalibrationSuite {
         Self {
             calibrator_version: CALIBRATOR_VERSION.to_string(),
             method: CALIBRATOR_METHOD.to_string(),
+            serving_method: SERVING_CALIBRATOR_METHOD.to_string(),
             min_complete,
             diagnostic_only,
             censoring_treatment:
@@ -946,6 +996,7 @@ impl CalibrationSuite {
             cells_ready,
             cells_not_ready,
             cells_not_ready_examples,
+            scope_models,
             cells,
         }
     }
@@ -982,8 +1033,12 @@ impl CalibrationSuite {
         floor_bp: i32,
         raw_p: f64,
     ) -> CalibrationApplication {
-        match self.model(scope, horizon_s, floor_bp) {
-            Some(model) if model.status == "ok" => CalibrationApplication {
+        let cell_ready = self
+            .model(scope, horizon_s, floor_bp)
+            .map(|model| model.status == "ok")
+            .unwrap_or(false);
+        match (cell_ready, self.scope_models.get(scope)) {
+            (true, Some(model)) if model.status == "ok" => CalibrationApplication {
                 probability: model.calibrate(raw_p),
                 applied: true,
             },
@@ -992,6 +1047,56 @@ impl CalibrationSuite {
                 applied: false,
             },
         }
+    }
+}
+
+impl ScopeCalibrationModel {
+    fn fit(scope: String, acc: CalibrationFitAccumulator, min_complete: u64) -> Self {
+        let raw_quality = calibration_quality(&acc.buckets, None);
+        let blocks = fit_isotonic_blocks(&acc.buckets);
+        let knots = blocks
+            .iter()
+            .map(|block| CalibrationKnot {
+                raw_lower: probability_from_key(block.lower_key),
+                raw_upper: probability_from_key(block.upper_key),
+                calibrated_p: block.calibrated_p,
+                n_complete: block.n,
+                hits: block.hits,
+            })
+            .collect::<Vec<_>>();
+        let status = if acc.n_complete >= min_complete && !knots.is_empty() {
+            "ok"
+        } else {
+            "insufficient_calibration_support"
+        }
+        .to_string();
+        let calibrated_quality = calibration_quality(&acc.buckets, Some(&knots));
+        Self {
+            prediction_scope: scope,
+            status,
+            n_rows: acc.n_rows,
+            n_predicted: acc.n_predicted,
+            n_abstained: acc.n_abstained,
+            n_complete: acc.n_complete,
+            n_censored: acc.n_censored,
+            unique_raw_scores: acc.buckets.len() as u64,
+            knots,
+            raw_quality,
+            calibrated_quality,
+        }
+    }
+
+    fn calibrate(&self, raw_p: f64) -> f64 {
+        if self.status != "ok" || self.knots.is_empty() {
+            return raw_p.clamp(0.0, 1.0);
+        }
+        let p = raw_p.clamp(0.0, 1.0);
+        for knot in &self.knots {
+            if p <= knot.raw_upper {
+                return knot.calibrated_p;
+            }
+        }
+        self.knots.last().map(|knot| knot.calibrated_p).unwrap_or(p)
     }
 }
 
@@ -1035,6 +1140,7 @@ impl CalibrationModel {
         }
     }
 
+    #[cfg(test)]
     fn calibrate(&self, raw_p: f64) -> f64 {
         if self.status != "ok" || self.knots.is_empty() {
             return raw_p.clamp(0.0, 1.0);
@@ -1147,10 +1253,18 @@ struct MonotonicityProjectionAudit {
     adjusted_curves: u64,
     rows_seen: u64,
     rows_adjusted: u64,
+    uncalibrated_rows_adjusted: u64,
     max_iterations_used: u32,
     max_abs_delta: f64,
+    mean_abs_delta: f64,
+    p95_abs_delta: f64,
     total_abs_delta: f64,
+    max_uncalibrated_abs_delta: f64,
+    mean_uncalibrated_abs_delta: f64,
+    p95_uncalibrated_abs_delta: f64,
+    total_uncalibrated_abs_delta: f64,
     examples: Vec<String>,
+    uncalibrated_examples: Vec<String>,
 }
 
 impl Default for MonotonicityProjectionAudit {
@@ -1164,10 +1278,18 @@ impl Default for MonotonicityProjectionAudit {
             adjusted_curves: 0,
             rows_seen: 0,
             rows_adjusted: 0,
+            uncalibrated_rows_adjusted: 0,
             max_iterations_used: 0,
             max_abs_delta: 0.0,
+            mean_abs_delta: 0.0,
+            p95_abs_delta: 0.0,
             total_abs_delta: 0.0,
+            max_uncalibrated_abs_delta: 0.0,
+            mean_uncalibrated_abs_delta: 0.0,
+            p95_uncalibrated_abs_delta: 0.0,
+            total_uncalibrated_abs_delta: 0.0,
             examples: Vec::new(),
+            uncalibrated_examples: Vec::new(),
         }
     }
 }
@@ -1261,6 +1383,7 @@ pub fn run(cli: Cli) -> Result<()> {
         &calibration_suite,
         &scorecards,
         &monotonicity_audit,
+        &serving_probability_projection,
         &serving_monotonicity_audit,
         split,
     );
@@ -1872,6 +1995,7 @@ fn build_prediction_surface(
 
 fn apply_monotonicity_projection(rows: &mut [EstimatorRow]) -> MonotonicityProjectionAudit {
     let mut audit = MonotonicityProjectionAudit::default();
+    let mut abs_deltas = Vec::new();
     let mut curves = BTreeMap::<(String, String, String), Vec<usize>>::new();
     for (idx, row) in rows.iter().enumerate() {
         if row.p_hit_km.is_some() {
@@ -1966,6 +2090,7 @@ fn apply_monotonicity_projection(rows: &mut [EstimatorRow]) -> MonotonicityProje
                 curve_adjusted = true;
                 audit.rows_adjusted = audit.rows_adjusted.saturating_add(1);
                 let abs_delta = delta.abs();
+                abs_deltas.push(abs_delta);
                 audit.max_abs_delta = audit.max_abs_delta.max(abs_delta);
                 audit.total_abs_delta += abs_delta;
                 shift_projected_confidence_interval(row, raw, projected);
@@ -1991,6 +2116,7 @@ fn apply_monotonicity_projection(rows: &mut [EstimatorRow]) -> MonotonicityProje
         }
     }
 
+    finish_projection_delta_summary(&mut audit, &mut abs_deltas);
     audit
 }
 
@@ -2096,6 +2222,8 @@ fn apply_serving_probability_projection(
         method: SERVING_PROBABILITY_PROJECTION_METHOD.to_string(),
         ..MonotonicityProjectionAudit::default()
     };
+    let mut abs_deltas = Vec::new();
+    let mut uncalibrated_abs_deltas = Vec::new();
     let mut curves = BTreeMap::<(String, String, String), Vec<usize>>::new();
     for (idx, row) in rows.iter_mut().enumerate() {
         let Some(raw_p) = row.p_hit_km else {
@@ -2204,8 +2332,30 @@ fn apply_serving_probability_projection(
                 curve_adjusted = true;
                 audit.rows_adjusted = audit.rows_adjusted.saturating_add(1);
                 let abs_delta = delta.abs();
+                abs_deltas.push(abs_delta);
                 audit.max_abs_delta = audit.max_abs_delta.max(abs_delta);
                 audit.total_abs_delta += abs_delta;
+                if !row.p_hit_calibration_applied {
+                    audit.uncalibrated_rows_adjusted =
+                        audit.uncalibrated_rows_adjusted.saturating_add(1);
+                    uncalibrated_abs_deltas.push(abs_delta);
+                    audit.max_uncalibrated_abs_delta =
+                        audit.max_uncalibrated_abs_delta.max(abs_delta);
+                    audit.total_uncalibrated_abs_delta += abs_delta;
+                    if audit.uncalibrated_examples.len() < 50 {
+                        audit.uncalibrated_examples.push(format!(
+                            "scope={} level={} entity={} horizon_s={} floor_bp={} raw_fallback_p={} serving_p={} delta={}",
+                            scope,
+                            level,
+                            entity,
+                            row.horizon_s,
+                            floor_to_bp(row.floor_pct),
+                            calibrated_raw,
+                            projected,
+                            delta
+                        ));
+                    }
+                }
                 if audit.examples.len() < 50 {
                     audit.examples.push(format!(
                         "scope={} level={} entity={} horizon_s={} floor_bp={} calibrated_p={} serving_p={} delta={}",
@@ -2226,7 +2376,40 @@ fn apply_serving_probability_projection(
         }
     }
 
+    finish_projection_delta_summary(&mut audit, &mut abs_deltas);
+    finish_uncalibrated_projection_delta_summary(&mut audit, &mut uncalibrated_abs_deltas);
     audit
+}
+
+fn finish_projection_delta_summary(
+    audit: &mut MonotonicityProjectionAudit,
+    abs_deltas: &mut Vec<f64>,
+) {
+    if audit.rows_adjusted == 0 || abs_deltas.is_empty() {
+        return;
+    }
+    audit.mean_abs_delta = audit.total_abs_delta / audit.rows_adjusted as f64;
+    abs_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = (((abs_deltas.len() as f64) * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(abs_deltas.len().saturating_sub(1));
+    audit.p95_abs_delta = abs_deltas[idx];
+}
+
+fn finish_uncalibrated_projection_delta_summary(
+    audit: &mut MonotonicityProjectionAudit,
+    abs_deltas: &mut Vec<f64>,
+) {
+    if audit.uncalibrated_rows_adjusted == 0 || abs_deltas.is_empty() {
+        return;
+    }
+    audit.mean_uncalibrated_abs_delta =
+        audit.total_uncalibrated_abs_delta / audit.uncalibrated_rows_adjusted as f64;
+    abs_deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let idx = (((abs_deltas.len() as f64) * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(abs_deltas.len().saturating_sub(1));
+    audit.p95_uncalibrated_abs_delta = abs_deltas[idx];
 }
 
 fn process_calibration_pass(
@@ -3761,6 +3944,7 @@ fn promotion_blockers(
     calibration: &CalibrationSuite,
     scorecards: &BTreeMap<String, ScoreStats>,
     monotonicity: &MonotonicityAudit,
+    serving_projection: &MonotonicityProjectionAudit,
     serving_monotonicity: &MonotonicityAudit,
     split: TemporalSplit,
 ) -> Vec<String> {
@@ -3871,6 +4055,14 @@ fn promotion_blockers(
             "serving_monotonicity_violations horizon={} floor={}",
             serving_monotonicity.horizon_monotonicity_violations,
             serving_monotonicity.floor_monotonicity_violations
+        ));
+    }
+    if serving_projection.uncalibrated_rows_adjusted > 0 {
+        blockers.push(format!(
+            "serving_projection_adjusted_uncalibrated_rows={} max_abs_delta={} p95_abs_delta={}",
+            serving_projection.uncalibrated_rows_adjusted,
+            serving_projection.max_uncalibrated_abs_delta,
+            serving_projection.p95_uncalibrated_abs_delta
         ));
     }
     blockers
@@ -4500,7 +4692,7 @@ mod tests {
     }
 
     #[test]
-    fn serving_projection_removes_violations_reintroduced_by_cell_calibration() {
+    fn scope_pooled_serving_calibration_preserves_floor_order_for_ready_cells() {
         let mut rows = vec![
             estimator_row("all", "global", "*", 900, 0.3, 0.70),
             estimator_row("all", "global", "*", 900, 0.5, 0.60),
@@ -4521,19 +4713,42 @@ mod tests {
             }
             serving_monotonicity_audit(&clone)
         };
-        assert_eq!(calibrated_only.floor_monotonicity_violations, 1);
+        assert_eq!(calibrated_only.floor_monotonicity_violations, 0);
 
         let projection = apply_serving_probability_projection(&mut rows, &calibration);
         let serving_audit = serving_monotonicity_audit(&rows);
 
         assert_eq!(serving_audit.floor_monotonicity_violations, 0);
         assert_eq!(serving_audit.horizon_monotonicity_violations, 0);
-        assert!(projection.rows_adjusted > 0);
+        assert_eq!(projection.rows_adjusted, 0);
         assert!(rows.iter().all(|row| row.p_hit_calibrated_raw.is_some()));
         assert!(rows.iter().all(|row| row.p_hit_calibration_applied));
         assert!(rows
             .iter()
-            .any(|row| row.p_hit_serving_monotonicity_adjusted));
+            .all(|row| !row.p_hit_serving_monotonicity_adjusted));
+    }
+
+    #[test]
+    fn serving_projection_audits_uncalibrated_fallback_adjustments() {
+        let mut rows = vec![
+            estimator_row("all", "global", "*", 900, 0.3, 0.20),
+            estimator_row("all", "global", "*", 900, 0.5, 0.80),
+        ];
+        let mut calibration = calibration_suite_with_constant_cells(vec![
+            ("all", 900, 30, 0.20),
+            ("all", 900, 50, 0.80),
+        ]);
+        let easy_floor_key = CalibrationCellKey::new("all", 900, 30).as_artifact_key();
+        calibration.cells.get_mut(&easy_floor_key).unwrap().status =
+            "insufficient_calibration_support".to_string();
+
+        let projection = apply_serving_probability_projection(&mut rows, &calibration);
+
+        assert!(projection.rows_adjusted > 0);
+        assert!(projection.uncalibrated_rows_adjusted > 0);
+        assert!(projection.max_uncalibrated_abs_delta > 0.0);
+        assert!(projection.mean_uncalibrated_abs_delta > 0.0);
+        assert!(!projection.uncalibrated_examples.is_empty());
     }
 
     #[test]
@@ -4606,6 +4821,7 @@ mod tests {
         let calibration = CalibrationSuite {
             calibrator_version: CALIBRATOR_VERSION.to_string(),
             method: CALIBRATOR_METHOD.to_string(),
+            serving_method: SERVING_CALIBRATOR_METHOD.to_string(),
             min_complete: MIN_CALIBRATION_COMPLETE,
             diagnostic_only: false,
             censoring_treatment: "test".to_string(),
@@ -4613,6 +4829,7 @@ mod tests {
             cells_ready: 1,
             cells_not_ready: 0,
             cells_not_ready_examples: Vec::new(),
+            scope_models: BTreeMap::new(),
             cells: BTreeMap::new(),
         };
         let mut scorecards = BTreeMap::new();
@@ -4624,6 +4841,10 @@ mod tests {
             },
         );
         let monotonicity = MonotonicityAudit::default();
+        let mut serving_projection = MonotonicityProjectionAudit::default();
+        serving_projection.uncalibrated_rows_adjusted = 1;
+        serving_projection.max_uncalibrated_abs_delta = 0.10;
+        serving_projection.p95_uncalibrated_abs_delta = 0.10;
         let serving_monotonicity = MonotonicityAudit::default();
         let split = TemporalSplit {
             min_ts_ns: 0,
@@ -4647,6 +4868,7 @@ mod tests {
             &calibration,
             &scorecards,
             &monotonicity,
+            &serving_projection,
             &serving_monotonicity,
             split,
         );
@@ -4654,6 +4876,9 @@ mod tests {
         assert!(blockers
             .iter()
             .any(|blocker| blocker.starts_with("uncertainty_interval_not_promotion_ready")));
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker.starts_with("serving_projection_adjusted_uncalibrated_rows")));
     }
 
     #[test]
@@ -5001,6 +5226,7 @@ mod tests {
         CalibrationSuite {
             calibrator_version: CALIBRATOR_VERSION.to_string(),
             method: CALIBRATOR_METHOD.to_string(),
+            serving_method: SERVING_CALIBRATOR_METHOD.to_string(),
             min_complete: MIN_CALIBRATION_COMPLETE,
             diagnostic_only: false,
             censoring_treatment: "test".to_string(),
@@ -5008,7 +5234,54 @@ mod tests {
             cells_ready: cells.len() as u64,
             cells_not_ready: 0,
             cells_not_ready_examples: Vec::new(),
+            scope_models: scope_models_for_constant_cells(&cells),
             cells,
         }
+    }
+
+    fn scope_models_for_constant_cells(
+        cells: &BTreeMap<String, CalibrationModel>,
+    ) -> BTreeMap<String, ScopeCalibrationModel> {
+        let mut by_scope = BTreeMap::<String, Vec<f64>>::new();
+        for cell in cells.values() {
+            if let Some(knot) = cell.knots.first() {
+                by_scope
+                    .entry(cell.prediction_scope.clone())
+                    .or_default()
+                    .push(knot.calibrated_p);
+            }
+        }
+        by_scope
+            .into_iter()
+            .map(|(scope, values)| {
+                let calibrated_p = if values.is_empty() {
+                    0.0
+                } else {
+                    values.iter().sum::<f64>() / values.len() as f64
+                };
+                (
+                    scope.clone(),
+                    ScopeCalibrationModel {
+                        prediction_scope: scope,
+                        status: "ok".to_string(),
+                        n_rows: MIN_CALIBRATION_COMPLETE,
+                        n_predicted: MIN_CALIBRATION_COMPLETE,
+                        n_abstained: 0,
+                        n_complete: MIN_CALIBRATION_COMPLETE,
+                        n_censored: 0,
+                        unique_raw_scores: 1,
+                        knots: vec![CalibrationKnot {
+                            raw_lower: 0.0,
+                            raw_upper: 1.0,
+                            calibrated_p,
+                            n_complete: MIN_CALIBRATION_COMPLETE,
+                            hits: (calibrated_p * MIN_CALIBRATION_COMPLETE as f64).round() as u64,
+                        }],
+                        raw_quality: CalibrationQuality::default(),
+                        calibrated_quality: CalibrationQuality::default(),
+                    },
+                )
+            })
+            .collect()
     }
 }

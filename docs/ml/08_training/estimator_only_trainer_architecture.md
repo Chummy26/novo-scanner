@@ -43,12 +43,13 @@ conceitual do paradoxo de entrada/saída:
   não pode subir quando o floor fica mais difícil. A projeção usa PAVA
   isotônico ponderado e preserva `p_hit_km_raw`, `p_hit_ci_*_raw`, contagens,
   labels, floors, horizontes e frequência de coleta.
-- A probabilidade que alimenta o contrato público é `p_hit_serving`: primeiro
-  `p_hit_km` é calibrado por célula `(scope, horizon, floor)` e depois passa por
-  uma segunda projeção monotônica na grade final `floor × horizon`. Isso é
-  necessário porque calibradores independentes por célula não preservam ordem
-  entre floors/horizontes. `p_hit_calibrated_raw` preserva o valor calibrado
-  antes da projeção final.
+- A probabilidade que alimenta o contrato público é `p_hit_serving`. O trainer
+  mantém diagnósticos e readiness por célula `(scope, horizon, floor)`, mas a
+  transformação de serving usa um calibrador isotônico pooled por `scope` e só
+  aplica quando a célula correspondente tem suporte mínimo. Isso preserva o
+  blocker por célula sem deixar calibradores independentes quebrarem a ordem
+  natural entre floors/horizontes. `p_hit_calibrated_raw` preserva o valor
+  calibrado antes da projeção final.
 - No serving/scorecard, a curva completa da oportunidade passa por uma projeção
   final depois de lookup, shrinkage e fallback. Essa é a camada mais próxima do
   contrato: `candidate_curve[].p_hit` e `primary_setup.p_hit` devem sair dessa
@@ -83,7 +84,10 @@ O binário grava:
 - `serving_probability_projection.json`: auditoria da projeção aplicada à
   probabilidade final de serving (`p_hit_serving`), que é a única probabilidade
   elegível para preencher `candidate_curve[].p_hit` e `primary_setup.p_hit` no
-  contrato `trade_recommendation/v2.3`.
+  contrato `trade_recommendation/v2.3`. O artefato separa ajustes feitos em
+  células sem calibração aplicada (`raw fallback`); qualquer ajuste desse tipo
+  bloqueia promoção, porque indica que uma probabilidade não calibrada precisou
+  ser alterada para cumprir a forma monotônica da curva.
 - `trainer_manifest.json`: fingerprint do treino e blockers de promoção.
   Inclui também `aggregate_build_stats`, com contagem dos agregados descartados
   por baixo suporte. Esses agregados não são apagados do dataset fonte; eles
@@ -126,6 +130,7 @@ manter `promotion_allowed=false` quando:
 - o teste temporal não tem linhas completas suficientes;
 - alguma célula `(prediction_scope, horizon_s, floor_pct)` não tem suporte de
   calibração suficiente;
+- a projeção final de serving ajustou qualquer célula sem calibração aplicada;
 - o intervalo de incerteza ainda for diagnóstico e não usar
   bootstrap/conformal por bloco.
 
