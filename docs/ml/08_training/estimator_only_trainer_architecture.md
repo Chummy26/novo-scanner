@@ -9,7 +9,7 @@ O primeiro trainer do projeto não escolhe ainda uma `ExitTargetPolicy` final e
 não treina um GBDT. Ele estima a curva supervisionada:
 
 ```text
-P_hit, P_censor, T_hit e IC por
+P_hit, P_censor, T_hit condicional aos realized dentro do horizonte, e IC por
 (population_scope, aggregation_level, entity_key, horizon_s, floor_pct)
 ```
 
@@ -31,9 +31,11 @@ conceitual do paradoxo de entrada/saída:
   para `P_hit` sob censura à direita.
 - Greenwood/log-log para intervalo diagnóstico de sobrevivência, convertido
   para intervalo de `P_hit`.
-- Bins PIT globais (`pit_state_bucket/v1`) derivados de `entry_rank_percentile_24h`,
-  `p_exit_ge_label_floor_minus_entry_24h`, `exit_start_pct` e
-  `time_alive_at_t0_s`.
+- Bins PIT globais (`pit_state_bucket/v2`) derivados de `entry_rank_percentile_24h`,
+  posição do `exit_target = floor_pct - entry_locked_pct` contra
+  `exit_p25/p50/p75/p95_24h`, `exit_start_pct` e `time_alive_at_t0_s`.
+  O bucket de saída é específico ao `floor_pct` da curva avaliada; ele não
+  reutiliza a feature do floor primário.
 - Predição diagnóstica por shrinkage rota -> estado PIT -> global
   (`route_km_shrunk_to_global_pit_state_km`). Isso reduz variância de rotas
   com pouco suporte sem alterar labels, floors, horizontes ou frequência de
@@ -66,13 +68,13 @@ O binário grava:
 Smoke test:
 
 ```powershell
-cargo run --bin ml_train_estimator_only -- --input data/ml_v2/labeled_trades --max-manifests 2 --out-dir target/ml_trainer_smoke
+cargo run --manifest-path scanner/Cargo.toml --bin ml_train_estimator_only -- --input data/ml_v2/labeled_trades --max-manifests 2 --out-dir scanner/target/ml_trainer_smoke
 ```
 
 Treino diagnóstico completo:
 
 ```powershell
-cargo run --release --bin ml_train_estimator_only -- --input data/ml_v2/labeled_trades
+cargo run --release --manifest-path scanner/Cargo.toml --bin ml_train_estimator_only -- --input data/ml_v2/labeled_trades
 ```
 
 ## Critério de promoção

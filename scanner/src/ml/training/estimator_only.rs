@@ -23,7 +23,7 @@ const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.1.0";
 const MODEL_FAMILY: &str = "forward_labeled_ecdf";
 const OUTPUT_CONTRACT_VERSION: &str = "trade_recommendation/v2.3";
 const CI_METHOD: &str = "kaplan_meier_loglog_greenwood_95";
-const STATE_BUCKET_VERSION: &str = "pit_state_bucket/v1";
+const STATE_BUCKET_VERSION: &str = "pit_state_bucket/v2";
 const PREDICTION_METHOD: &str = "route_km_shrunk_to_global_pit_state_km";
 const EPS: f32 = 1e-4;
 const MAX_AUDIT_ISSUES: usize = 1_000;
@@ -306,9 +306,9 @@ impl GroupStats {
             p_hit_complete_naive,
             p_hit_ipw_complete,
             p_censor,
-            t_hit_p25_s: quantile_from_counts(&self.event_counts, 0.25),
-            t_hit_p50_s: quantile_from_counts(&self.event_counts, 0.50),
-            t_hit_p75_s: quantile_from_counts(&self.event_counts, 0.75),
+            t_hit_conditional_p25_s: quantile_from_counts(&self.event_counts, 0.25),
+            t_hit_conditional_p50_s: quantile_from_counts(&self.event_counts, 0.50),
+            t_hit_conditional_p75_s: quantile_from_counts(&self.event_counts, 0.75),
             ci_method: CI_METHOD.to_string(),
             sampling_probability_invalid: self.sampling_probability_invalid,
         }
@@ -371,9 +371,9 @@ struct EstimatorRow {
     p_hit_complete_naive: Option<f64>,
     p_hit_ipw_complete: Option<f64>,
     p_censor: f64,
-    t_hit_p25_s: Option<u32>,
-    t_hit_p50_s: Option<u32>,
-    t_hit_p75_s: Option<u32>,
+    t_hit_conditional_p25_s: Option<u32>,
+    t_hit_conditional_p50_s: Option<u32>,
+    t_hit_conditional_p75_s: Option<u32>,
     ci_method: String,
     sampling_probability_invalid: u64,
 }
@@ -1080,12 +1080,12 @@ fn process_train_batch(
         let sample_decision = required_str(view.sample_decision, row, "sample_decision")?;
         let label_pi = optional_f32(view.label_sampling_probability, row)
             .or_else(|| optional_f32(Some(view.sampling_probability), row));
-        let state_bucket = state_bucket_for_row(view, row);
         let hits = floor_hit_range(view.label_floor_hits, row)?;
         for hit_idx in hits {
             let floor_pct =
                 required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
             let floor_bp = floor_to_bp(floor_pct);
+            let state_bucket = state_bucket_for_floor(view, row, floor_pct);
             let outcome = floor_outcome(view, row, hit_idx, horizon_s)?;
             update_aggregates(
                 aggregates,
@@ -1240,11 +1240,11 @@ fn process_score_batch(
         let sample_decision = required_str(view.sample_decision, row, "sample_decision")?;
         let route_id = required_str(view.route_id, row, "route_id")?;
         let horizon_s = required_u32(view.horizon_s, row, "horizon_s")?;
-        let state_bucket = state_bucket_for_row(view, row);
         for hit_idx in floor_hit_range(view.label_floor_hits, row)? {
             let floor_pct =
                 required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
             let floor_bp = floor_to_bp(floor_pct);
+            let state_bucket = state_bucket_for_floor(view, row, floor_pct);
             let outcome = floor_outcome(view, row, hit_idx, horizon_s)?;
             for scope in scopes {
                 if !scope.includes_sample_decision(sample_decision) {
@@ -1712,22 +1712,79 @@ fn audit_feature(features: &StructArray, name: &str, row: usize, audit: &mut Dat
     }
 }
 
-fn state_bucket_for_row(view: &BatchView<'_>, row: usize) -> String {
+fn state_bucket_for_floor(view: &BatchView<'_>, row: usize, floor_pct: f32) -> String {
     let entry_rank = probability_like_feature(view.features_t0, "entry_rank_percentile_24h", row);
-    let exit_support = probability_like_feature(
-        view.features_t0,
-        "p_exit_ge_label_floor_minus_entry_24h",
-        row,
-    );
+    let exit_position = exit_target_position_for_floor(view, row, floor_pct);
     let exit_start = optional_f32(Some(view.exit_start_pct), row);
     let alive_s = nonnegative_seconds_feature(view.features_t0, "time_alive_at_t0_s", row);
     format!(
         "{}|{}|{}|{}",
         entry_rank_bucket(entry_rank),
-        exit_support_bucket(exit_support),
+        exit_target_position_bucket(exit_position),
         exit_start_bucket(exit_start),
         alive_bucket(alive_s),
     )
+}
+
+fn exit_target_position_for_floor(
+    view: &BatchView<'_>,
+    row: usize,
+    floor_pct: f32,
+) -> Option<ExitTargetPosition> {
+    let entry = optional_f32(Some(view.entry_locked_pct), row)?;
+    if !entry.is_finite() || !floor_pct.is_finite() {
+        return None;
+    }
+    exit_target_position_from_quantiles(
+        floor_pct - entry,
+        f32_feature(view.features_t0, "exit_p25_24h", row),
+        f32_feature(view.features_t0, "exit_p50_24h", row),
+        f32_feature(view.features_t0, "exit_p75_24h", row),
+        f32_feature(view.features_t0, "exit_p95_24h", row),
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitTargetPosition {
+    LeP25,
+    P25P50,
+    P50P75,
+    P75P95,
+    GtP95,
+}
+
+fn exit_target_position_from_quantiles(
+    target_pct: f32,
+    p25: Option<f32>,
+    p50: Option<f32>,
+    p75: Option<f32>,
+    p95: Option<f32>,
+) -> Option<ExitTargetPosition> {
+    if !target_pct.is_finite() {
+        return None;
+    }
+    let p25 = finite(p25)?;
+    let p50 = finite(p50)?;
+    let p75 = finite(p75)?;
+    let p95 = finite(p95)?;
+    if !(p25 <= p50 && p50 <= p75 && p75 <= p95) {
+        return None;
+    }
+    if target_pct <= p25 {
+        Some(ExitTargetPosition::LeP25)
+    } else if target_pct <= p50 {
+        Some(ExitTargetPosition::P25P50)
+    } else if target_pct <= p75 {
+        Some(ExitTargetPosition::P50P75)
+    } else if target_pct <= p95 {
+        Some(ExitTargetPosition::P75P95)
+    } else {
+        Some(ExitTargetPosition::GtP95)
+    }
+}
+
+fn finite(value: Option<f32>) -> Option<f32> {
+    value.filter(|v| v.is_finite())
 }
 
 fn probability_like_feature(features: &StructArray, name: &str, row: usize) -> Option<f32> {
@@ -1784,14 +1841,14 @@ fn entry_rank_bucket(value: Option<f32>) -> &'static str {
     }
 }
 
-fn exit_support_bucket(value: Option<f32>) -> &'static str {
+fn exit_target_position_bucket(value: Option<ExitTargetPosition>) -> &'static str {
     match value {
-        Some(v) if v >= 0.50 => "exit_support_ge_50",
-        Some(v) if v >= 0.25 => "exit_support_25_50",
-        Some(v) if v >= 0.10 => "exit_support_10_25",
-        Some(v) if v >= 0.05 => "exit_support_05_10",
-        Some(_) => "exit_support_lt_05",
-        None => "exit_support_unknown",
+        Some(ExitTargetPosition::LeP25) => "exit_target_le_p25",
+        Some(ExitTargetPosition::P25P50) => "exit_target_p25_p50",
+        Some(ExitTargetPosition::P50P75) => "exit_target_p50_p75",
+        Some(ExitTargetPosition::P75P95) => "exit_target_p75_p95",
+        Some(ExitTargetPosition::GtP95) => "exit_target_gt_p95",
+        None => "exit_target_unknown",
     }
 }
 
@@ -2659,7 +2716,7 @@ mod tests {
             AggregationKey {
                 scope: "accept".to_string(),
                 level: AggregationLevel::GlobalState,
-                entity: "entry_rank_ge_995|exit_support_ge_50|exit_start_ge_m050|alive_le_15s"
+                entity: "entry_rank_ge_995|exit_target_le_p25|exit_start_ge_m050|alive_le_15s"
                     .to_string(),
                 horizon_s: 900,
                 floor_bp: floor_to_bp(0.3),
@@ -2673,7 +2730,7 @@ mod tests {
             &index,
             PredictionScope::Accept,
             "r1",
-            "entry_rank_ge_995|exit_support_ge_50|exit_start_ge_m050|alive_le_15s",
+            "entry_rank_ge_995|exit_target_le_p25|exit_start_ge_m050|alive_le_15s",
             900,
             floor_to_bp(0.3),
             100.0,
@@ -2687,7 +2744,7 @@ mod tests {
         let state = estimator_row(
             "accept",
             "global_state",
-            "entry_rank_ge_995|exit_support_ge_50|exit_start_ge_m050|alive_le_15s",
+            "entry_rank_ge_995|exit_target_le_p25|exit_start_ge_m050|alive_le_15s",
             900,
             0.3,
             0.80,
@@ -2697,13 +2754,56 @@ mod tests {
             &index,
             PredictionScope::Accept,
             "missing_route",
-            "entry_rank_ge_995|exit_support_ge_50|exit_start_ge_m050|alive_le_15s",
+            "entry_rank_ge_995|exit_target_le_p25|exit_start_ge_m050|alive_le_15s",
             900,
             floor_to_bp(0.3),
             100.0,
         )
         .unwrap();
         assert!((p - 0.80).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exit_target_position_is_floor_specific_and_uses_pit_exit_quantiles() {
+        let p25 = Some(-3.0);
+        let p50 = Some(-2.0);
+        let p75 = Some(-1.0);
+        let p95 = Some(0.5);
+
+        assert_eq!(
+            exit_target_position_from_quantiles(-3.5, p25, p50, p75, p95),
+            Some(ExitTargetPosition::LeP25)
+        );
+        assert_eq!(
+            exit_target_position_from_quantiles(-2.5, p25, p50, p75, p95),
+            Some(ExitTargetPosition::P25P50)
+        );
+        assert_eq!(
+            exit_target_position_from_quantiles(-1.5, p25, p50, p75, p95),
+            Some(ExitTargetPosition::P50P75)
+        );
+        assert_eq!(
+            exit_target_position_from_quantiles(-0.5, p25, p50, p75, p95),
+            Some(ExitTargetPosition::P75P95)
+        );
+        assert_eq!(
+            exit_target_position_from_quantiles(1.0, p25, p50, p75, p95),
+            Some(ExitTargetPosition::GtP95)
+        );
+    }
+
+    #[test]
+    fn exit_target_position_rejects_non_monotonic_quantiles() {
+        assert_eq!(
+            exit_target_position_from_quantiles(
+                -1.0,
+                Some(-2.0),
+                Some(-3.0),
+                Some(-1.0),
+                Some(0.0),
+            ),
+            None
+        );
     }
 
     fn estimator_row(
@@ -2736,9 +2836,9 @@ mod tests {
             p_hit_complete_naive: Some(p_hit),
             p_hit_ipw_complete: Some(p_hit),
             p_censor: 0.0,
-            t_hit_p25_s: Some(1),
-            t_hit_p50_s: Some(1),
-            t_hit_p75_s: Some(1),
+            t_hit_conditional_p25_s: Some(1),
+            t_hit_conditional_p50_s: Some(1),
+            t_hit_conditional_p75_s: Some(1),
             ci_method: CI_METHOD.to_string(),
             sampling_probability_invalid: 0,
         }
