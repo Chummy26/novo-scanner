@@ -37,9 +37,12 @@ conceitual do paradoxo de entrada/saída:
   O bucket de saída é específico ao `floor_pct` da curva avaliada; ele não
   reutiliza a feature do floor primário.
 - Predição diagnóstica por shrinkage rota -> estado PIT -> global
-  (`route_km_shrunk_to_global_pit_state_km`). Isso reduz variância de rotas
-  com pouco suporte sem alterar labels, floors, horizontes ou frequência de
-  coleta.
+  (`route_monotone_km_shrunk_to_global_pit_state_km`). A superfície KM é
+  projetada por curva `(scope, level, entity)` antes da calibração para cumprir
+  as restrições naturais: `P_hit` não pode cair quando o horizonte aumenta e
+  não pode subir quando o floor fica mais difícil. A projeção usa PAVA
+  isotônico ponderado e preserva `p_hit_km_raw`, `p_hit_ci_*_raw`, contagens,
+  labels, floors, horizontes e frequência de coleta.
 - Separação temporal com purge/embargo igual ao maior horizonte por default
   para reduzir leakage por overlap de janelas.
 - Sampling metadata (`sampling_probability`, `sampling_probability_kind`,
@@ -64,6 +67,9 @@ O binário grava:
   `(prediction_scope, horizon_s, floor_pct)`. O scorecard de teste usa a
   probabilidade calibrada somente quando a célula tem suporte mínimo; caso
   contrário, registra fallback cru e bloqueia promoção.
+- `monotonicity_projection.json`: auditoria da projeção isotônica aplicada ao
+  artefato preditivo. Ela registra curvas ajustadas, deltas e exemplos; não
+  altera o dataset supervisionado nem remove observações.
 - `trainer_manifest.json`: fingerprint do treino e blockers de promoção.
   Inclui também `aggregate_build_stats`, com contagem dos agregados descartados
   por baixo suporte. Esses agregados não são apagados do dataset fonte; eles
@@ -117,4 +123,5 @@ A versão `v0.1.0` gera estimadores diagnósticos, mas não deve ser promovida p
 recomendação ativa enquanto:
 
 - o intervalo de incerteza ainda não usar bootstrap/conformal por bloco;
-- houver violação de monotonicidade na curva `floor × horizon`.
+- a auditoria pós-projeção ainda encontrar violação de monotonicidade na curva
+  `floor × horizon`.

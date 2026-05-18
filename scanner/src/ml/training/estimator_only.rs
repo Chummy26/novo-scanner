@@ -19,14 +19,18 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
 const NS_PER_S: u64 = 1_000_000_000;
-const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.1.0";
+const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.1.1";
 const MODEL_FAMILY: &str = "forward_labeled_ecdf";
 const OUTPUT_CONTRACT_VERSION: &str = "trade_recommendation/v2.3";
 const CI_METHOD: &str = "kaplan_meier_loglog_greenwood_95";
 const STATE_BUCKET_VERSION: &str = "pit_state_bucket/v2";
-const PREDICTION_METHOD: &str = "route_km_shrunk_to_global_pit_state_km";
+const PREDICTION_METHOD: &str = "route_monotone_km_shrunk_to_global_pit_state_km";
 const CALIBRATOR_VERSION: &str = "isotonic_complete_case_temporal/v0.1.0";
 const CALIBRATOR_METHOD: &str = "isotonic_pava_complete_case_temporal";
+const MONOTONICITY_PROJECTION_METHOD: &str =
+    "weighted_coordinate_isotonic_pava_horizon_floor/v0.1.0";
+const MONOTONICITY_PROJECTION_MAX_ITERATIONS: u32 = 100;
+const MONOTONICITY_PROJECTION_TOLERANCE: f64 = 1e-12;
 const MIN_CALIBRATION_COMPLETE: u64 = 1_000;
 const CALIBRATION_PROB_SCALE: f64 = 1_000_000_000_000.0;
 const EPS: f32 = 1e-4;
@@ -308,9 +312,14 @@ impl GroupStats {
             n_miss: self.n_miss,
             n_censored: self.n_censored,
             n_eff_sampling,
+            p_hit_km_raw: km.p_hit,
             p_hit_km: km.p_hit,
+            p_hit_ci_lower_raw: km.ci_lower,
             p_hit_ci_lower: km.ci_lower,
+            p_hit_ci_upper_raw: km.ci_upper,
             p_hit_ci_upper: km.ci_upper,
+            p_hit_monotonicity_delta: km.p_hit.map(|_| 0.0),
+            p_hit_monotonicity_adjusted: false,
             p_hit_lower_bound,
             p_hit_complete_naive,
             p_hit_ipw_complete,
@@ -631,9 +640,14 @@ struct EstimatorRow {
     n_miss: u64,
     n_censored: u64,
     n_eff_sampling: Option<f64>,
+    p_hit_km_raw: Option<f64>,
     p_hit_km: Option<f64>,
+    p_hit_ci_lower_raw: Option<f64>,
     p_hit_ci_lower: Option<f64>,
+    p_hit_ci_upper_raw: Option<f64>,
     p_hit_ci_upper: Option<f64>,
+    p_hit_monotonicity_delta: Option<f64>,
+    p_hit_monotonicity_adjusted: bool,
     p_hit_lower_bound: Option<f64>,
     p_hit_complete_naive: Option<f64>,
     p_hit_ipw_complete: Option<f64>,
@@ -1037,6 +1051,7 @@ struct TrainerManifest {
     aggregate_build_stats: AggregateBuildStats,
     calibration: CalibrationSuite,
     dedupe_audit: DedupeReport,
+    monotonicity_projection: MonotonicityProjectionAudit,
     monotonicity_audit: MonotonicityAudit,
     promotion_allowed: bool,
     promotion_blockers: Vec<String>,
@@ -1098,6 +1113,41 @@ struct MonotonicityAudit {
     examples: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct MonotonicityProjectionAudit {
+    enabled: bool,
+    method: String,
+    max_iterations: u32,
+    tolerance: f64,
+    checked_curves: u64,
+    adjusted_curves: u64,
+    rows_seen: u64,
+    rows_adjusted: u64,
+    max_iterations_used: u32,
+    max_abs_delta: f64,
+    total_abs_delta: f64,
+    examples: Vec<String>,
+}
+
+impl Default for MonotonicityProjectionAudit {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            method: MONOTONICITY_PROJECTION_METHOD.to_string(),
+            max_iterations: MONOTONICITY_PROJECTION_MAX_ITERATIONS,
+            tolerance: MONOTONICITY_PROJECTION_TOLERANCE,
+            checked_curves: 0,
+            adjusted_curves: 0,
+            rows_seen: 0,
+            rows_adjusted: 0,
+            max_iterations_used: 0,
+            max_abs_delta: 0.0,
+            total_abs_delta: 0.0,
+            examples: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct KmEstimate {
     p_hit: Option<f64>,
@@ -1147,8 +1197,9 @@ pub fn run(cli: Cli) -> Result<()> {
     )?;
     let training_dedupe_audit = training_dedupe.into_audit();
 
-    let (estimator_rows, aggregate_build_stats) =
+    let (mut estimator_rows, aggregate_build_stats) =
         build_prediction_surface(&aggregates, cli.min_support);
+    let monotonicity_projection = apply_monotonicity_projection(&mut estimator_rows);
     let index = build_prediction_index(&estimator_rows);
     let mut calibration_dedupe = DedupeTracker::new("calibration_fit");
     let calibration_suite =
@@ -1191,6 +1242,9 @@ pub fn run(cli: Cli) -> Result<()> {
     let calibration_artifact = write_json(&calibration_path, &calibration_suite)?;
     let dedupe_path = out_dir.join("duplicate_audit.json");
     let dedupe_artifact = write_json(&dedupe_path, &dedupe_report)?;
+    let monotonicity_projection_path = out_dir.join("monotonicity_projection.json");
+    let monotonicity_projection_artifact =
+        write_json(&monotonicity_projection_path, &monotonicity_projection)?;
     let sources_path = out_dir.join("sources.jsonl");
     let source_summaries = source_manifest_summaries(&manifests)?;
     let sources_artifact = write_jsonl(&sources_path, &source_summaries)?;
@@ -1204,6 +1258,10 @@ pub fn run(cli: Cli) -> Result<()> {
     artifacts.insert("scorecard".to_string(), scorecard_artifact);
     artifacts.insert("calibration_model".to_string(), calibration_artifact);
     artifacts.insert("duplicate_audit".to_string(), dedupe_artifact);
+    artifacts.insert(
+        "monotonicity_projection".to_string(),
+        monotonicity_projection_artifact,
+    );
     artifacts.insert("sources".to_string(), sources_artifact);
     artifacts.insert("corpus_manifest".to_string(), corpus_manifest_artifact);
 
@@ -1229,6 +1287,7 @@ pub fn run(cli: Cli) -> Result<()> {
         aggregate_build_stats,
         calibration: calibration_suite,
         dedupe_audit: dedupe_report,
+        monotonicity_projection,
         monotonicity_audit,
         promotion_allowed,
         promotion_blockers,
@@ -1764,6 +1823,224 @@ fn build_prediction_surface(
             })
     });
     (rows, build)
+}
+
+fn apply_monotonicity_projection(rows: &mut [EstimatorRow]) -> MonotonicityProjectionAudit {
+    let mut audit = MonotonicityProjectionAudit::default();
+    let mut curves = BTreeMap::<(String, String, String), Vec<usize>>::new();
+    for (idx, row) in rows.iter().enumerate() {
+        if row.p_hit_km.is_some() {
+            curves
+                .entry((
+                    row.population_scope.clone(),
+                    row.aggregation_level.clone(),
+                    row.entity_key.clone(),
+                ))
+                .or_default()
+                .push(idx);
+        }
+    }
+
+    for ((scope, level, entity), row_indices) in curves {
+        audit.checked_curves = audit.checked_curves.saturating_add(1);
+        audit.rows_seen = audit.rows_seen.saturating_add(row_indices.len() as u64);
+        let mut values = row_indices
+            .iter()
+            .map(|idx| rows[*idx].p_hit_km.unwrap_or(0.0).clamp(0.0, 1.0))
+            .collect::<Vec<_>>();
+        let weights = row_indices
+            .iter()
+            .map(|idx| {
+                rows[*idx]
+                    .n_eff_sampling
+                    .filter(|w| w.is_finite() && *w > 0.0)
+                    .unwrap_or(rows[*idx].n_total.max(1) as f64)
+                    .max(1.0)
+            })
+            .collect::<Vec<_>>();
+
+        let mut by_floor = BTreeMap::<i32, Vec<usize>>::new();
+        let mut by_horizon = BTreeMap::<u32, Vec<usize>>::new();
+        for (local_idx, row_idx) in row_indices.iter().enumerate() {
+            let row = &rows[*row_idx];
+            by_floor
+                .entry(floor_to_bp(row.floor_pct))
+                .or_default()
+                .push(local_idx);
+            by_horizon.entry(row.horizon_s).or_default().push(local_idx);
+        }
+        for positions in by_floor.values_mut() {
+            positions.sort_by_key(|local_idx| rows[row_indices[*local_idx]].horizon_s);
+        }
+        for positions in by_horizon.values_mut() {
+            positions.sort_by(|a, b| {
+                rows[row_indices[*a]]
+                    .floor_pct
+                    .partial_cmp(&rows[row_indices[*b]].floor_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let mut iterations_used = 0u32;
+        for iteration in 0..MONOTONICITY_PROJECTION_MAX_ITERATIONS {
+            iterations_used = iteration.saturating_add(1);
+            let mut max_step: f64 = 0.0;
+            for positions in by_floor.values() {
+                max_step = max_step.max(apply_isotonic_sequence(
+                    positions,
+                    &mut values,
+                    &weights,
+                    1.0,
+                ));
+            }
+            for positions in by_horizon.values() {
+                max_step = max_step.max(apply_isotonic_sequence(
+                    positions,
+                    &mut values,
+                    &weights,
+                    -1.0,
+                ));
+            }
+            if max_step <= MONOTONICITY_PROJECTION_TOLERANCE {
+                break;
+            }
+        }
+        audit.max_iterations_used = audit.max_iterations_used.max(iterations_used);
+
+        let mut curve_adjusted = false;
+        for (local_idx, row_idx) in row_indices.iter().enumerate() {
+            let projected = values[local_idx].clamp(0.0, 1.0);
+            let row = &mut rows[*row_idx];
+            let raw = row.p_hit_km_raw.or(row.p_hit_km).unwrap_or(projected);
+            row.p_hit_km_raw = Some(raw);
+            let delta = projected - raw;
+            row.p_hit_km = Some(projected);
+            row.p_hit_monotonicity_delta = Some(delta);
+            row.p_hit_monotonicity_adjusted = delta.abs() > MONOTONICITY_PROJECTION_TOLERANCE;
+            if row.p_hit_monotonicity_adjusted {
+                curve_adjusted = true;
+                audit.rows_adjusted = audit.rows_adjusted.saturating_add(1);
+                let abs_delta = delta.abs();
+                audit.max_abs_delta = audit.max_abs_delta.max(abs_delta);
+                audit.total_abs_delta += abs_delta;
+                shift_projected_confidence_interval(row, raw, projected);
+                if audit.examples.len() < 50 {
+                    audit.examples.push(format!(
+                        "scope={} level={} entity={} horizon_s={} floor_bp={} raw_p={} projected_p={} delta={}",
+                        scope,
+                        level,
+                        entity,
+                        row.horizon_s,
+                        floor_to_bp(row.floor_pct),
+                        raw,
+                        projected,
+                        delta
+                    ));
+                }
+            } else {
+                shift_projected_confidence_interval(row, raw, projected);
+            }
+        }
+        if curve_adjusted {
+            audit.adjusted_curves = audit.adjusted_curves.saturating_add(1);
+        }
+    }
+
+    audit
+}
+
+fn apply_isotonic_sequence(
+    positions: &[usize],
+    values: &mut [f64],
+    weights: &[f64],
+    sign: f64,
+) -> f64 {
+    if positions.len() < 2 {
+        return 0.0;
+    }
+    let sequence = positions
+        .iter()
+        .map(|position| (values[*position] * sign, weights[*position]))
+        .collect::<Vec<_>>();
+    let fitted = weighted_isotonic_increasing(&sequence);
+    let mut max_step: f64 = 0.0;
+    for (idx, position) in positions.iter().enumerate() {
+        let next = (fitted[idx] * sign).clamp(0.0, 1.0);
+        max_step = max_step.max((values[*position] - next).abs());
+        values[*position] = next;
+    }
+    max_step
+}
+
+fn weighted_isotonic_increasing(sequence: &[(f64, f64)]) -> Vec<f64> {
+    #[derive(Clone, Copy)]
+    struct Block {
+        start: usize,
+        end: usize,
+        weight: f64,
+        weighted_sum: f64,
+        value: f64,
+    }
+
+    let mut blocks = Vec::<Block>::new();
+    for (idx, (value, weight)) in sequence.iter().enumerate() {
+        let weight = if weight.is_finite() && *weight > 0.0 {
+            *weight
+        } else {
+            1.0
+        };
+        blocks.push(Block {
+            start: idx,
+            end: idx,
+            weight,
+            weighted_sum: value.clamp(-1.0, 1.0) * weight,
+            value: value.clamp(-1.0, 1.0),
+        });
+        while blocks.len() >= 2 {
+            let len = blocks.len();
+            if blocks[len - 2].value <= blocks[len - 1].value + MONOTONICITY_PROJECTION_TOLERANCE {
+                break;
+            }
+            let right = blocks.pop().expect("right isotonic block");
+            let left = blocks.pop().expect("left isotonic block");
+            let weight = left.weight + right.weight;
+            let weighted_sum = left.weighted_sum + right.weighted_sum;
+            blocks.push(Block {
+                start: left.start,
+                end: right.end,
+                weight,
+                weighted_sum,
+                value: if weight > 0.0 {
+                    weighted_sum / weight
+                } else {
+                    0.0
+                },
+            });
+        }
+    }
+
+    let mut fitted = vec![0.0; sequence.len()];
+    for block in blocks {
+        for value in fitted.iter_mut().take(block.end + 1).skip(block.start) {
+            *value = block.value;
+        }
+    }
+    fitted
+}
+
+fn shift_projected_confidence_interval(row: &mut EstimatorRow, raw: f64, projected: f64) {
+    let delta = projected - raw;
+    row.p_hit_ci_lower_raw = row.p_hit_ci_lower_raw.or(row.p_hit_ci_lower);
+    row.p_hit_ci_upper_raw = row.p_hit_ci_upper_raw.or(row.p_hit_ci_upper);
+    if let Some(lower_raw) = row.p_hit_ci_lower_raw {
+        row.p_hit_ci_lower = Some((lower_raw + delta).clamp(0.0, projected));
+    }
+    if let Some(upper_raw) = row.p_hit_ci_upper_raw {
+        row.p_hit_ci_upper = Some((upper_raw + delta).clamp(projected, 1.0));
+    }
+    if row.p_hit_monotonicity_adjusted && !row.ci_method.contains("monotonicity_delta_shifted") {
+        row.ci_method = format!("{};monotonicity_delta_shifted", row.ci_method);
+    }
 }
 
 fn process_calibration_pass(
@@ -3844,6 +4121,45 @@ mod tests {
     }
 
     #[test]
+    fn monotonicity_projection_removes_floor_and_horizon_violations() {
+        let mut rows = vec![
+            estimator_row("all", "route", "r1", 900, 0.3, 0.70),
+            estimator_row("all", "route", "r1", 1800, 0.3, 0.40),
+            estimator_row("all", "route", "r1", 900, 0.5, 0.80),
+            estimator_row("all", "route", "r1", 1800, 0.5, 0.30),
+        ];
+
+        let before = monotonicity_audit(&rows);
+        assert!(before.horizon_monotonicity_violations > 0);
+        assert!(before.floor_monotonicity_violations > 0);
+
+        let projection = apply_monotonicity_projection(&mut rows);
+        let after = monotonicity_audit(&rows);
+
+        assert_eq!(after.horizon_monotonicity_violations, 0);
+        assert_eq!(after.floor_monotonicity_violations, 0);
+        assert!(projection.rows_adjusted > 0);
+        assert!(rows.iter().any(|row| row.p_hit_monotonicity_adjusted));
+        assert!(rows.iter().all(|row| row.p_hit_km_raw.is_some()));
+    }
+
+    #[test]
+    fn weighted_isotonic_increasing_preserves_monotone_sequence() {
+        let fitted = weighted_isotonic_increasing(&[(0.1, 1.0), (0.2, 10.0), (0.3, 1.0)]);
+
+        assert_eq!(fitted, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn weighted_isotonic_increasing_pools_decreasing_blocks() {
+        let fitted = weighted_isotonic_increasing(&[(0.8, 1.0), (0.2, 1.0), (0.9, 1.0)]);
+
+        assert!((fitted[0] - 0.5).abs() < 1e-12);
+        assert!((fitted[1] - 0.5).abs() < 1e-12);
+        assert!((fitted[2] - 0.9).abs() < 1e-12);
+    }
+
+    #[test]
     fn prediction_shrinks_route_to_pit_state_prior() {
         let mut aggregates = HashMap::new();
         let mut route_stats = GroupStats {
@@ -4108,9 +4424,14 @@ mod tests {
             n_miss: 0,
             n_censored: 0,
             n_eff_sampling: Some(1.0),
+            p_hit_km_raw: Some(p_hit),
             p_hit_km: Some(p_hit),
+            p_hit_ci_lower_raw: Some(p_hit),
             p_hit_ci_lower: Some(p_hit),
+            p_hit_ci_upper_raw: Some(p_hit),
             p_hit_ci_upper: Some(p_hit),
+            p_hit_monotonicity_delta: Some(0.0),
+            p_hit_monotonicity_adjusted: false,
             p_hit_lower_bound: Some(p_hit),
             p_hit_complete_naive: Some(p_hit),
             p_hit_ipw_complete: Some(p_hit),
