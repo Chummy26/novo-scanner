@@ -25,11 +25,13 @@ const OUTPUT_CONTRACT_VERSION: &str = "trade_recommendation/v2.3";
 const CI_METHOD: &str = "kaplan_meier_loglog_greenwood_95";
 const PROMOTION_INTERVAL_REQUIREMENT: &str = "block_bootstrap_or_conformal_interval";
 const STATE_BUCKET_VERSION: &str = "pit_state_bucket/v2";
-const PREDICTION_METHOD: &str = "route_monotone_km_shrunk_to_global_pit_state_km";
+const PREDICTION_METHOD: &str = "route_serving_monotone_km_shrunk_to_global_pit_state_km";
 const CALIBRATOR_VERSION: &str = "isotonic_complete_case_temporal/v0.1.0";
 const CALIBRATOR_METHOD: &str = "isotonic_pava_complete_case_temporal";
 const MONOTONICITY_PROJECTION_METHOD: &str =
     "weighted_coordinate_isotonic_pava_horizon_floor/v0.1.0";
+const SERVING_PROBABILITY_PROJECTION_METHOD: &str =
+    "cell_calibrated_weighted_coordinate_isotonic_pava_horizon_floor/v0.1.0";
 const MONOTONICITY_PROJECTION_MAX_ITERATIONS: u32 = 100;
 const MONOTONICITY_PROJECTION_TOLERANCE: f64 = 1e-12;
 const MIN_CALIBRATION_COMPLETE: u64 = 1_000;
@@ -321,6 +323,11 @@ impl GroupStats {
             p_hit_ci_upper: km.ci_upper,
             p_hit_monotonicity_delta: km.p_hit.map(|_| 0.0),
             p_hit_monotonicity_adjusted: false,
+            p_hit_calibrated_raw: None,
+            p_hit_calibration_applied: false,
+            p_hit_serving: None,
+            p_hit_serving_monotonicity_delta: None,
+            p_hit_serving_monotonicity_adjusted: false,
             p_hit_lower_bound,
             p_hit_complete_naive,
             p_hit_ipw_complete,
@@ -617,6 +624,14 @@ struct CalibrationApplication {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct ServingCurvePoint {
+    horizon_s: u32,
+    floor_bp: i32,
+    probability: Option<f64>,
+    calibration_applied: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct FirstHitAuditInput {
     hit_idx: usize,
     ts_emit_ns: u64,
@@ -649,6 +664,11 @@ struct EstimatorRow {
     p_hit_ci_upper: Option<f64>,
     p_hit_monotonicity_delta: Option<f64>,
     p_hit_monotonicity_adjusted: bool,
+    p_hit_calibrated_raw: Option<f64>,
+    p_hit_calibration_applied: bool,
+    p_hit_serving: Option<f64>,
+    p_hit_serving_monotonicity_delta: Option<f64>,
+    p_hit_serving_monotonicity_adjusted: bool,
     p_hit_lower_bound: Option<f64>,
     p_hit_complete_naive: Option<f64>,
     p_hit_ipw_complete: Option<f64>,
@@ -1054,6 +1074,8 @@ struct TrainerManifest {
     dedupe_audit: DedupeReport,
     monotonicity_projection: MonotonicityProjectionAudit,
     monotonicity_audit: MonotonicityAudit,
+    serving_probability_projection: MonotonicityProjectionAudit,
+    serving_monotonicity_audit: MonotonicityAudit,
     promotion_allowed: bool,
     promotion_blockers: Vec<String>,
     artifacts: BTreeMap<String, ArtifactInfo>,
@@ -1111,6 +1133,7 @@ struct MonotonicityAudit {
     checked_curves: u64,
     horizon_monotonicity_violations: u64,
     floor_monotonicity_violations: u64,
+    probability_field: String,
     examples: Vec<String>,
 }
 
@@ -1201,17 +1224,25 @@ pub fn run(cli: Cli) -> Result<()> {
     let (mut estimator_rows, aggregate_build_stats) =
         build_prediction_surface(&aggregates, cli.min_support);
     let monotonicity_projection = apply_monotonicity_projection(&mut estimator_rows);
-    let index = build_prediction_index(&estimator_rows);
+    let raw_index = build_prediction_index(&estimator_rows);
     let mut calibration_dedupe = DedupeTracker::new("calibration_fit");
-    let calibration_suite =
-        process_calibration_pass(&manifests, &split, &cli, &index, &mut calibration_dedupe)?;
+    let calibration_suite = process_calibration_pass(
+        &manifests,
+        &split,
+        &cli,
+        &raw_index,
+        &mut calibration_dedupe,
+    )?;
     let calibration_dedupe_audit = calibration_dedupe.into_audit();
+    let serving_probability_projection =
+        apply_serving_probability_projection(&mut estimator_rows, &calibration_suite);
+    let serving_index = build_prediction_index(&estimator_rows);
     let mut scoring_dedupe = DedupeTracker::new("scoring_scorecard");
     let scorecards = process_scoring_pass(
         &manifests,
         &split,
         &cli,
-        &index,
+        &serving_index,
         &calibration_suite,
         &mut scoring_dedupe,
     )?;
@@ -1223,12 +1254,14 @@ pub fn run(cli: Cli) -> Result<()> {
     };
 
     let monotonicity_audit = monotonicity_audit(&estimator_rows);
+    let serving_monotonicity_audit = serving_monotonicity_audit(&estimator_rows);
     let promotion_blockers = promotion_blockers(
         &audit,
         &dedupe_report,
         &calibration_suite,
         &scorecards,
         &monotonicity_audit,
+        &serving_monotonicity_audit,
         split,
     );
     let promotion_allowed = promotion_blockers.is_empty();
@@ -1246,6 +1279,11 @@ pub fn run(cli: Cli) -> Result<()> {
     let monotonicity_projection_path = out_dir.join("monotonicity_projection.json");
     let monotonicity_projection_artifact =
         write_json(&monotonicity_projection_path, &monotonicity_projection)?;
+    let serving_probability_projection_path = out_dir.join("serving_probability_projection.json");
+    let serving_probability_projection_artifact = write_json(
+        &serving_probability_projection_path,
+        &serving_probability_projection,
+    )?;
     let sources_path = out_dir.join("sources.jsonl");
     let source_summaries = source_manifest_summaries(&manifests)?;
     let sources_artifact = write_jsonl(&sources_path, &source_summaries)?;
@@ -1262,6 +1300,10 @@ pub fn run(cli: Cli) -> Result<()> {
     artifacts.insert(
         "monotonicity_projection".to_string(),
         monotonicity_projection_artifact,
+    );
+    artifacts.insert(
+        "serving_probability_projection".to_string(),
+        serving_probability_projection_artifact,
     );
     artifacts.insert("sources".to_string(), sources_artifact);
     artifacts.insert("corpus_manifest".to_string(), corpus_manifest_artifact);
@@ -1290,6 +1332,8 @@ pub fn run(cli: Cli) -> Result<()> {
         dedupe_audit: dedupe_report,
         monotonicity_projection,
         monotonicity_audit,
+        serving_probability_projection,
+        serving_monotonicity_audit,
         promotion_allowed,
         promotion_blockers,
         artifacts,
@@ -2044,6 +2088,147 @@ fn shift_projected_confidence_interval(row: &mut EstimatorRow, raw: f64, project
     }
 }
 
+fn apply_serving_probability_projection(
+    rows: &mut [EstimatorRow],
+    calibration_suite: &CalibrationSuite,
+) -> MonotonicityProjectionAudit {
+    let mut audit = MonotonicityProjectionAudit {
+        method: SERVING_PROBABILITY_PROJECTION_METHOD.to_string(),
+        ..MonotonicityProjectionAudit::default()
+    };
+    let mut curves = BTreeMap::<(String, String, String), Vec<usize>>::new();
+    for (idx, row) in rows.iter_mut().enumerate() {
+        let Some(raw_p) = row.p_hit_km else {
+            row.p_hit_calibrated_raw = None;
+            row.p_hit_calibration_applied = false;
+            row.p_hit_serving = None;
+            row.p_hit_serving_monotonicity_delta = None;
+            row.p_hit_serving_monotonicity_adjusted = false;
+            continue;
+        };
+        let floor_bp = floor_to_bp(row.floor_pct);
+        let calibrated =
+            calibration_suite.calibrate(&row.population_scope, row.horizon_s, floor_bp, raw_p);
+        row.p_hit_calibrated_raw = Some(calibrated.probability);
+        row.p_hit_calibration_applied = calibrated.applied;
+        row.p_hit_serving = Some(calibrated.probability);
+        row.p_hit_serving_monotonicity_delta = Some(0.0);
+        row.p_hit_serving_monotonicity_adjusted = false;
+        curves
+            .entry((
+                row.population_scope.clone(),
+                row.aggregation_level.clone(),
+                row.entity_key.clone(),
+            ))
+            .or_default()
+            .push(idx);
+    }
+
+    for ((scope, level, entity), row_indices) in curves {
+        audit.checked_curves = audit.checked_curves.saturating_add(1);
+        audit.rows_seen = audit.rows_seen.saturating_add(row_indices.len() as u64);
+        let mut values = row_indices
+            .iter()
+            .map(|idx| rows[*idx].p_hit_serving.unwrap_or(0.0).clamp(0.0, 1.0))
+            .collect::<Vec<_>>();
+        let weights = row_indices
+            .iter()
+            .map(|idx| {
+                rows[*idx]
+                    .n_eff_sampling
+                    .filter(|w| w.is_finite() && *w > 0.0)
+                    .unwrap_or(rows[*idx].n_total.max(1) as f64)
+                    .max(1.0)
+            })
+            .collect::<Vec<_>>();
+
+        let mut by_floor = BTreeMap::<i32, Vec<usize>>::new();
+        let mut by_horizon = BTreeMap::<u32, Vec<usize>>::new();
+        for (local_idx, row_idx) in row_indices.iter().enumerate() {
+            let row = &rows[*row_idx];
+            by_floor
+                .entry(floor_to_bp(row.floor_pct))
+                .or_default()
+                .push(local_idx);
+            by_horizon.entry(row.horizon_s).or_default().push(local_idx);
+        }
+        for positions in by_floor.values_mut() {
+            positions.sort_by_key(|local_idx| rows[row_indices[*local_idx]].horizon_s);
+        }
+        for positions in by_horizon.values_mut() {
+            positions.sort_by(|a, b| {
+                rows[row_indices[*a]]
+                    .floor_pct
+                    .partial_cmp(&rows[row_indices[*b]].floor_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let mut iterations_used = 0u32;
+        for iteration in 0..MONOTONICITY_PROJECTION_MAX_ITERATIONS {
+            iterations_used = iteration.saturating_add(1);
+            let mut max_step: f64 = 0.0;
+            for positions in by_floor.values() {
+                max_step = max_step.max(apply_isotonic_sequence(
+                    positions,
+                    &mut values,
+                    &weights,
+                    1.0,
+                ));
+            }
+            for positions in by_horizon.values() {
+                max_step = max_step.max(apply_isotonic_sequence(
+                    positions,
+                    &mut values,
+                    &weights,
+                    -1.0,
+                ));
+            }
+            if max_step <= MONOTONICITY_PROJECTION_TOLERANCE {
+                break;
+            }
+        }
+        audit.max_iterations_used = audit.max_iterations_used.max(iterations_used);
+
+        let mut curve_adjusted = false;
+        for (local_idx, row_idx) in row_indices.iter().enumerate() {
+            let projected = values[local_idx].clamp(0.0, 1.0);
+            let row = &mut rows[*row_idx];
+            let calibrated_raw = row.p_hit_calibrated_raw.unwrap_or(projected);
+            let delta = projected - calibrated_raw;
+            row.p_hit_serving = Some(projected);
+            row.p_hit_serving_monotonicity_delta = Some(delta);
+            row.p_hit_serving_monotonicity_adjusted =
+                delta.abs() > MONOTONICITY_PROJECTION_TOLERANCE;
+            if row.p_hit_serving_monotonicity_adjusted {
+                curve_adjusted = true;
+                audit.rows_adjusted = audit.rows_adjusted.saturating_add(1);
+                let abs_delta = delta.abs();
+                audit.max_abs_delta = audit.max_abs_delta.max(abs_delta);
+                audit.total_abs_delta += abs_delta;
+                if audit.examples.len() < 50 {
+                    audit.examples.push(format!(
+                        "scope={} level={} entity={} horizon_s={} floor_bp={} calibrated_p={} serving_p={} delta={}",
+                        scope,
+                        level,
+                        entity,
+                        row.horizon_s,
+                        floor_to_bp(row.floor_pct),
+                        calibrated_raw,
+                        projected,
+                        delta
+                    ));
+                }
+            }
+        }
+        if curve_adjusted {
+            audit.adjusted_curves = audit.adjusted_curves.saturating_add(1);
+        }
+    }
+
+    audit
+}
+
 fn process_calibration_pass(
     manifests: &[ManifestRecord],
     split: &TemporalSplit,
@@ -2237,6 +2422,7 @@ fn process_score_batch(
         let horizon_s = required_u32(view.horizon_s, row, "horizon_s")?;
         let hits = floor_hit_range(view.label_floor_hits, row)?;
         let floor_count = hits.len() as u64;
+        let floor_state_buckets = expected_floor_state_buckets(view, row);
         let dedupe_key = supervised_dedupe_row_key(sample_id, horizon_s);
         let dedupe_fingerprint =
             supervised_dedupe_row_fingerprint(view, row, hits.clone(), horizon_s)?;
@@ -2251,26 +2437,29 @@ fn process_score_batch(
         {
             continue;
         }
-        for hit_idx in hits {
-            let floor_pct =
-                required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
-            let floor_bp = floor_to_bp(floor_pct);
-            let state_bucket = state_bucket_for_floor(view, row, floor_pct);
-            let outcome = floor_outcome(view, row, hit_idx, horizon_s)?;
-            for scope in scopes {
-                if !scope.includes_sample_decision(sample_decision) {
-                    continue;
-                }
-                let prediction = predict(
-                    index,
-                    *scope,
-                    route_id,
-                    &state_bucket,
-                    horizon_s,
-                    floor_bp,
-                    shrinkage_k,
-                )
-                .map(|p| calibration_suite.calibrate(scope.as_str(), horizon_s, floor_bp, p));
+        for scope in scopes {
+            if !scope.includes_sample_decision(sample_decision) {
+                continue;
+            }
+            let serving_curve = predict_serving_curve(
+                index,
+                calibration_suite,
+                *scope,
+                route_id,
+                &floor_state_buckets,
+                shrinkage_k,
+            );
+            for hit_idx in hits.clone() {
+                let floor_pct =
+                    required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
+                let floor_bp = floor_to_bp(floor_pct);
+                let outcome = floor_outcome(view, row, hit_idx, horizon_s)?;
+                let prediction = serving_curve.get(&(horizon_s, floor_bp)).and_then(|point| {
+                    point.probability.map(|probability| CalibrationApplication {
+                        probability,
+                        applied: point.calibration_applied,
+                    })
+                });
                 let key = scope.as_str();
                 if let Some(score) = scores.get_mut(key) {
                     score.observe(prediction, outcome.outcome);
@@ -2279,6 +2468,130 @@ fn process_score_batch(
         }
     }
     Ok(())
+}
+
+fn expected_floor_state_buckets(view: &BatchView<'_>, row: usize) -> BTreeMap<i32, String> {
+    EXPECTED_FLOOR_BP
+        .iter()
+        .copied()
+        .map(|floor_bp| {
+            (
+                floor_bp,
+                state_bucket_for_floor(view, row, floor_bp as f32 / 100.0),
+            )
+        })
+        .collect()
+}
+
+fn predict_serving_curve(
+    index: &HashMap<AggregationKey, EstimatorRow>,
+    calibration_suite: &CalibrationSuite,
+    scope: PredictionScope,
+    route_id: &str,
+    floor_state_buckets: &BTreeMap<i32, String>,
+    shrinkage_k: f64,
+) -> BTreeMap<(u32, i32), ServingCurvePoint> {
+    let mut points = Vec::new();
+    for &horizon_s in EXPECTED_HORIZONS_S {
+        for &floor_bp in EXPECTED_FLOOR_BP {
+            let state_bucket = floor_state_buckets
+                .get(&floor_bp)
+                .map(String::as_str)
+                .unwrap_or("exit_target_unknown");
+            let probability = predict(
+                index,
+                scope,
+                route_id,
+                state_bucket,
+                horizon_s,
+                floor_bp,
+                shrinkage_k,
+            );
+            let calibration_applied = calibration_suite
+                .model(scope.as_str(), horizon_s, floor_bp)
+                .map(|model| model.status == "ok")
+                .unwrap_or(false);
+            points.push(ServingCurvePoint {
+                horizon_s,
+                floor_bp,
+                probability,
+                calibration_applied,
+            });
+        }
+    }
+
+    project_serving_curve_points(&mut points);
+    points
+        .into_iter()
+        .map(|point| ((point.horizon_s, point.floor_bp), point))
+        .collect()
+}
+
+fn project_serving_curve_points(points: &mut [ServingCurvePoint]) {
+    let present = points
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, point)| point.probability.map(|p| (idx, p.clamp(0.0, 1.0))))
+        .collect::<Vec<_>>();
+    if present.len() < 2 {
+        return;
+    }
+    let mut index_to_local = HashMap::<usize, usize>::new();
+    let mut values = Vec::with_capacity(present.len());
+    let weights = vec![1.0; present.len()];
+    for (local_idx, (point_idx, probability)) in present.iter().copied().enumerate() {
+        index_to_local.insert(point_idx, local_idx);
+        values.push(probability);
+    }
+
+    let mut by_floor = BTreeMap::<i32, Vec<usize>>::new();
+    let mut by_horizon = BTreeMap::<u32, Vec<usize>>::new();
+    for (point_idx, _) in present.iter().copied() {
+        let Some(&local_idx) = index_to_local.get(&point_idx) else {
+            continue;
+        };
+        by_floor
+            .entry(points[point_idx].floor_bp)
+            .or_default()
+            .push(local_idx);
+        by_horizon
+            .entry(points[point_idx].horizon_s)
+            .or_default()
+            .push(local_idx);
+    }
+    for positions in by_floor.values_mut() {
+        positions.sort_by_key(|local_idx| points[present[*local_idx].0].horizon_s);
+    }
+    for positions in by_horizon.values_mut() {
+        positions.sort_by_key(|local_idx| points[present[*local_idx].0].floor_bp);
+    }
+
+    for _ in 0..MONOTONICITY_PROJECTION_MAX_ITERATIONS {
+        let mut max_step: f64 = 0.0;
+        for positions in by_floor.values() {
+            max_step = max_step.max(apply_isotonic_sequence(
+                positions,
+                &mut values,
+                &weights,
+                1.0,
+            ));
+        }
+        for positions in by_horizon.values() {
+            max_step = max_step.max(apply_isotonic_sequence(
+                positions,
+                &mut values,
+                &weights,
+                -1.0,
+            ));
+        }
+        if max_step <= MONOTONICITY_PROJECTION_TOLERANCE {
+            break;
+        }
+    }
+
+    for (local_idx, (point_idx, _)) in present.iter().copied().enumerate() {
+        points[point_idx].probability = Some(values[local_idx].clamp(0.0, 1.0));
+    }
 }
 
 fn score_scopes(primary: PredictionScope) -> Vec<PredictionScope> {
@@ -2611,9 +2924,13 @@ fn predict(
     let global_row = index.get(&global_key);
 
     shrink_prediction(route_row, state_row.or(global_row), shrinkage_k)
-        .or_else(|| state_row.and_then(|row| row.p_hit_km))
-        .or_else(|| route_row.and_then(|row| row.p_hit_km))
-        .or_else(|| global_row.and_then(|row| row.p_hit_km))
+        .or_else(|| state_row.and_then(prediction_probability))
+        .or_else(|| route_row.and_then(prediction_probability))
+        .or_else(|| global_row.and_then(prediction_probability))
+}
+
+fn prediction_probability(row: &EstimatorRow) -> Option<f64> {
+    row.p_hit_serving.or(row.p_hit_km)
 }
 
 fn shrink_prediction(
@@ -2622,11 +2939,11 @@ fn shrink_prediction(
     shrinkage_k: f64,
 ) -> Option<f64> {
     let route = route_row?;
-    let route_p = route.p_hit_km?;
+    let route_p = prediction_probability(route)?;
     let Some(prior) = prior_row else {
         return Some(route_p);
     };
-    let prior_p = prior.p_hit_km?;
+    let prior_p = prediction_probability(prior)?;
     let weight = route.n_total as f64 / (route.n_total as f64 + shrinkage_k);
     Some((weight * route_p + (1.0 - weight) * prior_p).clamp(0.0, 1.0))
 }
@@ -3326,10 +3643,28 @@ fn quantile_from_counts(counts: &BTreeMap<u32, u64>, q: f64) -> Option<u32> {
 }
 
 fn monotonicity_audit(rows: &[EstimatorRow]) -> MonotonicityAudit {
-    let mut audit = MonotonicityAudit::default();
+    monotonicity_audit_for(rows, "p_hit_km", |row| row.p_hit_km)
+}
+
+fn serving_monotonicity_audit(rows: &[EstimatorRow]) -> MonotonicityAudit {
+    monotonicity_audit_for(rows, "p_hit_serving", |row| row.p_hit_serving)
+}
+
+fn monotonicity_audit_for<F>(
+    rows: &[EstimatorRow],
+    probability_field: &str,
+    probability: F,
+) -> MonotonicityAudit
+where
+    F: Fn(&EstimatorRow) -> Option<f64> + Copy,
+{
+    let mut audit = MonotonicityAudit {
+        probability_field: probability_field.to_string(),
+        ..MonotonicityAudit::default()
+    };
     let mut curves = BTreeMap::<(String, String, String), Vec<&EstimatorRow>>::new();
     for row in rows {
-        if row.p_hit_km.is_some() {
+        if probability(row).is_some() {
             curves
                 .entry((
                     row.population_scope.clone(),
@@ -3366,7 +3701,7 @@ fn monotonicity_audit(rows: &[EstimatorRow]) -> MonotonicityAudit {
             for pair in rows.windows(2) {
                 let a = pair[0];
                 let b = pair[1];
-                if let (Some(pa), Some(pb)) = (a.p_hit_km, b.p_hit_km) {
+                if let (Some(pa), Some(pb)) = (probability(a), probability(b)) {
                     if pb + 1e-12 < pa {
                         audit.horizon_monotonicity_violations =
                             audit.horizon_monotonicity_violations.saturating_add(1);
@@ -3391,7 +3726,7 @@ fn monotonicity_audit(rows: &[EstimatorRow]) -> MonotonicityAudit {
             for pair in rows.windows(2) {
                 let a = pair[0];
                 let b = pair[1];
-                if let (Some(pa), Some(pb)) = (a.p_hit_km, b.p_hit_km) {
+                if let (Some(pa), Some(pb)) = (probability(a), probability(b)) {
                     if pb > pa + 1e-12 {
                         audit.floor_monotonicity_violations =
                             audit.floor_monotonicity_violations.saturating_add(1);
@@ -3426,6 +3761,7 @@ fn promotion_blockers(
     calibration: &CalibrationSuite,
     scorecards: &BTreeMap<String, ScoreStats>,
     monotonicity: &MonotonicityAudit,
+    serving_monotonicity: &MonotonicityAudit,
     split: TemporalSplit,
 ) -> Vec<String> {
     let mut blockers = Vec::new();
@@ -3523,9 +3859,18 @@ fn promotion_blockers(
         || monotonicity.floor_monotonicity_violations > 0
     {
         blockers.push(format!(
-            "monotonicity_violations horizon={} floor={}",
+            "km_monotonicity_violations horizon={} floor={}",
             monotonicity.horizon_monotonicity_violations,
             monotonicity.floor_monotonicity_violations
+        ));
+    }
+    if serving_monotonicity.horizon_monotonicity_violations > 0
+        || serving_monotonicity.floor_monotonicity_violations > 0
+    {
+        blockers.push(format!(
+            "serving_monotonicity_violations horizon={} floor={}",
+            serving_monotonicity.horizon_monotonicity_violations,
+            serving_monotonicity.floor_monotonicity_violations
         ));
     }
     blockers
@@ -4155,6 +4500,88 @@ mod tests {
     }
 
     #[test]
+    fn serving_projection_removes_violations_reintroduced_by_cell_calibration() {
+        let mut rows = vec![
+            estimator_row("all", "global", "*", 900, 0.3, 0.70),
+            estimator_row("all", "global", "*", 900, 0.5, 0.60),
+        ];
+        let calibration = calibration_suite_with_constant_cells(vec![
+            ("all", 900, 30, 0.40),
+            ("all", 900, 50, 0.80),
+        ]);
+
+        let calibrated_only = {
+            let mut clone = rows.clone();
+            for row in &mut clone {
+                let floor_bp = floor_to_bp(row.floor_pct);
+                let p = row.p_hit_km.unwrap();
+                let calibrated =
+                    calibration.calibrate(&row.population_scope, row.horizon_s, floor_bp, p);
+                row.p_hit_serving = Some(calibrated.probability);
+            }
+            serving_monotonicity_audit(&clone)
+        };
+        assert_eq!(calibrated_only.floor_monotonicity_violations, 1);
+
+        let projection = apply_serving_probability_projection(&mut rows, &calibration);
+        let serving_audit = serving_monotonicity_audit(&rows);
+
+        assert_eq!(serving_audit.floor_monotonicity_violations, 0);
+        assert_eq!(serving_audit.horizon_monotonicity_violations, 0);
+        assert!(projection.rows_adjusted > 0);
+        assert!(rows.iter().all(|row| row.p_hit_calibrated_raw.is_some()));
+        assert!(rows.iter().all(|row| row.p_hit_calibration_applied));
+        assert!(rows
+            .iter()
+            .any(|row| row.p_hit_serving_monotonicity_adjusted));
+    }
+
+    #[test]
+    fn prediction_prefers_serving_probability_over_intermediate_km() {
+        let mut row = estimator_row("accept", "global", "*", 900, 0.3, 0.20);
+        row.p_hit_serving = Some(0.77);
+        let index = build_prediction_index(&[row]);
+
+        let p = predict(
+            &index,
+            PredictionScope::Accept,
+            "missing_route",
+            "missing_state",
+            900,
+            floor_to_bp(0.3),
+            100.0,
+        )
+        .unwrap();
+
+        assert!((p - 0.77).abs() < 1e-12);
+    }
+
+    #[test]
+    fn serving_curve_projection_runs_after_lookup_and_shrinkage() {
+        let mut easy = estimator_row("accept", "global", "*", 900, 0.3, 0.40);
+        easy.p_hit_serving = Some(0.40);
+        let mut hard = estimator_row("accept", "global", "*", 900, 0.5, 0.80);
+        hard.p_hit_serving = Some(0.80);
+        let index = build_prediction_index(&[easy, hard]);
+        let floor_state_buckets =
+            BTreeMap::from([(30, "state".to_string()), (50, "state".to_string())]);
+        let calibration = calibration_suite_with_constant_cells(Vec::new());
+
+        let curve = predict_serving_curve(
+            &index,
+            &calibration,
+            PredictionScope::Accept,
+            "missing_route",
+            &floor_state_buckets,
+            100.0,
+        );
+
+        let p_easy = curve.get(&(900, 30)).unwrap().probability.unwrap();
+        let p_hard = curve.get(&(900, 50)).unwrap().probability.unwrap();
+        assert!(p_easy + 1e-12 >= p_hard);
+    }
+
+    #[test]
     fn promotion_blocks_diagnostic_greenwood_interval() {
         let mut audit = DatasetAudit::default();
         audit.runtime_config_hashes.insert("cfg".to_string(), 1);
@@ -4197,6 +4624,7 @@ mod tests {
             },
         );
         let monotonicity = MonotonicityAudit::default();
+        let serving_monotonicity = MonotonicityAudit::default();
         let split = TemporalSplit {
             min_ts_ns: 0,
             max_ts_ns: 1,
@@ -4219,6 +4647,7 @@ mod tests {
             &calibration,
             &scorecards,
             &monotonicity,
+            &serving_monotonicity,
             split,
         );
 
@@ -4516,6 +4945,11 @@ mod tests {
             p_hit_ci_upper: Some(p_hit),
             p_hit_monotonicity_delta: Some(0.0),
             p_hit_monotonicity_adjusted: false,
+            p_hit_calibrated_raw: None,
+            p_hit_calibration_applied: false,
+            p_hit_serving: None,
+            p_hit_serving_monotonicity_delta: None,
+            p_hit_serving_monotonicity_adjusted: false,
             p_hit_lower_bound: Some(p_hit),
             p_hit_complete_naive: Some(p_hit),
             p_hit_ipw_complete: Some(p_hit),
@@ -4525,6 +4959,56 @@ mod tests {
             t_hit_conditional_p75_s: Some(1),
             ci_method: CI_METHOD.to_string(),
             sampling_probability_invalid: 0,
+        }
+    }
+
+    fn calibration_suite_with_constant_cells(
+        cells: Vec<(&str, u32, i32, f64)>,
+    ) -> CalibrationSuite {
+        let cells = cells
+            .into_iter()
+            .map(|(scope, horizon_s, floor_bp, calibrated_p)| {
+                let key = CalibrationCellKey::new(scope, horizon_s, floor_bp);
+                let artifact_key = key.as_artifact_key();
+                (
+                    artifact_key.clone(),
+                    CalibrationModel {
+                        prediction_scope: scope.to_string(),
+                        horizon_s,
+                        floor_pct: floor_bp as f32 / 100.0,
+                        floor_bp,
+                        cell_key: artifact_key,
+                        status: "ok".to_string(),
+                        n_rows: MIN_CALIBRATION_COMPLETE,
+                        n_predicted: MIN_CALIBRATION_COMPLETE,
+                        n_abstained: 0,
+                        n_complete: MIN_CALIBRATION_COMPLETE,
+                        n_censored: 0,
+                        unique_raw_scores: 1,
+                        knots: vec![CalibrationKnot {
+                            raw_lower: 0.0,
+                            raw_upper: 1.0,
+                            calibrated_p,
+                            n_complete: MIN_CALIBRATION_COMPLETE,
+                            hits: (calibrated_p * MIN_CALIBRATION_COMPLETE as f64).round() as u64,
+                        }],
+                        raw_quality: CalibrationQuality::default(),
+                        calibrated_quality: CalibrationQuality::default(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        CalibrationSuite {
+            calibrator_version: CALIBRATOR_VERSION.to_string(),
+            method: CALIBRATOR_METHOD.to_string(),
+            min_complete: MIN_CALIBRATION_COMPLETE,
+            diagnostic_only: false,
+            censoring_treatment: "test".to_string(),
+            cells_total: cells.len() as u64,
+            cells_ready: cells.len() as u64,
+            cells_not_ready: 0,
+            cells_not_ready_examples: Vec::new(),
+            cells,
         }
     }
 }

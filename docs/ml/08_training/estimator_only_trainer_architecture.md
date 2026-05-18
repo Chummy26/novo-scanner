@@ -37,12 +37,22 @@ conceitual do paradoxo de entrada/saída:
   O bucket de saída é específico ao `floor_pct` da curva avaliada; ele não
   reutiliza a feature do floor primário.
 - Predição diagnóstica por shrinkage rota -> estado PIT -> global
-  (`route_monotone_km_shrunk_to_global_pit_state_km`). A superfície KM é
+  (`route_serving_monotone_km_shrunk_to_global_pit_state_km`). A superfície KM é
   projetada por curva `(scope, level, entity)` antes da calibração para cumprir
   as restrições naturais: `P_hit` não pode cair quando o horizonte aumenta e
   não pode subir quando o floor fica mais difícil. A projeção usa PAVA
   isotônico ponderado e preserva `p_hit_km_raw`, `p_hit_ci_*_raw`, contagens,
   labels, floors, horizontes e frequência de coleta.
+- A probabilidade que alimenta o contrato público é `p_hit_serving`: primeiro
+  `p_hit_km` é calibrado por célula `(scope, horizon, floor)` e depois passa por
+  uma segunda projeção monotônica na grade final `floor × horizon`. Isso é
+  necessário porque calibradores independentes por célula não preservam ordem
+  entre floors/horizontes. `p_hit_calibrated_raw` preserva o valor calibrado
+  antes da projeção final.
+- No serving/scorecard, a curva completa da oportunidade passa por uma projeção
+  final depois de lookup, shrinkage e fallback. Essa é a camada mais próxima do
+  contrato: `candidate_curve[].p_hit` e `primary_setup.p_hit` devem sair dessa
+  curva final, não de uma célula consultada isoladamente.
 - Separação temporal com purge/embargo igual ao maior horizonte por default
   para reduzir leakage por overlap de janelas.
 - Sampling metadata (`sampling_probability`, `sampling_probability_kind`,
@@ -70,6 +80,10 @@ O binário grava:
 - `monotonicity_projection.json`: auditoria da projeção isotônica aplicada ao
   artefato preditivo. Ela registra curvas ajustadas, deltas e exemplos; não
   altera o dataset supervisionado nem remove observações.
+- `serving_probability_projection.json`: auditoria da projeção aplicada à
+  probabilidade final de serving (`p_hit_serving`), que é a única probabilidade
+  elegível para preencher `candidate_curve[].p_hit` e `primary_setup.p_hit` no
+  contrato `trade_recommendation/v2.3`.
 - `trainer_manifest.json`: fingerprint do treino e blockers de promoção.
   Inclui também `aggregate_build_stats`, com contagem dos agregados descartados
   por baixo suporte. Esses agregados não são apagados do dataset fonte; eles
@@ -126,4 +140,4 @@ recomendação ativa enquanto:
 
 - o intervalo de incerteza ainda não usar bootstrap/conformal por bloco;
 - a auditoria pós-projeção ainda encontrar violação de monotonicidade na curva
-  `floor × horizon`.
+  `floor × horizon`, especialmente na probabilidade final de serving.
