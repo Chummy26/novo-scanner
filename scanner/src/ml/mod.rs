@@ -41,6 +41,7 @@ pub mod metrics;
 pub mod persistence;
 pub mod retention;
 pub mod serving;
+pub mod training;
 pub mod trigger;
 pub mod util;
 

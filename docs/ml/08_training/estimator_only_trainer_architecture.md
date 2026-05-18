@@ -1,0 +1,99 @@
+# EstimatorOnly Trainer — Forward-Labeled ECDF/KM
+
+Status: fase inicial implementada em `scanner/src/ml/training/estimator_only.rs`.
+O binário `scanner/src/bin/ml_train_estimator_only.rs` é apenas wrapper CLI.
+
+## Objetivo
+
+O primeiro trainer do projeto não escolhe ainda uma `ExitTargetPolicy` final e
+não treina um GBDT. Ele estima a curva supervisionada:
+
+```text
+P_hit, P_censor, T_hit e IC por
+(population_scope, aggregation_level, entity_key, horizon_s, floor_pct)
+```
+
+Isso segue o contrato final `trade_recommendation_output_contract_v2_3.json`.
+Quando houver conflito entre esse contrato e `CLAUDE.md`, o contrato v2.3 tem
+precedência para o formato/semântica de saída; `CLAUDE.md` permanece como guia
+conceitual do paradoxo de entrada/saída:
+
+- `entry_locked_pct` é a entrada observada em `t0`, imutável;
+- o evento futuro é first-hit de `S_saida(t)`;
+- `label_floor_hits[]` é a unidade multi-floor obrigatória;
+- `censored` é categoria de primeira ordem;
+- raw/accepted não são fonte de label supervisionado;
+- fees, funding, slippage, size, margin, fill, stop e PnL líquido ficam fora.
+
+## Fontes estatísticas usadas
+
+- Kaplan-Meier produto-limite para observações incompletas: o estimador base
+  para `P_hit` sob censura à direita.
+- Greenwood/log-log para intervalo diagnóstico de sobrevivência, convertido
+  para intervalo de `P_hit`.
+- Bins PIT globais (`pit_state_bucket/v1`) derivados de `entry_rank_percentile_24h`,
+  `p_exit_ge_label_floor_minus_entry_24h`, `exit_start_pct` e
+  `time_alive_at_t0_s`.
+- Predição diagnóstica por shrinkage rota -> estado PIT -> global
+  (`route_km_shrunk_to_global_pit_state_km`). Isso reduz variância de rotas
+  com pouco suporte sem alterar labels, floors, horizontes ou frequência de
+  coleta.
+- Separação temporal com purge/embargo igual ao maior horizonte por default
+  para reduzir leakage por overlap de janelas.
+- Sampling metadata (`sampling_probability`, `sampling_probability_kind`,
+  `sampling_tier`, `label_sampling_probability`) é auditada e preservada; o
+  trainer calcula diagnósticos IPW simples, mas ainda bloqueia promoção quando
+  o dataset/split não é maduro o bastante.
+
+## Artefatos
+
+O binário grava:
+
+- `estimator_table.jsonl`: superfície de predição elegível por suporte mínimo
+  (`min_support`) em rota, estado PIT global e fallback global;
+- `dataset_audit.json`: invariantes de schema, floors, horizontes, hashes,
+  sampling, split e features PIT;
+- `scorecard.json`: métricas diagnósticas no teste temporal;
+- `trainer_manifest.json`: fingerprint do treino e blockers de promoção.
+  Inclui também `aggregate_build_stats`, com contagem dos agregados descartados
+  por baixo suporte. Esses agregados não são apagados do dataset fonte; eles
+  apenas não entram no artefato preditivo porque o próprio índice não os usaria.
+- `sources.jsonl`: manifestos V2 consumidos, digests, versões e contagens.
+- `_SUCCESS`: marcador escrito apenas depois da publicação dos artefatos.
+
+## Comando
+
+Smoke test:
+
+```powershell
+cargo run --bin ml_train_estimator_only -- --input data/ml_v2/labeled_trades --max-manifests 2 --out-dir target/ml_trainer_smoke
+```
+
+Treino diagnóstico completo:
+
+```powershell
+cargo run --release --bin ml_train_estimator_only -- --input data/ml_v2/labeled_trades
+```
+
+## Critério de promoção
+
+Com ~24h de dados, o resultado esperado ainda é diagnóstico. O manifest deve
+manter `promotion_allowed=false` quando:
+
+- o split temporal não suporta purge/embargo completo com teste maduro;
+- há mais de um `runtime_config_hash` supervisionado;
+- há qualquer issue de auditoria;
+- o teste temporal não tem linhas completas suficientes.
+
+O próximo marco é trocar o IC diagnóstico por bootstrap/conformal por bloco,
+usar a calibração temporal para isotonic/beta e auditar dedupe exato antes de
+qualquer comparação contra LightGBM/XGBoost.
+
+## Bloqueios intencionais atuais
+
+A versão `v0.1.0` gera estimadores diagnósticos, mas não deve ser promovida para
+recomendação ativa enquanto:
+
+- o split de calibração ainda não alimentar isotonic/beta/conformal;
+- não houver dedupe exato por `(sample_id, horizon_s, floor_pct)`;
+- houver violação de monotonicidade na curva `floor × horizon`.
