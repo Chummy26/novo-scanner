@@ -3873,10 +3873,10 @@ fn predict_serving_point(
     };
     let global_row = index.get(&global_key);
     let prior_row = state_row.or(global_row);
-    let probability = shrink_prediction(route_row, prior_row, shrinkage_k)
-        .or_else(|| state_row.and_then(prediction_probability))
-        .or_else(|| route_row.and_then(prediction_probability))
-        .or_else(|| global_row.and_then(prediction_probability));
+    let probability = shrink_serving_component_prediction(route_row, prior_row, shrinkage_k)
+        .or_else(|| state_row.and_then(serving_component_probability))
+        .or_else(|| route_row.and_then(serving_component_probability))
+        .or_else(|| global_row.and_then(serving_component_probability));
     let calibration_applied = calibration_suite
         .model(scope.as_str(), horizon_s, floor_bp)
         .map(|model| model.status == "ok")
@@ -4378,7 +4378,7 @@ fn predict(
 }
 
 fn prediction_probability(row: &EstimatorRow) -> Option<f64> {
-    row.p_hit_serving.or(row.p_hit_km)
+    row.p_hit_km
 }
 
 fn shrink_prediction(
@@ -4392,6 +4392,25 @@ fn shrink_prediction(
         return Some(route_p);
     };
     let prior_p = prediction_probability(prior)?;
+    let weight = route.n_total as f64 / (route.n_total as f64 + shrinkage_k);
+    Some((weight * route_p + (1.0 - weight) * prior_p).clamp(0.0, 1.0))
+}
+
+fn serving_component_probability(row: &EstimatorRow) -> Option<f64> {
+    row.p_hit_serving
+}
+
+fn shrink_serving_component_prediction(
+    route_row: Option<&EstimatorRow>,
+    prior_row: Option<&EstimatorRow>,
+    shrinkage_k: f64,
+) -> Option<f64> {
+    let route = route_row?;
+    let route_p = serving_component_probability(route)?;
+    let Some(prior) = prior_row else {
+        return Some(route_p);
+    };
+    let prior_p = serving_component_probability(prior)?;
     let weight = route.n_total as f64 / (route.n_total as f64 + shrinkage_k);
     Some((weight * route_p + (1.0 - weight) * prior_p).clamp(0.0, 1.0))
 }
@@ -6210,7 +6229,7 @@ mod tests {
     }
 
     #[test]
-    fn prediction_prefers_serving_probability_over_intermediate_km() {
+    fn raw_prediction_uses_intermediate_km_for_calibration() {
         let mut row = estimator_row("accept", "global", "*", 900, 0.3, 0.20);
         row.p_hit_serving = Some(0.77);
         let index = build_prediction_index(&[row]);
@@ -6226,7 +6245,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!((p - 0.77).abs() < 1e-12);
+        assert!((p - 0.20).abs() < 1e-12);
     }
 
     #[test]
@@ -6648,6 +6667,48 @@ mod tests {
         )
         .unwrap();
         assert!((p - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn public_serving_curve_never_falls_back_to_km_component() {
+        let mut row = estimator_row("accept", "global", "*", 900, 0.3, 0.77);
+        row.p_hit_km = Some(0.77);
+        row.p_hit_serving = None;
+        let index = build_prediction_index(&[row]);
+        let floor_state_buckets = BTreeMap::from([(30, "state".to_string())]);
+        let calibration = calibration_suite_with_constant_cells(vec![("accept", 900, 30, 0.77)]);
+
+        let curve = predict_serving_curve(
+            &index,
+            &calibration,
+            PredictionScope::Accept,
+            "missing_route",
+            &floor_state_buckets,
+            100.0,
+        );
+
+        assert!(curve.get(&(900, 30)).unwrap().probability.is_none());
+    }
+
+    #[test]
+    fn public_serving_curve_uses_serving_component_probability() {
+        let mut row = estimator_row("accept", "global", "*", 900, 0.3, 0.20);
+        row.p_hit_serving = Some(0.77);
+        let index = build_prediction_index(&[row]);
+        let floor_state_buckets = BTreeMap::from([(30, "state".to_string())]);
+        let calibration = calibration_suite_with_constant_cells(vec![("accept", 900, 30, 0.77)]);
+
+        let curve = predict_serving_curve(
+            &index,
+            &calibration,
+            PredictionScope::Accept,
+            "missing_route",
+            &floor_state_buckets,
+            100.0,
+        );
+
+        let probability = curve.get(&(900, 30)).unwrap().probability.unwrap();
+        assert!((probability - 0.77).abs() < 1e-12);
     }
 
     #[test]
