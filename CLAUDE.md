@@ -19,7 +19,9 @@ Para tarefas envolvendo dataset, schema, labels, coleta, features, sampling ou t
 
 Nenhum agente deve propor schema, feature, label, baseline, métrica, filtro, gate ou alteração de código relacionado ao ML sem antes checar se a proposta respeita essas skills. Se houver conflito entre uma interpretação genérica de ML/trading, este arquivo e uma skill canônica, a skill vence.
 
-Importante: a skill também descreve riscos operacionais da estratégia, mas isso **não** autoriza colocar taker fees, slippage, funding, posição, margem, stop, execução parcial ou PnL líquido no objetivo, label, função de perda ou gate do ML. Para este projeto, a skill deve ser usada para preservar o objetivo bruto: `enter`, `exit`, `lucro bruto`, `P`, `T` e `IC`.
+Importante: a skill também descreve riscos operacionais da estratégia, mas isso **não** autoriza colocar taker fees, slippage, funding, posição, margem, stop, execução parcial ou PnL líquido no objetivo, label, função de perda ou gate do ML. Para este projeto, a skill deve ser usada para preservar o objetivo bruto conceitual: entrada cotada, saída-alvo, lucro bruto, probabilidade, tempo e incerteza.
+
+Para formato público de recomendação, nomes de campos, badges, gates, validade, `ExitTargetPolicy`, curva de candidatos, metadados de modelo/calibração, dedupe/cooldown e semântica de `P`, `T` e `IC`, a fonte canônica é **somente** `docs/ml/07_decision_policy/trade_recommendation_output_contract_v2_3.json`. Se este `CLAUDE.md` e o contrato v2.3 divergirem sobre output, o contrato v2.3 vence.
 
 ---
 
@@ -29,7 +31,7 @@ Importante: a skill também descreve riscos operacionais da estratégia, mas iss
 |---|---|---|
 | **Estratégia** | Cross-exchange convergence arbitrage em cripto (SPOT/PERP e PERP/PERP; **nunca** SPOT/SPOT — é outra família) | Documento conceitual canônico na skill |
 | **Scanner** | Rust. Detector de spread bruto top-of-book, 14 streams WS, 11 venues, ~2600 rotas, broadcast a 150 ms | Pronto, 90/90 testes, em operação |
-| **Modelo ML** | Consome o stream do scanner e produz recomendação calibrada de TradeSetup | Em construção; Waves 1–3 de pesquisa parcialmente concluídas em `docs/ml/` |
+| **Modelo ML** | Consome o stream do scanner e produz recomendação calibrada conforme contrato público v2.3 | Em construção; Waves 1–3 de pesquisa parcialmente concluídas em `docs/ml/` |
 
 Scanner não é modelo. Modelo não é scanner. Estratégia é a teoria que ambos servem.
 
@@ -53,30 +55,30 @@ O modelo deste projeto não existe para "prever mercado" de forma genérica. Ele
 
 Hoje o operador faz isso manualmente dezenas ou centenas de vezes por dia: vê a rota, observa o `entrySpread(t0)` e o `exitSpread(t0)` atuais, compara com o comportamento recente da rota, julga se a entrada atual está realmente forte ou apenas normal para aquela rota, estima uma saída-alvo possível e decide se vale entrar. Parte desse processo é análise; parte é heurística; parte é discricionariedade baseada em experiência.
 
-O scanner já responde: **"há um spread agora"**. O modelo deve responder: **"esse spread atual, comparado ao histórico point-in-time desta rota, merece recomendação ativa agora? Se sim, qual `entry_now`, qual `exit_target`, qual `lucro_bruto_alvo`, qual `P`, qual `T` e qual `IC`?"**
+O scanner já responde: **"há um spread agora"**. O modelo deve responder: **"esse spread atual, comparado ao histórico point-in-time desta rota, merece recomendação ativa agora? Se sim, qual leitura calibrada deve ser emitida no contrato público v2.3?"**
 
 ### Formulação operacional do objetivo
 
 Para cada rota `r` e para cada instante `t0`, o objetivo do modelo é converter **estado atual + histórico disponível até `t0` da própria rota** em uma recomendação calibrada no domínio de spread bruto:
 
-`{ enter, exit, lucro_bruto = enter + exit, P, T, IC }`
+Conceitualmente: entrada cotada em `t0`, saída-alvo, lucro bruto alvo, probabilidade, tempo até evento e incerteza.
 
 onde:
 
-- `enter` = `S_entrada(t0)` observado/cotado no instante da recomendação e aceito pelo modelo como entrada válida agora
-- `exit` = threshold de `S_saída(t1)` recomendado para essa entrada e para esse estado atual
-- `lucro_bruto` = `enter + exit`, sempre em termos de spread bruto cotado
-- `P` = probabilidade de `S_saída(t1)` atingir o threshold `exit` dentro do horizonte considerado, condicionada ao estado disponível em `t0` e calibrada empiricamente
-- `T` = distribuição/quantis do tempo até `S_saída(t1)` atingir o threshold `exit`, condicionado ao estado disponível em `t0`; no contrato público, `t_hit` deve declarar quando é condicional a `realized_within_horizon`
-- `IC` = intervalo de confiança honesto sobre a recomendação
+- a entrada é `S_entrada(t0)` observado/cotado no instante da recomendação e aceito pelo modelo como entrada válida agora;
+- a saída-alvo é um threshold de `S_saída(t1)` recomendado para essa entrada e para esse estado atual;
+- o lucro bruto é sempre calculado no domínio de spread bruto cotado;
+- a probabilidade, o tempo até evento e a incerteza devem ser empiricamente calibrados e auditáveis.
+
+O mapeamento público desses conceitos para nomes de campos, estruturas aninhadas, thresholds, gates, badges, intervalos, validade e semântica de UI/serving pertence exclusivamente ao contrato v2.3: `docs/ml/07_decision_policy/trade_recommendation_output_contract_v2_3.json`.
 
 Importante: entradas e saídas são variáveis. Não existe um par único universalmente correto de `enter` e `exit` para uma rota. Como a skill mostra, diferentes operadores podem entrar e sair em pontos distintos da mesma trajetória e obter PnL diferentes sem violar a estratégia.
 
 Portanto, o objetivo do modelo **não** é acertar a melhor entrada e a melhor saída absolutas em hindsight, nem 100% das vezes. Isso exigiria conhecer a trajetória futura completa e, no limite, escolher entre muitos pares possíveis `(t0, t1)`, o que é problema de oracle, não de previsão.
 
-A solução correta para esse paradoxo é esta: os valores numéricos emitidos pelo modelo (`enter`, `exit`) devem ser entendidos como **targets recomendados no instante `t0`**, e não como descrição da melhor entrada ou da melhor saída absolutas da trajetória completa. O problema econômico real admite muitos pares possíveis `(t0, t1)`, mas o modelo não tenta identificar o melhor par ex post. Ele implementa uma **regra de decisão em `t0`** que transforma uma trajetória potencialmente infinita em uma recomendação operacional finita, calibrada e auditável.
+A solução correta para esse paradoxo é esta: os valores numéricos emitidos pelo modelo devem ser entendidos como **targets recomendados no instante `t0`**, e não como descrição da melhor entrada ou da melhor saída absolutas da trajetória completa. O problema econômico real admite muitos pares possíveis `(t0, t1)`, mas o modelo não tenta identificar o melhor par ex post. Ele implementa uma **regra de decisão em `t0`** que transforma uma trajetória potencialmente infinita em uma recomendação operacional finita, calibrada e auditável.
 
-O objetivo correto é outro: em cada instante `t0`, usando apenas o histórico disponível até `t0` da própria rota, avaliar se a entrada observada agora merece recomendação. Quando houver evidência suficiente, o modelo deve emitir uma recomendação concreta e calibrada no formato `{enter, exit, lucro_bruto, P, T, IC}`. Aqui, `exit` não significa a saída única ou ótima em sentido absoluto; significa uma **saída-alvo recomendada**, condicional à entrada atual e ao estado atual da rota.
+O objetivo correto é outro: em cada instante `t0`, usando apenas o histórico disponível até `t0` da própria rota, avaliar se a entrada observada agora merece recomendação. Quando houver evidência suficiente, o modelo deve emitir uma recomendação concreta e calibrada conforme o contrato v2.3. A saída-alvo não significa a saída única ou ótima em sentido absoluto; significa uma **saída-alvo recomendada**, condicional à entrada atual e ao estado atual da rota.
 
 ### EntryContextT0 para leitura da entrada
 
@@ -88,7 +90,7 @@ O objetivo correto é outro: em cada instante `t0`, usando apenas o histórico d
 
 Coleta e primeiro treino não precisam escolher um `exit_target` único. O primeiro trainer pode operar em modo **EstimatorOnly**: estimar, por `floor` e horizonte, `P_hit`, `T`, `P_censor`, quantis e `IC`, sem declarar uma utility final.
 
-Quando o contrato público ou a UI exigir um `TradeSetup` primário único, a escolha de `exit_target` deve ser feita por uma `ExitTargetPolicy` versionada, conforme a skill canônica. A policy escolhe entre candidatos já estimados usando fronteira de Pareto e função de utilidade bruta declarada sobre lucro bruto, probabilidade, tempo, censura e incerteza.
+Quando o contrato público ou a UI exigir um setup primário único, a escolha de `exit_target` deve ser feita por uma `ExitTargetPolicy` versionada, conforme a skill canônica. A policy escolhe entre candidatos já estimados usando fronteira de Pareto e função de utilidade bruta declarada sobre lucro bruto, probabilidade, tempo, censura e incerteza.
 
 Essa escolha é decisão operacional auditável, não label novo e não verdade universal da rota. O dataset deve permitir treinar e auditar múltiplos floors/horizontes; a policy decide qual setup apresentar como primário (`conservador`, `balanceado` ou `agressivo`, quando aplicável). Trocar a policy muda a recomendação, não a identidade matemática da estratégia nem os labels históricos.
 
@@ -96,48 +98,13 @@ Se minutos depois surgir uma entrada ainda melhor, isso caracteriza uma **nova o
 
 Abstenção continua sendo resposta válida e obrigatória quando não houver oportunidade suficientemente forte, evidência suficiente ou confiança suficiente. O modelo não deve forçar recomendação em todo snapshot; deve recomendar apenas quando a oportunidade atual, comparada ao histórico point-in-time da rota, justificar convicção operacional.
 
-### Output esperado para o operador humano
+### Output público
 
-O output é estruturado em dois níveis de leitura: linha de scanning (decisão go/no-go em <1s) e painel de detalhe (deep-read sob demanda).
+O output público, incluindo payload de replay, UI/serving, nomes de campos, badges, abstenções, validade, curva de candidatos, `ExitTargetPolicy`, metadados de modelo/calibração, dedupe/cooldown e semântica de probabilidade/tempo/incerteza, é definido exclusivamente em:
 
-Contrato operacional atual: `docs/ml/07_decision_policy/trade_recommendation_output_contract_v2_3.json`. Este arquivo é a especificação de payload para replay, UI/serving e auditoria; esta seção mantém apenas o norte conceitual.
+`docs/ml/07_decision_policy/trade_recommendation_output_contract_v2_3.json`
 
-Princípios de representação:
-
-- `enter` é ponto único: valor cotado de `S_entrada(t0)` no instante da recomendação (preço observado top-of-book, não estimativa).
-- `exit` público é `exit_target_pct`: um threshold probabilístico selecionado por `ExitTargetPolicy`, não ponto ótimo absoluto, não ordem exata e não oracle. Evidências de distribuição/quantis devem aparecer em `candidate_curve`, `exit_context_t0`, `t_hit` e logs de curva completa.
-- `T` é distribuição com `P_censura` explícito: censura é primeira ordem (skill §6: rota pode sumir antes do horizonte); omiti-la distorce o risco de recomendação.
-- `lucro_bruto` alvo/threshold é derivado de `enter + exit_target`; estimativa central só deve aparecer quando houver modelo próprio, em campo separado como `gross_central_pct`.
-- `IC` precisa declarar método, cobertura, escopo de calibração e cutoff temporal. Métodos conformal/distribution-free, IPCW/bootstrap ou equivalente são aceitáveis se a cobertura empírica for auditada; Wald ingênuo não é aceitável.
-- Nenhuma prosa qualitativa deve aparecer se não for derivada deterministicamente dos números.
-
-Status categórico (badge primário do scanning):
-
-- `[ENTER]` — recomendação ativa: `P` acima do piso, lucro bruto acima do floor econômico e `IC` suficientemente apertado.
-- `[CAUTION]` — emite números, mas com convicção reduzida (`P` borderline ou `T` longo).
-- `[FLOOR]` — emite números, mas lucro bruto abaixo do floor econômico típico.
-- `[LOW_CONFIDENCE]` — `IC` largo demais; números de execução suprimidos; só metadata.
-- `[NO_OPPORTUNITY]` / `[INSUFFICIENT_DATA]` — abstenção tipada.
-
-Linha de scanning (~80 caracteres, badge + 5 campos primários):
-
-`[ENTER]    BP       mexc:FUT->bingx:FUT   enter@2.00%  exit>=-1.00%  L=1.00%  P=83%  T~28m`
-
-`[CAUTION]  IQ       bingx:FUT->xt:FUT     enter@2.00%  exit>=+1.00%  L=3.00%  P=41%  T~2h15`
-
-`[FLOOR]    GRIFFAIN gate:SPOT->bingx:FUT  enter@0.50%  exit>=-0.30%  L=0.20%  P=72%  T~6m`
-
-Convenções:
-
-- `enter@X%` = `S_entrada(t0)` cotado em `t0`; não é instrução de limit order.
-- `exit>=Y%` = threshold a partir do qual `S_saída(t1)` é favorável; é alvo probabilístico, não ordem exata.
-- `L = enter + exit_target`, sempre em termos de lucro bruto cotado alvo/threshold.
-- `T~` = mediana condicional do tempo até o threshold.
-- O payload canônico usa `FUTURES_PERP`; a UI pode abreviar para `FUT` apenas como apresentação.
-
-Painel de detalhe (expandido sob demanda) expõe os quantis de `exit` e `T`, `P_censura`, `IC` com método declarado e os Testes 1/2 da skill §4 derivados deterministicamente dos números.
-
-Esse é o produto final que o operador deve receber: não apenas "há spread", mas uma leitura estruturada da oportunidade atual que substitua a consulta manual ao histórico, com rigor estatístico que respeita a multiplicidade de pares legítimos `(t0, t1)` da skill §3.3/§3.4.
+Este `CLAUDE.md` não deve duplicar exemplos de payload, linha de UI, lista de badges ou convenções de campo. Ele mantém apenas o norte conceitual: o operador deve receber uma leitura estruturada da oportunidade atual que substitua a consulta manual ao histórico, com rigor estatístico e sem oracle de hindsight. Qualquer mudança no output público deve ser feita primeiro no contrato v2.3 ou em versão posterior do contrato, e só depois refletida aqui como referência.
 
 ### O que o modelo deve aprender, e o que ele não deve aprender
 
@@ -145,7 +112,7 @@ O modelo deve aprender a responder, para a rota atual:
 
 1. se o `entrySpread(t0)` atual está forte ou fraco em relação ao histórico recente da própria rota;
 2. se a dinâmica histórica da rota e o estado atual tornam defensável uma saída-alvo suficientemente favorável;
-3. qual combinação `{enter, exit}` produz uma recomendação economicamente interessante em termos de **lucro bruto cotado**;
+3. qual combinação de entrada cotada e saída-alvo produz uma recomendação economicamente interessante em termos de **lucro bruto cotado**;
 4. com qual probabilidade e em qual horizonte essa recomendação tende a se realizar;
 5. quando deve **abster-se** por falta de oportunidade, evidência ou confiança.
 
@@ -169,7 +136,7 @@ O modelo orbita em torno desse output — **é o objetivo máximo, tudo deve gir
 
 - **Precision-first**: falso positivo é catastrófico (operador abre e fica preso). Recall baixo é aceitável — melhor perder 70% das oportunidades e ter 95% de precisão nos 30% emitidos do que o contrário.
 - **Calibração rigorosa**: se o modelo diz 80% de probabilidade, ~80% dos trades precisam realizar-se empiricamente (ECE baixa, reliability diagram calibrado).
-- **Abstenção é resposta válida**: sem confiança suficiente, não emitir nada — melhor silêncio do que ruído. Distinguir três tipos: `NO_OPPORTUNITY`, `INSUFFICIENT_DATA`, `LOW_CONFIDENCE`.
+- **Abstenção é resposta válida**: sem confiança suficiente, não emitir nada — melhor silêncio do que ruído. Tipos públicos de abstenção pertencem ao contrato v2.3.
 - **Honestidade sobre lucro bruto**: o modelo não pode viciar em micro-spreads do tipo `enter 0.3%, exit −0.2%, lucro 0.1%` com P=95%. Floor econômico obrigatório no design da função de utilidade, mas sempre como filtro/penalização sobre **lucro bruto cotado**. Não transformar isso em cálculo de PnL líquido.
 
 Detalhamento das 12 armadilhas críticas (T1–T12) em `plans/ml_stack_research_prompt.md` §3.5 e `docs/ml/02_traps/`.
@@ -237,4 +204,4 @@ Identidade estrutural: `S_entrada(t) + S_saída(t) = −(bid_ask_A + bid_ask_B) 
 
 ## Critério de sucesso
 
-Quando o operador olhar uma recomendação `{enter, exit, lucro_bruto, P, T, IC}` do modelo e conseguir executar com convicção **sem precisar consultar o histórico manualmente**, o sistema venceu. Se o modelo também souber **abster-se corretamente** quando não houver evidência suficiente, melhor ainda. Esse é o norte. Todo o resto é meio.
+Quando o operador olhar uma recomendação emitida conforme o contrato público v2.3 e conseguir executar com convicção **sem precisar consultar o histórico manualmente**, o sistema venceu. Se o modelo também souber **abster-se corretamente** quando não houver evidência suficiente, melhor ainda. Esse é o norte. Todo o resto é meio.
