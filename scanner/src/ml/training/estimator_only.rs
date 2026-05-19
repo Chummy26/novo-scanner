@@ -19,7 +19,7 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
 const NS_PER_S: u64 = 1_000_000_000;
-const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.1.3";
+const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.2.0";
 const MODEL_FAMILY: &str = "forward_labeled_ecdf";
 const OUTPUT_CONTRACT_VERSION: &str = "trade_recommendation/v2.3";
 const CI_METHOD: &str = "temporal_block_bootstrap_km_percentile_95";
@@ -27,9 +27,11 @@ const FALLBACK_CI_METHOD: &str = "kaplan_meier_loglog_greenwood_95";
 const PROMOTION_INTERVAL_REQUIREMENT: &str = "block_bootstrap_or_conformal_interval";
 const STATE_BUCKET_VERSION: &str = "pit_state_bucket/v2";
 const PREDICTION_METHOD: &str = "route_serving_monotone_km_shrunk_to_global_pit_state_km";
-const CALIBRATOR_VERSION: &str = "isotonic_complete_case_temporal/v0.1.0";
-const CALIBRATOR_METHOD: &str = "isotonic_pava_complete_case_temporal";
+const CALIBRATOR_VERSION: &str = "isotonic_ipcw_temporal/v0.2.0";
+const CALIBRATOR_METHOD: &str = "ipcw_weighted_isotonic_pava_temporal";
 const SERVING_CALIBRATOR_METHOD: &str = "scope_pooled_isotonic_with_cell_readiness_gate/v0.1.0";
+const IPCW_CENSORING_METHOD: &str = "kaplan_meier_censoring_ipcw_by_scope_horizon_floor/v0.1.0";
+const IPCW_MIN_SURVIVAL: f64 = 1e-6;
 const MONOTONICITY_PROJECTION_METHOD: &str =
     "weighted_coordinate_isotonic_pava_horizon_floor/v0.1.0";
 const SERVING_PROBABILITY_PROJECTION_METHOD: &str =
@@ -366,6 +368,208 @@ struct FloorOutcome {
     duration_s: u32,
 }
 
+#[derive(Debug, Default, Clone)]
+struct CensoringAccumulator {
+    n_predicted: u64,
+    n_censored_before_horizon: u64,
+    censor_events: BTreeMap<u32, u64>,
+    terminal_events: BTreeMap<u32, u64>,
+}
+
+impl CensoringAccumulator {
+    fn observe(&mut self, outcome: FloorOutcome, horizon_s: u32) {
+        self.n_predicted = self.n_predicted.saturating_add(1);
+        match outcome.outcome {
+            FloorOutcomeKind::Censored if outcome.duration_s < horizon_s => {
+                self.n_censored_before_horizon = self.n_censored_before_horizon.saturating_add(1);
+                *self.censor_events.entry(outcome.duration_s).or_insert(0) += 1;
+            }
+            FloorOutcomeKind::Realized => {
+                *self.terminal_events.entry(outcome.duration_s).or_insert(0) += 1;
+            }
+            FloorOutcomeKind::Miss | FloorOutcomeKind::Censored => {
+                *self.terminal_events.entry(horizon_s).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CensoringModel {
+    method: String,
+    prediction_scope: String,
+    horizon_s: u32,
+    floor_bp: i32,
+    status: String,
+    n_predicted: u64,
+    n_censored_before_horizon: u64,
+    survival_at_horizon: f64,
+    min_survival: f64,
+    #[serde(skip)]
+    survival_before_time: BTreeMap<u32, f64>,
+    #[serde(skip)]
+    survival_after_time: BTreeMap<u32, f64>,
+}
+
+impl CensoringModel {
+    fn fit(key: &CalibrationCellKey, acc: CensoringAccumulator) -> Self {
+        let mut times = BTreeMap::<u32, (u64, u64)>::new();
+        for (&duration_s, &count) in &acc.censor_events {
+            times.entry(duration_s).or_default().0 = count;
+        }
+        for (&duration_s, &count) in &acc.terminal_events {
+            times.entry(duration_s).or_default().1 = count;
+        }
+
+        let mut survival_before_time = BTreeMap::new();
+        let mut survival_after_time = BTreeMap::new();
+        let mut at_risk = acc.n_predicted as f64;
+        let mut survival = 1.0f64;
+        let mut min_survival = 1.0f64;
+        for (duration_s, (censors, terminals)) in times {
+            survival_before_time.insert(duration_s, survival);
+            if at_risk > 0.0 && censors > 0 {
+                let c = censors as f64;
+                survival = if c < at_risk {
+                    survival * (1.0 - c / at_risk)
+                } else {
+                    0.0
+                };
+                min_survival = min_survival.min(survival);
+            }
+            survival_after_time.insert(duration_s, survival);
+            at_risk = (at_risk - censors as f64 - terminals as f64).max(0.0);
+        }
+
+        let survival_at_horizon = survival_after_time
+            .range(..=key.horizon_s)
+            .next_back()
+            .map(|(_, survival)| *survival)
+            .unwrap_or(1.0);
+        let status = if acc.n_predicted > 0
+            && survival_at_horizon.is_finite()
+            && survival_at_horizon >= IPCW_MIN_SURVIVAL
+        {
+            "ok"
+        } else {
+            "unstable_or_empty_censoring_model"
+        }
+        .to_string();
+
+        Self {
+            method: IPCW_CENSORING_METHOD.to_string(),
+            prediction_scope: key.prediction_scope.clone(),
+            horizon_s: key.horizon_s,
+            floor_bp: key.floor_bp,
+            status,
+            n_predicted: acc.n_predicted,
+            n_censored_before_horizon: acc.n_censored_before_horizon,
+            survival_at_horizon,
+            min_survival,
+            survival_before_time,
+            survival_after_time,
+        }
+    }
+
+    fn survival_before(&self, duration_s: u32) -> f64 {
+        self.survival_before_time
+            .get(&duration_s)
+            .copied()
+            .or_else(|| {
+                self.survival_after_time
+                    .range(..duration_s)
+                    .next_back()
+                    .map(|(_, survival)| *survival)
+            })
+            .unwrap_or(1.0)
+    }
+
+    fn survival_at(&self, duration_s: u32) -> f64 {
+        self.survival_after_time
+            .range(..=duration_s)
+            .next_back()
+            .map(|(_, survival)| *survival)
+            .unwrap_or(1.0)
+    }
+
+    fn ipcw_weight(&self, outcome: FloorOutcome, horizon_s: u32) -> Option<f64> {
+        if self.status != "ok" {
+            return None;
+        }
+        match outcome.outcome {
+            FloorOutcomeKind::Realized => {
+                stable_ipcw_weight(self.survival_before(outcome.duration_s))
+            }
+            FloorOutcomeKind::Miss => stable_ipcw_weight(self.survival_at(horizon_s)),
+            FloorOutcomeKind::Censored => Some(0.0),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+struct CensoringModelSuite {
+    method: String,
+    min_survival: f64,
+    models_total: u64,
+    models_ready: u64,
+    models_not_ready: u64,
+    models_not_ready_examples: Vec<String>,
+    models: BTreeMap<String, CensoringModel>,
+}
+
+impl CensoringModelSuite {
+    fn fit(accumulators: BTreeMap<CalibrationCellKey, CensoringAccumulator>) -> Self {
+        let models = accumulators
+            .into_iter()
+            .map(|(key, acc)| {
+                let artifact_key = key.as_artifact_key();
+                (artifact_key, CensoringModel::fit(&key, acc))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let models_total = models.len() as u64;
+        let models_ready = models.values().filter(|model| model.status == "ok").count() as u64;
+        let models_not_ready = models_total.saturating_sub(models_ready);
+        let models_not_ready_examples = models
+            .values()
+            .filter(|model| model.status != "ok")
+            .take(20)
+            .map(|model| {
+                format!(
+                    "{} h={} floor_bp={} n_predicted={} survival_at_horizon={}",
+                    model.prediction_scope,
+                    model.horizon_s,
+                    model.floor_bp,
+                    model.n_predicted,
+                    model.survival_at_horizon
+                )
+            })
+            .collect();
+        Self {
+            method: IPCW_CENSORING_METHOD.to_string(),
+            min_survival: IPCW_MIN_SURVIVAL,
+            models_total,
+            models_ready,
+            models_not_ready,
+            models_not_ready_examples,
+            models,
+        }
+    }
+
+    fn weight_for(&self, key: &CalibrationCellKey, outcome: FloorOutcome) -> Option<f64> {
+        self.models
+            .get(&key.as_artifact_key())
+            .and_then(|model| model.ipcw_weight(outcome, key.horizon_s))
+    }
+}
+
+fn stable_ipcw_weight(survival: f64) -> Option<f64> {
+    if survival.is_finite() && survival >= IPCW_MIN_SURVIVAL {
+        Some(1.0 / survival)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SupervisedDedupeRowKey {
     digest: u128,
@@ -382,6 +586,12 @@ enum DedupeDecision {
     Unique,
     DuplicateExact,
     DuplicateConflict,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CensoringPredictionMode {
+    RawCalibration,
+    ServingScore,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -429,7 +639,9 @@ impl DedupeAudit {
 struct DedupeReport {
     training_aggregation: DedupeAudit,
     bootstrap_interval: DedupeAudit,
+    calibration_censoring_fit: DedupeAudit,
     calibration_fit: DedupeAudit,
+    scoring_censoring_fit: DedupeAudit,
     scoring_scorecard: DedupeAudit,
 }
 
@@ -654,7 +866,18 @@ impl CalibrationFitAccumulator {
             let out = self.buckets.entry(key).or_default();
             out.n = out.n.saturating_add(bucket.n);
             out.hits = out.hits.saturating_add(bucket.hits);
+            out.weight_sum += bucket.weight_sum;
+            out.weighted_hits += bucket.weighted_hits;
+            out.weight_sq_sum += bucket.weight_sq_sum;
         }
+    }
+
+    fn effective_n(&self) -> f64 {
+        effective_n_from_weights(
+            self.buckets
+                .values()
+                .map(|bucket| (bucket.weight_sum, bucket.weight_sq_sum)),
+        )
     }
 }
 
@@ -686,6 +909,22 @@ impl CalibrationCellKey {
 struct CalibrationBucket {
     n: u64,
     hits: u64,
+    weight_sum: f64,
+    weighted_hits: f64,
+    weight_sq_sum: f64,
+}
+
+impl CalibrationBucket {
+    #[cfg(test)]
+    fn from_unweighted_counts(n: u64, hits: u64) -> Self {
+        Self {
+            n,
+            hits,
+            weight_sum: n as f64,
+            weighted_hits: hits as f64,
+            weight_sq_sum: n as f64,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -694,6 +933,9 @@ struct IsotonicBlock {
     upper_key: u64,
     n: u64,
     hits: u64,
+    weight_sum: f64,
+    weighted_hits: f64,
+    weight_sq_sum: f64,
     calibrated_p: f64,
 }
 
@@ -705,6 +947,7 @@ struct CalibrationSuite {
     min_complete: u64,
     diagnostic_only: bool,
     censoring_treatment: String,
+    censoring_models: CensoringModelSuite,
     cells_total: u64,
     cells_ready: u64,
     cells_not_ready: u64,
@@ -722,6 +965,8 @@ struct ScopeCalibrationModel {
     n_abstained: u64,
     n_complete: u64,
     n_censored: u64,
+    ipcw_weight_sum: f64,
+    ipcw_effective_n: f64,
     unique_raw_scores: u64,
     knots: Vec<CalibrationKnot>,
     raw_quality: CalibrationQuality,
@@ -741,6 +986,8 @@ struct CalibrationModel {
     n_abstained: u64,
     n_complete: u64,
     n_censored: u64,
+    ipcw_weight_sum: f64,
+    ipcw_effective_n: f64,
     unique_raw_scores: u64,
     knots: Vec<CalibrationKnot>,
     raw_quality: CalibrationQuality,
@@ -754,11 +1001,15 @@ struct CalibrationKnot {
     calibrated_p: f64,
     n_complete: u64,
     hits: u64,
+    weight_sum: f64,
+    effective_n: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 struct CalibrationQuality {
     n_complete: u64,
+    weight_sum: f64,
+    effective_n: f64,
     brier: Option<f64>,
     ece_10bin: Option<f64>,
     bins: Vec<ScoreBin>,
@@ -768,6 +1019,25 @@ struct CalibrationQuality {
 struct CalibrationApplication {
     probability: f64,
     applied: bool,
+}
+
+fn effective_n_from_weights<I>(weights: I) -> f64
+where
+    I: IntoIterator<Item = (f64, f64)>,
+{
+    let mut weight_sum = 0.0;
+    let mut weight_sq_sum = 0.0;
+    for (sum, sq_sum) in weights {
+        if sum.is_finite() && sq_sum.is_finite() && sum > 0.0 && sq_sum > 0.0 {
+            weight_sum += sum;
+            weight_sq_sum += sq_sum;
+        }
+    }
+    if weight_sq_sum > 0.0 {
+        weight_sum * weight_sum / weight_sq_sum
+    } else {
+        0.0
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -958,6 +1228,7 @@ struct ScoreStats {
     prediction_method: String,
     state_bucket_version: String,
     probability_kind: String,
+    censoring_method: String,
     calibrator_version: Option<String>,
     calibration_status: Option<String>,
     calibration_n_complete: Option<u64>,
@@ -967,10 +1238,15 @@ struct ScoreStats {
     shrinkage_k: f64,
     n_rows: u64,
     n_complete: u64,
+    n_censored: u64,
     n_predicted: u64,
     n_abstained: u64,
     n_above_threshold_complete: u64,
     hits_above_threshold: u64,
+    ipcw_weight_sum: f64,
+    ipcw_effective_n: f64,
+    ipcw_weight_above_threshold: f64,
+    ipcw_weighted_hits_above_threshold: f64,
     brier: Option<f64>,
     ece_10bin: Option<f64>,
     precision_at_threshold: Option<f64>,
@@ -1101,6 +1377,8 @@ struct ScoreBin {
     bin_lower: f64,
     bin_upper: f64,
     n: u64,
+    weight_sum: f64,
+    effective_n: f64,
     mean_predicted: Option<f64>,
     empirical_hit_rate: Option<f64>,
 }
@@ -1109,12 +1387,15 @@ struct ScoreBin {
 struct ScoreAccumulator {
     stats: ScoreStats,
     brier_sum: f64,
+    weight_sq_sum: f64,
     bins: [BinAccumulator; 10],
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 struct BinAccumulator {
     n: u64,
+    weight_sum: f64,
+    weight_sq_sum: f64,
     pred_sum: f64,
     hit_sum: f64,
 }
@@ -1139,6 +1420,7 @@ impl ScoreAccumulator {
                 prediction_method: PREDICTION_METHOD.to_string(),
                 state_bucket_version: STATE_BUCKET_VERSION.to_string(),
                 probability_kind,
+                censoring_method: IPCW_CENSORING_METHOD.to_string(),
                 calibrator_version: Some(CALIBRATOR_VERSION.to_string()),
                 calibration_status: Some(calibration_status),
                 calibration_n_complete: Some(calibration_n_complete),
@@ -1150,7 +1432,12 @@ impl ScoreAccumulator {
         }
     }
 
-    fn observe(&mut self, prediction: Option<CalibrationApplication>, outcome: FloorOutcomeKind) {
+    fn observe(
+        &mut self,
+        prediction: Option<CalibrationApplication>,
+        outcome: FloorOutcomeKind,
+        ipcw_weight: Option<f64>,
+    ) {
         self.stats.n_rows = self.stats.n_rows.saturating_add(1);
         let Some(prediction) = prediction else {
             self.stats.n_abstained = self.stats.n_abstained.saturating_add(1);
@@ -1164,24 +1451,35 @@ impl ScoreAccumulator {
         }
         self.stats.n_predicted = self.stats.n_predicted.saturating_add(1);
         if outcome == FloorOutcomeKind::Censored {
+            self.stats.n_censored = self.stats.n_censored.saturating_add(1);
             return;
         }
 
         self.stats.n_complete = self.stats.n_complete.saturating_add(1);
+        let weight = ipcw_weight.unwrap_or(0.0);
+        if weight <= 0.0 || !weight.is_finite() {
+            return;
+        }
+        self.stats.ipcw_weight_sum += weight;
+        self.weight_sq_sum += weight * weight;
         let y = if outcome == FloorOutcomeKind::Realized {
             1.0
         } else {
             0.0
         };
         let err = p - y;
-        self.brier_sum += err * err;
+        self.brier_sum += weight * err * err;
         let bin = ((p * 10.0).floor() as usize).min(9);
         self.bins[bin].n = self.bins[bin].n.saturating_add(1);
-        self.bins[bin].pred_sum += p;
-        self.bins[bin].hit_sum += y;
+        self.bins[bin].weight_sum += weight;
+        self.bins[bin].weight_sq_sum += weight * weight;
+        self.bins[bin].pred_sum += weight * p;
+        self.bins[bin].hit_sum += weight * y;
         if p >= self.stats.decision_threshold {
             self.stats.n_above_threshold_complete =
                 self.stats.n_above_threshold_complete.saturating_add(1);
+            self.stats.ipcw_weight_above_threshold += weight;
+            self.stats.ipcw_weighted_hits_above_threshold += weight * y;
             if outcome == FloorOutcomeKind::Realized {
                 self.stats.hits_above_threshold = self.stats.hits_above_threshold.saturating_add(1);
             }
@@ -1189,13 +1487,15 @@ impl ScoreAccumulator {
     }
 
     fn finalize(mut self) -> ScoreStats {
-        if self.stats.n_complete > 0 {
-            self.stats.brier = Some(self.brier_sum / self.stats.n_complete as f64);
+        if self.stats.ipcw_weight_sum > 0.0 {
+            self.stats.brier = Some(self.brier_sum / self.stats.ipcw_weight_sum);
+            self.stats.ipcw_effective_n = self.stats.ipcw_weight_sum * self.stats.ipcw_weight_sum
+                / self.weight_sq_sum.max(f64::MIN_POSITIVE);
         }
-        if self.stats.n_above_threshold_complete > 0 {
+        if self.stats.ipcw_weight_above_threshold > 0.0 {
             self.stats.precision_at_threshold = Some(
-                self.stats.hits_above_threshold as f64
-                    / self.stats.n_above_threshold_complete as f64,
+                self.stats.ipcw_weighted_hits_above_threshold
+                    / self.stats.ipcw_weight_above_threshold,
             );
         }
 
@@ -1203,10 +1503,12 @@ impl ScoreAccumulator {
         let mut bins = Vec::with_capacity(10);
         for idx in 0..10 {
             let acc = self.bins[idx];
-            let (mean_predicted, empirical_hit_rate) = if acc.n > 0 {
-                let mean = acc.pred_sum / acc.n as f64;
-                let hit = acc.hit_sum / acc.n as f64;
-                ece += (acc.n as f64 / self.stats.n_complete.max(1) as f64) * (mean - hit).abs();
+            let effective_n = effective_n_from_weights([(acc.weight_sum, acc.weight_sq_sum)]);
+            let (mean_predicted, empirical_hit_rate) = if acc.weight_sum > 0.0 {
+                let mean = acc.pred_sum / acc.weight_sum;
+                let hit = acc.hit_sum / acc.weight_sum;
+                ece += (acc.weight_sum / self.stats.ipcw_weight_sum.max(f64::MIN_POSITIVE))
+                    * (mean - hit).abs();
                 (Some(mean), Some(hit))
             } else {
                 (None, None)
@@ -1215,11 +1517,13 @@ impl ScoreAccumulator {
                 bin_lower: idx as f64 / 10.0,
                 bin_upper: (idx + 1) as f64 / 10.0,
                 n: acc.n,
+                weight_sum: acc.weight_sum,
+                effective_n,
                 mean_predicted,
                 empirical_hit_rate,
             });
         }
-        if self.stats.n_complete > 0 {
+        if self.stats.ipcw_weight_sum > 0.0 {
             self.stats.ece_10bin = Some(ece);
         }
         self.stats.bins = bins;
@@ -1228,7 +1532,12 @@ impl ScoreAccumulator {
 }
 
 impl CalibrationFitAccumulator {
-    fn observe(&mut self, prediction: Option<f64>, outcome: FloorOutcomeKind) {
+    fn observe(
+        &mut self,
+        prediction: Option<f64>,
+        outcome: FloorOutcomeKind,
+        ipcw_weight: Option<f64>,
+    ) {
         self.n_rows = self.n_rows.saturating_add(1);
         let Some(p) = prediction else {
             self.n_abstained = self.n_abstained.saturating_add(1);
@@ -1240,11 +1549,18 @@ impl CalibrationFitAccumulator {
             return;
         }
         self.n_complete = self.n_complete.saturating_add(1);
+        let weight = ipcw_weight.unwrap_or(0.0);
+        if weight <= 0.0 || !weight.is_finite() {
+            return;
+        }
         let key = probability_key(p);
         let bucket = self.buckets.entry(key).or_default();
         bucket.n = bucket.n.saturating_add(1);
+        bucket.weight_sum += weight;
+        bucket.weight_sq_sum += weight * weight;
         if outcome == FloorOutcomeKind::Realized {
             bucket.hits = bucket.hits.saturating_add(1);
+            bucket.weighted_hits += weight;
         }
     }
 }
@@ -1253,6 +1569,7 @@ impl CalibrationSuite {
     fn from_accumulators(
         scopes: &[PredictionScope],
         mut accumulators: BTreeMap<CalibrationCellKey, CalibrationFitAccumulator>,
+        censoring_models: CensoringModelSuite,
         min_complete: u64,
     ) -> Self {
         for scope in scopes {
@@ -1310,7 +1627,9 @@ impl CalibrationSuite {
             min_complete,
             diagnostic_only,
             censoring_treatment:
-                "complete_case_for_calibration_only; censored_rows_excluded_from_fit".to_string(),
+                "ipcw_kaplan_meier_by_scope_horizon_floor; censored_before_horizon_weight_zero"
+                    .to_string(),
+            censoring_models,
             cells_total,
             cells_ready,
             cells_not_ready,
@@ -1381,9 +1700,13 @@ impl ScopeCalibrationModel {
                 calibrated_p: block.calibrated_p,
                 n_complete: block.n,
                 hits: block.hits,
+                weight_sum: block.weight_sum,
+                effective_n: effective_n_from_weights([(block.weight_sum, block.weight_sq_sum)]),
             })
             .collect::<Vec<_>>();
-        let status = if acc.n_complete >= min_complete && !knots.is_empty() {
+        let ipcw_effective_n = acc.effective_n();
+        let ipcw_weight_sum = acc.buckets.values().map(|bucket| bucket.weight_sum).sum();
+        let status = if ipcw_effective_n >= min_complete as f64 && !knots.is_empty() {
             "ok"
         } else {
             "insufficient_calibration_support"
@@ -1398,6 +1721,8 @@ impl ScopeCalibrationModel {
             n_abstained: acc.n_abstained,
             n_complete: acc.n_complete,
             n_censored: acc.n_censored,
+            ipcw_weight_sum,
+            ipcw_effective_n,
             unique_raw_scores: acc.buckets.len() as u64,
             knots,
             raw_quality,
@@ -1431,9 +1756,13 @@ impl CalibrationModel {
                 calibrated_p: block.calibrated_p,
                 n_complete: block.n,
                 hits: block.hits,
+                weight_sum: block.weight_sum,
+                effective_n: effective_n_from_weights([(block.weight_sum, block.weight_sq_sum)]),
             })
             .collect::<Vec<_>>();
-        let status = if acc.n_complete >= min_complete && !knots.is_empty() {
+        let ipcw_effective_n = acc.effective_n();
+        let ipcw_weight_sum = acc.buckets.values().map(|bucket| bucket.weight_sum).sum();
+        let status = if ipcw_effective_n >= min_complete as f64 && !knots.is_empty() {
             "ok"
         } else {
             "insufficient_calibration_support"
@@ -1452,6 +1781,8 @@ impl CalibrationModel {
             n_abstained: acc.n_abstained,
             n_complete: acc.n_complete,
             n_censored: acc.n_censored,
+            ipcw_weight_sum,
+            ipcw_effective_n,
             unique_raw_scores: acc.buckets.len() as u64,
             knots,
             raw_quality,
@@ -1497,6 +1828,7 @@ struct TrainerManifest {
     aggregate_build_stats: AggregateBuildStats,
     bootstrap_interval_audit: BootstrapIntervalAudit,
     calibration: CalibrationSuite,
+    scoring_censoring: CensoringModelSuite,
     dedupe_audit: DedupeReport,
     monotonicity_projection: MonotonicityProjectionAudit,
     monotonicity_audit: MonotonicityAudit,
@@ -1690,6 +2022,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let bootstrap_dedupe_audit = bootstrap_dedupe.into_audit();
     let monotonicity_projection = apply_monotonicity_projection(&mut estimator_rows);
     let raw_index = build_prediction_index(&estimator_rows);
+    let mut calibration_censoring_dedupe = DedupeTracker::new("calibration_censoring_fit");
     let mut calibration_dedupe = DedupeTracker::new("calibration_fit");
     let calibration_suite = process_calibration_pass(
         &manifests,
@@ -1697,27 +2030,34 @@ pub fn run(cli: Cli) -> Result<()> {
         &cli,
         &raw_index,
         &mut calibration_dedupe,
+        &mut calibration_censoring_dedupe,
     )?;
+    let calibration_censoring_dedupe_audit = calibration_censoring_dedupe.into_audit();
     let calibration_dedupe_audit = calibration_dedupe.into_audit();
     let serving_probability_projection =
         apply_serving_probability_projection(&mut estimator_rows, &calibration_suite);
     let serving_index = build_prediction_index(&estimator_rows);
+    let mut scoring_censoring_dedupe = DedupeTracker::new("scoring_censoring_fit");
     let mut scoring_dedupe = DedupeTracker::new("scoring_scorecard");
-    let scorecards = process_scoring_pass(
+    let (scorecards, scoring_censoring_suite) = process_scoring_pass(
         &manifests,
         &split,
         &cli,
         &serving_index,
         &calibration_suite,
         &mut scoring_dedupe,
+        &mut scoring_censoring_dedupe,
     )?;
+    let scoring_censoring_dedupe_audit = scoring_censoring_dedupe.into_audit();
     let scoring_dedupe_audit = scoring_dedupe.into_audit();
     let exit_policy_replay =
         process_exit_policy_replay(&manifests, &split, &cli, &serving_index, &calibration_suite)?;
     let dedupe_report = DedupeReport {
         training_aggregation: training_dedupe_audit,
         bootstrap_interval: bootstrap_dedupe_audit,
+        calibration_censoring_fit: calibration_censoring_dedupe_audit,
         calibration_fit: calibration_dedupe_audit,
+        scoring_censoring_fit: scoring_censoring_dedupe_audit,
         scoring_scorecard: scoring_dedupe_audit,
     };
 
@@ -1730,6 +2070,7 @@ pub fn run(cli: Cli) -> Result<()> {
         &bootstrap_interval_audit,
         &public_interval_audit,
         &calibration_suite,
+        &scoring_censoring_suite,
         &scorecards,
         &monotonicity_audit,
         &serving_probability_projection,
@@ -1750,6 +2091,8 @@ pub fn run(cli: Cli) -> Result<()> {
     let exit_policy_replay_artifact = write_json(&exit_policy_replay_path, &exit_policy_replay)?;
     let calibration_path = out_dir.join("calibration_model.json");
     let calibration_artifact = write_json(&calibration_path, &calibration_suite)?;
+    let scoring_censoring_path = out_dir.join("scoring_censoring_model.json");
+    let scoring_censoring_artifact = write_json(&scoring_censoring_path, &scoring_censoring_suite)?;
     let dedupe_path = out_dir.join("duplicate_audit.json");
     let dedupe_artifact = write_json(&dedupe_path, &dedupe_report)?;
     let bootstrap_interval_path = out_dir.join("bootstrap_interval_audit.json");
@@ -1788,6 +2131,10 @@ pub fn run(cli: Cli) -> Result<()> {
         exit_policy_replay_artifact,
     );
     artifacts.insert("calibration_model".to_string(), calibration_artifact);
+    artifacts.insert(
+        "scoring_censoring_model".to_string(),
+        scoring_censoring_artifact,
+    );
     artifacts.insert("duplicate_audit".to_string(), dedupe_artifact);
     artifacts.insert(
         "bootstrap_interval_audit".to_string(),
@@ -1838,6 +2185,7 @@ pub fn run(cli: Cli) -> Result<()> {
         aggregate_build_stats,
         bootstrap_interval_audit,
         calibration: calibration_suite,
+        scoring_censoring: scoring_censoring_suite,
         dedupe_audit: dedupe_report,
         monotonicity_projection,
         monotonicity_audit,
@@ -3208,9 +3556,21 @@ fn process_calibration_pass(
     cli: &Cli,
     index: &HashMap<AggregationKey, EstimatorRow>,
     dedupe: &mut DedupeTracker,
+    censoring_dedupe: &mut DedupeTracker,
 ) -> Result<CalibrationSuite> {
     let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
     let scopes = score_scopes(cli.prediction_scope);
+    let censoring_models = process_censoring_model_pass(
+        manifests,
+        split,
+        cli,
+        index,
+        None,
+        SplitName::Calibration,
+        CensoringPredictionMode::RawCalibration,
+        &scopes,
+        censoring_dedupe,
+    )?;
     let mut accumulators = BTreeMap::<CalibrationCellKey, CalibrationFitAccumulator>::new();
     for rec in manifests {
         if rows_left == 0 {
@@ -3234,6 +3594,7 @@ fn process_calibration_pass(
                 cli.shrinkage_k,
                 index,
                 &scopes,
+                &censoring_models,
                 &mut accumulators,
                 dedupe,
             )?;
@@ -3243,8 +3604,167 @@ fn process_calibration_pass(
     Ok(CalibrationSuite::from_accumulators(
         &scopes,
         accumulators,
+        censoring_models,
         MIN_CALIBRATION_COMPLETE,
     ))
+}
+
+fn seed_censoring_accumulators(
+    scopes: &[PredictionScope],
+) -> BTreeMap<CalibrationCellKey, CensoringAccumulator> {
+    let mut accumulators = BTreeMap::new();
+    for scope in scopes {
+        for &horizon_s in EXPECTED_HORIZONS_S {
+            for &floor_bp in EXPECTED_FLOOR_BP {
+                accumulators
+                    .entry(CalibrationCellKey::new(scope.as_str(), horizon_s, floor_bp))
+                    .or_default();
+            }
+        }
+    }
+    accumulators
+}
+
+fn process_censoring_model_pass(
+    manifests: &[ManifestRecord],
+    split: &TemporalSplit,
+    cli: &Cli,
+    index: &HashMap<AggregationKey, EstimatorRow>,
+    calibration_suite: Option<&CalibrationSuite>,
+    target_split: SplitName,
+    mode: CensoringPredictionMode,
+    scopes: &[PredictionScope],
+    dedupe: &mut DedupeTracker,
+) -> Result<CensoringModelSuite> {
+    let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
+    let mut accumulators = seed_censoring_accumulators(scopes);
+    for rec in manifests {
+        if rows_left == 0 {
+            break;
+        }
+        let mut reader =
+            open_storage_v2_sidecar_logical_reader(&rec.manifest, DatasetKind::LabeledTrades)
+                .with_context(|| format!("open logical V2 reader {}", rec.path.display()))?;
+        for batch in &mut reader {
+            if rows_left == 0 {
+                break;
+            }
+            let batch = batch?;
+            let view = BatchView::new(&batch)?;
+            let n = batch.num_rows().min(rows_left as usize);
+            rows_left -= n as u64;
+            process_censoring_model_batch(
+                &view,
+                n,
+                split,
+                cli.shrinkage_k,
+                index,
+                calibration_suite,
+                target_split,
+                mode,
+                scopes,
+                &mut accumulators,
+                dedupe,
+            )?;
+        }
+    }
+    Ok(CensoringModelSuite::fit(accumulators))
+}
+
+fn process_censoring_model_batch(
+    view: &BatchView<'_>,
+    n_rows: usize,
+    split: &TemporalSplit,
+    shrinkage_k: f64,
+    index: &HashMap<AggregationKey, EstimatorRow>,
+    calibration_suite: Option<&CalibrationSuite>,
+    target_split: SplitName,
+    mode: CensoringPredictionMode,
+    scopes: &[PredictionScope],
+    accumulators: &mut BTreeMap<CalibrationCellKey, CensoringAccumulator>,
+    dedupe: &mut DedupeTracker,
+) -> Result<()> {
+    for row in 0..n_rows {
+        let ts = required_u64(view.ts_emit_ns, row, "ts_emit_ns")?;
+        if split.assign(ts) != target_split {
+            continue;
+        }
+        let sample_decision = required_str(view.sample_decision, row, "sample_decision")?;
+        let route_id = required_str(view.route_id, row, "route_id")?;
+        let sample_id = required_str(view.sample_id, row, "sample_id")?;
+        let horizon_s = required_u32(view.horizon_s, row, "horizon_s")?;
+        let hits = floor_hit_range(view.label_floor_hits, row)?;
+        let floor_count = hits.len() as u64;
+        let dedupe_key = supervised_dedupe_row_key(sample_id, horizon_s);
+        let dedupe_fingerprint =
+            supervised_dedupe_row_fingerprint(view, row, hits.clone(), horizon_s)?;
+        if dedupe.observe(
+            dedupe_key,
+            dedupe_fingerprint,
+            target_split,
+            sample_id,
+            route_id,
+            floor_count,
+        ) != DedupeDecision::Unique
+        {
+            continue;
+        }
+
+        let floor_state_buckets = match mode {
+            CensoringPredictionMode::ServingScore => Some(expected_floor_state_buckets(view, row)),
+            CensoringPredictionMode::RawCalibration => None,
+        };
+        for scope in scopes {
+            if !scope.includes_sample_decision(sample_decision) {
+                continue;
+            }
+            let serving_curve = match mode {
+                CensoringPredictionMode::ServingScore => Some(predict_serving_curve(
+                    index,
+                    calibration_suite
+                        .context("serving score censoring requires calibration suite")?,
+                    *scope,
+                    route_id,
+                    floor_state_buckets.as_ref().expect("serving state buckets"),
+                    shrinkage_k,
+                )),
+                CensoringPredictionMode::RawCalibration => None,
+            };
+            for hit_idx in hits.clone() {
+                let floor_pct =
+                    required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
+                let floor_bp = floor_to_bp(floor_pct);
+                let state_bucket = state_bucket_for_floor(view, row, floor_pct);
+                let predicted = match mode {
+                    CensoringPredictionMode::RawCalibration => predict(
+                        index,
+                        *scope,
+                        route_id,
+                        &state_bucket,
+                        horizon_s,
+                        floor_bp,
+                        shrinkage_k,
+                    )
+                    .is_some(),
+                    CensoringPredictionMode::ServingScore => serving_curve
+                        .as_ref()
+                        .and_then(|curve| curve.get(&(horizon_s, floor_bp)))
+                        .and_then(|point| point.probability)
+                        .is_some(),
+                };
+                if !predicted {
+                    continue;
+                }
+                let outcome = floor_outcome(view, row, hit_idx, horizon_s)?;
+                let key = CalibrationCellKey::new(scope.as_str(), horizon_s, floor_bp);
+                accumulators
+                    .entry(key)
+                    .or_default()
+                    .observe(outcome, horizon_s);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn process_calibration_batch(
@@ -3254,6 +3774,7 @@ fn process_calibration_batch(
     shrinkage_k: f64,
     index: &HashMap<AggregationKey, EstimatorRow>,
     scopes: &[PredictionScope],
+    censoring_models: &CensoringModelSuite,
     accumulators: &mut BTreeMap<CalibrationCellKey, CalibrationFitAccumulator>,
     dedupe: &mut DedupeTracker,
 ) -> Result<()> {
@@ -3302,10 +3823,12 @@ fn process_calibration_batch(
                     shrinkage_k,
                 );
                 let key = CalibrationCellKey::new(scope.as_str(), horizon_s, floor_bp);
-                accumulators
-                    .entry(key)
-                    .or_default()
-                    .observe(prediction, outcome.outcome);
+                let ipcw_weight = censoring_models.weight_for(&key, outcome);
+                accumulators.entry(key).or_default().observe(
+                    prediction,
+                    outcome.outcome,
+                    ipcw_weight,
+                );
             }
         }
     }
@@ -3319,9 +3842,21 @@ fn process_scoring_pass(
     index: &HashMap<AggregationKey, EstimatorRow>,
     calibration_suite: &CalibrationSuite,
     dedupe: &mut DedupeTracker,
-) -> Result<BTreeMap<String, ScoreStats>> {
+    censoring_dedupe: &mut DedupeTracker,
+) -> Result<(BTreeMap<String, ScoreStats>, CensoringModelSuite)> {
     let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
     let scopes = score_scopes(cli.prediction_scope);
+    let scoring_censoring = process_censoring_model_pass(
+        manifests,
+        split,
+        cli,
+        index,
+        Some(calibration_suite),
+        SplitName::Test,
+        CensoringPredictionMode::ServingScore,
+        &scopes,
+        censoring_dedupe,
+    )?;
     let mut scores = scopes
         .iter()
         .map(|scope| {
@@ -3361,16 +3896,20 @@ fn process_scoring_pass(
                 cli.shrinkage_k,
                 index,
                 calibration_suite,
+                &scoring_censoring,
                 &scopes,
                 &mut scores,
                 dedupe,
             )?;
         }
     }
-    Ok(scores
-        .into_iter()
-        .map(|(scope, acc)| (scope, acc.finalize()))
-        .collect())
+    Ok((
+        scores
+            .into_iter()
+            .map(|(scope, acc)| (scope, acc.finalize()))
+            .collect(),
+        scoring_censoring,
+    ))
 }
 
 fn process_score_batch(
@@ -3380,6 +3919,7 @@ fn process_score_batch(
     shrinkage_k: f64,
     index: &HashMap<AggregationKey, EstimatorRow>,
     calibration_suite: &CalibrationSuite,
+    scoring_censoring: &CensoringModelSuite,
     scopes: &[PredictionScope],
     scores: &mut BTreeMap<String, ScoreAccumulator>,
     dedupe: &mut DedupeTracker,
@@ -3433,9 +3973,11 @@ fn process_score_batch(
                         applied: point.calibration_applied,
                     })
                 });
+                let censoring_key = CalibrationCellKey::new(scope.as_str(), horizon_s, floor_bp);
+                let ipcw_weight = scoring_censoring.weight_for(&censoring_key, outcome);
                 let key = scope.as_str();
                 if let Some(score) = scores.get_mut(key) {
-                    score.observe(prediction, outcome.outcome);
+                    score.observe(prediction, outcome.outcome, ipcw_weight);
                 }
             }
         }
@@ -4159,15 +4701,33 @@ fn probability_from_key(key: u64) -> f64 {
 fn fit_isotonic_blocks(buckets: &BTreeMap<u64, CalibrationBucket>) -> Vec<IsotonicBlock> {
     let mut blocks = Vec::<IsotonicBlock>::new();
     for (&key, bucket) in buckets {
-        if bucket.n == 0 {
+        let weight_sum = if bucket.weight_sum > 0.0 {
+            bucket.weight_sum
+        } else {
+            bucket.n as f64
+        };
+        if bucket.n == 0 || weight_sum <= 0.0 {
             continue;
         }
+        let weighted_hits = if bucket.weight_sum > 0.0 {
+            bucket.weighted_hits
+        } else {
+            bucket.hits as f64
+        };
+        let weight_sq_sum = if bucket.weight_sq_sum > 0.0 {
+            bucket.weight_sq_sum
+        } else {
+            bucket.n as f64
+        };
         blocks.push(IsotonicBlock {
             lower_key: key,
             upper_key: key,
             n: bucket.n,
             hits: bucket.hits,
-            calibrated_p: bucket.hits as f64 / bucket.n as f64,
+            weight_sum,
+            weighted_hits,
+            weight_sq_sum,
+            calibrated_p: (weighted_hits / weight_sum).clamp(0.0, 1.0),
         });
         while blocks.len() >= 2 {
             let len = blocks.len();
@@ -4178,12 +4738,22 @@ fn fit_isotonic_blocks(buckets: &BTreeMap<u64, CalibrationBucket>) -> Vec<Isoton
             let left = blocks.pop().expect("left block");
             let n = left.n.saturating_add(right.n);
             let hits = left.hits.saturating_add(right.hits);
+            let weight_sum = left.weight_sum + right.weight_sum;
+            let weighted_hits = left.weighted_hits + right.weighted_hits;
+            let weight_sq_sum = left.weight_sq_sum + right.weight_sq_sum;
             blocks.push(IsotonicBlock {
                 lower_key: left.lower_key,
                 upper_key: right.upper_key,
                 n,
                 hits,
-                calibrated_p: if n > 0 { hits as f64 / n as f64 } else { 0.0 },
+                weight_sum,
+                weighted_hits,
+                weight_sq_sum,
+                calibrated_p: if weight_sum > 0.0 {
+                    (weighted_hits / weight_sum).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
             });
         }
     }
@@ -4200,6 +4770,8 @@ fn calibration_quality(
                 bin_lower: idx as f64 / 10.0,
                 bin_upper: (idx + 1) as f64 / 10.0,
                 n: 0,
+                weight_sum: 0.0,
+                effective_n: 0.0,
                 mean_predicted: None,
                 empirical_hit_rate: None,
             })
@@ -4207,33 +4779,55 @@ fn calibration_quality(
         ..CalibrationQuality::default()
     };
     let mut brier_sum = 0.0;
+    let mut weight_sq_sum = 0.0;
     let mut bin_acc = [BinAccumulator::default(); 10];
     for (&key, bucket) in buckets {
-        if bucket.n == 0 {
+        let weight_sum = if bucket.weight_sum > 0.0 {
+            bucket.weight_sum
+        } else {
+            bucket.n as f64
+        };
+        if bucket.n == 0 || weight_sum <= 0.0 {
             continue;
         }
+        let weighted_hits = if bucket.weight_sum > 0.0 {
+            bucket.weighted_hits
+        } else {
+            bucket.hits as f64
+        };
+        let weight_sq = if bucket.weight_sq_sum > 0.0 {
+            bucket.weight_sq_sum
+        } else {
+            bucket.n as f64
+        };
         let raw_p = probability_from_key(key);
         let p = knots
             .map(|knots| calibrate_with_knots(knots, raw_p))
             .unwrap_or(raw_p);
-        let y_mean = bucket.hits as f64 / bucket.n as f64;
-        let misses = bucket.n.saturating_sub(bucket.hits);
-        brier_sum += bucket.hits as f64 * (p - 1.0) * (p - 1.0) + misses as f64 * p * p;
+        let y_mean = (weighted_hits / weight_sum).clamp(0.0, 1.0);
+        let weighted_misses = (weight_sum - weighted_hits).max(0.0);
+        brier_sum += weighted_hits * (p - 1.0) * (p - 1.0) + weighted_misses * p * p;
         quality.n_complete = quality.n_complete.saturating_add(bucket.n);
+        quality.weight_sum += weight_sum;
+        weight_sq_sum += weight_sq;
         let bin = ((p * 10.0).floor() as usize).min(9);
         bin_acc[bin].n = bin_acc[bin].n.saturating_add(bucket.n);
-        bin_acc[bin].pred_sum += p * bucket.n as f64;
-        bin_acc[bin].hit_sum += y_mean * bucket.n as f64;
+        bin_acc[bin].weight_sum += weight_sum;
+        bin_acc[bin].weight_sq_sum += weight_sq;
+        bin_acc[bin].pred_sum += p * weight_sum;
+        bin_acc[bin].hit_sum += y_mean * weight_sum;
     }
-    if quality.n_complete > 0 {
-        quality.brier = Some(brier_sum / quality.n_complete as f64);
+    if quality.weight_sum > 0.0 {
+        quality.effective_n = effective_n_from_weights([(quality.weight_sum, weight_sq_sum)]);
+        quality.brier = Some(brier_sum / quality.weight_sum);
         let mut ece = 0.0;
         quality.bins.clear();
         for (idx, acc) in bin_acc.iter().enumerate() {
-            let (mean_predicted, empirical_hit_rate) = if acc.n > 0 {
-                let mean = acc.pred_sum / acc.n as f64;
-                let hit = acc.hit_sum / acc.n as f64;
-                ece += (acc.n as f64 / quality.n_complete as f64) * (mean - hit).abs();
+            let effective_n = effective_n_from_weights([(acc.weight_sum, acc.weight_sq_sum)]);
+            let (mean_predicted, empirical_hit_rate) = if acc.weight_sum > 0.0 {
+                let mean = acc.pred_sum / acc.weight_sum;
+                let hit = acc.hit_sum / acc.weight_sum;
+                ece += (acc.weight_sum / quality.weight_sum) * (mean - hit).abs();
                 (Some(mean), Some(hit))
             } else {
                 (None, None)
@@ -4242,6 +4836,8 @@ fn calibration_quality(
                 bin_lower: idx as f64 / 10.0,
                 bin_upper: (idx + 1) as f64 / 10.0,
                 n: acc.n,
+                weight_sum: acc.weight_sum,
+                effective_n,
                 mean_predicted,
                 empirical_hit_rate,
             });
@@ -5309,6 +5905,7 @@ fn promotion_blockers(
     bootstrap_intervals: &BootstrapIntervalAudit,
     public_interval: &PublicIntervalAudit,
     calibration: &CalibrationSuite,
+    scoring_censoring: &CensoringModelSuite,
     scorecards: &BTreeMap<String, ScoreStats>,
     monotonicity: &MonotonicityAudit,
     serving_projection: &MonotonicityProjectionAudit,
@@ -5371,6 +5968,12 @@ fn promotion_blockers(
     if scorecards.values().all(|score| score.n_complete == 0) {
         blockers.push("no_complete_test_rows_for_scorecard".to_string());
     }
+    if scorecards
+        .values()
+        .all(|score| score.ipcw_weight_sum <= 0.0)
+    {
+        blockers.push("no_ipcw_weighted_test_rows_for_scorecard".to_string());
+    }
     if !uncertainty_interval_ready_for_promotion(bootstrap_intervals) {
         blockers.push(format!(
             "uncertainty_interval_not_promotion_ready method={} ready_rows={} fallback_rows={} required={}",
@@ -5396,6 +5999,9 @@ fn promotion_blockers(
     }
     if !dedupe.training_aggregation.enabled
         || !dedupe.bootstrap_interval.enabled
+        || !dedupe.calibration_censoring_fit.enabled
+        || !dedupe.calibration_fit.enabled
+        || !dedupe.scoring_censoring_fit.enabled
         || !dedupe.scoring_scorecard.enabled
     {
         blockers.push("supervised_dedupe_disabled".to_string());
@@ -5412,10 +6018,28 @@ fn promotion_blockers(
             dedupe.calibration_fit.duplicate_conflict_floor_keys
         ));
     }
+    if dedupe
+        .calibration_censoring_fit
+        .duplicate_conflict_floor_keys
+        > 0
+    {
+        blockers.push(format!(
+            "calibration_censoring_duplicate_conflict_floor_keys={}",
+            dedupe
+                .calibration_censoring_fit
+                .duplicate_conflict_floor_keys
+        ));
+    }
     if dedupe.bootstrap_interval.duplicate_conflict_floor_keys > 0 {
         blockers.push(format!(
             "bootstrap_interval_duplicate_conflict_floor_keys={}",
             dedupe.bootstrap_interval.duplicate_conflict_floor_keys
+        ));
+    }
+    if dedupe.scoring_censoring_fit.duplicate_conflict_floor_keys > 0 {
+        blockers.push(format!(
+            "scoring_censoring_duplicate_conflict_floor_keys={}",
+            dedupe.scoring_censoring_fit.duplicate_conflict_floor_keys
         ));
     }
     if dedupe.scoring_scorecard.duplicate_conflict_floor_keys > 0 {
@@ -5428,6 +6052,19 @@ fn promotion_blockers(
         blockers.push(format!(
             "calibration_not_ready_cells={} examples={:?}",
             calibration.cells_not_ready, calibration.cells_not_ready_examples
+        ));
+    }
+    if calibration.censoring_models.models_not_ready > 0 {
+        blockers.push(format!(
+            "calibration_censoring_not_ready_models={} examples={:?}",
+            calibration.censoring_models.models_not_ready,
+            calibration.censoring_models.models_not_ready_examples
+        ));
+    }
+    if scoring_censoring.models_not_ready > 0 {
+        blockers.push(format!(
+            "scoring_censoring_not_ready_models={} examples={:?}",
+            scoring_censoring.models_not_ready, scoring_censoring.models_not_ready_examples
         ));
     }
     if audit.label_floor_hit_lengths.len() != 1 || !audit.label_floor_hit_lengths.contains_key(&6) {
@@ -6013,6 +6650,8 @@ fn build_contract_output_mapping() -> ContractOutputMapping {
             "serving_probability_projection_has_zero_monotonicity_violations".to_string(),
             "no_uncalibrated_raw_fallback_adjusted_by_serving_projection".to_string(),
             "all_calibration_cells_ready".to_string(),
+            "all_ipcw_censoring_models_ready".to_string(),
+            "scorecard_has_positive_ipcw_effective_n".to_string(),
             "temporal_split_not_diagnostic".to_string(),
         ],
     }
@@ -6439,7 +7078,9 @@ mod tests {
         let dedupe = DedupeReport {
             training_aggregation: DedupeAudit::new("training_aggregation"),
             bootstrap_interval: DedupeAudit::new("bootstrap_interval"),
+            calibration_censoring_fit: DedupeAudit::new("calibration_censoring_fit"),
             calibration_fit: DedupeAudit::new("calibration_fit"),
+            scoring_censoring_fit: DedupeAudit::new("scoring_censoring_fit"),
             scoring_scorecard: DedupeAudit::new("scoring_scorecard"),
         };
         let bootstrap_intervals = BootstrapIntervalAudit::default();
@@ -6450,6 +7091,7 @@ mod tests {
             min_complete: MIN_CALIBRATION_COMPLETE,
             diagnostic_only: false,
             censoring_treatment: "test".to_string(),
+            censoring_models: CensoringModelSuite::default(),
             cells_total: 1,
             cells_ready: 1,
             cells_not_ready: 0,
@@ -6494,6 +7136,7 @@ mod tests {
             &bootstrap_intervals,
             &public_interval,
             &calibration,
+            &CensoringModelSuite::default(),
             &scorecards,
             &monotonicity,
             &serving_projection,
@@ -6531,7 +7174,9 @@ mod tests {
         let dedupe = DedupeReport {
             training_aggregation: DedupeAudit::new("training_aggregation"),
             bootstrap_interval: DedupeAudit::new("bootstrap_interval"),
+            calibration_censoring_fit: DedupeAudit::new("calibration_censoring_fit"),
             calibration_fit: DedupeAudit::new("calibration_fit"),
+            scoring_censoring_fit: DedupeAudit::new("scoring_censoring_fit"),
             scoring_scorecard: DedupeAudit::new("scoring_scorecard"),
         };
         let mut bootstrap_intervals = BootstrapIntervalAudit::default();
@@ -6543,6 +7188,7 @@ mod tests {
             min_complete: MIN_CALIBRATION_COMPLETE,
             diagnostic_only: false,
             censoring_treatment: "test".to_string(),
+            censoring_models: CensoringModelSuite::default(),
             cells_total: 1,
             cells_ready: 1,
             cells_not_ready: 0,
@@ -6579,6 +7225,7 @@ mod tests {
             &bootstrap_intervals,
             &PublicIntervalAudit::default(),
             &calibration,
+            &CensoringModelSuite::default(),
             &scorecards,
             &MonotonicityAudit::default(),
             &MonotonicityProjectionAudit::default(),
@@ -6848,9 +7495,9 @@ mod tests {
     #[test]
     fn isotonic_calibration_merges_decreasing_blocks() {
         let mut buckets = BTreeMap::new();
-        buckets.insert(100, CalibrationBucket { n: 10, hits: 8 });
-        buckets.insert(200, CalibrationBucket { n: 10, hits: 2 });
-        buckets.insert(300, CalibrationBucket { n: 10, hits: 9 });
+        buckets.insert(100, CalibrationBucket::from_unweighted_counts(10, 8));
+        buckets.insert(200, CalibrationBucket::from_unweighted_counts(10, 2));
+        buckets.insert(300, CalibrationBucket::from_unweighted_counts(10, 9));
 
         let blocks = fit_isotonic_blocks(&buckets);
 
@@ -6866,7 +7513,7 @@ mod tests {
     #[test]
     fn calibration_model_falls_back_when_support_is_low() {
         let mut acc = CalibrationFitAccumulator::default();
-        acc.observe(Some(0.9), FloorOutcomeKind::Realized);
+        acc.observe(Some(0.9), FloorOutcomeKind::Realized, Some(1.0));
         let model = CalibrationModel::fit(CalibrationCellKey::new("accept", 900, 80), acc, 10);
 
         assert_eq!(model.status, "insufficient_calibration_support");
@@ -6881,11 +7528,16 @@ mod tests {
         let key = CalibrationCellKey::new("accept", 900, 80);
         let mut acc = CalibrationFitAccumulator::default();
         for _ in 0..10 {
-            acc.observe(Some(0.2), FloorOutcomeKind::Realized);
+            acc.observe(Some(0.2), FloorOutcomeKind::Realized, Some(1.0));
         }
         accumulators.insert(key, acc);
 
-        let suite = CalibrationSuite::from_accumulators(&scopes, accumulators, 10);
+        let suite = CalibrationSuite::from_accumulators(
+            &scopes,
+            accumulators,
+            CensoringModelSuite::default(),
+            10,
+        );
 
         assert_eq!(suite.model("accept", 900, 80).unwrap().status, "ok");
         assert_eq!(
@@ -6897,6 +7549,112 @@ mod tests {
         let raw_fallback = suite.calibrate("accept", 28_800, 300, 0.42);
         assert!(!raw_fallback.applied);
         assert!((raw_fallback.probability - 0.42).abs() < 1e-12);
+    }
+
+    #[test]
+    fn censoring_model_uses_g_before_event_time_for_realized_ties() {
+        let key = CalibrationCellKey::new("accept", 100, 80);
+        let mut acc = CensoringAccumulator::default();
+        acc.observe(
+            FloorOutcome {
+                outcome: FloorOutcomeKind::Censored,
+                duration_s: 10,
+            },
+            100,
+        );
+        acc.observe(
+            FloorOutcome {
+                outcome: FloorOutcomeKind::Realized,
+                duration_s: 10,
+            },
+            100,
+        );
+        acc.observe(
+            FloorOutcome {
+                outcome: FloorOutcomeKind::Miss,
+                duration_s: 100,
+            },
+            100,
+        );
+
+        let model = CensoringModel::fit(&key, acc);
+
+        assert_eq!(model.status, "ok");
+        let realized_weight = model
+            .ipcw_weight(
+                FloorOutcome {
+                    outcome: FloorOutcomeKind::Realized,
+                    duration_s: 10,
+                },
+                100,
+            )
+            .unwrap();
+        let miss_weight = model
+            .ipcw_weight(
+                FloorOutcome {
+                    outcome: FloorOutcomeKind::Miss,
+                    duration_s: 100,
+                },
+                100,
+            )
+            .unwrap();
+        assert!((realized_weight - 1.0).abs() < 1e-12);
+        assert!((miss_weight - 1.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn weighted_isotonic_blocks_use_ipcw_weighted_hit_rate() {
+        let mut buckets = BTreeMap::new();
+        buckets.insert(
+            100,
+            CalibrationBucket {
+                n: 10,
+                hits: 9,
+                weight_sum: 10.0,
+                weighted_hits: 9.0,
+                weight_sq_sum: 10.0,
+            },
+        );
+        buckets.insert(
+            200,
+            CalibrationBucket {
+                n: 10,
+                hits: 2,
+                weight_sum: 10.0,
+                weighted_hits: 2.0,
+                weight_sq_sum: 10.0,
+            },
+        );
+
+        let blocks = fit_isotonic_blocks(&buckets);
+
+        assert_eq!(blocks.len(), 1);
+        assert!((blocks[0].calibrated_p - 0.55).abs() < 1e-12);
+        assert!((blocks[0].weight_sum - 20.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn scorecard_brier_and_precision_are_ipcw_weighted() {
+        let mut score = ScoreAccumulator::new(
+            "accept".to_string(),
+            0.5,
+            100.0,
+            "ok".to_string(),
+            MIN_CALIBRATION_COMPLETE,
+        );
+        let prediction = Some(CalibrationApplication {
+            probability: 0.8,
+            applied: true,
+        });
+
+        score.observe(prediction, FloorOutcomeKind::Realized, Some(1.0));
+        score.observe(prediction, FloorOutcomeKind::Miss, Some(9.0));
+        let stats = score.finalize();
+
+        assert_eq!(stats.n_complete, 2);
+        assert!((stats.ipcw_weight_sum - 10.0).abs() < 1e-12);
+        assert!((stats.precision_at_threshold.unwrap() - 0.1).abs() < 1e-12);
+        assert!((stats.brier.unwrap() - 0.58).abs() < 1e-12);
     }
 
     fn estimator_row(
@@ -6969,6 +7727,8 @@ mod tests {
                         n_abstained: 0,
                         n_complete: MIN_CALIBRATION_COMPLETE,
                         n_censored: 0,
+                        ipcw_weight_sum: MIN_CALIBRATION_COMPLETE as f64,
+                        ipcw_effective_n: MIN_CALIBRATION_COMPLETE as f64,
                         unique_raw_scores: 1,
                         knots: vec![CalibrationKnot {
                             raw_lower: 0.0,
@@ -6976,6 +7736,8 @@ mod tests {
                             calibrated_p,
                             n_complete: MIN_CALIBRATION_COMPLETE,
                             hits: (calibrated_p * MIN_CALIBRATION_COMPLETE as f64).round() as u64,
+                            weight_sum: MIN_CALIBRATION_COMPLETE as f64,
+                            effective_n: MIN_CALIBRATION_COMPLETE as f64,
                         }],
                         raw_quality: CalibrationQuality::default(),
                         calibrated_quality: CalibrationQuality::default(),
@@ -6990,6 +7752,7 @@ mod tests {
             min_complete: MIN_CALIBRATION_COMPLETE,
             diagnostic_only: false,
             censoring_treatment: "test".to_string(),
+            censoring_models: CensoringModelSuite::default(),
             cells_total: cells.len() as u64,
             cells_ready: cells.len() as u64,
             cells_not_ready: 0,
@@ -7029,6 +7792,8 @@ mod tests {
                         n_abstained: 0,
                         n_complete: MIN_CALIBRATION_COMPLETE,
                         n_censored: 0,
+                        ipcw_weight_sum: MIN_CALIBRATION_COMPLETE as f64,
+                        ipcw_effective_n: MIN_CALIBRATION_COMPLETE as f64,
                         unique_raw_scores: 1,
                         knots: vec![CalibrationKnot {
                             raw_lower: 0.0,
@@ -7036,6 +7801,8 @@ mod tests {
                             calibrated_p,
                             n_complete: MIN_CALIBRATION_COMPLETE,
                             hits: (calibrated_p * MIN_CALIBRATION_COMPLETE as f64).round() as u64,
+                            weight_sum: MIN_CALIBRATION_COMPLETE as f64,
+                            effective_n: MIN_CALIBRATION_COMPLETE as f64,
                         }],
                         raw_quality: CalibrationQuality::default(),
                         calibrated_quality: CalibrationQuality::default(),

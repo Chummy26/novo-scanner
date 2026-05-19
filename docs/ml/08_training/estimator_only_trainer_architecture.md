@@ -70,8 +70,11 @@ real.
   para reduzir leakage por overlap de janelas.
 - Sampling metadata (`sampling_probability`, `sampling_probability_kind`,
   `sampling_tier`, `label_sampling_probability`) é auditada e preservada; o
-  trainer calcula diagnósticos IPW simples, mas ainda bloqueia promoção quando
-  o dataset/split não é maduro o bastante.
+  trainer calcula diagnósticos IPW simples e usa IPCW por Kaplan-Meier para
+  censura na calibração e no scorecard. A população fonte não é reduzida: linhas
+  censuradas antes do horizonte recebem peso zero no estimando de hit/miss, e
+  `n_rows`, `n_predicted`, `n_abstained`, `n_complete`, `n_censored`,
+  `ipcw_weight_sum` e `ipcw_effective_n` ficam explícitos nos artefatos.
 
 ## Artefatos
 
@@ -84,12 +87,20 @@ O binário grava:
   trainer sobre `sample_id`, `runtime_config_hash`, schema, horizonte, sampling,
   estado PIT usado e o vetor completo de `label_floor_hits[]`; esse digest é
   separado do digest lógico V2 mínimo do storage.
-- `scorecard.json`: métricas diagnósticas no teste temporal;
+- `scorecard.json`: métricas diagnósticas no teste temporal. Brier, ECE e
+  precision-at-threshold são ponderados por IPCW usando um modelo de censura
+  ajustado somente no split de teste para avaliação offline. Esse modelo de
+  censura não ajusta o calibrador nem altera a probabilidade de serving.
 - `calibration_model.json`: calibradores isotônicos (`PAVA`) ajustados somente
-  no split temporal de calibração, usando casos completos, por célula
-  `(prediction_scope, horizon_s, floor_pct)`. O scorecard de teste usa a
+  no split temporal de calibração. O ajuste usa PAVA ponderado por IPCW, com
+  Kaplan-Meier de censura por `(prediction_scope, horizon_s, floor_pct)` e
+  suporte mínimo por `effective_n` ponderado. O scorecard de teste usa a
   probabilidade calibrada somente quando a célula tem suporte mínimo; caso
   contrário, registra fallback cru e bloqueia promoção.
+- `scoring_censoring_model.json`: modelo de censura usado exclusivamente para
+  ponderar o scorecard no split de teste. Ele reporta `models_ready`,
+  `models_not_ready`, sobrevivência no horizonte e exemplos de células sem
+  suporte, sem reescrever labels nem mudar a curva pública.
 - `bootstrap_interval_audit.json`: auditoria do intervalo de confiança
   `temporal_block_bootstrap_km_percentile_95`, calculado em passe separado
   apenas para as linhas elegíveis do artefato. O passe usa blocos temporais
@@ -170,6 +181,9 @@ manter `promotion_allowed=false` quando:
 - algum `p_hit_serving` público ficou fora do intervalo público gravado;
 - alguma célula `(prediction_scope, horizon_s, floor_pct)` não tem suporte de
   calibração suficiente;
+- algum modelo de censura IPCW de calibração ou scorecard estiver ausente ou
+  instável;
+- o scorecard não tiver linhas com peso IPCW positivo;
 - a projeção final de serving ajustou qualquer célula sem calibração aplicada;
 - o intervalo de incerteza ainda for diagnóstico.
 
@@ -179,7 +193,7 @@ que uma coleta longa deixar as células 28800s prontas.
 
 ## Bloqueios intencionais atuais
 
-A versão `v0.1.3` gera estimadores diagnósticos, mas não deve ser promovida para
+A versão `v0.2.0` gera estimadores diagnósticos, mas não deve ser promovida para
 recomendação ativa enquanto:
 
 - o intervalo de incerteza tiver fallback diagnóstico em qualquer linha elegível;
