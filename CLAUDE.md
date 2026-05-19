@@ -23,6 +23,8 @@ Importante: a skill também descreve riscos operacionais da estratégia, mas iss
 
 Para formato público de recomendação, nomes de campos, badges, gates, validade, `ExitTargetPolicy`, curva de candidatos, metadados de modelo/calibração, dedupe/cooldown e semântica de `P`, `T` e `IC`, a fonte canônica é **somente** `docs/ml/07_decision_policy/trade_recommendation_output_contract_v2_3.json`. Se este `CLAUDE.md` e o contrato v2.3 divergirem sobre output, o contrato v2.3 vence.
 
+Hierarquia normativa: **skill spread-arbitrage-strategy > contrato público v2.3 > CLAUDE.md**. A skill vence em matemática, identidade de PnL bruto, escopo da estratégia, fronteiras entre spread bruto e execução, famílias de rota permitidas e paradoxos estruturais; o contrato v2.3 vence em payload público, nomes de campos, badges, gates, validade, dedupe, metadados e semântica operacional de output; este `CLAUDE.md` apresenta o norte conceitual, a separação de camadas, critérios de qualidade e regras de governança para manter agentes e implementações alinhados sem substituir as fontes canônicas acima.
+
 ---
 
 ## Três camadas. Não misture.
