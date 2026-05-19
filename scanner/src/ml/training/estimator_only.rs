@@ -19,7 +19,7 @@ use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
 const NS_PER_S: u64 = 1_000_000_000;
-const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.1.2";
+const TRAINER_VERSION: &str = "estimator_only_ecdf/v0.1.3";
 const MODEL_FAMILY: &str = "forward_labeled_ecdf";
 const OUTPUT_CONTRACT_VERSION: &str = "trade_recommendation/v2.3";
 const CI_METHOD: &str = "temporal_block_bootstrap_km_percentile_95";
@@ -45,7 +45,7 @@ const STORAGE_V2_LOGICAL_DIGEST_KIND: &str = "fnv1a64_storage_v2_logical_require
 const TRAINER_SUPERVISED_DIGEST_KIND: &str = "fnv1a128_estimator_supervised_fields_v1";
 const EXPECTED_FLOOR_BP: &[i32] = &[30, 50, 80, 120, 200, 300];
 const EXPECTED_HORIZONS_S: &[u32] = &[900, 1800, 3600, 7200, 14400, 28800];
-const BLOCK_BOOTSTRAP_BLOCK_S: u64 = 1_800;
+const BLOCK_BOOTSTRAP_MIN_BLOCK_S: u64 = 1_800;
 const BLOCK_BOOTSTRAP_REPLICATES: usize = 128;
 const BLOCK_BOOTSTRAP_MIN_BLOCKS: usize = 3;
 const SUPERVISED_DEDUPE_KEY_ALGORITHM: &str =
@@ -575,6 +575,7 @@ struct BootstrapAccumulator {
 struct BootstrapInterval {
     lower: f64,
     upper: f64,
+    block_s: u64,
     n_blocks: usize,
     n_replicates: usize,
 }
@@ -587,7 +588,7 @@ impl BootstrapAccumulator {
             .update(outcome, horizon_s);
     }
 
-    fn interval(&self, seed: u128, point_estimate: f64) -> Option<BootstrapInterval> {
+    fn interval(&self, seed: u128, point_estimate: f64, block_s: u64) -> Option<BootstrapInterval> {
         let blocks = self.blocks.values().collect::<Vec<_>>();
         if blocks.len() < BLOCK_BOOTSTRAP_MIN_BLOCKS || BLOCK_BOOTSTRAP_REPLICATES == 0 {
             return None;
@@ -618,6 +619,7 @@ impl BootstrapAccumulator {
         Some(BootstrapInterval {
             lower,
             upper,
+            block_s,
             n_blocks: blocks.len(),
             n_replicates: samples.len(),
         })
@@ -863,6 +865,7 @@ struct BootstrapIntervalAudit {
     method: String,
     fallback_method: String,
     block_s: u64,
+    block_s_policy: String,
     min_blocks: usize,
     requested_replicates: usize,
     eligible_rows: u64,
@@ -870,6 +873,8 @@ struct BootstrapIntervalAudit {
     fallback_rows: u64,
     missing_accumulator_rows: u64,
     insufficient_block_rows: u64,
+    min_observed_block_s: Option<u64>,
+    max_observed_block_s: Option<u64>,
     min_observed_blocks: Option<usize>,
     max_observed_blocks: Option<usize>,
     min_replicates_used: Option<usize>,
@@ -883,7 +888,8 @@ impl Default for BootstrapIntervalAudit {
             enabled: true,
             method: CI_METHOD.to_string(),
             fallback_method: FALLBACK_CI_METHOD.to_string(),
-            block_s: BLOCK_BOOTSTRAP_BLOCK_S,
+            block_s: BLOCK_BOOTSTRAP_MIN_BLOCK_S,
+            block_s_policy: "max(bootstrap_min_block_s,horizon_s)".to_string(),
             min_blocks: BLOCK_BOOTSTRAP_MIN_BLOCKS,
             requested_replicates: BLOCK_BOOTSTRAP_REPLICATES,
             eligible_rows: 0,
@@ -891,10 +897,43 @@ impl Default for BootstrapIntervalAudit {
             fallback_rows: 0,
             missing_accumulator_rows: 0,
             insufficient_block_rows: 0,
+            min_observed_block_s: None,
+            max_observed_block_s: None,
             min_observed_blocks: None,
             max_observed_blocks: None,
             min_replicates_used: None,
             max_replicates_used: None,
+            examples: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicIntervalAudit {
+    enabled: bool,
+    probability_field: String,
+    interval_fields: Vec<String>,
+    checked_rows: u64,
+    missing_probability_rows: u64,
+    missing_interval_rows: u64,
+    outside_interval_rows: u64,
+    max_below_lower: f64,
+    max_above_upper: f64,
+    examples: Vec<String>,
+}
+
+impl Default for PublicIntervalAudit {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            probability_field: "p_hit_serving".to_string(),
+            interval_fields: vec!["p_hit_ci_lower".to_string(), "p_hit_ci_upper".to_string()],
+            checked_rows: 0,
+            missing_probability_rows: 0,
+            missing_interval_rows: 0,
+            outside_interval_rows: 0,
+            max_below_lower: 0.0,
+            max_above_upper: 0.0,
             examples: Vec::new(),
         }
     }
@@ -1331,6 +1370,7 @@ struct TrainerManifest {
     monotonicity_audit: MonotonicityAudit,
     serving_probability_projection: MonotonicityProjectionAudit,
     serving_monotonicity_audit: MonotonicityAudit,
+    public_interval_audit: PublicIntervalAudit,
     promotion_allowed: bool,
     promotion_blockers: Vec<String>,
     artifacts: BTreeMap<String, ArtifactInfo>,
@@ -1548,10 +1588,12 @@ pub fn run(cli: Cli) -> Result<()> {
 
     let monotonicity_audit = monotonicity_audit(&estimator_rows);
     let serving_monotonicity_audit = serving_monotonicity_audit(&estimator_rows);
+    let public_interval_audit = audit_public_interval_alignment(&estimator_rows);
     let promotion_blockers = promotion_blockers(
         &audit,
         &dedupe_report,
         &bootstrap_interval_audit,
+        &public_interval_audit,
         &calibration_suite,
         &scorecards,
         &monotonicity_audit,
@@ -1582,6 +1624,11 @@ pub fn run(cli: Cli) -> Result<()> {
         &serving_probability_projection_path,
         &serving_probability_projection,
     )?;
+    let public_interval_path = out_dir.join("public_interval_audit.json");
+    let public_interval_artifact = write_json(&public_interval_path, &public_interval_audit)?;
+    let serving_monotonicity_path = out_dir.join("serving_monotonicity_audit.json");
+    let serving_monotonicity_artifact =
+        write_json(&serving_monotonicity_path, &serving_monotonicity_audit)?;
     let sources_path = out_dir.join("sources.jsonl");
     let source_summaries = source_manifest_summaries(&manifests)?;
     let sources_artifact = write_jsonl(&sources_path, &source_summaries)?;
@@ -1610,6 +1657,14 @@ pub fn run(cli: Cli) -> Result<()> {
     artifacts.insert(
         "serving_probability_projection".to_string(),
         serving_probability_projection_artifact,
+    );
+    artifacts.insert(
+        "public_interval_audit".to_string(),
+        public_interval_artifact,
+    );
+    artifacts.insert(
+        "serving_monotonicity_audit".to_string(),
+        serving_monotonicity_artifact,
     );
     artifacts.insert("sources".to_string(), sources_artifact);
     artifacts.insert("corpus_manifest".to_string(), corpus_manifest_artifact);
@@ -1645,6 +1700,7 @@ pub fn run(cli: Cli) -> Result<()> {
         monotonicity_audit,
         serving_probability_projection,
         serving_monotonicity_audit,
+        public_interval_audit,
         promotion_allowed,
         promotion_blockers,
         artifacts,
@@ -2256,7 +2312,21 @@ fn process_bootstrap_interval_pass(
                 .map(|current| current.max(block_count))
                 .unwrap_or(block_count),
         );
-        let Some(interval) = acc.interval(bootstrap_seed_for_key(&key), point_estimate) else {
+        let block_s = bootstrap_block_s(key.horizon_s);
+        audit.min_observed_block_s = Some(
+            audit
+                .min_observed_block_s
+                .map(|current| current.min(block_s))
+                .unwrap_or(block_s),
+        );
+        audit.max_observed_block_s = Some(
+            audit
+                .max_observed_block_s
+                .map(|current| current.max(block_s))
+                .unwrap_or(block_s),
+        );
+        let Some(interval) = acc.interval(bootstrap_seed_for_key(&key), point_estimate, block_s)
+        else {
             audit.fallback_rows = audit.fallback_rows.saturating_add(1);
             audit.insufficient_block_rows = audit.insufficient_block_rows.saturating_add(1);
             row.ci_method = format!(
@@ -2282,6 +2352,18 @@ fn process_bootstrap_interval_pass(
                 .max_replicates_used
                 .map(|current| current.max(interval.n_replicates))
                 .unwrap_or(interval.n_replicates),
+        );
+        audit.min_observed_block_s = Some(
+            audit
+                .min_observed_block_s
+                .map(|current| current.min(interval.block_s))
+                .unwrap_or(interval.block_s),
+        );
+        audit.max_observed_block_s = Some(
+            audit
+                .max_observed_block_s
+                .map(|current| current.max(interval.block_s))
+                .unwrap_or(interval.block_s),
         );
         audit.min_observed_blocks = Some(
             audit
@@ -2338,7 +2420,7 @@ fn process_bootstrap_interval_batch(
         {
             continue;
         }
-        let block_id = bootstrap_block_id(ts);
+        let block_id = bootstrap_block_id(ts, horizon_s);
         for hit_idx in hits {
             let floor_pct =
                 required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
@@ -2445,8 +2527,12 @@ fn estimator_row_key(row: &EstimatorRow) -> Option<AggregationKey> {
     })
 }
 
-fn bootstrap_block_id(ts_ns: u64) -> u64 {
-    ts_ns / (BLOCK_BOOTSTRAP_BLOCK_S.saturating_mul(NS_PER_S)).max(1)
+fn bootstrap_block_s(horizon_s: u32) -> u64 {
+    BLOCK_BOOTSTRAP_MIN_BLOCK_S.max(horizon_s as u64)
+}
+
+fn bootstrap_block_id(ts_ns: u64, horizon_s: u32) -> u64 {
+    ts_ns / (bootstrap_block_s(horizon_s).saturating_mul(NS_PER_S)).max(1)
 }
 
 fn bootstrap_seed_for_key(key: &AggregationKey) -> u128 {
@@ -2727,6 +2813,51 @@ fn shift_projected_confidence_interval(row: &mut EstimatorRow, raw: f64, project
     }
 }
 
+fn append_ci_method_tag(row: &mut EstimatorRow, tag: &str) {
+    if !row.ci_method.contains(tag) {
+        row.ci_method = format!("{};{}", row.ci_method, tag);
+    }
+}
+
+fn map_confidence_interval_to_serving_calibration(
+    row: &mut EstimatorRow,
+    calibration_suite: &CalibrationSuite,
+) {
+    let Some(center) = row.p_hit_calibrated_raw else {
+        return;
+    };
+    let (Some(lower), Some(upper)) = (row.p_hit_ci_lower, row.p_hit_ci_upper) else {
+        return;
+    };
+    let scope = row.population_scope.clone();
+    let horizon_s = row.horizon_s;
+    let floor_bp = floor_to_bp(row.floor_pct);
+    let lower = calibration_suite
+        .calibrate(&scope, horizon_s, floor_bp, lower)
+        .probability;
+    let upper = calibration_suite
+        .calibrate(&scope, horizon_s, floor_bp, upper)
+        .probability;
+    let lower_bound = lower.min(upper).min(center).clamp(0.0, center);
+    let upper_bound = lower.max(upper).max(center).clamp(center, 1.0);
+    row.p_hit_ci_lower = Some(lower_bound);
+    row.p_hit_ci_upper = Some(upper_bound);
+    append_ci_method_tag(row, "serving_calibration_mapped");
+}
+
+fn shift_serving_confidence_interval(row: &mut EstimatorRow, before: f64, after: f64) {
+    let delta = after - before;
+    if let Some(lower) = row.p_hit_ci_lower {
+        row.p_hit_ci_lower = Some((lower + delta).clamp(0.0, after));
+    }
+    if let Some(upper) = row.p_hit_ci_upper {
+        row.p_hit_ci_upper = Some((upper + delta).clamp(after, 1.0));
+    }
+    if delta.abs() > MONOTONICITY_PROJECTION_TOLERANCE {
+        append_ci_method_tag(row, "serving_monotonicity_delta_shifted");
+    }
+}
+
 fn apply_serving_probability_projection(
     rows: &mut [EstimatorRow],
     calibration_suite: &CalibrationSuite,
@@ -2753,6 +2884,7 @@ fn apply_serving_probability_projection(
         row.p_hit_calibrated_raw = Some(calibrated.probability);
         row.p_hit_calibration_applied = calibrated.applied;
         row.p_hit_serving = Some(calibrated.probability);
+        map_confidence_interval_to_serving_calibration(row, calibration_suite);
         row.p_hit_serving_monotonicity_delta = Some(0.0);
         row.p_hit_serving_monotonicity_adjusted = false;
         curves
@@ -2838,6 +2970,7 @@ fn apply_serving_probability_projection(
             let calibrated_raw = row.p_hit_calibrated_raw.unwrap_or(projected);
             let delta = projected - calibrated_raw;
             row.p_hit_serving = Some(projected);
+            shift_serving_confidence_interval(row, calibrated_raw, projected);
             row.p_hit_serving_monotonicity_delta = Some(delta);
             row.p_hit_serving_monotonicity_adjusted =
                 delta.abs() > MONOTONICITY_PROJECTION_TOLERANCE;
@@ -4459,6 +4592,73 @@ fn push_monotonicity_example(audit: &mut MonotonicityAudit, example: String) {
     }
 }
 
+fn audit_public_interval_alignment(rows: &[EstimatorRow]) -> PublicIntervalAudit {
+    let mut audit = PublicIntervalAudit::default();
+    for row in rows {
+        audit.checked_rows = audit.checked_rows.saturating_add(1);
+        let Some(p) = row.p_hit_serving else {
+            audit.missing_probability_rows = audit.missing_probability_rows.saturating_add(1);
+            push_public_interval_example(&mut audit, "missing_probability", row, None, None, None);
+            continue;
+        };
+        let (Some(lower), Some(upper)) = (row.p_hit_ci_lower, row.p_hit_ci_upper) else {
+            audit.missing_interval_rows = audit.missing_interval_rows.saturating_add(1);
+            push_public_interval_example(&mut audit, "missing_interval", row, Some(p), None, None);
+            continue;
+        };
+        if p + 1e-12 < lower {
+            audit.outside_interval_rows = audit.outside_interval_rows.saturating_add(1);
+            audit.max_below_lower = audit.max_below_lower.max(lower - p);
+            push_public_interval_example(
+                &mut audit,
+                "below_lower",
+                row,
+                Some(p),
+                Some(lower),
+                Some(upper),
+            );
+        } else if p > upper + 1e-12 {
+            audit.outside_interval_rows = audit.outside_interval_rows.saturating_add(1);
+            audit.max_above_upper = audit.max_above_upper.max(p - upper);
+            push_public_interval_example(
+                &mut audit,
+                "above_upper",
+                row,
+                Some(p),
+                Some(lower),
+                Some(upper),
+            );
+        }
+    }
+    audit
+}
+
+fn push_public_interval_example(
+    audit: &mut PublicIntervalAudit,
+    reason: &str,
+    row: &EstimatorRow,
+    p: Option<f64>,
+    lower: Option<f64>,
+    upper: Option<f64>,
+) {
+    if audit.examples.len() >= 50 {
+        return;
+    }
+    audit.examples.push(format!(
+        "reason={} scope={} level={} entity={} horizon_s={} floor_bp={} p_hit_serving={:?} lower={:?} upper={:?} ci_method={}",
+        reason,
+        row.population_scope,
+        row.aggregation_level,
+        row.entity_key,
+        row.horizon_s,
+        floor_to_bp(row.floor_pct),
+        p,
+        lower,
+        upper,
+        row.ci_method
+    ));
+}
+
 fn uncertainty_interval_ready_for_promotion(audit: &BootstrapIntervalAudit) -> bool {
     audit.ready_rows > 0
         && audit.fallback_rows == 0
@@ -4469,6 +4669,7 @@ fn promotion_blockers(
     audit: &DatasetAudit,
     dedupe: &DedupeReport,
     bootstrap_intervals: &BootstrapIntervalAudit,
+    public_interval: &PublicIntervalAudit,
     calibration: &CalibrationSuite,
     scorecards: &BTreeMap<String, ScoreStats>,
     monotonicity: &MonotonicityAudit,
@@ -4519,6 +4720,20 @@ fn promotion_blockers(
             bootstrap_intervals.ready_rows,
             bootstrap_intervals.fallback_rows,
             PROMOTION_INTERVAL_REQUIREMENT
+        ));
+    }
+    if public_interval.missing_probability_rows > 0
+        || public_interval.missing_interval_rows > 0
+        || public_interval.outside_interval_rows > 0
+    {
+        blockers.push(format!(
+            "public_p_hit_interval_not_aligned probability_field={} missing_probability_rows={} missing_interval_rows={} outside_interval_rows={} max_below_lower={} max_above_upper={}",
+            public_interval.probability_field,
+            public_interval.missing_probability_rows,
+            public_interval.missing_interval_rows,
+            public_interval.outside_interval_rows,
+            public_interval.max_below_lower,
+            public_interval.max_above_upper
         ));
     }
     if !dedupe.training_aggregation.enabled
@@ -5122,7 +5337,9 @@ fn build_contract_output_mapping() -> ContractOutputMapping {
         primary_setup_p_hit_source:
             "selected candidate_curve[].p_hit; never recompute from p_hit_km or p_hit_calibrated_raw"
                 .to_string(),
-        p_hit_interval_source: "EstimatorRow.p_hit_ci_lower/p_hit_ci_upper with ci_method".to_string(),
+        p_hit_interval_source:
+            "EstimatorRow.p_hit_ci_lower/p_hit_ci_upper mapped to p_hit_serving scale with ci_method"
+                .to_string(),
         public_probability_field: "p_hit_serving".to_string(),
         intermediate_probability_fields_not_public: vec![
             "p_hit_km_raw".to_string(),
@@ -5131,6 +5348,7 @@ fn build_contract_output_mapping() -> ContractOutputMapping {
         ],
         promotion_requires: vec![
             "bootstrap_or_conformal_interval_ready_for_all_eligible_rows".to_string(),
+            "public_p_hit_serving_inside_public_interval".to_string(),
             "serving_probability_projection_has_zero_monotonicity_violations".to_string(),
             "no_uncalibrated_raw_fallback_adjusted_by_serving_projection".to_string(),
             "all_calibration_cells_ready".to_string(),
@@ -5317,6 +5535,39 @@ mod tests {
     }
 
     #[test]
+    fn serving_interval_contains_public_probability_after_calibration_projection() {
+        let mut rows = vec![
+            estimator_row("accept", "global", "*", 900, 0.3, 0.20),
+            estimator_row("accept", "global", "*", 900, 0.5, 0.80),
+        ];
+        rows[0].p_hit_ci_lower = Some(0.10);
+        rows[0].p_hit_ci_upper = Some(0.30);
+        rows[1].p_hit_ci_lower = Some(0.70);
+        rows[1].p_hit_ci_upper = Some(0.90);
+        let mut calibration = calibration_suite_with_constant_cells(vec![
+            ("accept", 900, 30, 0.70),
+            ("accept", 900, 50, 0.40),
+        ]);
+        let easy_floor_key = CalibrationCellKey::new("accept", 900, 30).as_artifact_key();
+        calibration.cells.get_mut(&easy_floor_key).unwrap().status =
+            "insufficient_calibration_support".to_string();
+
+        let projection = apply_serving_probability_projection(&mut rows, &calibration);
+        let audit = audit_public_interval_alignment(&rows);
+
+        assert!(projection.rows_adjusted > 0);
+        assert_eq!(audit.missing_probability_rows, 0);
+        assert_eq!(audit.missing_interval_rows, 0);
+        assert_eq!(audit.outside_interval_rows, 0);
+        for row in rows {
+            let p = row.p_hit_serving.unwrap();
+            assert!(row.p_hit_ci_lower.unwrap() <= p);
+            assert!(row.p_hit_ci_upper.unwrap() >= p);
+            assert!(row.ci_method.contains("serving_calibration_mapped"));
+        }
+    }
+
+    #[test]
     fn prediction_prefers_serving_probability_over_intermediate_km() {
         let mut row = estimator_row("accept", "global", "*", 900, 0.3, 0.20);
         row.p_hit_serving = Some(0.77);
@@ -5404,12 +5655,19 @@ mod tests {
             );
         }
 
-        let interval = acc.interval(123, 0.50).unwrap();
+        let interval = acc.interval(123, 0.50, bootstrap_block_s(900)).unwrap();
 
         assert_eq!(interval.n_blocks, 4);
+        assert_eq!(interval.block_s, BLOCK_BOOTSTRAP_MIN_BLOCK_S);
         assert_eq!(interval.n_replicates, BLOCK_BOOTSTRAP_REPLICATES);
         assert!(interval.lower <= 0.50);
         assert!(interval.upper >= 0.50);
+    }
+
+    #[test]
+    fn bootstrap_block_width_is_at_least_horizon() {
+        assert_eq!(bootstrap_block_s(900), BLOCK_BOOTSTRAP_MIN_BLOCK_S);
+        assert_eq!(bootstrap_block_s(28_800), 28_800);
     }
 
     #[test]
@@ -5464,6 +5722,7 @@ mod tests {
         serving_projection.max_uncalibrated_abs_delta = 0.10;
         serving_projection.p95_uncalibrated_abs_delta = 0.10;
         let serving_monotonicity = MonotonicityAudit::default();
+        let public_interval = PublicIntervalAudit::default();
         let split = TemporalSplit {
             min_ts_ns: 0,
             max_ts_ns: 1,
@@ -5484,6 +5743,7 @@ mod tests {
             &audit,
             &dedupe,
             &bootstrap_intervals,
+            &public_interval,
             &calibration,
             &scorecards,
             &monotonicity,

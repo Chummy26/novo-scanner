@@ -54,6 +54,10 @@ conceitual do paradoxo de entrada/saída:
   final depois de lookup, shrinkage e fallback. Essa é a camada mais próxima do
   contrato: `candidate_curve[].p_hit` e `primary_setup.p_hit` devem sair dessa
   curva final, não de uma célula consultada isoladamente.
+- O intervalo publicado acompanha a mesma escala de `p_hit_serving`: o IC
+  bootstrap nasce na escala KM, é mapeado pela calibração aplicada e deslocado
+  pela projeção final quando necessário. A promoção bloqueia se qualquer linha
+  ficar com `p_hit_serving` fora de `p_hit_ci_lower/p_hit_ci_upper`.
 - Separação temporal com purge/embargo igual ao maior horizonte por default
   para reduzir leakage por overlap de janelas.
 - Sampling metadata (`sampling_probability`, `sampling_probability_kind`,
@@ -80,10 +84,10 @@ O binário grava:
   contrário, registra fallback cru e bloqueia promoção.
 - `bootstrap_interval_audit.json`: auditoria do intervalo de confiança
   `temporal_block_bootstrap_km_percentile_95`, calculado em passe separado
-  apenas para as linhas elegíveis do artefato. O passe usa blocos temporais de
-  30 min sobre o split de treino, 128 réplicas determinísticas e dedupe próprio.
-  Se alguma linha elegível cair para o IC diagnóstico antigo, a promoção fica
-  bloqueada.
+  apenas para as linhas elegíveis do artefato. O passe usa blocos temporais
+  determinísticos por horizonte, com largura `max(30 min, horizon_s)`, 128
+  réplicas e dedupe próprio. Se alguma linha elegível cair para o IC diagnóstico
+  antigo, a promoção fica bloqueada.
 - `monotonicity_projection.json`: auditoria da projeção isotônica aplicada ao
   artefato preditivo. Ela registra curvas ajustadas, deltas e exemplos; não
   altera o dataset supervisionado nem remove observações.
@@ -94,6 +98,11 @@ O binário grava:
   células sem calibração aplicada (`raw fallback`); qualquer ajuste desse tipo
   bloqueia promoção, porque indica que uma probabilidade não calibrada precisou
   ser alterada para cumprir a forma monotônica da curva.
+- `public_interval_audit.json`: auditoria de contrato que prova que todo
+  `p_hit_serving` publicado está dentro de `p_hit_ci_lower/p_hit_ci_upper` após
+  calibração e projeção final.
+- `serving_monotonicity_audit.json`: auditoria standalone da monotonicidade da
+  probabilidade pública de serving, além da cópia embutida no manifest.
 - `trainer_manifest.json`: fingerprint do treino e blockers de promoção.
   Inclui também `aggregate_build_stats`, com contagem dos agregados descartados
   por baixo suporte. Esses agregados não são apagados do dataset fonte; eles
@@ -141,6 +150,7 @@ manter `promotion_allowed=false` quando:
 - há conflito de duplicata supervisionada por `(sample_id, horizon_s, floor_pct)`;
 - o teste temporal não tem linhas completas suficientes;
 - alguma linha elegível não recebeu IC bootstrap/conformal por bloco;
+- algum `p_hit_serving` público ficou fora do intervalo público gravado;
 - alguma célula `(prediction_scope, horizon_s, floor_pct)` não tem suporte de
   calibração suficiente;
 - a projeção final de serving ajustou qualquer célula sem calibração aplicada;
@@ -152,10 +162,11 @@ que uma coleta longa deixar as células 28800s prontas.
 
 ## Bloqueios intencionais atuais
 
-A versão `v0.1.2` gera estimadores diagnósticos, mas não deve ser promovida para
+A versão `v0.1.3` gera estimadores diagnósticos, mas não deve ser promovida para
 recomendação ativa enquanto:
 
 - o intervalo de incerteza tiver fallback diagnóstico em qualquer linha elegível;
+- o intervalo público não estiver alinhado com `p_hit_serving`;
 - a projeção final de serving precisar ajustar células sem calibração aplicada;
 - a auditoria pós-projeção encontrar violação de monotonicidade na curva
   `floor × horizon`, especialmente na probabilidade final de serving;
