@@ -5,7 +5,7 @@ O binário `scanner/src/bin/ml_train_estimator_only.rs` é apenas wrapper CLI.
 
 ## Objetivo
 
-O primeiro trainer do projeto não escolhe ainda uma `ExitTargetPolicy` final e
+O primeiro trainer do projeto ainda não ativa uma `ExitTargetPolicy` online e
 não treina um GBDT. Ele estima a curva supervisionada:
 
 ```text
@@ -24,6 +24,14 @@ conceitual do paradoxo de entrada/saída:
 - `censored` é categoria de primeira ordem;
 - raw/accepted não são fonte de label supervisionado;
 - fees, funding, slippage, size, margin, fill, stop e PnL líquido ficam fora.
+
+Além da superfície probabilística, o trainer gera um replay offline da política
+`gross_utility/v0.1.0` no split de teste. Esse replay reconstrói a
+`candidate_curve` completa a partir de `p_hit_serving`, aplica gates de
+probabilidade/censura/incerteza/tempo e escolhe no máximo um candidato por
+`sample_id` apenas para diagnóstico. Ele não reescreve labels, não reduz
+floors/horizontes, não altera a coleta e não habilita recomendação em tempo
+real.
 
 ## Fontes estatísticas usadas
 
@@ -103,6 +111,13 @@ O binário grava:
   calibração e projeção final.
 - `serving_monotonicity_audit.json`: auditoria standalone da monotonicidade da
   probabilidade pública de serving, além da cópia embutida no manifest.
+- `exit_policy_replay.json`: replay offline da `ExitTargetPolicy` diagnóstica
+  sobre o split de teste. Ele usa a curva final de serving (`p_hit_serving`) por
+  6 floors x 6 horizontes, calcula `exit_target_pct = gross_floor_pct -
+  entry_locked_pct`, aplica os gates versionados e mede realized/miss/censored
+  do candidato escolhido contra o vetor multi-floor real de `labeled_trades`.
+  O replay faz dedupe por `sample_id` no horizonte canônico de seleção e reporta
+  qualquer candidato selecionado que não pôde ser avaliado.
 - `trainer_manifest.json`: fingerprint do treino e blockers de promoção.
   Inclui também `aggregate_build_stats`, com contagem dos agregados descartados
   por baixo suporte. Esses agregados não são apagados do dataset fonte; eles

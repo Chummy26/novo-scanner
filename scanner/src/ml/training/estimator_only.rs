@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, File},
     io::{BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -34,6 +34,13 @@ const MONOTONICITY_PROJECTION_METHOD: &str =
     "weighted_coordinate_isotonic_pava_horizon_floor/v0.1.0";
 const SERVING_PROBABILITY_PROJECTION_METHOD: &str =
     "scope_pooled_calibrated_weighted_coordinate_isotonic_pava_horizon_floor/v0.1.0";
+const EXIT_POLICY_NAME: &str = "gross_utility";
+const EXIT_POLICY_VERSION: &str = "gross_utility/v0.1.0";
+const EXIT_POLICY_MIN_GROSS_FLOOR_PCT: f64 = 0.80;
+const EXIT_POLICY_MIN_P_HIT: f64 = 0.60;
+const EXIT_POLICY_MAX_P_CENSOR: f64 = 0.10;
+const EXIT_POLICY_MAX_P_HIT_INTERVAL_WIDTH: f64 = 0.20;
+const EXIT_POLICY_MAX_T_HIT_P75_S: u32 = 3_600;
 const MONOTONICITY_PROJECTION_MAX_ITERATIONS: u32 = 100;
 const MONOTONICITY_PROJECTION_TOLERANCE: f64 = 1e-12;
 const MIN_CALIBRATION_COMPLETE: u64 = 1_000;
@@ -768,6 +775,12 @@ struct ServingCurvePoint {
     horizon_s: u32,
     floor_bp: i32,
     probability: Option<f64>,
+    ci_lower: Option<f64>,
+    ci_upper: Option<f64>,
+    p_censor: Option<f64>,
+    t_hit_p75_s: Option<u32>,
+    n_total: u64,
+    n_complete: u64,
     calibration_applied: bool,
 }
 
@@ -962,6 +975,125 @@ struct ScoreStats {
     ece_10bin: Option<f64>,
     precision_at_threshold: Option<f64>,
     bins: Vec<ScoreBin>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ExitPolicyReplayReport {
+    enabled: bool,
+    policy_name: String,
+    policy_version: String,
+    prediction_scope: String,
+    split: String,
+    source_probability_field: String,
+    min_gross_floor_pct: f64,
+    min_p_hit: f64,
+    max_p_censor: f64,
+    max_p_hit_interval_width: f64,
+    max_t_hit_conditional_p75_s: u32,
+    utility_formula: String,
+    candidate_grid_floors_bp: Vec<i32>,
+    candidate_grid_horizons_s: Vec<u32>,
+    canonical_selection_horizon_s: u32,
+    canonical_rows_seen: u64,
+    candidates_scored: u64,
+    selected: u64,
+    abstained_no_candidate: u64,
+    evaluated: u64,
+    complete: u64,
+    realized: u64,
+    miss: u64,
+    censored: u64,
+    selected_not_evaluated: u64,
+    selected_floor_missing: u64,
+    gross_precision_complete: Option<f64>,
+    gross_realized_rate_all_evaluated: Option<f64>,
+    censor_rate_evaluated: Option<f64>,
+    mean_selected_p_hit: Option<f64>,
+    mean_selected_gross_floor_pct: Option<f64>,
+    mean_selected_utility_score: Option<f64>,
+    selected_by_horizon_s: BTreeMap<u32, u64>,
+    selected_by_floor_bp: BTreeMap<i32, u64>,
+    evaluated_by_horizon_s: BTreeMap<u32, u64>,
+    evaluated_by_floor_bp: BTreeMap<i32, u64>,
+    gate_fail_counts: BTreeMap<String, u64>,
+    examples: Vec<String>,
+    #[serde(skip)]
+    selected_p_hit_sum: f64,
+    #[serde(skip)]
+    selected_gross_floor_sum: f64,
+    #[serde(skip)]
+    selected_utility_sum: f64,
+}
+
+impl Default for ExitPolicyReplayReport {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            policy_name: EXIT_POLICY_NAME.to_string(),
+            policy_version: EXIT_POLICY_VERSION.to_string(),
+            prediction_scope: PredictionScope::Accept.as_str().to_string(),
+            split: "test".to_string(),
+            source_probability_field: "p_hit_serving".to_string(),
+            min_gross_floor_pct: EXIT_POLICY_MIN_GROSS_FLOOR_PCT,
+            min_p_hit: EXIT_POLICY_MIN_P_HIT,
+            max_p_censor: EXIT_POLICY_MAX_P_CENSOR,
+            max_p_hit_interval_width: EXIT_POLICY_MAX_P_HIT_INTERVAL_WIDTH,
+            max_t_hit_conditional_p75_s: EXIT_POLICY_MAX_T_HIT_P75_S,
+            utility_formula:
+                "gross_floor_pct*p_hit - p_censor - 0.10*(interval_width/max_interval_width) - 0.05*(t_hit_p75_s/max_t_hit_p75_s)"
+                    .to_string(),
+            candidate_grid_floors_bp: EXPECTED_FLOOR_BP.to_vec(),
+            candidate_grid_horizons_s: EXPECTED_HORIZONS_S.to_vec(),
+            canonical_selection_horizon_s: EXPECTED_HORIZONS_S[0],
+            canonical_rows_seen: 0,
+            candidates_scored: 0,
+            selected: 0,
+            abstained_no_candidate: 0,
+            evaluated: 0,
+            complete: 0,
+            realized: 0,
+            miss: 0,
+            censored: 0,
+            selected_not_evaluated: 0,
+            selected_floor_missing: 0,
+            gross_precision_complete: None,
+            gross_realized_rate_all_evaluated: None,
+            censor_rate_evaluated: None,
+            mean_selected_p_hit: None,
+            mean_selected_gross_floor_pct: None,
+            mean_selected_utility_score: None,
+            selected_by_horizon_s: BTreeMap::new(),
+            selected_by_floor_bp: BTreeMap::new(),
+            evaluated_by_horizon_s: BTreeMap::new(),
+            evaluated_by_floor_bp: BTreeMap::new(),
+            gate_fail_counts: BTreeMap::new(),
+            examples: Vec::new(),
+            selected_p_hit_sum: 0.0,
+            selected_gross_floor_sum: 0.0,
+            selected_utility_sum: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PolicyCandidate {
+    horizon_s: u32,
+    floor_bp: i32,
+    gross_floor_pct: f64,
+    exit_target_pct: f64,
+    p_hit: f64,
+    ci_lower: f64,
+    ci_upper: f64,
+    p_censor: f64,
+    t_hit_p75_s: u32,
+    n_total: u64,
+    n_complete: u64,
+    utility_score: f64,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedPolicyDecision {
+    candidate: PolicyCandidate,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -1371,6 +1503,7 @@ struct TrainerManifest {
     serving_probability_projection: MonotonicityProjectionAudit,
     serving_monotonicity_audit: MonotonicityAudit,
     public_interval_audit: PublicIntervalAudit,
+    exit_policy_replay: ExitPolicyReplayReport,
     promotion_allowed: bool,
     promotion_blockers: Vec<String>,
     artifacts: BTreeMap<String, ArtifactInfo>,
@@ -1579,6 +1712,8 @@ pub fn run(cli: Cli) -> Result<()> {
         &mut scoring_dedupe,
     )?;
     let scoring_dedupe_audit = scoring_dedupe.into_audit();
+    let exit_policy_replay =
+        process_exit_policy_replay(&manifests, &split, &cli, &serving_index, &calibration_suite)?;
     let dedupe_report = DedupeReport {
         training_aggregation: training_dedupe_audit,
         bootstrap_interval: bootstrap_dedupe_audit,
@@ -1609,6 +1744,8 @@ pub fn run(cli: Cli) -> Result<()> {
     let audit_artifact = write_json(&audit_path, &audit)?;
     let scorecard_path = out_dir.join("scorecard.json");
     let scorecard_artifact = write_json(&scorecard_path, &scorecards)?;
+    let exit_policy_replay_path = out_dir.join("exit_policy_replay.json");
+    let exit_policy_replay_artifact = write_json(&exit_policy_replay_path, &exit_policy_replay)?;
     let calibration_path = out_dir.join("calibration_model.json");
     let calibration_artifact = write_json(&calibration_path, &calibration_suite)?;
     let dedupe_path = out_dir.join("duplicate_audit.json");
@@ -1644,6 +1781,10 @@ pub fn run(cli: Cli) -> Result<()> {
     artifacts.insert("estimator_table".to_string(), estimator_artifact);
     artifacts.insert("dataset_audit".to_string(), audit_artifact);
     artifacts.insert("scorecard".to_string(), scorecard_artifact);
+    artifacts.insert(
+        "exit_policy_replay".to_string(),
+        exit_policy_replay_artifact,
+    );
     artifacts.insert("calibration_model".to_string(), calibration_artifact);
     artifacts.insert("duplicate_audit".to_string(), dedupe_artifact);
     artifacts.insert(
@@ -1701,6 +1842,7 @@ pub fn run(cli: Cli) -> Result<()> {
         serving_probability_projection,
         serving_monotonicity_audit,
         public_interval_audit,
+        exit_policy_replay,
         promotion_allowed,
         promotion_blockers,
         artifacts,
@@ -3299,6 +3441,351 @@ fn process_score_batch(
     Ok(())
 }
 
+fn process_exit_policy_replay(
+    manifests: &[ManifestRecord],
+    split: &TemporalSplit,
+    cli: &Cli,
+    index: &HashMap<AggregationKey, EstimatorRow>,
+    calibration_suite: &CalibrationSuite,
+) -> Result<ExitPolicyReplayReport> {
+    let mut report = ExitPolicyReplayReport {
+        prediction_scope: cli.prediction_scope.as_str().to_string(),
+        ..ExitPolicyReplayReport::default()
+    };
+    let mut selected = HashMap::<String, SelectedPolicyDecision>::new();
+    collect_exit_policy_selections(
+        manifests,
+        split,
+        cli,
+        index,
+        calibration_suite,
+        &mut report,
+        &mut selected,
+    )?;
+    evaluate_exit_policy_selections(manifests, split, cli, &mut report, &mut selected)?;
+    report.selected_not_evaluated = selected.len() as u64;
+    finalize_exit_policy_replay(&mut report);
+    Ok(report)
+}
+
+fn collect_exit_policy_selections(
+    manifests: &[ManifestRecord],
+    split: &TemporalSplit,
+    cli: &Cli,
+    index: &HashMap<AggregationKey, EstimatorRow>,
+    calibration_suite: &CalibrationSuite,
+    report: &mut ExitPolicyReplayReport,
+    selected: &mut HashMap<String, SelectedPolicyDecision>,
+) -> Result<()> {
+    let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
+    let mut seen_canonical = HashSet::<String>::new();
+    for rec in manifests {
+        if rows_left == 0 {
+            break;
+        }
+        let mut reader =
+            open_storage_v2_sidecar_logical_reader(&rec.manifest, DatasetKind::LabeledTrades)
+                .with_context(|| format!("open logical V2 reader {}", rec.path.display()))?;
+        for batch in &mut reader {
+            if rows_left == 0 {
+                break;
+            }
+            let batch = batch?;
+            let view = BatchView::new(&batch)?;
+            let n = batch.num_rows().min(rows_left as usize);
+            rows_left -= n as u64;
+            for row in 0..n {
+                let ts = required_u64(view.ts_emit_ns, row, "ts_emit_ns")?;
+                if split.assign(ts) != SplitName::Test {
+                    continue;
+                }
+                let horizon_s = required_u32(view.horizon_s, row, "horizon_s")?;
+                if horizon_s != EXPECTED_HORIZONS_S[0] {
+                    continue;
+                }
+                let sample_decision = required_str(view.sample_decision, row, "sample_decision")?;
+                if !cli
+                    .prediction_scope
+                    .includes_sample_decision(sample_decision)
+                {
+                    continue;
+                }
+                let sample_id = required_str(view.sample_id, row, "sample_id")?;
+                if !seen_canonical.insert(sample_id.to_string()) {
+                    continue;
+                }
+                let route_id = required_str(view.route_id, row, "route_id")?;
+                let entry_locked_pct =
+                    required_f32(view.entry_locked_pct, row, "entry_locked_pct")?;
+                let floor_state_buckets = expected_floor_state_buckets(&view, row);
+                let serving_curve = predict_serving_curve(
+                    index,
+                    calibration_suite,
+                    cli.prediction_scope,
+                    route_id,
+                    &floor_state_buckets,
+                    cli.shrinkage_k,
+                );
+                report.canonical_rows_seen = report.canonical_rows_seen.saturating_add(1);
+                if let Some(candidate) =
+                    select_exit_policy_candidate(entry_locked_pct, &serving_curve, report)
+                {
+                    report.selected = report.selected.saturating_add(1);
+                    report.selected_p_hit_sum += candidate.p_hit;
+                    report.selected_gross_floor_sum += candidate.gross_floor_pct;
+                    report.selected_utility_sum += candidate.utility_score;
+                    *report
+                        .selected_by_horizon_s
+                        .entry(candidate.horizon_s)
+                        .or_insert(0) += 1;
+                    *report
+                        .selected_by_floor_bp
+                        .entry(candidate.floor_bp)
+                        .or_insert(0) += 1;
+                    push_exit_policy_example(report, "selected", sample_id, route_id, &candidate);
+                    selected.insert(sample_id.to_string(), SelectedPolicyDecision { candidate });
+                } else {
+                    report.abstained_no_candidate = report.abstained_no_candidate.saturating_add(1);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn evaluate_exit_policy_selections(
+    manifests: &[ManifestRecord],
+    split: &TemporalSplit,
+    cli: &Cli,
+    report: &mut ExitPolicyReplayReport,
+    selected: &mut HashMap<String, SelectedPolicyDecision>,
+) -> Result<()> {
+    let mut rows_left = cli.max_rows.unwrap_or(u64::MAX);
+    for rec in manifests {
+        if rows_left == 0 || selected.is_empty() {
+            break;
+        }
+        let mut reader =
+            open_storage_v2_sidecar_logical_reader(&rec.manifest, DatasetKind::LabeledTrades)
+                .with_context(|| format!("open logical V2 reader {}", rec.path.display()))?;
+        for batch in &mut reader {
+            if rows_left == 0 || selected.is_empty() {
+                break;
+            }
+            let batch = batch?;
+            let view = BatchView::new(&batch)?;
+            let n = batch.num_rows().min(rows_left as usize);
+            rows_left -= n as u64;
+            for row in 0..n {
+                let ts = required_u64(view.ts_emit_ns, row, "ts_emit_ns")?;
+                if split.assign(ts) != SplitName::Test {
+                    continue;
+                }
+                let sample_id = required_str(view.sample_id, row, "sample_id")?;
+                let Some(decision) = selected.get(sample_id).cloned() else {
+                    continue;
+                };
+                let horizon_s = required_u32(view.horizon_s, row, "horizon_s")?;
+                if horizon_s != decision.candidate.horizon_s {
+                    continue;
+                }
+                let route_id = required_str(view.route_id, row, "route_id")?;
+                let Some(hit_idx) = find_floor_hit_idx(&view, row, decision.candidate.floor_bp)?
+                else {
+                    report.selected_floor_missing = report.selected_floor_missing.saturating_add(1);
+                    push_exit_policy_example(
+                        report,
+                        "selected_floor_missing",
+                        sample_id,
+                        route_id,
+                        &decision.candidate,
+                    );
+                    selected.remove(sample_id);
+                    continue;
+                };
+                let outcome = floor_outcome(&view, row, hit_idx, horizon_s)?;
+                report.evaluated = report.evaluated.saturating_add(1);
+                *report
+                    .evaluated_by_horizon_s
+                    .entry(decision.candidate.horizon_s)
+                    .or_insert(0) += 1;
+                *report
+                    .evaluated_by_floor_bp
+                    .entry(decision.candidate.floor_bp)
+                    .or_insert(0) += 1;
+                match outcome.outcome {
+                    FloorOutcomeKind::Realized => {
+                        report.realized = report.realized.saturating_add(1);
+                        report.complete = report.complete.saturating_add(1);
+                    }
+                    FloorOutcomeKind::Miss => {
+                        report.miss = report.miss.saturating_add(1);
+                        report.complete = report.complete.saturating_add(1);
+                    }
+                    FloorOutcomeKind::Censored => {
+                        report.censored = report.censored.saturating_add(1);
+                    }
+                }
+                selected.remove(sample_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn select_exit_policy_candidate(
+    entry_locked_pct: f32,
+    serving_curve: &BTreeMap<(u32, i32), ServingCurvePoint>,
+    report: &mut ExitPolicyReplayReport,
+) -> Option<PolicyCandidate> {
+    let mut best: Option<PolicyCandidate> = None;
+    for point in serving_curve.values() {
+        report.candidates_scored = report.candidates_scored.saturating_add(1);
+        let Some(candidate) = policy_candidate_from_point(entry_locked_pct, point, report) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|current| candidate.utility_score > current.utility_score)
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+fn policy_candidate_from_point(
+    entry_locked_pct: f32,
+    point: &ServingCurvePoint,
+    report: &mut ExitPolicyReplayReport,
+) -> Option<PolicyCandidate> {
+    let gross_floor_pct = point.floor_bp as f64 / 100.0;
+    if gross_floor_pct + 1e-12 < EXIT_POLICY_MIN_GROSS_FLOOR_PCT {
+        bump_gate_fail(report, "gross_floor_below_min");
+        return None;
+    }
+    if !point.calibration_applied {
+        bump_gate_fail(report, "uncalibrated_probability");
+        return None;
+    }
+    let Some(p_hit) = point.probability else {
+        bump_gate_fail(report, "missing_p_hit");
+        return None;
+    };
+    if p_hit + 1e-12 < EXIT_POLICY_MIN_P_HIT {
+        bump_gate_fail(report, "p_hit_below_min");
+        return None;
+    }
+    let (Some(ci_lower), Some(ci_upper)) = (point.ci_lower, point.ci_upper) else {
+        bump_gate_fail(report, "missing_p_hit_interval");
+        return None;
+    };
+    let interval_width = (ci_upper - ci_lower).max(0.0);
+    if interval_width > EXIT_POLICY_MAX_P_HIT_INTERVAL_WIDTH + 1e-12 {
+        bump_gate_fail(report, "p_hit_interval_too_wide");
+        return None;
+    }
+    let Some(p_censor) = point.p_censor else {
+        bump_gate_fail(report, "missing_p_censor");
+        return None;
+    };
+    if p_censor > EXIT_POLICY_MAX_P_CENSOR + 1e-12 {
+        bump_gate_fail(report, "p_censor_too_high");
+        return None;
+    }
+    let Some(t_hit_p75_s) = point.t_hit_p75_s else {
+        bump_gate_fail(report, "missing_t_hit_p75");
+        return None;
+    };
+    if t_hit_p75_s > EXIT_POLICY_MAX_T_HIT_P75_S {
+        bump_gate_fail(report, "t_hit_p75_too_slow");
+        return None;
+    }
+    let utility_score = gross_floor_pct * p_hit
+        - p_censor
+        - 0.10 * (interval_width / EXIT_POLICY_MAX_P_HIT_INTERVAL_WIDTH).clamp(0.0, 10.0)
+        - 0.05 * (t_hit_p75_s as f64 / EXIT_POLICY_MAX_T_HIT_P75_S as f64).clamp(0.0, 10.0);
+    Some(PolicyCandidate {
+        horizon_s: point.horizon_s,
+        floor_bp: point.floor_bp,
+        gross_floor_pct,
+        exit_target_pct: gross_floor_pct - entry_locked_pct as f64,
+        p_hit,
+        ci_lower,
+        ci_upper,
+        p_censor,
+        t_hit_p75_s,
+        n_total: point.n_total,
+        n_complete: point.n_complete,
+        utility_score,
+    })
+}
+
+fn bump_gate_fail(report: &mut ExitPolicyReplayReport, reason: &str) {
+    *report
+        .gate_fail_counts
+        .entry(reason.to_string())
+        .or_insert(0) += 1;
+}
+
+fn find_floor_hit_idx(view: &BatchView<'_>, row: usize, floor_bp: i32) -> Result<Option<usize>> {
+    for hit_idx in floor_hit_range(view.label_floor_hits, row)? {
+        let floor_pct = required_f32(view.hit_floor_pct, hit_idx, "label_floor_hits.floor_pct")?;
+        if floor_to_bp(floor_pct) == floor_bp {
+            return Ok(Some(hit_idx));
+        }
+    }
+    Ok(None)
+}
+
+fn push_exit_policy_example(
+    report: &mut ExitPolicyReplayReport,
+    reason: &str,
+    sample_id: &str,
+    route_id: &str,
+    candidate: &PolicyCandidate,
+) {
+    if report.examples.len() >= 50 {
+        return;
+    }
+    report.examples.push(format!(
+        "reason={} sample_id={} route_id={} horizon_s={} floor_bp={} gross_floor_pct={} exit_target_pct={} p_hit={} ci=[{},{}] p_censor={} t_hit_p75_s={} n_total={} n_complete={} utility={}",
+        reason,
+        sample_id,
+        route_id,
+        candidate.horizon_s,
+        candidate.floor_bp,
+        candidate.gross_floor_pct,
+        candidate.exit_target_pct,
+        candidate.p_hit,
+        candidate.ci_lower,
+        candidate.ci_upper,
+        candidate.p_censor,
+        candidate.t_hit_p75_s,
+        candidate.n_total,
+        candidate.n_complete,
+        candidate.utility_score
+    ));
+}
+
+fn finalize_exit_policy_replay(report: &mut ExitPolicyReplayReport) {
+    if report.complete > 0 {
+        report.gross_precision_complete = Some(report.realized as f64 / report.complete as f64);
+    }
+    if report.evaluated > 0 {
+        report.gross_realized_rate_all_evaluated =
+            Some(report.realized as f64 / report.evaluated as f64);
+        report.censor_rate_evaluated = Some(report.censored as f64 / report.evaluated as f64);
+    }
+    if report.selected > 0 {
+        let denom = report.selected as f64;
+        report.mean_selected_p_hit = Some(report.selected_p_hit_sum / denom);
+        report.mean_selected_gross_floor_pct = Some(report.selected_gross_floor_sum / denom);
+        report.mean_selected_utility_score = Some(report.selected_utility_sum / denom);
+    }
+}
+
 fn expected_floor_state_buckets(view: &BatchView<'_>, row: usize) -> BTreeMap<i32, String> {
     EXPECTED_FLOOR_BP
         .iter()
@@ -3327,7 +3814,7 @@ fn predict_serving_curve(
                 .get(&floor_bp)
                 .map(String::as_str)
                 .unwrap_or("exit_target_unknown");
-            let probability = predict(
+            let point = predict_serving_point(
                 index,
                 scope,
                 route_id,
@@ -3335,17 +3822,9 @@ fn predict_serving_curve(
                 horizon_s,
                 floor_bp,
                 shrinkage_k,
+                calibration_suite,
             );
-            let calibration_applied = calibration_suite
-                .model(scope.as_str(), horizon_s, floor_bp)
-                .map(|model| model.status == "ok")
-                .unwrap_or(false);
-            points.push(ServingCurvePoint {
-                horizon_s,
-                floor_bp,
-                probability,
-                calibration_applied,
-            });
+            points.push(point);
         }
     }
 
@@ -3354,6 +3833,135 @@ fn predict_serving_curve(
         .into_iter()
         .map(|point| ((point.horizon_s, point.floor_bp), point))
         .collect()
+}
+
+fn predict_serving_point(
+    index: &HashMap<AggregationKey, EstimatorRow>,
+    scope: PredictionScope,
+    route_id: &str,
+    state_bucket: &str,
+    horizon_s: u32,
+    floor_bp: i32,
+    shrinkage_k: f64,
+    calibration_suite: &CalibrationSuite,
+) -> ServingCurvePoint {
+    let scope_str = scope.as_str().to_string();
+    let route_key = AggregationKey {
+        scope: scope_str.clone(),
+        level: AggregationLevel::Route,
+        entity: route_id.to_string(),
+        horizon_s,
+        floor_bp,
+    };
+    let route_row = index.get(&route_key);
+    let state_key = AggregationKey {
+        scope: scope_str.clone(),
+        level: AggregationLevel::GlobalState,
+        entity: state_bucket.to_string(),
+        horizon_s,
+        floor_bp,
+    };
+    let state_row = index.get(&state_key);
+    let global_key = AggregationKey {
+        scope: scope_str,
+        level: AggregationLevel::Global,
+        entity: "*".to_string(),
+        horizon_s,
+        floor_bp,
+    };
+    let global_row = index.get(&global_key);
+    let prior_row = state_row.or(global_row);
+    let probability = shrink_prediction(route_row, prior_row, shrinkage_k)
+        .or_else(|| state_row.and_then(prediction_probability))
+        .or_else(|| route_row.and_then(prediction_probability))
+        .or_else(|| global_row.and_then(prediction_probability));
+    let calibration_applied = calibration_suite
+        .model(scope.as_str(), horizon_s, floor_bp)
+        .map(|model| model.status == "ok")
+        .unwrap_or(false);
+    let mut point = if let Some(route) = route_row {
+        if let Some(prior) = prior_row {
+            let weight = route.n_total as f64 / (route.n_total as f64 + shrinkage_k);
+            combined_serving_point(horizon_s, floor_bp, route, prior, weight, probability)
+        } else {
+            row_serving_point(horizon_s, floor_bp, route, probability)
+        }
+    } else if let Some(row) = state_row.or(global_row) {
+        row_serving_point(horizon_s, floor_bp, row, probability)
+    } else {
+        ServingCurvePoint {
+            horizon_s,
+            floor_bp,
+            probability,
+            ci_lower: None,
+            ci_upper: None,
+            p_censor: None,
+            t_hit_p75_s: None,
+            n_total: 0,
+            n_complete: 0,
+            calibration_applied,
+        }
+    };
+    point.calibration_applied = calibration_applied;
+    point
+}
+
+fn row_serving_point(
+    horizon_s: u32,
+    floor_bp: i32,
+    row: &EstimatorRow,
+    probability: Option<f64>,
+) -> ServingCurvePoint {
+    ServingCurvePoint {
+        horizon_s,
+        floor_bp,
+        probability,
+        ci_lower: row.p_hit_ci_lower,
+        ci_upper: row.p_hit_ci_upper,
+        p_censor: Some(row.p_censor),
+        t_hit_p75_s: row.t_hit_conditional_p75_s,
+        n_total: row.n_total,
+        n_complete: row.n_complete,
+        calibration_applied: row.p_hit_calibration_applied,
+    }
+}
+
+fn combined_serving_point(
+    horizon_s: u32,
+    floor_bp: i32,
+    route: &EstimatorRow,
+    prior: &EstimatorRow,
+    weight: f64,
+    probability: Option<f64>,
+) -> ServingCurvePoint {
+    let combine = |a: Option<f64>, b: Option<f64>| match (a, b) {
+        (Some(a), Some(b)) => Some((weight * a + (1.0 - weight) * b).clamp(0.0, 1.0)),
+        (Some(a), None) => Some(a.clamp(0.0, 1.0)),
+        (None, Some(b)) => Some(b.clamp(0.0, 1.0)),
+        (None, None) => None,
+    };
+    let ci_lower = combine(route.p_hit_ci_lower, prior.p_hit_ci_lower);
+    let ci_upper = combine(route.p_hit_ci_upper, prior.p_hit_ci_upper);
+    let p_censor =
+        Some((weight * route.p_censor + (1.0 - weight) * prior.p_censor).clamp(0.0, 1.0));
+    let t_hit_p75_s = match (route.t_hit_conditional_p75_s, prior.t_hit_conditional_p75_s) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    ServingCurvePoint {
+        horizon_s,
+        floor_bp,
+        probability,
+        ci_lower,
+        ci_upper,
+        p_censor,
+        t_hit_p75_s,
+        n_total: route.n_total,
+        n_complete: route.n_complete,
+        calibration_applied: route.p_hit_calibration_applied && prior.p_hit_calibration_applied,
+    }
 }
 
 fn project_serving_curve_points(points: &mut [ServingCurvePoint]) {
@@ -3419,7 +4027,16 @@ fn project_serving_curve_points(points: &mut [ServingCurvePoint]) {
     }
 
     for (local_idx, (point_idx, _)) in present.iter().copied().enumerate() {
-        points[point_idx].probability = Some(values[local_idx].clamp(0.0, 1.0));
+        let projected = values[local_idx].clamp(0.0, 1.0);
+        let before = points[point_idx].probability.unwrap_or(projected);
+        let delta = projected - before;
+        points[point_idx].probability = Some(projected);
+        if let Some(lower) = points[point_idx].ci_lower {
+            points[point_idx].ci_lower = Some((lower + delta).clamp(0.0, projected));
+        }
+        if let Some(upper) = points[point_idx].ci_upper {
+            points[point_idx].ci_upper = Some((upper + delta).clamp(projected, 1.0));
+        }
     }
 }
 
@@ -5585,6 +6202,89 @@ mod tests {
         .unwrap();
 
         assert!((p - 0.77).abs() < 1e-12);
+    }
+
+    #[test]
+    fn exit_policy_replay_selects_best_gated_candidate() {
+        let mut report = ExitPolicyReplayReport::default();
+        let mut curve = BTreeMap::new();
+        curve.insert(
+            (900, 80),
+            ServingCurvePoint {
+                horizon_s: 900,
+                floor_bp: 80,
+                probability: Some(0.90),
+                ci_lower: Some(0.84),
+                ci_upper: Some(0.95),
+                p_censor: Some(0.02),
+                t_hit_p75_s: Some(600),
+                n_total: 1_000,
+                n_complete: 900,
+                calibration_applied: true,
+            },
+        );
+        curve.insert(
+            (3600, 120),
+            ServingCurvePoint {
+                horizon_s: 3600,
+                floor_bp: 120,
+                probability: Some(0.80),
+                ci_lower: Some(0.72),
+                ci_upper: Some(0.88),
+                p_censor: Some(0.03),
+                t_hit_p75_s: Some(1800),
+                n_total: 800,
+                n_complete: 700,
+                calibration_applied: true,
+            },
+        );
+
+        let selected = select_exit_policy_candidate(3.40, &curve, &mut report).unwrap();
+
+        assert_eq!(selected.horizon_s, 3600);
+        assert_eq!(selected.floor_bp, 120);
+        assert!((selected.exit_target_pct - (-2.20)).abs() < 1e-6);
+        assert_eq!(report.candidates_scored, 2);
+    }
+
+    #[test]
+    fn exit_policy_replay_rejects_uncalibrated_or_wide_interval_candidates() {
+        let mut report = ExitPolicyReplayReport::default();
+        let mut curve = BTreeMap::new();
+        curve.insert(
+            (900, 120),
+            ServingCurvePoint {
+                horizon_s: 900,
+                floor_bp: 120,
+                probability: Some(0.90),
+                ci_lower: Some(0.10),
+                ci_upper: Some(0.90),
+                p_censor: Some(0.02),
+                t_hit_p75_s: Some(600),
+                n_total: 1_000,
+                n_complete: 900,
+                calibration_applied: true,
+            },
+        );
+        curve.insert(
+            (1800, 200),
+            ServingCurvePoint {
+                horizon_s: 1800,
+                floor_bp: 200,
+                probability: Some(0.90),
+                ci_lower: Some(0.82),
+                ci_upper: Some(0.94),
+                p_censor: Some(0.02),
+                t_hit_p75_s: Some(600),
+                n_total: 1_000,
+                n_complete: 900,
+                calibration_applied: false,
+            },
+        );
+
+        assert!(select_exit_policy_candidate(3.40, &curve, &mut report).is_none());
+        assert_eq!(report.gate_fail_counts["p_hit_interval_too_wide"], 1);
+        assert_eq!(report.gate_fail_counts["uncalibrated_probability"], 1);
     }
 
     #[test]
