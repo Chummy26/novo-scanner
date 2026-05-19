@@ -14,9 +14,11 @@ P_hit, P_censor, T_hit condicional aos realized dentro do horizonte, e IC por
 ```
 
 Isso segue o contrato final `trade_recommendation_output_contract_v2_3.json`.
-Quando houver conflito entre esse contrato e `CLAUDE.md`, o contrato v2.3 tem
-precedência para o formato/semântica de saída; `CLAUDE.md` permanece como guia
-conceitual do paradoxo de entrada/saída:
+A hierarquia normativa atual é: skill `spread-arbitrage-strategy` > contrato
+público v2.3 > `CLAUDE.md`. A skill vence em matemática, PnL bruto, famílias de
+rota e paradoxos estruturais; o contrato v2.3 vence no payload público,
+campos, gates, badges, dedupe, validade e semântica operacional de output;
+`CLAUDE.md` permanece como guia conceitual do paradoxo de entrada/saída:
 
 - `entry_locked_pct` é a entrada observada em `t0`, imutável;
 - o evento futuro é first-hit de `S_saida(t)`;
@@ -28,10 +30,11 @@ conceitual do paradoxo de entrada/saída:
 Além da superfície probabilística, o trainer gera um replay offline da política
 `gross_utility/v0.1.0` no split de teste. Esse replay reconstrói a
 `candidate_curve` completa a partir de `p_hit_serving`, aplica gates de
-probabilidade/censura/incerteza/tempo e escolhe no máximo um candidato por
-`sample_id` apenas para diagnóstico. Ele não reescreve labels, não reduz
-floors/horizontes, não altera a coleta e não habilita recomendação em tempo
-real.
+probabilidade/censura/incerteza/tempo, filtra o subconjunto Pareto
+non-dominated exigido pelo contrato (`UI_NON_DOMINATED_SUBSET`) e escolhe no
+máximo um candidato por `sample_id` apenas para diagnóstico. Ele não reescreve
+labels, não reduz floors/horizontes, não altera a coleta e não habilita
+recomendação em tempo real.
 
 ## Fontes estatísticas usadas
 
@@ -126,9 +129,11 @@ O binário grava:
 - `exit_policy_replay.json`: replay offline da `ExitTargetPolicy` diagnóstica
   sobre o split de teste. Ele usa a curva final de serving (`p_hit_serving`) por
   6 floors x 6 horizontes, calcula `exit_target_pct = gross_floor_pct -
-  entry_locked_pct`, aplica os gates versionados e mede realized/miss/censored
-  do candidato escolhido contra o vetor multi-floor real de `labeled_trades`.
-  O replay faz dedupe por `sample_id` no horizonte canônico de seleção e reporta
+  entry_locked_pct`, aplica os gates versionados, remove candidatos dominados
+  por Pareto antes da utility e mede realized/miss/censored do candidato
+  escolhido contra o vetor multi-floor real de `labeled_trades`. O replay faz
+  dedupe por `sample_id` no horizonte canônico de seleção, reporta contagens
+  `pareto_non_dominated_candidates`/`pareto_dominated_candidates` e registra
   qualquer candidato selecionado que não pôde ser avaliado.
 - `trainer_manifest.json`: fingerprint do treino e blockers de promoção.
   Inclui também `aggregate_build_stats`, com contagem dos agregados descartados

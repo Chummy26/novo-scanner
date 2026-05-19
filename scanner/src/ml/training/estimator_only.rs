@@ -1267,11 +1267,16 @@ struct ExitPolicyReplayReport {
     max_p_hit_interval_width: f64,
     max_t_hit_conditional_p75_s: u32,
     utility_formula: String,
+    candidate_curve_scope: String,
+    selection_reason: String,
+    pareto_frontier_enabled: bool,
     candidate_grid_floors_bp: Vec<i32>,
     candidate_grid_horizons_s: Vec<u32>,
     canonical_selection_horizon_s: u32,
     canonical_rows_seen: u64,
     candidates_scored: u64,
+    pareto_non_dominated_candidates: u64,
+    pareto_dominated_candidates: u64,
     selected: u64,
     abstained_no_candidate: u64,
     evaluated: u64,
@@ -1318,11 +1323,17 @@ impl Default for ExitPolicyReplayReport {
             utility_formula:
                 "gross_floor_pct*p_hit - p_censor - 0.10*(interval_width/max_interval_width) - 0.05*(t_hit_p75_s/max_t_hit_p75_s)"
                     .to_string(),
+            candidate_curve_scope: "UI_NON_DOMINATED_SUBSET".to_string(),
+            selection_reason:
+                "highest utility among non-dominated candidates passing all gates".to_string(),
+            pareto_frontier_enabled: true,
             candidate_grid_floors_bp: EXPECTED_FLOOR_BP.to_vec(),
             candidate_grid_horizons_s: EXPECTED_HORIZONS_S.to_vec(),
             canonical_selection_horizon_s: EXPECTED_HORIZONS_S[0],
             canonical_rows_seen: 0,
             candidates_scored: 0,
+            pareto_non_dominated_candidates: 0,
+            pareto_dominated_candidates: 0,
             selected: 0,
             abstained_no_candidate: 0,
             evaluated: 0,
@@ -1365,6 +1376,8 @@ struct PolicyCandidate {
     n_total: u64,
     n_complete: u64,
     utility_score: f64,
+    pareto_status: String,
+    dominated_by: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -4182,21 +4195,69 @@ fn select_exit_policy_candidate(
     serving_curve: &BTreeMap<(u32, i32), ServingCurvePoint>,
     report: &mut ExitPolicyReplayReport,
 ) -> Option<PolicyCandidate> {
-    let mut best: Option<PolicyCandidate> = None;
+    let mut gated = Vec::new();
     for point in serving_curve.values() {
         report.candidates_scored = report.candidates_scored.saturating_add(1);
         let Some(candidate) = policy_candidate_from_point(entry_locked_pct, point, report) else {
             continue;
         };
-        if best
-            .as_ref()
-            .map(|current| candidate.utility_score > current.utility_score)
-            .unwrap_or(true)
-        {
-            best = Some(candidate);
+        gated.push(candidate);
+    }
+    apply_pareto_frontier(&mut gated, report);
+    gated
+        .into_iter()
+        .filter(|candidate| candidate.dominated_by.is_none())
+        .max_by(|left, right| {
+            left.utility_score
+                .partial_cmp(&right.utility_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+fn apply_pareto_frontier(candidates: &mut [PolicyCandidate], report: &mut ExitPolicyReplayReport) {
+    for idx in 0..candidates.len() {
+        let dominated_by = (0..candidates.len())
+            .filter(|&other_idx| other_idx != idx)
+            .find(|&other_idx| pareto_dominates(&candidates[other_idx], &candidates[idx]))
+            .map(|other_idx| candidate_id(&candidates[other_idx]));
+        if let Some(dominated_by) = dominated_by {
+            candidates[idx].pareto_status = "DOMINATED".to_string();
+            candidates[idx].dominated_by = Some(dominated_by);
+            report.pareto_dominated_candidates =
+                report.pareto_dominated_candidates.saturating_add(1);
+        } else {
+            candidates[idx].pareto_status = "NON_DOMINATED".to_string();
+            candidates[idx].dominated_by = None;
+            report.pareto_non_dominated_candidates =
+                report.pareto_non_dominated_candidates.saturating_add(1);
         }
     }
-    best
+}
+
+fn pareto_dominates(left: &PolicyCandidate, right: &PolicyCandidate) -> bool {
+    let left_interval = left.p_hit_interval_width();
+    let right_interval = right.p_hit_interval_width();
+    let weakly_better = left.gross_floor_pct + 1e-12 >= right.gross_floor_pct
+        && left.p_hit + 1e-12 >= right.p_hit
+        && left.p_censor <= right.p_censor + 1e-12
+        && left_interval <= right_interval + 1e-12
+        && left.t_hit_p75_s <= right.t_hit_p75_s;
+    let strictly_better = left.gross_floor_pct > right.gross_floor_pct + 1e-12
+        || left.p_hit > right.p_hit + 1e-12
+        || left.p_censor + 1e-12 < right.p_censor
+        || left_interval + 1e-12 < right_interval
+        || left.t_hit_p75_s < right.t_hit_p75_s;
+    weakly_better && strictly_better
+}
+
+fn candidate_id(candidate: &PolicyCandidate) -> String {
+    format!("h{}_floor_bp{}", candidate.horizon_s, candidate.floor_bp)
+}
+
+impl PolicyCandidate {
+    fn p_hit_interval_width(&self) -> f64 {
+        (self.ci_upper - self.ci_lower).max(0.0)
+    }
 }
 
 fn policy_candidate_from_point(
@@ -4263,6 +4324,8 @@ fn policy_candidate_from_point(
         n_total: point.n_total,
         n_complete: point.n_complete,
         utility_score,
+        pareto_status: "UNCLASSIFIED".to_string(),
+        dominated_by: None,
     })
 }
 
@@ -4294,7 +4357,7 @@ fn push_exit_policy_example(
         return;
     }
     report.examples.push(format!(
-        "reason={} sample_id={} route_id={} horizon_s={} floor_bp={} gross_floor_pct={} exit_target_pct={} p_hit={} ci=[{},{}] p_censor={} t_hit_p75_s={} n_total={} n_complete={} utility={}",
+        "reason={} sample_id={} route_id={} horizon_s={} floor_bp={} gross_floor_pct={} exit_target_pct={} p_hit={} ci=[{},{}] p_censor={} t_hit_p75_s={} n_total={} n_complete={} utility={} pareto_status={} dominated_by={}",
         reason,
         sample_id,
         route_id,
@@ -4309,7 +4372,9 @@ fn push_exit_policy_example(
         candidate.t_hit_p75_s,
         candidate.n_total,
         candidate.n_complete,
-        candidate.utility_score
+        candidate.utility_score,
+        candidate.pareto_status,
+        candidate.dominated_by.as_deref().unwrap_or("null")
     ));
 }
 
@@ -6652,6 +6717,7 @@ fn build_contract_output_mapping() -> ContractOutputMapping {
             "all_calibration_cells_ready".to_string(),
             "all_ipcw_censoring_models_ready".to_string(),
             "scorecard_has_positive_ipcw_effective_n".to_string(),
+            "exit_policy_replay_uses_non_dominated_candidate_subset".to_string(),
             "temporal_split_not_diagnostic".to_string(),
         ],
     }
@@ -6928,6 +6994,55 @@ mod tests {
         assert_eq!(selected.floor_bp, 120);
         assert!((selected.exit_target_pct - (-2.20)).abs() < 1e-6);
         assert_eq!(report.candidates_scored, 2);
+        assert_eq!(report.pareto_non_dominated_candidates, 2);
+        assert_eq!(report.pareto_dominated_candidates, 0);
+        assert_eq!(selected.pareto_status, "NON_DOMINATED");
+        assert!(selected.dominated_by.is_none());
+    }
+
+    #[test]
+    fn exit_policy_replay_filters_dominated_candidates_before_utility_selection() {
+        let mut report = ExitPolicyReplayReport::default();
+        let mut curve = BTreeMap::new();
+        curve.insert(
+            (900, 80),
+            ServingCurvePoint {
+                horizon_s: 900,
+                floor_bp: 80,
+                probability: Some(0.70),
+                ci_lower: Some(0.62),
+                ci_upper: Some(0.76),
+                p_censor: Some(0.06),
+                t_hit_p75_s: Some(1_200),
+                n_total: 1_000,
+                n_complete: 900,
+                calibration_applied: true,
+            },
+        );
+        curve.insert(
+            (1800, 120),
+            ServingCurvePoint {
+                horizon_s: 1800,
+                floor_bp: 120,
+                probability: Some(0.72),
+                ci_lower: Some(0.66),
+                ci_upper: Some(0.78),
+                p_censor: Some(0.04),
+                t_hit_p75_s: Some(900),
+                n_total: 1_000,
+                n_complete: 900,
+                calibration_applied: true,
+            },
+        );
+
+        let selected = select_exit_policy_candidate(3.40, &curve, &mut report).unwrap();
+
+        assert_eq!(selected.horizon_s, 1800);
+        assert_eq!(selected.floor_bp, 120);
+        assert_eq!(selected.pareto_status, "NON_DOMINATED");
+        assert_eq!(report.candidates_scored, 2);
+        assert_eq!(report.pareto_non_dominated_candidates, 1);
+        assert_eq!(report.pareto_dominated_candidates, 1);
     }
 
     #[test]
