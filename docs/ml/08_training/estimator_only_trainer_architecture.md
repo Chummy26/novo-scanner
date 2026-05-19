@@ -100,12 +100,13 @@ O binário grava:
   artefato preditivo. Ela registra curvas ajustadas, deltas e exemplos; não
   altera o dataset supervisionado nem remove observações.
 - `serving_probability_projection.json`: auditoria da projeção aplicada à
-  probabilidade final de serving (`p_hit_serving`), que é a única probabilidade
-  elegível para preencher `candidate_curve[].p_hit` e `primary_setup.p_hit` no
-  contrato `trade_recommendation/v2.3`. O artefato separa ajustes feitos em
-  células sem calibração aplicada (`raw fallback`); qualquer ajuste desse tipo
-  bloqueia promoção, porque indica que uma probabilidade não calibrada precisou
-  ser alterada para cumprir a forma monotônica da curva.
+  probabilidade componente de serving (`EstimatorRow.p_hit_serving`). O payload
+  público não deve ler esse campo isoladamente: `candidate_curve[].p_hit` vem de
+  `ServingCurvePoint.probability`, produzido por lookup rota/PIT/global,
+  shrinkage, fallback e projeção da curva 6x6. O artefato separa ajustes feitos
+  em células sem calibração aplicada (`raw fallback`); qualquer ajuste desse
+  tipo bloqueia promoção, porque indica que uma probabilidade não calibrada
+  precisou ser alterada para cumprir a forma monotônica da curva.
 - `public_interval_audit.json`: auditoria de contrato que prova que todo
   `p_hit_serving` publicado está dentro de `p_hit_ci_lower/p_hit_ci_upper` após
   calibração e projeção final.
@@ -134,9 +135,10 @@ O binário grava:
 - `contract_output_mapping.json`: contrato machine-readable entre o artefato do
   trainer e o payload público `trade_recommendation/v2.3`. Ele declara
   explicitamente que `candidate_curve[].p_hit` deve vir de
-  `EstimatorRow.p_hit_serving` e que `primary_setup.p_hit` é apenas o `p_hit` do
-  candidato selecionado pela policy, nunca recomputado a partir de `p_hit_km` ou
-  `p_hit_calibrated_raw`.
+  `ServingCurvePoint.probability` após lookup/shrinkage/fallback/projeção, e que
+  `primary_setup.p_hit` é apenas o `p_hit` do candidato selecionado pela policy,
+  nunca recomputado a partir de `p_hit_km`, `p_hit_calibrated_raw` ou do
+  componente agregado `EstimatorRow.p_hit_serving`.
 - `sources.jsonl`: manifestos V2 consumidos, digests, versões e contagens.
 - `_SUCCESS`: marcador escrito apenas depois da publicação dos artefatos.
 

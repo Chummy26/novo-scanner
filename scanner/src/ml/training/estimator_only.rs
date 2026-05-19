@@ -1735,6 +1735,8 @@ pub fn run(cli: Cli) -> Result<()> {
         &serving_probability_projection,
         &serving_monotonicity_audit,
         split,
+        cli.max_manifests,
+        cli.max_rows,
     );
     let promotion_allowed = promotion_blockers.is_empty();
 
@@ -5293,6 +5295,8 @@ fn promotion_blockers(
     serving_projection: &MonotonicityProjectionAudit,
     serving_monotonicity: &MonotonicityAudit,
     split: TemporalSplit,
+    max_manifests: Option<usize>,
+    max_rows: Option<u64>,
 ) -> Vec<String> {
     let mut blockers = Vec::new();
     if !audit.issues.is_empty() {
@@ -5307,6 +5311,18 @@ fn promotion_blockers(
     if split.diagnostic_only {
         blockers.push("temporal_span_insufficient_for_full_purge_embargo_promotion".to_string());
     }
+    if let Some(max_manifests) = max_manifests {
+        blockers.push(format!(
+            "trainer_max_manifests_set={} reason=limited_corpus_cannot_promote",
+            max_manifests
+        ));
+    }
+    if let Some(max_rows) = max_rows {
+        blockers.push(format!(
+            "trainer_max_rows_set={} reason=partial_read_cannot_promote",
+            max_rows
+        ));
+    }
     if split.requested_purge_s < split.max_horizon_s
         || split.requested_embargo_s < split.max_horizon_s
     {
@@ -5319,6 +5335,12 @@ fn promotion_blockers(
         blockers.push(format!(
             "runtime_config_hash_count={}",
             audit.runtime_config_hashes.len()
+        ));
+    }
+    if audit.logical_digest_skipped_manifests > 0 {
+        blockers.push(format!(
+            "logical_digest_skipped_manifests={} verified_manifests={} reason=max_rows_or_partial_read_cannot_promote",
+            audit.logical_digest_skipped_manifests, audit.logical_digest_verified_manifests
         ));
     }
     if !audit
@@ -5950,18 +5972,21 @@ fn build_contract_output_mapping() -> ContractOutputMapping {
     ContractOutputMapping {
         output_contract_version: OUTPUT_CONTRACT_VERSION.to_string(),
         serving_mode: "POLICY_SELECTED_AFTER_FULL_CURVE_PROJECTION".to_string(),
-        candidate_curve_p_hit_source: "EstimatorRow.p_hit_serving".to_string(),
+        candidate_curve_p_hit_source:
+            "ServingCurvePoint.probability after lookup/shrinkage/fallback/projection from EstimatorRow.p_hit_serving"
+                .to_string(),
         primary_setup_p_hit_source:
             "selected candidate_curve[].p_hit; never recompute from p_hit_km or p_hit_calibrated_raw"
                 .to_string(),
         p_hit_interval_source:
             "EstimatorRow.p_hit_ci_lower/p_hit_ci_upper mapped to p_hit_serving scale with ci_method"
                 .to_string(),
-        public_probability_field: "p_hit_serving".to_string(),
+        public_probability_field: "candidate_curve[].p_hit".to_string(),
         intermediate_probability_fields_not_public: vec![
             "p_hit_km_raw".to_string(),
             "p_hit_km".to_string(),
             "p_hit_calibrated_raw".to_string(),
+            "EstimatorRow.p_hit_serving_component".to_string(),
         ],
         promotion_requires: vec![
             "bootstrap_or_conformal_interval_ready_for_all_eligible_rows".to_string(),
@@ -6317,11 +6342,13 @@ mod tests {
         let mapping = build_contract_output_mapping();
 
         assert_eq!(mapping.output_contract_version, OUTPUT_CONTRACT_VERSION);
-        assert_eq!(mapping.public_probability_field, "p_hit_serving");
-        assert_eq!(
-            mapping.candidate_curve_p_hit_source,
-            "EstimatorRow.p_hit_serving"
-        );
+        assert_eq!(mapping.public_probability_field, "candidate_curve[].p_hit");
+        assert!(mapping
+            .candidate_curve_p_hit_source
+            .contains("ServingCurvePoint.probability"));
+        assert!(mapping
+            .candidate_curve_p_hit_source
+            .contains("lookup/shrinkage/fallback/projection"));
         assert!(mapping
             .primary_setup_p_hit_source
             .contains("selected candidate_curve[].p_hit"));
@@ -6331,6 +6358,9 @@ mod tests {
         assert!(mapping
             .intermediate_probability_fields_not_public
             .contains(&"p_hit_calibrated_raw".to_string()));
+        assert!(mapping
+            .intermediate_probability_fields_not_public
+            .contains(&"EstimatorRow.p_hit_serving_component".to_string()));
     }
 
     #[test]
@@ -6450,6 +6480,8 @@ mod tests {
             &serving_projection,
             &serving_monotonicity,
             split,
+            None,
+            None,
         );
 
         assert!(blockers
@@ -6458,6 +6490,94 @@ mod tests {
         assert!(blockers
             .iter()
             .any(|blocker| blocker.starts_with("serving_projection_adjusted_uncalibrated_rows")));
+    }
+
+    #[test]
+    fn promotion_blocks_skipped_logical_digest_verification() {
+        let mut audit = DatasetAudit::default();
+        audit.runtime_config_hashes.insert("cfg".to_string(), 1);
+        audit
+            .schema_versions
+            .insert(LABELED_TRADE_SCHEMA_VERSION, 1);
+        audit.label_floor_hit_lengths.insert(6, 1);
+        audit.logical_digest_skipped_manifests = 1;
+        for &floor_bp in EXPECTED_FLOOR_BP {
+            audit
+                .floor_values
+                .insert(format!("{:.6}", floor_bp as f32 / 100.0), 1);
+        }
+        for &horizon_s in EXPECTED_HORIZONS_S {
+            audit.horizons_s.insert(horizon_s, 1);
+        }
+        let dedupe = DedupeReport {
+            training_aggregation: DedupeAudit::new("training_aggregation"),
+            bootstrap_interval: DedupeAudit::new("bootstrap_interval"),
+            calibration_fit: DedupeAudit::new("calibration_fit"),
+            scoring_scorecard: DedupeAudit::new("scoring_scorecard"),
+        };
+        let mut bootstrap_intervals = BootstrapIntervalAudit::default();
+        bootstrap_intervals.ready_rows = 1;
+        let calibration = CalibrationSuite {
+            calibrator_version: CALIBRATOR_VERSION.to_string(),
+            method: CALIBRATOR_METHOD.to_string(),
+            serving_method: SERVING_CALIBRATOR_METHOD.to_string(),
+            min_complete: MIN_CALIBRATION_COMPLETE,
+            diagnostic_only: false,
+            censoring_treatment: "test".to_string(),
+            cells_total: 1,
+            cells_ready: 1,
+            cells_not_ready: 0,
+            cells_not_ready_examples: Vec::new(),
+            scope_models: BTreeMap::new(),
+            cells: BTreeMap::new(),
+        };
+        let scorecards = BTreeMap::from([(
+            "accept".to_string(),
+            ScoreStats {
+                n_complete: 1,
+                ..ScoreStats::default()
+            },
+        )]);
+        let split = TemporalSplit {
+            min_ts_ns: 0,
+            max_ts_ns: 1,
+            train_end_ns: 0,
+            calibration_start_ns: 0,
+            calibration_end_ns: 0,
+            test_start_ns: 0,
+            max_horizon_s: 28_800,
+            requested_purge_s: 28_800,
+            requested_embargo_s: 28_800,
+            purge_s: 28_800,
+            embargo_s: 28_800,
+            data_span_s: 1,
+            diagnostic_only: false,
+        };
+
+        let blockers = promotion_blockers(
+            &audit,
+            &dedupe,
+            &bootstrap_intervals,
+            &PublicIntervalAudit::default(),
+            &calibration,
+            &scorecards,
+            &MonotonicityAudit::default(),
+            &MonotonicityProjectionAudit::default(),
+            &MonotonicityAudit::default(),
+            split,
+            Some(1),
+            Some(1),
+        );
+
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker.starts_with("logical_digest_skipped_manifests=1")));
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker.starts_with("trainer_max_manifests_set=1")));
+        assert!(blockers
+            .iter()
+            .any(|blocker| blocker.starts_with("trainer_max_rows_set=1")));
     }
 
     #[test]

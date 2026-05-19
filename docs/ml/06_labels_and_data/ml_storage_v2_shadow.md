@@ -1,17 +1,28 @@
-# ml_storage_v2 Shadow Audit
+# ml_storage_v2 Primary Audit
 
-`ml_storage_v2` deve entrar primeiro como auditoria shadow/offline, nao como
-substituicao imediata do writer canonico.
+`ml_storage_v2` com `fact.parquet + route_dim.parquet + manifest` ja e o formato
+principal de persistencia do corpus ML atual. Este documento registra o caminho
+de auditoria que levou a essa migracao e os gates que continuam obrigatorios
+para treino/serving.
 
-Objetivo: provar que uma representacao fisica mais compacta poderia remover
-redundancia sem perder o contrato logico usado por auditoria e trainer.
+Objetivo: manter a representacao fisica compacta sem perder o contrato logico
+usado por auditoria e trainer.
 
 ## Regra de seguranca
 
-O storage v1 continua sendo a fonte canonica ate o shadow report ficar Green em
-runs longos e representativos. O v2 nao pode reduzir frequencia, linhas,
-horizontes, floors, labels, `sampling_probability`, PIT features, `entry_locked`
-ou outcomes.
+O V2 nao pode reduzir frequencia, linhas, horizontes, floors, labels,
+`sampling_probability`, PIT features, `entry_locked` ou outcomes. O trainer deve
+ler o schema logico reconstruido pelo loader V2, nao a forma fisica compactada
+diretamente.
+
+Como os defaults atuais removem JSONL e Parquet V1 apos compactacao/equivalencia
+bem-sucedida, a promocao de qualquer modelo deve exigir:
+
+- manifests V2 presentes para todos os arquivos do corpus;
+- digest logico V2 verificado em todos os manifests consumidos;
+- `schema_version`, `runtime_config_hash`, politica de sampling e grid
+  floor/horizon compativeis;
+- `_SUCCESS` do trainer e `promotion_allowed=true` antes de servir online.
 
 ## O que o shadow valida
 
@@ -63,9 +74,10 @@ A materializacao sidecar le Parquets v1 ja fechados e validados, grava:
 - `*.storage_v2.manifest.json`: manifesto com contagens, bytes, digest logico e
   versoes de contrato.
 
-Essa etapa nao substitui writer, nao altera a coleta e nao remove o Parquet v1.
-Ela existe para medir compressao real e validar contrato antes de qualquer
-migracao.
+Essa etapa foi originalmente shadow. No modo primary atual, a publicacao V2 so
+pode apagar o V1 depois de validar equivalencia logica, contagens e manifesto.
+Falha de equivalencia deve preservar a fonte anterior e remover sidecars
+incompletos.
 
 ## Loader logico V2
 
@@ -79,10 +91,9 @@ O V2 agora tambem possui reader logico:
 - possui gate de equivalencia `v1 parquet -> v2 fact+route_dim -> batch logico`
   para comparar o batch reconstruido com o batch v1 original.
 
-Esse e o gate necessario para o V2 virar formato principal sem reduzir dados:
-o trainer deve consumir o schema logico reconstruido, nao depender da forma
-fisica compactada. O Parquet v1 pode continuar como shadow ate runs longos
-provarem equivalencia completa.
+Esse e o gate necessario para o V2 permanecer formato principal sem reduzir
+dados: o trainer consome o schema logico reconstruido, nao depende da forma
+fisica compactada.
 
 ## Benchmarks reais
 
@@ -103,9 +114,10 @@ Projetando sobre os tamanhos de 7 dias estimados anteriormente:
 O ganho real ficou acima da estimativa shadow porque remover colunas de alta
 cardinalidade tambem melhora a compressao das colunas restantes no Parquet.
 
-## Proximo gate
+## Proximos gates
 
-Antes de qualquer substituicao do storage canonico, ainda precisa existir um
-loader/auditor que leia `fact + route_dim + manifest`, reconstitua o schema
-logico usado pelo trainer e compare contra o v1 em amostras completas por
-dataset.
+- Adicionar hash forte de corpus por arquivo (`fact`, `route_dim`, manifest e
+  schema logico) alem do digest logico operacional atual.
+- Bloquear promocao de trainer quando qualquer manifest tiver digest logico
+  pulado, inclusive em runs com `--max-rows`.
+- Manter auditoria de run Green para corpus destinado a promocao.

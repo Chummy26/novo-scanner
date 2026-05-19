@@ -1,10 +1,10 @@
-//! Auditoria shadow para `ml_storage_v2`.
+//! Storage V2 primario e auditoria de equivalencia para `ml_storage_v2`.
 //!
-//! O V2 não altera frequência, labels, horizontes ou floors. Ele lê Parquets
-//! V1 fechados, materializa `fact + route_dim + manifest`, e reconstrói o
-//! contrato lógico virtualizado (`sample_id`, `route_id` e dimensão estática
-//! de rota). Em modo primário, o compactor só remove o Parquet V1 pesado
-//! depois que a equivalência `V1 == V2 reconstruído` fica Green.
+//! O V2 não altera frequência, labels, horizontes ou floors. Ele materializa
+//! `fact + route_dim + manifest` e reconstrói o contrato lógico virtualizado
+//! (`sample_id`, `route_id` e dimensão estática de rota). Em modo primário, o
+//! compactor só remove o Parquet V1 pesado depois que a equivalência
+//! `V1 == V2 reconstruído` fica Green.
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
