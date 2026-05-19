@@ -537,7 +537,7 @@ pub enum KucoinMode {
     Classic,
     /// Pro API / UTA — documented as BETA by exchange. Opt-in only.
     ProBeta,
-    /// Disabled entirely (conservative default given beta status).
+    /// Disabled entirely for explicit operator override.
     Disabled,
 }
 

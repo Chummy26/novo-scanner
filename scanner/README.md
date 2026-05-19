@@ -94,7 +94,7 @@ cargo run --release -- --config config.toml
 - D-14 XT spot atual usa `method=subscribe` + `depth@{sym},5`; manter handshake sem permessage-deflate até o cliente WS suportar descompressão dessa extensão
 - D-16 Bitget v2 para market data (v3 é order placement)
 - D-09 BingX futures ping server = 30s (não 5s como spot)
-- D-13 KuCoin default **OFF** em config (beta status Pro API + não testado)
+- D-13 KuCoin classic market-data API habilitada por padrão; Pro/UTA beta continua opt-in via `kucoin_mode = "probeta"`
 
 ## Output contract (frontend)
 

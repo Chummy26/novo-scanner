@@ -567,6 +567,34 @@ fn label_priority_rerank_interval_s_from_ml_config(ml: &config::MlConfig) -> u64
     ml.raw_rerank_interval_s.max(60)
 }
 
+fn venue_universe_key_from_config(cfg: &config::Config) -> String {
+    let kucoin_mode = match cfg.kucoin_mode {
+        config::KucoinMode::Classic => "classic",
+        config::KucoinMode::ProBeta => "probeta",
+        config::KucoinMode::Disabled => "disabled",
+    };
+    let bitget_mode = match cfg.bitget_mode {
+        config::BitgetMode::V2 => "v2",
+        config::BitgetMode::V3Uta => "v3uta",
+    };
+    let mut parts = Vec::with_capacity(crate::types::Venue::ALL.len() + 2);
+    parts.push(format!("kucoin_mode={kucoin_mode}"));
+    parts.push(format!("bitget_mode={bitget_mode}"));
+    for venue in crate::types::Venue::ALL {
+        let enabled = if matches!(
+            venue,
+            crate::types::Venue::KucoinSpot | crate::types::Venue::KucoinFut
+        ) && cfg.kucoin_mode == config::KucoinMode::Disabled
+        {
+            false
+        } else {
+            cfg.venues.is_enabled(venue)
+        };
+        parts.push(format!("{:?}={}", venue, enabled));
+    }
+    parts.join(",")
+}
+
 fn operational_audit_from_metrics(metrics: &obs::Metrics) -> OperationalAudit {
     metrics.refresh_process_memory();
 
@@ -901,6 +929,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 label_priority_target_coverage_from_ml_config(&cfg.ml),
                 label_priority_rerank_interval_s_from_ml_config(&cfg.ml),
             )
+            .with_venue_universe_key(venue_universe_key_from_config(&cfg))
             .with_ml_cycle_shards(ml_cycle_shards)
             .with_raw_writer(ml_raw_writer_handle)
             .with_route_ranking(Arc::clone(&ranker))
@@ -2076,6 +2105,28 @@ mod tests {
             super::label_priority_rerank_interval_s_from_ml_config(&ml),
             60
         );
+    }
+
+    #[test]
+    fn venue_universe_key_versions_kucoin_policy() {
+        let mut with_kucoin = crate::config::Config::default_in_memory();
+        with_kucoin.kucoin_mode = crate::config::KucoinMode::Classic;
+        with_kucoin.venues.kucoin_spot = true;
+        with_kucoin.venues.kucoin_fut = true;
+
+        let mut without_kucoin = with_kucoin.clone();
+        without_kucoin.kucoin_mode = crate::config::KucoinMode::Disabled;
+
+        let active_key = super::venue_universe_key_from_config(&with_kucoin);
+        let disabled_key = super::venue_universe_key_from_config(&without_kucoin);
+
+        assert_ne!(active_key, disabled_key);
+        assert!(active_key.contains("kucoin_mode=classic"));
+        assert!(active_key.contains("KucoinSpot=true"));
+        assert!(active_key.contains("KucoinFut=true"));
+        assert!(disabled_key.contains("kucoin_mode=disabled"));
+        assert!(disabled_key.contains("KucoinSpot=false"));
+        assert!(disabled_key.contains("KucoinFut=false"));
     }
 
     #[test]

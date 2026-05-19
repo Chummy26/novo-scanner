@@ -370,6 +370,10 @@ pub struct MlServer {
     label_allowlist_symbols_key: String,
     label_priority_target_coverage: f64,
     label_priority_rerank_interval_s: u64,
+    // Fingerprint determinístico do universo configurado de venues/modos.
+    // Habilitar/desabilitar uma venue muda a população supervisionada de
+    // rotas; o trainer não deve tratar esses runs como equivalentes.
+    venue_universe_key: String,
     ml_cycle_shards: usize,
     // geração do priority_set (incrementado em set_priority_set_and_bump).
     priority_set_generation_id: AtomicU64,
@@ -387,6 +391,7 @@ fn compute_supervised_config_hash(
     label_allowlist_symbols_key: &str,
     label_priority_target_coverage: f64,
     label_priority_rerank_interval_s: u64,
+    venue_universe_key: &str,
     ml_cycle_shards: usize,
     recommendation_cooldown_ns: u64,
     opportunity_alive_threshold_pct: f32,
@@ -409,6 +414,7 @@ fn compute_supervised_config_hash(
             "label_horizons_s=[{}]|label_background_decimation_mod={}|",
             "label_allowlist_symbols=[{}]|label_priority_target_coverage={:.6}|",
             "label_priority_rerank_interval_s={}|",
+            "venue_universe_key={}|",
             "ml_cycle_shards={}|",
             "recommendation_cooldown_ns={}|",
             "accepted_schema_version={}|labeled_schema_version={}|",
@@ -430,6 +436,7 @@ fn compute_supervised_config_hash(
         label_allowlist_symbols_key,
         label_priority_target_coverage,
         label_priority_rerank_interval_s,
+        venue_universe_key,
         ml_cycle_shards.max(1),
         recommendation_cooldown_ns,
         ACCEPTED_SAMPLE_SCHEMA_VERSION,
@@ -780,6 +787,7 @@ impl MlServer {
         let label_allowlist_symbols_key = String::new();
         let label_priority_target_coverage = 0.95;
         let label_priority_rerank_interval_s = 3600;
+        let venue_universe_key = "venue_universe=unspecified".to_string();
         let ml_cycle_shards = 1;
         let runtime_config_hash = compute_supervised_config_hash(
             trigger.config(),
@@ -792,6 +800,7 @@ impl MlServer {
             &label_allowlist_symbols_key,
             label_priority_target_coverage,
             label_priority_rerank_interval_s,
+            &venue_universe_key,
             ml_cycle_shards,
             recommendation_cooldown_ns,
             0.0,
@@ -839,6 +848,7 @@ impl MlServer {
             label_allowlist_symbols_key,
             label_priority_target_coverage,
             label_priority_rerank_interval_s,
+            venue_universe_key,
             ml_cycle_shards,
             priority_set_generation_id: AtomicU64::new(0),
             priority_set_updated_at_ns: AtomicU64::new(0),
@@ -857,6 +867,7 @@ impl MlServer {
             &self.label_allowlist_symbols_key,
             self.label_priority_target_coverage,
             self.label_priority_rerank_interval_s,
+            &self.venue_universe_key,
             self.ml_cycle_shards,
             self.recommendation_cooldown_ns,
             self.opportunity_alive_threshold_pct,
@@ -923,6 +934,15 @@ impl MlServer {
         self.label_allowlist_symbols_key = allowlist_symbols_key;
         self.label_priority_target_coverage = priority_target_coverage;
         self.label_priority_rerank_interval_s = priority_rerank_interval_s;
+        self.refresh_runtime_config_hash();
+        self
+    }
+
+    /// Versiona o universo configurado de venues e modos de market-data. A
+    /// entrada/remoção de uma venue altera quais rotas podem gerar samples e
+    /// labels, portanto precisa fragmentar a linhagem supervisionada.
+    pub fn with_venue_universe_key(mut self, venue_universe_key: String) -> Self {
+        self.venue_universe_key = venue_universe_key;
         self.refresh_runtime_config_hash();
         self
     }
@@ -2446,6 +2466,20 @@ mod tests {
         assert_ne!(
             base.runtime_config_hash, changed_rerank.runtime_config_hash,
             "cadencia de rerank altera quando rotas entram em priority supervisionado"
+        );
+    }
+
+    #[test]
+    fn venue_universe_changes_supervised_config_hash() {
+        let without_kucoin = mk_server().with_venue_universe_key(
+            "kucoin_mode=disabled,KucoinSpot=false,KucoinFut=false".into(),
+        );
+        let with_kucoin = mk_server()
+            .with_venue_universe_key("kucoin_mode=classic,KucoinSpot=true,KucoinFut=true".into());
+
+        assert_ne!(
+            without_kucoin.runtime_config_hash, with_kucoin.runtime_config_hash,
+            "habilitar KuCoin muda o universo de rotas supervisionadas"
         );
     }
 

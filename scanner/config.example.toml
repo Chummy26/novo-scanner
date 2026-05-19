@@ -11,9 +11,9 @@ broadcast_ms = 150
 # 0.05 for noisy dev.
 entry_threshold_pct = 0.30
 
-# PhD#5 D-13: KuCoin Pro/UTA API is documented as BETA by the exchange.
-# Values: "classic" (default, opt-in), "probeta", "disabled".
-kucoin_mode = "disabled"
+# KuCoin classic market-data API is part of the production universe.
+# Values: "classic" (default), "probeta" (beta Pro/UTA API), "disabled".
+kucoin_mode = "classic"
 
 # PhD#5 D-16: v2 = market-data (current); v3 = UTA order placement.
 # Values: "v2" (default), "v3uta".
@@ -28,7 +28,7 @@ bingx_spot   = true
 bingx_fut    = true
 gate_spot    = true
 gate_fut     = true
-kucoin       = false  # off by default (see kucoin_mode)
+kucoin       = true
 xt_spot      = true
 xt_fut       = true
 bitget       = true
